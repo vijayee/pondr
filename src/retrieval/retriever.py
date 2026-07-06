@@ -65,11 +65,19 @@ class HippocampalRetriever:
             return
         self.vector_search = vs
 
-    def retrieve(self, prompt: str, use_semantic: bool = True) -> list[dict]:
+    def retrieve(
+        self,
+        prompt: str,
+        conversation_history: list[dict] | None = None,
+        use_semantic: bool = True,
+    ) -> list[dict]:
         """Retrieve relevant episodes for a natural-language prompt.
 
         Args:
             prompt: The user's question.
+            conversation_history: Recent turns for pronoun / implicit-reference
+                resolution by the planner (Phase 1c). Optional, backward
+                compatible (``None`` = plan from the prompt alone).
             use_semantic: Fall back to semantic search if graph traversal
                 returns fewer than 3 results. No-op until Phase F (no vector
                 index yet) — kept wired so Phase F only fills in the hook.
@@ -78,7 +86,7 @@ class HippocampalRetriever:
             Ranked list of episode dicts (see ``GraphTraversal.retrieve`` for
             the shape), highest score first.
         """
-        query_plan = self.planner.plan(prompt)
+        query_plan = self.planner.plan(prompt, conversation_history)
         results = self.traversal.retrieve(query_plan)
 
         if use_semantic and len(results) < 3:

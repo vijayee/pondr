@@ -56,7 +56,10 @@ class ModeAGenerator:
         Returns:
             ``{"response", "retrieved_episodes", "context_used", "model"}``.
         """
-        episodes = self.retriever.retrieve(prompt)
+        # Phase 1c: pass conversation_history to the retriever so the planner
+        # can resolve pronouns / implicit references against recent context
+        # (not just to the LLM, which the lines below already do).
+        episodes = self.retriever.retrieve(prompt, conversation_history=conversation_history)
         context = self.retriever.build_context_string(episodes, max_context_tokens)
 
         messages: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]

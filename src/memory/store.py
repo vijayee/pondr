@@ -233,6 +233,63 @@ class HippocampalStore:
             json.dumps(embedding),
         )
 
+    # ---- entity salience (Phase 1c) ----
+
+    def get_entity_salience(self, entity: str) -> float:
+        """Salience score in ``[0, 1]``. Phase 1c: mention_count only (log-scaled).
+
+        Recency and structural factors are Phase 3 (GNN salience). Returns ``0.0``
+        for an unknown entity. This is a ``get_sync`` point lookup on a single
+        known key — safe on the sorted-built compact corpora; the salience keys
+        are written in a sorted batch by ``write_entity_salience_batch`` (see
+        ``docs/Phase 1c.md`` §0.3 for the get_sync caveat).
+        """
+        count_str = _b2s(self.db.get_sync(f"content/entity/{entity}/mention_count"))
+        if not count_str:
+            return 0.0
+        try:
+            count = int(count_str)
+        except ValueError:
+            return 0.0
+        # Log-scaled: 0 mentions -> 0; 1 -> ~0.1; 100 -> ~0.4; capped at 1.0.
+        # Gentle curve so a dominant entity doesn't fully drown out rarer ones.
+        return min(1.0, 0.1 + 0.3 * (count ** 0.5) / 10.0)
+
+    def write_entity_salience_batch(
+        self,
+        counts: dict[str, int],
+        last_ep: dict[str, str],
+    ) -> None:
+        """Persist salience for all entities in ONE sorted ``batch_sync``.
+
+        Writes ``content/entity/{entity}/mention_count`` and
+        ``content/entity/{entity}/last_mentioned``. Keys are SORTED before
+        submission so subsequent ``get_sync`` reads on them are reliable (sorted
+        insertion avoids the insertion-order-dependent split path — see
+        ``docs/Phase 1c.md`` §0.3). Called by ``scripts/compute_entity_salience.py``;
+        do NOT call per-encode (unsorted incremental writes are not get_sync-safe).
+
+        Entities containing ``/`` or NUL are skipped: the encoder assumes
+        ``/``-free entity strings for its own ``memory/spo/{eid}/has_entity/E:{entity}``
+        keys, and a ``/`` would split the salience key into the wrong namespace.
+        """
+        ops: list[dict] = []
+        for entity in sorted(counts):
+            if "/" in entity or "\x00" in entity:
+                continue
+            ops.append({
+                "type": "put",
+                "key": f"content/entity/{entity}/mention_count",
+                "value": str(counts[entity]),
+            })
+            ops.append({
+                "type": "put",
+                "key": f"content/entity/{entity}/last_mentioned",
+                "value": last_ep.get(entity, ""),
+            })
+        if ops:
+            self.db.batch_sync(ops)
+
     # ---- user / session / global ids ----
 
     def _counter_next(self, key: str) -> int:

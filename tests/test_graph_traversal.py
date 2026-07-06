@@ -293,4 +293,124 @@ def test_traversal_scans_are_nul_free(tmp_path):
     assert keys, "no graph keys stored"
     corrupt = [k for k in keys if "\x00" in k]
     assert not corrupt, f"corrupt graph keys (scan bug regressed): {corrupt[:3]}"
+
+
+# ── entity salience (Phase 1c) ──
+
+
+def test_salience_weighted_scoring(tmp_path):
+    """High-salience entity matches outscore low-salience ones (Phase 1c).
+
+    Two episodes each matching one query entity: Alice (salience ~0.31 from 50
+    mentions) vs Bob (salience ~0.13 from 1 mention). Alice's entity term
+    (~6.56) beats Bob's (~5.65) by more than the recency tiebreaker (Bob is one
+    day newer → +0.1), so Alice ranks higher despite being older.
+    """
+    store, trav = _traversal(tmp_path)
+    store.encode_episode(_ep("ep_001", entities=["Alice"], ts="2026-07-01T00:00:00"))
+    store.encode_episode(_ep("ep_002", entities=["Bob"], ts="2026-07-02T00:00:00"))
+
+    # Persist salience via the sorted-batch store method so the keys are
+    # get_sync-safe (NOT raw put_sync).
+    store.write_entity_salience_batch(
+        counts={"Alice": 50, "Bob": 1},
+        last_ep={"Alice": "ep_001", "Bob": "ep_002"},
+    )
+
+    results = trav.retrieve(
+        {"entities": ["Alice", "Bob"], "entity_mode": "union", "limit": 5}
+    )
+    by_id = {r["episode_id"]: r for r in results}
+    assert "ep_001" in by_id and "ep_002" in by_id
+    assert by_id["ep_001"]["score"] > by_id["ep_002"]["score"]
+    store.close()
+
+
+def test_salience_unknown_entity_still_scores(tmp_path):
+    """An entity with no salience entry still contributes _W_ENTITY/2 (not 0)."""
+    store, trav = _traversal(tmp_path)
+    store.encode_episode(_ep("ep_001", entities=["Alice"], ts="2026-07-01T00:00:00"))
+    # No write_entity_salience_batch call → get_entity_salience("Alice") == 0.0.
+    results = trav.retrieve({"entities": ["Alice"], "limit": 5})
+    assert results and results[0]["episode_id"] == "ep_001"
+    # Entity match with salience 0.0 = _W_ENTITY * 0.5 = 5.0; recency rank 0 → 0.
+    assert results[0]["score"] == 5.0
+    store.close()
+
+
+def test_compute_entity_salience_script(tmp_path):
+    """The batch script counts has_entity triples correctly and persists them.
+
+    Mirrors what scripts/compute_entity_salience.py does, against a tmp store,
+    so the scan/parse/batch-persist path is exercised without a real corpus.
+    """
+    from collections import Counter
+
+    from scripts.compute_entity_salience import _iter_entity_episode_pairs
+
+    store, _ = _traversal(tmp_path)
+    store.encode_episode(_ep("ep_001", entities=["Alice", "Bob"]))
+    store.encode_episode(_ep("ep_002", entities=["Alice"]))
+    store.encode_episode(_ep("ep_003", entities=["Alice"]))
+
+    counts: Counter[str] = Counter()
+    last_ep: dict[str, str] = {}
+    for entity, eid in _iter_entity_episode_pairs(store):
+        counts[entity] += 1
+        last_ep[entity] = eid
+    store.write_entity_salience_batch(dict(counts), last_ep)
+
+    assert counts["Alice"] == 3
+    assert counts["Bob"] == 1
+    # get_sync reads the sorted-written keys back.
+    assert store.get_entity_salience("Alice") > store.get_entity_salience("Bob")
+    store.close()
+
+
+# ── temporal date-range (Phase 1c) ──
+
+
+def test_date_range_query(tmp_path):
+    """Absolute date_from/date_to filters episodes by timestamp."""
+    store, trav = _traversal(tmp_path)
+    store.encode_episode(_ep("ep_001", ts="2025-06-15T10:00:00"))
+    store.encode_episode(_ep("ep_002", ts="2025-07-15T10:00:00"))
+    store.encode_episode(_ep("ep_003", ts="2025-08-15T10:00:00"))
+
+    results = trav.retrieve({"date_from": "2025-06-01", "date_to": "2025-07-31", "limit": 5})
+    ids = {r["episode_id"] for r in results}
+    assert ids == {"ep_001", "ep_002"}, ids
+    store.close()
+
+
+def test_date_range_and_entity_combined(tmp_path):
+    """Absolute date range combines with an entity filter."""
+    store, trav = _traversal(tmp_path)
+    store.encode_episode(_ep("ep_001", entities=["Alice"], ts="2025-06-15T10:00:00"))
+    store.encode_episode(_ep("ep_002", entities=["Bob"], ts="2025-06-15T10:00:00"))
+    store.encode_episode(_ep("ep_003", entities=["Alice"], ts="2025-08-15T10:00:00"))
+
+    results = trav.retrieve(
+        {
+            "entities": ["Alice"],
+            "entity_mode": "union",
+            "date_from": "2025-06-01",
+            "date_to": "2025-07-31",
+            "limit": 5,
+        }
+    )
+    ids = {r["episode_id"] for r in results}
+    assert ids == {"ep_001"}, ids  # Bob excluded (entity); ep_003 excluded (August)
+    store.close()
+
+
+def test_date_range_one_sided(tmp_path):
+    """date_from alone (open-ended upper bound) keeps everything at/after it."""
+    store, trav = _traversal(tmp_path)
+    store.encode_episode(_ep("ep_001", ts="2025-05-15T10:00:00"))
+    store.encode_episode(_ep("ep_002", ts="2025-07-15T10:00:00"))
+
+    results = trav.retrieve({"date_from": "2025-06-01", "limit": 5})
+    ids = {r["episode_id"] for r in results}
+    assert ids == {"ep_002"}, ids
     store.close()

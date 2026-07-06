@@ -36,8 +36,8 @@ class _RulePlanner:
     def __init__(self) -> None:
         self._p = BonsaiQueryPlanner()
 
-    def plan(self, prompt: str) -> dict:
-        return self._p.plan_rule_based(prompt)
+    def plan(self, prompt: str, conversation_history: list | None = None) -> dict:
+        return self._p.plan_rule_based(prompt, conversation_history)
 
 
 def _load_corpus_episodes() -> list[Episode]:

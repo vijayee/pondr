@@ -251,6 +251,46 @@ class GraphTraversal:
                 out.add(eid)
         return out
 
+    def _filter_date_range(
+        self,
+        candidates: set[str],
+        date_from: Optional[str],
+        date_to: Optional[str],
+    ) -> set[str]:
+        """Keep candidates whose timestamp falls in ``[date_from, date_to]``.
+
+        ``date_from`` / ``date_to`` are ISO date or datetime strings; either may
+        be ``None`` (one-sided range). A bare date (``"2025-06-01"``) parses at
+        midnight. Inclusive on both ends. O(candidates) with one ``get_episode``
+        per candidate — same cost shape as ``_filter_temporal``. This is the
+        Phase 1c long-range path: O(candidates) instead of walking a ``follows``
+        chain capped at ``_MAX_FOLLOWS_HOPS``.
+        """
+        lo = self._parse_dt(date_from) if date_from else None
+        hi = self._parse_dt(date_to) if date_to else None
+        out: set[str] = set()
+        for eid in candidates:
+            ep = self.store.get_episode(eid)
+            if not ep or not ep.timestamp:
+                continue
+            ts = self._parse_dt(ep.timestamp)
+            if ts is None:
+                continue
+            if lo is not None and ts < lo:
+                continue
+            if hi is not None and ts > hi:
+                continue
+            out.add(eid)
+        return out
+
+    @staticmethod
+    def _parse_dt(s: str) -> Optional[datetime]:
+        """Parse an ISO date/datetime string; return ``None`` on failure."""
+        try:
+            return datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+
     # ── hydration (scope rehydration deferred from Phase 1a) ──
 
     def _user_for_session(self, session_id: str) -> Optional[str]:
@@ -329,6 +369,12 @@ class GraphTraversal:
     ) -> list[dict]:
         """Heuristic ranker: axis-match counts × weights + recency ordinal.
 
+        Entity matches are weighted by per-entity salience
+        (``store.get_entity_salience``): each match contributes
+        ``_W_ENTITY * (0.5 + 0.5 * salience)`` ∈ [_W_ENTITY/2, _W_ENTITY], so a
+        high-salience entity match is worth up to 2× a low-salience one. Phase 3
+        GNN salience replaces this.
+
         Recency is the candidate's rank by timestamp within the result set
         (newest = highest rank), so the recency term is a small tiebreaker
         bounded by ``_W_RECENCY * len(candidates)`` — never enough to override an
@@ -349,7 +395,22 @@ class GraphTraversal:
 
         for r in hydrated:
             score = 0.0
-            score += _W_ENTITY * len({e.lower() for e in r["entities"]} & ent_set)
+            # Entity matches — salience-weighted (Phase 1c). A high-salience
+            # entity match is worth up to 2× a low-salience one; an unknown
+            # entity (salience 0.0) still scores _W_ENTITY/2 so a query entity
+            # not present in the salience index isn't zeroed out. Phase 3 GNN
+            # salience replaces this heuristic. Dedup by lowercased key so a
+            # duplicate in r["entities"] (a corrupt stream entry) can't
+            # double-count; salience is looked up with the original-case entity
+            # because the salience key is case-sensitive.
+            matched_entities = {e.lower() for e in r["entities"]} & ent_set
+            seen: set[str] = set()
+            for e in r["entities"]:
+                key = e.lower()
+                if key in matched_entities and key not in seen:
+                    seen.add(key)
+                    salience = self.store.get_entity_salience(e)
+                    score += _W_ENTITY * (0.5 + 0.5 * salience)
             score += _W_TOPIC * len({t.lower() for t in r["topics"]} & top_set)
             score += _W_TONE * len({a.lower() for a in r["tones"]} & ton_set)
             score += _W_RECENCY * recency_rank[r["episode_id"]]
@@ -378,6 +439,8 @@ class GraphTraversal:
         temporal_filter = query_plan.get("temporal_filter")
         temporal_after = query_plan.get("temporal_after")
         temporal_before = query_plan.get("temporal_before")
+        date_from = query_plan.get("date_from")
+        date_to = query_plan.get("date_to")
         if limit is None:
             limit = query_plan.get("limit") or _config.default_retrieval_limit
 
@@ -396,6 +459,14 @@ class GraphTraversal:
             anchor = self._find_anchor(list(candidates), temporal_before)
             if anchor:
                 candidates = set(self._follow_chain(anchor, "backward"))
+
+        # Absolute date-range filter (Phase 1c). Mutually exclusive with the
+        # relative temporal_filter bucket in the planner; the code tolerates both
+        # (range applied first, then bucket) but the planner should not emit both.
+        if date_from or date_to:
+            candidates = self._filter_date_range(candidates, date_from, date_to)
+            if not candidates:
+                return []
 
         if temporal_filter:
             candidates = self._filter_temporal(candidates, temporal_filter)

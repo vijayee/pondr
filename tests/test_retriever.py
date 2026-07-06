@@ -17,7 +17,7 @@ class _StubPlanner:
     def __init__(self, plan: dict) -> None:
         self._plan = plan
 
-    def plan(self, prompt: str) -> dict:
+    def plan(self, prompt: str, conversation_history: list | None = None) -> dict:
         return self._plan
 
 
