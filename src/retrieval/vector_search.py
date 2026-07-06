@@ -77,7 +77,16 @@ class VectorSearch:
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
         vecs = self._get_embedder().encode(texts)
-        return [list(v) for v in vecs]
+        out: list[list[float]] = []
+        for v in vecs:
+            # sentence-transformers (and faiss) return numpy float32 arrays;
+            # convert to Python floats so json.dumps in set_summary_embedding
+            # works. Pure-Python stub embedders already return Python floats.
+            if hasattr(v, "tolist"):
+                out.append([float(x) for x in v.tolist()])
+            else:
+                out.append([float(x) for x in v])
+        return out
 
     # ── episode enumeration ──
 

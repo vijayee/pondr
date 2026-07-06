@@ -7,9 +7,9 @@ conversation to the JSONL shape ``scripts/process_corpus.py`` expects:
 
 Two corpora are supported (selectable via ``--corpus``; default both):
 
-- **DialogSum** (`knorng/DialogSum`): dialogues between ``#Person1#`` /
+- **DialogSum** (`knkarthick/dialogsum`): dialogues between ``#Person1#`` /
   ``#Person2#`` with a reference summary + topic.
-- **SAMSum** (`Samsung/samsum`): chat-style dialogues with speaker names and a
+- **SAMSum** (`knkarthick/samsum`): chat-style dialogues with speaker names and a
   reference summary.
 
 Normalization parses each dialogue into ``(speaker, text)`` utterances, merges
@@ -104,7 +104,7 @@ def _write_jsonl(rows: list[dict], path: Path) -> int:
 def fetch_dialogsum(limit: int | None) -> list[dict]:
     from datasets import load_dataset
 
-    ds = load_dataset("knorng/DialogSum", split="train")
+    ds = load_dataset("knkarthick/dialogsum", split="train")
     rows: list[dict] = []
     for i, ex in enumerate(ds):
         if limit and len(rows) >= limit:
@@ -124,7 +124,7 @@ def fetch_dialogsum(limit: int | None) -> list[dict]:
 def fetch_samsum(limit: int | None) -> list[dict]:
     from datasets import load_dataset
 
-    ds = load_dataset("Samsung/samsum", split="train")
+    ds = load_dataset("knkarthick/samsum", split="train")
     rows: list[dict] = []
     for i, ex in enumerate(ds):
         if limit and len(rows) >= limit:

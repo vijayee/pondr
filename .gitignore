@@ -12,6 +12,8 @@ venv/
 data/memory_db/
 data/test_corpus/
 data/corpora/
+data/pod_runs/*_extractions.jsonl
+data/pod_runs/memory_db/
 .checkpoint.json
 *.wal
 manifest.dat

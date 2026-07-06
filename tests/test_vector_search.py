@@ -153,6 +153,50 @@ def test_l2_normalize_basic():
     assert _l2_normalize([0.0, 0.0]) == [0.0, 0.0]  # zero vector unchanged
 
 
+class _NumpyLikeVec:
+    """Mimics a numpy array: has .tolist() and is iterable. sentence-transformers
+    returns numpy float32 arrays whose scalars json.dumps can't serialize;
+    VectorSearch._embed must convert via .tolist()+float()."""
+
+    def __init__(self, vals):
+        self._v = vals
+
+    def tolist(self):
+        return self._v
+
+    def __iter__(self):
+        return iter(self._v)
+
+
+class _NumpyLikeEmbedder:
+    def __init__(self, dim=8):
+        self.dim = dim
+
+    def encode(self, texts):
+        return [_NumpyLikeVec([float(len(t) % (i + 1)) for i in range(self.dim)])
+                for t in texts]
+
+
+def test_build_index_handles_numpy_like_vectors(tmp_path):
+    """Embedder returns numpy-like vectors (with .tolist()); embeddings persist
+    as JSON-serializable Python floats (regression for float32 serialization)."""
+    import json
+    store = _store(tmp_path)
+    store.encode_episode(_ep("ep_001", "summary one"))
+    store.encode_episode(_ep("ep_002", "summary two"))
+    vs = VectorSearch(store, embedder=_NumpyLikeEmbedder())
+    n = vs.build_index()
+    assert n == 2
+    # Persisted embeddings must be JSON (Python floats, not numpy scalars).
+    raw = store.db.get_sync("content/ep/ep_001/embedding")
+    parsed = json.loads(raw)  # would raise if numpy scalars slipped through
+    assert all(isinstance(x, float) for x in parsed)
+    # Search works end-to-end with the numpy-like embedder.
+    hits = vs.search("summary one", k=2)
+    assert hits[0][0] == "ep_001"
+    store.close()
+
+
 # ── retriever semantic fallback wiring ──
 
 

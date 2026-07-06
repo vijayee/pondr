@@ -1,0 +1,25 @@
+{
+  "input": "data/corpora/dialogsum.jsonl",
+  "db": "/root/Hippo/data/memory_db",
+  "user": "poduser",
+  "conversations_processed": 50,
+  "conversations_skipped_resume": 0,
+  "episodes_total": 243,
+  "mean_episodes_per_conv": 4.86,
+  "failures": 0,
+  "failure_list": [],
+  "axis_totals": {
+    "entities": 575,
+    "topics": 243,
+    "tones": 281,
+    "decisions": 1292
+  },
+  "mean_per_episode": {
+    "entities": 2.366255144032922,
+    "topics": 1.0,
+    "tones": 1.1563786008230452,
+    "decisions": 5.316872427983539
+  },
+  "elapsed_seconds": 824.6526169776917,
+  "rate_conversations_per_sec": 0.06063159076999884
+}
