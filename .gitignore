@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv*/
+venv/
+
+# WaveDB runtime data
+data/memory_db/
+data/test_corpus/
+data/corpora/
+data/.checkpoint.json
+*.wal
+manifest.dat
+
+# Phase 1b scale-ingest / vector index artifacts
+data/*/vector_index.faiss
+data/*/vector_index_ids.json
+
+# RunPod verbose-ssh log captures (local only)
+vp_stdout.txt
+vp_stderr.txt
+*.log
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Models (downloaded into the RunPod pod, never committed)
+*.gguf
+models/
+
+# Env
+.env
+.env.local
+
+# Editor
+.idea/
+
+# Claude Code local settings (project-shared config would be settings.json)
+.claude/settings.local.json

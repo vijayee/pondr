@@ -1,0 +1,1 @@
+"""Encoding pipeline: extractors + orchestrator."""

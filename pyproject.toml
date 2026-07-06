@@ -1,0 +1,48 @@
+[project]
+name = "hippocampal-memory"
+version = "0.1.0"
+description = "Brain-inspired hippocampal memory architecture for AI agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Hippo project" }]
+dependencies = [
+    # Storage: WaveDB (Graph layer = hippocampal index, HBTrie = neocortical store).
+    # Builds libwavedb from C source via CMake; needs a C compiler at install time.
+    "wavedb>=0.1.4",  # >=0.1.4: GraphLayer.expand_triple (atomic content+graph batch)
+    # GLiNER2 — stable extraction against the evolved schema (Fastino, CPU).
+    # [local] pulls torch + transformers for local inference.
+    "gliner2[local]>=1.3.0",
+    # GLiNER (Knowledgator fork) — GLiNER-Decoder for open entity discovery.
+    "gliner>=0.2.0",
+    # Bonsai — local 8B ternary relation model is served on the RunPod pod by the
+    # Prism fork of llama.cpp's `llama-server` (OpenAI-compatible HTTP). The
+    # Python side calls that endpoint over HTTP, so no llama-cpp-python build is
+    # needed here. See infra/runpod for the serving image.
+    "httpx>=0.27",
+    # Structured config + data.
+    "pydantic>=2.0",
+    "numpy",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "black",
+    "ruff",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# The doc's layout uses a top-level `src` package with `memory`/`encoding`
+# subpackages and `from src.memory.store import ...` style imports.
+packages = ["src", "src.memory", "src.encoding"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
