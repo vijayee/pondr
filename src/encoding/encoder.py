@@ -19,6 +19,7 @@ experiments, and threads them through.
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from typing import Optional
 
@@ -96,8 +97,18 @@ class HippocampalEncoder:
         # 1. Extract entities, topics, tones, decisions (+ open discovery).
         extracted = self.gliner.extract(full_text)
 
-        # 2. Extract relations.
-        relations = self.bonsai.extract(full_text)
+        # 2. Extract relations. Bonsai is a small Q2 model and occasionally
+        #    returns unparseable JSON (over-extraction -> max_tokens truncation,
+        #    transient server errors). Relations are supplementary -- an episode
+        #    with no relations is still fully usable for entity/topic/tone/
+        #    decision + semantic retrieval -- so a Bonsai failure degrades to
+        #    empty relations rather than failing the turn. This keeps one hiccup
+        #    from dropping a whole conversation's episodes.
+        try:
+            relations = self.bonsai.extract(full_text)
+        except Exception as e:  # noqa: BLE001 - intentional broad guard
+            print(f"[bonsai-fail] {episode_id}: {e}", file=sys.stderr)
+            relations = []
 
         # 3. Create episode, scoped to the current user/session.
         episode = Episode.from_extraction(

@@ -69,6 +69,36 @@ def test_parse_malformed_raises():
         BonsaiRelationExtractor._parse_relations("not json at all")
 
 
+def test_parse_truncated_recovers_complete_relations():
+    """A JSON stream truncated mid-object (max_tokens cut) still yields the
+    complete relations before the cut, instead of raising."""
+    truncated = (
+        '{"relations": ['
+        '{"subject": "Alice", "predicate": "decides", "object": "use HBTrie"}, '
+        '{"subject": "Bob", "predicate": "suggests", "object": "WAL config"}, '
+        '{"subject": "Alice", "predicate": "explains", "object": "the B+tr'
+    )
+    r = BonsaiRelationExtractor._parse_relations(truncated)
+    assert r == [
+        {"subject": "Alice", "predicate": "decides", "object": "use HBTrie"},
+        {"subject": "Bob", "predicate": "suggests", "object": "WAL config"},
+    ]
+
+
+def test_parse_caps_to_max_relations():
+    """Over-extraction is capped to _MAX_RELATIONS salient relations."""
+    rel = '{"subject": "a", "predicate": "explains", "object": "b"}'
+    body = '{"relations": [' + ', '.join([rel] * 20) + ']}'
+    r = BonsaiRelationExtractor._parse_relations(body)
+    from src.encoding.bonsai_relations import _MAX_RELATIONS
+    assert len(r) == _MAX_RELATIONS
+
+
+def test_prompt_caps_relation_count():
+    """The prompt tells the model to emit at most a small number of relations."""
+    assert "AT MOST 6" in BONSAI_RELATION_PROMPT or "at most 6" in BONSAI_RELATION_PROMPT
+
+
 def test_construct_is_offline():
     """Constructing the extractor opens no connection."""
     ext = BonsaiRelationExtractor()
