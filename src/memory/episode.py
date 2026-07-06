@@ -52,6 +52,11 @@ class Episode:
     retrieval_timestamps: list[str] = field(default_factory=list)
     saturation_flags: int = 0
 
+    # ── Phase 1b: semantic embedding of the summary for FAISS vector search ──
+    # None until the embedding backfill (scripts/build_vector_index.py) populates
+    # it; the store persists it as JSON under content/ep/{id}/embedding when set.
+    summary_embedding: Optional[list[float]] = None
+
     def __post_init__(self) -> None:
         # A fact's validity begins when the episode was encoded. Reconsolidation
         # sets validity_end when a newer episode supersedes this one — the old

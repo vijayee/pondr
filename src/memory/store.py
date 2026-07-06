@@ -14,6 +14,7 @@ while child handles are open, so ``HippocampalStore.close()`` closes the graph
 layer first.
 """
 
+import json
 from typing import Optional
 
 from wavedb import GraphLayer, WaveDB, WaveDBConfig
@@ -97,7 +98,18 @@ class HippocampalStore:
             {"type": "put", "key": f"content/ep/{eid}/retrieval_count", "value": str(episode.retrieval_count)},
             {"type": "put", "key": f"content/ep/{eid}/ltp_phase", "value": episode.ltp_phase},
             {"type": "put", "key": f"content/ep/{eid}/decay_rate", "value": str(episode.utility_decay_rate)},
+            # Phase 1b: persistence for the remaining downstream fields so the
+            # store schema is fully stable. saturation_flags / retrieval_timestamps
+            # are always written (defaults are meaningful); consolidation_window_start
+            # and summary_embedding are optional and only written when set, like
+            # validity_start above.
+            {"type": "put", "key": f"content/ep/{eid}/saturation_flags", "value": str(episode.saturation_flags)},
+            {"type": "put", "key": f"content/ep/{eid}/retrieval_timestamps", "value": json.dumps(episode.retrieval_timestamps)},
         ]
+        if episode.consolidation_window_start:
+            ops.append({"type": "put", "key": f"content/ep/{eid}/consolidation_window_start", "value": episode.consolidation_window_start})
+        if episode.summary_embedding:
+            ops.append({"type": "put", "key": f"content/ep/{eid}/embedding", "value": json.dumps(episode.summary_embedding)})
 
         # ── Graph: sparse pointers (hippocampal index) via expand_triple ──
         # expand_triple returns root-namespace ops (the "memory/" subtree prefix
@@ -162,6 +174,10 @@ class HippocampalStore:
         retrieval_count_str = _b2s(self.db.get_sync(f"content/ep/{episode_id}/retrieval_count")) or "0"
         ltp_phase = _b2s(self.db.get_sync(f"content/ep/{episode_id}/ltp_phase")) or "early"
         decay_rate_str = _b2s(self.db.get_sync(f"content/ep/{episode_id}/decay_rate")) or "0.01"
+        saturation_flags_str = _b2s(self.db.get_sync(f"content/ep/{episode_id}/saturation_flags")) or "0"
+        retrieval_timestamps_raw = _b2s(self.db.get_sync(f"content/ep/{episode_id}/retrieval_timestamps"))
+        consolidation_window_start = _b2s(self.db.get_sync(f"content/ep/{episode_id}/consolidation_window_start")) or None
+        embedding_raw = _b2s(self.db.get_sync(f"content/ep/{episode_id}/embedding"))
 
         try:
             salience = float(salience_str)
@@ -175,6 +191,18 @@ class HippocampalStore:
             utility_decay_rate = float(decay_rate_str)
         except ValueError:
             utility_decay_rate = 0.01
+        try:
+            saturation_flags = int(saturation_flags_str)
+        except ValueError:
+            saturation_flags = 0
+        try:
+            retrieval_timestamps = json.loads(retrieval_timestamps_raw) if retrieval_timestamps_raw else []
+        except (ValueError, TypeError):
+            retrieval_timestamps = []
+        try:
+            summary_embedding = json.loads(embedding_raw) if embedding_raw else None
+        except (ValueError, TypeError):
+            summary_embedding = None
 
         return Episode(
             id=episode_id,
@@ -186,6 +214,10 @@ class HippocampalStore:
             retrieval_count=retrieval_count,
             ltp_phase=ltp_phase,
             utility_decay_rate=utility_decay_rate,
+            saturation_flags=saturation_flags,
+            retrieval_timestamps=retrieval_timestamps,
+            consolidation_window_start=consolidation_window_start,
+            summary_embedding=summary_embedding,
         )
 
     # ---- user / session / global ids ----

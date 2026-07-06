@@ -41,6 +41,24 @@ class Config:
     episode_salience_default: float = 0.5
     discovery_buffer_threshold: int = 10  # promote a discovered label after N occurrences
 
+    # ── Phase 1b: Retrieval ──
+    # Graph-traversal + query-planner defaults. Zero OpenAI spend: the LLM pieces
+    # (query planner, Mode A generation) use the local Bonsai llama-server at
+    # bonsai_endpoint; vector-search embeddings use a local sentence-transformers
+    # model on the pod, not the OpenAI embeddings API.
+    default_retrieval_limit: int = 5
+    max_context_tokens: int = 4000
+    # Local embedding model (sentence-transformers), 384-dim. Swappable to a
+    # larger BGE/e5 model for quality at the cost of pod memory.
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    vector_index_type: str = "faiss"  # faiss | usearch
+
+    # ── Phase 1b: Mode A generation ──
+    # Default to the local Bonsai server's model (same GGUF as bonsai_model) so
+    # generation costs nothing; override GENERATION_MODEL for a different backend.
+    generation_model: str = os.getenv("GENERATION_MODEL", "prism-ml/Ternary-Bonsai-8B-gguf")
+    generation_temperature: float = 0.7
+
     # ── Phase 2+ (Shared Backbone + Retrieval Gate) — placeholders, unused in 1a ──
     ssm_state_dim: int = 512
     jepa_backbone_model: str = "mamba-2.8b"
@@ -59,6 +77,7 @@ class Config:
     # ── Paths ──
     data_dir: Path = Path("./data")
     sample_conversations: Path = Path("./data/sample_conversations.jsonl")
+    corpora_dir: Path = Path("./data/corpora")
 
 
 config = Config()

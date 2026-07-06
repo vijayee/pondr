@@ -110,3 +110,43 @@ def test_ontology_seeded_once(tmp_path):
     assert subclass_keys, "no subClassOf triples from ontology seed"
     assert not any("\x00" in k for k in subclass_keys)
     store.close()
+
+
+def test_downstream_fields_round_trip(tmp_path):
+    """Phase 1b downstream fields persist and reload through get_episode.
+
+    Covers the fields Phase 1a left unpersisted: saturation_flags,
+    retrieval_timestamps, consolidation_window_start, summary_embedding.
+    """
+    store = HippocampalStore(str(tmp_path / "test_db"))
+    ep = _make_episode("ep_007")
+    ep.saturation_flags = 3
+    ep.retrieval_timestamps = ["2026-07-05T10:00:00", "2026-07-05T11:00:00"]
+    ep.consolidation_window_start = "2026-07-06T00:00:00"
+    ep.summary_embedding = [0.1, 0.2, 0.3, -0.4]
+    store.encode_episode(ep)
+
+    loaded = store.get_episode("ep_007")
+    assert loaded is not None
+    assert loaded.saturation_flags == 3
+    assert loaded.retrieval_timestamps == ["2026-07-05T10:00:00", "2026-07-05T11:00:00"]
+    assert loaded.consolidation_window_start == "2026-07-06T00:00:00"
+    assert loaded.summary_embedding == [0.1, 0.2, 0.3, -0.4]
+    store.close()
+
+
+def test_downstream_fields_defaults_when_unset(tmp_path):
+    """A Phase 1a-style episode (downstream fields at defaults) reloads cleanly.
+
+    Backward compatibility: databases encoded before Phase 1b persisted these
+    fields must still load with safe defaults rather than raising.
+    """
+    store = HippocampalStore(str(tmp_path / "test_db"))
+    store.encode_episode(_make_episode("ep_001"))
+    loaded = store.get_episode("ep_001")
+    assert loaded is not None
+    assert loaded.saturation_flags == 0
+    assert loaded.retrieval_timestamps == []
+    assert loaded.consolidation_window_start is None
+    assert loaded.summary_embedding is None
+    store.close()
