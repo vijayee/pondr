@@ -33,6 +33,37 @@ and `src/encoding/bonsai_relations.py` POSTs relation-extraction requests to
 `http://localhost:8080/v1/chat/completions` (config: `bonsai_endpoint`). No
 llama-cpp-python is built on the Python side.
 
+### Provisioning (done 2026-07-05, pod `1dnqbnup9mem3l`, RTX 3090, CUDA 12.8)
+
+No build needed — the fork ships prebuilt Linux CUDA binaries. From an SSH
+session on the pod (`ssh -i ~/.ssh/github_rsa -p <public-22-port> root@<ip>`):
+
+    mkdir -p /root/bonsai && cd /root/bonsai
+    # Prebuilt llama-server (CUDA 12.8) — pick the asset matching the pod's CUDA.
+    curl -sL -o llama.tar.gz \
+      "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b8846-d104cf1/llama-prism-b8846-d104cf1-bin-linux-cuda-12.8-x64.tar.gz"
+    tar -xzf llama.tar.gz   # -> llama-prism-b8846-d104cf1/llama-server
+    # Bonsai GGUF (~2.1 GB).
+    curl -sL -o Ternary-Bonsai-8B-Q2_0.gguf \
+      "https://huggingface.co/prism-ml/Ternary-Bonsai-8B-gguf/resolve/main/Ternary-Bonsai-8B-Q2_0.gguf"
+    # Serve detached (redirect stdin too, or SSH lingers on the bg process).
+    setsid ./llama-prism-b8846-d104cf1/llama-server \
+        -m Ternary-Bonsai-8B-Q2_0.gguf --host 0.0.0.0 --port 8080 \
+        -ngl 99 -fa 1 -c 4096 < /dev/null > /root/bonsai/server.log 2>&1 &
+
+Verify on the pod: `curl -s http://localhost:8080/v1/models` (returns
+`Ternary-Bonsai-8B-Q2_0.gguf`, 8.18B params). The server accepts ANY model
+string in `/v1/chat/completions` (uses the single loaded model), so
+`config.bonsai_model = "prism-ml/Ternary-Bonsai-8B-gguf"` works without
+matching the server's filename. ~258 prompt tok/s, ~202 predicted tok/s on
+the 3090.
+
+Port 8080 is NOT publicly exposed (only 22/tcp + 8888/http). The on-pod
+pipeline reaches it at `http://localhost:8080/v1`. To run the live planner
+tests from the local machine, tunnel: `ssh -i ~/.ssh/github_rsa -p <22-port>
+-L 8080:localhost:8080 -N root@<ip>`, then `localhost:8080` locally maps to
+the pod.
+
 ## Files (to author when we launch)
 
 - `Dockerfile` — base CUDA image + build toolchain (CMake, build-essential) for
