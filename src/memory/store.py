@@ -41,6 +41,7 @@ class HippocampalStore:
             wal_sync_mode=config.get("wal_sync_mode", "debounced") if config else "debounced",
         )
         self.db = WaveDB(db_path, config=cfg)
+        self.db_path = db_path  # exposed so retrieval can load a persisted vector index
         # "memory" is the subtree prefix the graph layer lives under.
         self.graph = GraphLayer("memory", self.db)
         self._seed_ontology()
@@ -218,6 +219,18 @@ class HippocampalStore:
             retrieval_timestamps=retrieval_timestamps,
             consolidation_window_start=consolidation_window_start,
             summary_embedding=summary_embedding,
+        )
+
+    def set_summary_embedding(self, episode_id: str, embedding: list[float]) -> None:
+        """Backfill an episode's summary embedding (Phase F vector index build).
+
+        Writes ``content/ep/{episode_id}/embedding`` so ``get_episode`` and
+        ``VectorSearch`` can read it back without re-running the encoder.
+        """
+        import json
+        self.db.put_sync(
+            f"content/ep/{episode_id}/embedding",
+            json.dumps(embedding),
         )
 
     # ---- user / session / global ids ----

@@ -12,13 +12,14 @@ venv/
 data/memory_db/
 data/test_corpus/
 data/corpora/
-data/.checkpoint.json
+.checkpoint.json
 *.wal
 manifest.dat
 
 # Phase 1b scale-ingest / vector index artifacts
-data/*/vector_index.faiss
-data/*/vector_index_ids.json
+vector_index.faiss
+vector_index_ids.json
+vector_index_vectors.json
 
 # RunPod verbose-ssh log captures (local only)
 vp_stdout.txt

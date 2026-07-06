@@ -6,15 +6,18 @@ context string that Mode A generation consumes. Both LLM-facing pieces (planner,
 and later the generator) use the local Bonsai llama-server at
 ``config.bonsai_endpoint`` — no OpenAI spend.
 
-Semantic fallback (vector search over summary embeddings) is deferred to Phase F
-(FAISS + local sentence-transformers embeddings). Until then ``use_semantic`` is
-a no-op: ``_semantic_fallback`` returns an empty list, so retrieval is graph-
-traversal-only. The hook is wired so Phase F only needs to fill in
-``_semantic_fallback`` and ``_embed``.
+Semantic fallback (Phase F): when graph traversal returns fewer than 3
+results, the retriever falls back to ``VectorSearch`` over summary embeddings
+(local sentence-transformers, FAISS on the pod / pure-Python cosine offline).
+Hits are hydrated into episode dicts with a 0.5 score discount so graph-
+traversal matches rank higher. The index is auto-loaded from
+``{db}/vector_index_ids.json`` when ``auto_load_index=True``; otherwise
+``vector_search`` stays None and the fallback is a no-op (the graph-only path).
 """
 
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 from ..config import config
@@ -34,12 +37,33 @@ class HippocampalRetriever:
         self,
         store: HippocampalStore,
         planner: Optional[BonsaiQueryPlanner] = None,
+        auto_load_index: bool = False,
     ) -> None:
         self.store = store
         self.planner = planner or BonsaiQueryPlanner()
         self.traversal = GraphTraversal(store)
-        # Phase F: VectorSearch(store). None until FAISS + embeddings land.
+        # Phase F: VectorSearch over summary embeddings. Auto-loaded from
+        # {db}/vector_index_ids.json when auto_load_index is set (the live pod
+        # pipeline); tests pass a stub VectorSearch or leave it None.
         self.vector_search = None
+        if auto_load_index:
+            self._try_load_vector_index()
+
+    def _try_load_vector_index(self) -> None:
+        """Attach + load a persisted VectorSearch index if one exists."""
+        from pathlib import Path
+        from .vector_search import VectorSearch
+        ids_path = Path(self.store.db_path) / VectorSearch.IDS_NAME
+        if not ids_path.exists():
+            return
+        vs = VectorSearch(self.store)
+        try:
+            vs.load(self.store.db_path)
+        except (OSError, json.JSONDecodeError, RuntimeError):
+            # Corrupt index file, unreadable ids JSON, or faiss-saved index
+            # without faiss installed — degrade to graph-only retrieval.
+            return
+        self.vector_search = vs
 
     def retrieve(self, prompt: str, use_semantic: bool = True) -> list[dict]:
         """Retrieve relevant episodes for a natural-language prompt.
@@ -79,15 +103,20 @@ class HippocampalRetriever:
     def _semantic_fallback(self, prompt: str, query_plan: dict) -> list[dict]:
         """Semantic fallback over summary embeddings.
 
-        Phase F: embed ``prompt`` with the local sentence-transformers model,
-        run ``self.vector_search.search``, and hydrate hits into episode dicts
-        with a discounted score (×0.5) so graph-traversal matches rank higher.
-        Returns ``[]`` until the vector index exists.
+        Embed ``prompt`` with the local sentence-transformers model, run
+        ``self.vector_search.search``, and hydrate hits into episode dicts with
+        a discounted score (×0.5) so graph-traversal matches rank higher.
+        Returns ``[]`` when no vector index is configured.
         """
         if self.vector_search is None:
             return []
-        # Phase F fills this in once VectorSearch is implemented.
-        return []
+        hits = self.vector_search.search(prompt, k=config.default_retrieval_limit)
+        out: list[dict] = []
+        for eid, sim in hits:
+            ep = self.traversal._hydrate(eid)
+            ep["score"] = sim * 0.5  # discount so graph matches rank higher
+            out.append(ep)
+        return out
 
     def build_context_string(self, episodes: list[dict], max_tokens: Optional[int] = None) -> str:
         """Build a structured context string for Mode A generation.
