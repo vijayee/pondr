@@ -50,28 +50,29 @@ def test_extract_tones():
 
 
 def test_extract_topics():
-    """GLiNER extracts topics (multi-label classification)."""
+    """GLiNER extracts topics as free-form spans (varies with the corpus)."""
     extractor = _extractor()
     text = "The WAL sync modes need better documentation. DEBOUNCED vs ASYNC is unclear."
     result = extractor.extract(text)
-    # Probabilistic multi-label output: assert a valid topic surfaced, not a
-    # specific label (the model may read "WAL sync / ASYNC" as either
-    # `configuration` or `api_design`).
+    # Topics are spans now (not a fixed label set), so assert non-empty
+    # multi-word-ish spans rather than membership in a closed taxonomy.
     assert isinstance(result["topics"], list)
     assert len(result["topics"]) > 0, result["topics"]
-    known_topics = {
-        "database_design", "configuration", "graph_database", "performance",
-        "decision_making", "ai_architecture", "api_design", "security",
-    }
-    assert all(t in known_topics for t in result["topics"]), result["topics"]
+    # Regression guard for the char-split bug: a topic must be a whole span,
+    # not a single character leaked from an iterated string.
+    assert all(isinstance(t, str) and len(t) > 1 for t in result["topics"]), result["topics"]
 
 
 def test_extract_decisions():
-    """GLiNER extracts decisions."""
+    """GLiNER extracts decisions as content spans (not a yes/no label)."""
     extractor = _extractor()
     text = "I've decided to go with DEBOUNCED for the WAL sync mode."
     result = extractor.extract(text)
     assert len(result["decisions"]) > 0, result["decisions"]
+    # Regression guard for the char-split bug: decisions must be whole spans,
+    # never single chars (the old multi_label:False classification returned the
+    # bare string "decision" which iterated to ['d','e','c','i','s','i','o','n']).
+    assert all(isinstance(d, str) and len(d) > 1 for d in result["decisions"]), result["decisions"]
 
 
 def test_open_discovery():

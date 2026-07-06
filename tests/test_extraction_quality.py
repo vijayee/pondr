@@ -25,6 +25,32 @@ def _recall(expected: set, extracted: set) -> float:
     return len(expected & extracted) / len(expected)
 
 
+def _topic_recall(expected_labels: list[str], extracted_spans: list[str]) -> float:
+    """Recall for span-based topics against labeled intent.
+
+    Topics are free-form spans now (not a fixed label set), so exact set
+    intersection with the labeled ``expected_topics`` is meaningless — a
+    conversation about "database_design" yields a span like "HBTrie storage
+    layer", not the literal label. Instead, tokenize each expected label on
+    ``_`` and count it as recalled when any extracted span contains one of its
+    keywords as a case-insensitive substring ("database_design" → "database"
+    hits span "database storage layer"). This keeps the measurement meaningful
+    for span output while still flagging a collapsed extraction (no spans →
+    0 recall).
+    """
+    if not expected_labels:
+        return 1.0
+    spans_low = [s.lower() for s in extracted_spans if isinstance(s, str)]
+    hits = 0
+    for label in expected_labels:
+        keywords = [k for k in label.lower().split("_") if k]
+        if not keywords:
+            continue
+        if any(kw in span for kw in keywords for span in spans_low):
+            hits += 1
+    return hits / len(expected_labels)
+
+
 def test_extraction_matches_expected(capsys):
     """Print entity/topic/tone recall per conversation. Asserts only that the
     run completes and produces sane recall floors, so CI doesn't flake on
@@ -41,7 +67,7 @@ def test_extraction_matches_expected(capsys):
         result = extractor.extract(full_text)
 
         er = _recall(set(conv.get("expected_entities", [])), set(result["entities"]))
-        tr = _recall(set(conv.get("expected_topics", [])), set(result["topics"]))
+        tr = _topic_recall(conv.get("expected_topics", []), result["topics"])
         nr = _recall(set(conv.get("expected_tones", [])), set(result["tones"]))
         entity_recalls.append(er)
         topic_recalls.append(tr)

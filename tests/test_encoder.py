@@ -47,7 +47,10 @@ def test_encode_single_turn(live_encoder):
     assert ep.id.startswith("ep_")
     assert ep.user_id == "test_user"
     assert ep.session_id is not None and ep.session_id.startswith("S:")
-    assert "configuration" in ep.topics, ep.topics
+    # Topics are free-form spans now (not the fixed "configuration" label);
+    # the WAL-config conversation should yield at least one multi-char span.
+    assert len(ep.topics) > 0, ep.topics
+    assert all(isinstance(t, str) and len(t) > 1 for t in ep.topics), ep.topics
 
     loaded = live_encoder.store.get_episode(ep.id)
     assert loaded is not None

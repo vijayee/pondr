@@ -6,7 +6,8 @@ Two models cooperate:
   know about. Discoveries are buffered; labels that recur across enough episodes
   become promotion candidates for the schema to absorb.
 - GLiNER2 (``fastino/gliner2-base-v1``): stable extraction against the fixed
-  schema below (entities / topics / tones / decisions).
+  schema below — entities / topics / decisions as text spans, tones as a
+  fixed-label classification (see ``_STABLE_SCHEMA`` for the layout).
 
 Both models are heavy (GPU). They load on ``__init__``, so construct the
 extractor on the RunPod GPU pod, not in the local editing loop. The class
@@ -26,12 +27,34 @@ from ..config import config
 # Stable schema GLiNER2 extracts against. GLiNER2's schema only processes
 # `entities`, `relations`, `classifications`, and `structures` as top-level
 # keys — any other top-level key is silently dropped. Span-typed things
-# (person / project / technology) are `entities` (dict of label→prompt); the
-# model returns them as `{label: [span, ...]}`. Whole-text labels (topics /
-# tones / decisions) are `classifications` (list of task configs); the model
+# (person / project / technology / decision / topic) are `entities` (dict of
+# label→prompt); the model returns them as `{label: [span, ...]}`. Whole-text
+# labels (tones) are `classifications` (list of task configs); the model
 # returns each task as `{task_name: [predicted_label, ...]}`. The first RunPod
 # measurement run scored 0.00 topic/tone recall because topics/tones/decisions
-# were modeled as top-level dicts and dropped — this layout fixes that.
+# were modeled as top-level dicts and dropped — the classifications layout
+# fixed that. A later scale run on DialogSum then surfaced two more defects
+# (see _extract_stable + _as_list) which moved decisions and topics out of
+# `classifications` and into `entities` (span extraction).
+#
+# Decisions and topics are SPANS, not classifications:
+# - Decisions: the first scale run modeled decisions as a binary
+#   classification (labels ["decision","none"], multi_label:False). GLiNER2
+#   returned a bare STRING "decision"/"none" for that task, which
+#   _extract_stable iterated char-by-char → ["d","e","c","i","s","i","o","n"].
+#   The "none" sentinel filter compared chars to the string "none" so it never
+#   matched either. Even parsed correctly, the value was the useless label
+#   NAME, not actual decision content. Span extraction returns real decision
+#   phrases (e.g. "go with DEBOUNCED", "the 3pm appointment") as a list of
+#   strings — char-split is impossible and the content is meaningful.
+# - Topics: a fixed tech-domain label set (database_design/configuration/...)
+#   collapsed on daily-life corpora like DialogSum, forcing every
+#   conversation into api_design/decision_making. Span extraction yields
+#   varied, corpus-derived topic phrases so topic-based retrieval
+#   discriminates on any corpus, not just the project's own tech domain.
+#
+# Tones stay a fixed classification: AffectiveTone is a small bounded taxonomy
+# (frustrated/excited/curious/neutral) that discriminates well in practice.
 #
 # Evolving this schema (promoting a discovered label into it) is what the
 # discovery buffer feeds.
@@ -40,37 +63,36 @@ _STABLE_SCHEMA: dict[str, Any] = {
         "person": "Full name of a person mentioned",
         "project": "Software project or system name",
         "technology": "Technical tool, framework, or concept",
+        # Actual decision/choice text — spans, not a yes/no label.
+        "decision": "A specific decision, choice, or conclusion someone reaches or agrees on in the conversation",
+        # Free-form subject spans — the matter the conversation is about.
+        "topic": "The main subject, activity, or matter the conversation is about",
     },
     "classifications": [
-        {
-            "task": "topics",
-            "labels": [
-                "database_design",
-                "configuration",
-                "graph_database",
-                "performance",
-                "decision_making",
-                "ai_architecture",
-                "api_design",
-                "security",
-            ],
-            "multi_label": True,
-        },
         {
             "task": "tones",
             "labels": ["frustrated", "excited", "curious", "neutral"],
             "multi_label": True,
         },
-        {
-            # GLiNER2 requires >=2 labels per classification task, so pair the
-            # single "decision" label with a "none" sentinel and filter the
-            # sentinel out in _extract_stable.
-            "task": "decisions",
-            "labels": ["decision", "none"],
-            "multi_label": False,
-        },
     ],
 }
+
+
+def _as_list(v) -> list:
+    """Coerce a GLiNER2 classification result to a list of strings.
+
+    GLiNER2 classification tasks can return a bare string instead of a list
+    (observed for ``multi_label: False`` tasks, where the model emits the
+    single chosen label as a string). Iterating a string yields one-character
+    strings, which char-splits the label name (e.g. "decision" →
+    ["d","e","c","i","s","i","o","n"]). Coerce first so downstream filters see
+    the whole label.
+    """
+    if isinstance(v, str):
+        return [v]
+    if v is None:
+        return []
+    return list(v)
 
 
 class GLiNERExtractor:
@@ -124,13 +146,18 @@ class GLiNERExtractor:
         Returns:
             {
                 "entities": ["Alice", "WaveDB", "HBTrie"],
-                "topics": ["database_design", "configuration"],
+                "topics": ["WAL config", "storage layer"],
                 "tones": ["frustrated", "curious"],
-                "decisions": ["use_hbtrie"],
+                "decisions": ["go with DEBOUNCED"],
                 "discovered": [
                     {"text": "WAL config", "label": "technical concept"},
                 ],
             }
+
+        ``topics`` and ``decisions`` are free-form text spans pulled from the
+        conversation (GLiNER2 entity extraction), so they vary with the corpus;
+        ``tones`` are fixed-label classifications from the bounded
+        AffectiveTone taxonomy.
         """
         stable = self._extract_stable(text)
         discovered = self._extract_open(text)
@@ -143,21 +170,24 @@ class GLiNERExtractor:
 
         GLiNER2 returns `entities` as a dict of {category: [spans]} and each
         classification task as {task_name: [predicted_labels]}. We flatten the
-        person/project/technology entity spans and pass the topic/tone/decision
-        label lists through, dropping the "none" sentinel used to satisfy the
-        >=2-label-per-classification requirement.
+        person/project/technology spans into `entities`, pull `decision` and
+        `topic` spans out into their own fields, and pass the `tones`
+        classification through (coerced to a list, dropping the "none" sentinel
+        if it ever appears). Span fields are lists of strings by construction,
+        so there is no char-split path; `_as_list` guards the classification.
         """
         result: dict = self.extractor.extract(
             text, schema=_STABLE_SCHEMA, threshold=self.threshold
         )
 
+        ents: dict = result.get("entities", {}) or {}
         entities: list[str] = []
         for category in ("person", "project", "technology"):
-            entities.extend(result.get("entities", {}).get(category, []))
+            entities.extend(ents.get(category, []) or [])
 
-        topics = [t for t in result.get("topics", []) if t and t != "none"]
-        tones = [t for t in result.get("tones", []) if t and t != "none"]
-        decisions = [d for d in result.get("decisions", []) if d and d != "none"]
+        decisions = [d for d in (ents.get("decision", []) or []) if d]
+        topics = [t for t in (ents.get("topic", []) or []) if t]
+        tones = [t for t in _as_list(result.get("tones")) if t and t != "none"]
 
         return {
             "entities": list(set(entities)),
