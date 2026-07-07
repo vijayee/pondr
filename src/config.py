@@ -59,6 +59,24 @@ class Config:
     generation_model: str = os.getenv("GENERATION_MODEL", "prism-ml/Ternary-Bonsai-8B-gguf")
     generation_temperature: float = 0.7
 
+    # ── Phase 1d: Oracle (training-data labeling) ──
+    # The Oracle labels training data (GNN subgraphs, Bonsai query/relation pairs,
+    # JEPA routing, gate decisions, code-aware synthetics). It is DeepSeek served
+    # by the user's LOCAL Ollama instance — OpenAI-compatible at /v1 — NOT OpenAI.
+    # The ``:cloud`` tag routes inference to ollama.com (Ollama credits, not local
+    # compute); token counts are tracked but ``$`` cost is left at 0 (set
+    # ``OracleConfig.cost_per_1k_*`` to meter credits). Talks to the same
+    # OpenAI-compatible /chat/completions API the Bonsai client uses, so the
+    # OracleClient mirrors src/encoding/bonsai_relations.py (requests, no SDK dep).
+    oracle_model: str = os.getenv("ORACLE_MODEL", "deepseek-v4-pro:cloud")
+    oracle_endpoint: str = os.getenv("ORACLE_ENDPOINT", "http://localhost:11434/v1")
+    oracle_temperature: float = 0.1
+    oracle_max_tokens: int = 32768  # DeepSeek-v4-pro is a REASONING model: the `reasoning` CoT shares the max_tokens budget with `content`, so a small cap truncates content (even to a single inner fragment). DeepSeek supports ~1M context; 32768 output leaves comfortable headroom. Raise via --oracle-max-tokens if a task still truncates.
+    oracle_max_retries: int = 3
+    oracle_retry_delay: float = 2.0       # base seconds between retries (exp backoff)
+    oracle_batch_delay: float = 0.0       # throttle between calls (0 = no throttle)
+    oracle_timeout: float = 120.0         # :cloud routing can be slow
+
     # ── Phase 2+ (Shared Backbone + Retrieval Gate) — placeholders, unused in 1a ──
     ssm_state_dim: int = 512
     jepa_backbone_model: str = "mamba-2.8b"

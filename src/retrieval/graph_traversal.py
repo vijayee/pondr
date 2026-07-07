@@ -306,6 +306,23 @@ class GraphTraversal:
             return _strip_prefix(k.rsplit("/", 1)[-1], "U:")
         return None
 
+    def hydrate_episode(self, eid: str) -> dict:
+        """Public alias for ``_hydrate`` — load content + graph-side fields.
+
+        Exposed for Phase 1d training-data generators (and other read-only
+        consumers) that need a hydrated episode dict without running a full
+        ``retrieve`` query plan. Returns the same shape as ``_hydrate``.
+        """
+        return self._hydrate(eid)
+
+    def episodes_by_entity(self, entity: str) -> list[str]:
+        """Public alias for ``_get_episodes_by_entity`` (read-only consumers)."""
+        return self._get_episodes_by_entity(entity)
+
+    def episodes_by_topic(self, topic: str) -> list[str]:
+        """Public alias for ``_get_episodes_by_topic`` (read-only consumers)."""
+        return self._get_episodes_by_topic(topic)
+
     def _hydrate(self, eid: str) -> dict:
         """Load content + graph-side fields for one episode into a result dict.
 

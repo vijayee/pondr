@@ -20,9 +20,18 @@ for a sample of episodes and writes them to JSONL.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import time
 from collections import deque
-from typing import Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Callable
 
+import requests
+
+from ..config import config as _config
 from ..memory.store import HippocampalStore
 
 # Node-to-node predicates traversed by the BFS. Literal-valued predicates
@@ -157,3 +166,346 @@ def sample_episode_centers(store: HippocampalStore, n: Optional[int] = None) -> 
             ids.add(parts[2])
     centers = sorted(ids)
     return centers if n is None else centers[:n]
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 1d: Oracle API client (DeepSeek via local Ollama)
+# ═══════════════════════════════════════════════════════════════
+
+# Matches a ```json ... ``` (or bare ```) fenced block. The Oracle is told to
+# return ONLY JSON, but cloud models sometimes wrap output in fences anyway.
+# Same pattern as src/encoding/bonsai_relations.py:_FENCE_RE.
+_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+
+
+@dataclass
+class OracleConfig:
+    """Configuration for Oracle API calls.
+
+    Defaults are pulled from the Hippo ``Config`` (``oracle_*`` fields, env-
+    overridden) when the client is constructed with ``config=None``; the
+    dataclass is also instantiable directly for tests/scale runs. ``$`` cost is
+    left at 0 for the local/:cloud Ollama backend — set ``cost_per_1k_*`` to
+    meter Ollama-cloud credits if desired.
+    """
+    model: str = _config.oracle_model
+    endpoint: str = _config.oracle_endpoint
+    temperature: float = _config.oracle_temperature
+    max_tokens: int = _config.oracle_max_tokens
+    max_retries: int = _config.oracle_max_retries
+    retry_delay: float = _config.oracle_retry_delay
+    batch_delay: float = _config.oracle_batch_delay
+    timeout: float = _config.oracle_timeout
+    cost_per_1k_input: float = 0.0
+    cost_per_1k_output: float = 0.0
+    cache_path: Optional[Path] = None  # on-disk prompt-hash cache for resume
+
+
+@dataclass
+class OracleResult:
+    """Result of one Oracle API call (or a cache hit)."""
+    prompt: str
+    response: dict
+    input_tokens: int
+    output_tokens: int
+    cost: float
+    latency_seconds: float
+    retries: int
+    cached: bool = False
+
+
+class OracleClient:
+    """Calls the Oracle (DeepSeek via local Ollama) with caching + retries.
+
+    Mirrors ``src/encoding/bonsai_relations.py: BonsaiRelationExtractor``:
+    ``requests``-based (no ``openai`` SDK dependency), OpenAI-compatible
+    ``/chat/completions`` at ``config.oracle_endpoint``, ``response_format:
+    json_object``, fence-strip + outermost-span + balanced-object salvage
+    parse. Adds: retry with exponential backoff, a prompt-hash on-disk cache
+    (so resuming a generation run doesn't re-pay for identical prompts), and
+    token/cost tracking.
+
+    The HTTP layer is isolated as ``_post`` so tests stub it without
+    monkeypatching ``requests``. The connection is lazy — the class is
+    constructible offline and the module imports without the server present.
+    """
+
+    def __init__(self, config: Optional[OracleConfig] = None) -> None:
+        self.config = config or OracleConfig()
+        self.endpoint = self.config.endpoint.rstrip("/")
+        # In-memory prompt-hash -> OracleResult. Hydrated from cache_path on
+        # init so a resumed run skips already-labeled prompts.
+        self.cache: dict[str, OracleResult] = {}
+        self.total_cost = 0.0
+        self.total_calls = 0
+        self.total_tokens = 0
+        self._cache_dirty = False
+        if self.config.cache_path:
+            self._load_cache()
+
+    # ── on-disk cache ──
+
+    def _load_cache(self) -> None:
+        path = self.config.cache_path
+        if not path or not path.exists():
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+        for prompt_hash, rec in raw.items():
+            try:
+                self.cache[prompt_hash] = OracleResult(
+                    prompt=rec["prompt"],
+                    response=rec["response"],
+                    input_tokens=rec["input_tokens"],
+                    output_tokens=rec["output_tokens"],
+                    cost=rec["cost"],
+                    latency_seconds=rec["latency_seconds"],
+                    retries=rec["retries"],
+                    cached=True,
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    def flush_cache(self) -> None:
+        """Persist the in-memory cache to ``cache_path`` (atomic temp write).
+
+        Called by generators at each checkpoint and at the end of a batch.
+        No-op when ``cache_path`` is unset or the cache is clean.
+        """
+        path = self.config.cache_path
+        if not path or not self._cache_dirty:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        # Persist EVERY record (not just non-cached ones): ``tmp.replace`` swaps
+        # the whole file, so filtering out cache-loaded records would drop them
+        # from disk and defeat cross-run resume. The ``cached`` flag is an
+        # in-memory marker only; ``_load_cache`` resets it on the next run.
+        payload = {
+            h: {
+                "prompt": r.prompt,
+                "response": r.response,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "cost": r.cost,
+                "latency_seconds": r.latency_seconds,
+                "retries": r.retries,
+            }
+            for h, r in self.cache.items()
+        }
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        tmp.replace(path)
+        self._cache_dirty = False
+
+    # ── HTTP layer (isolated for tests) ──
+
+    def _post(self, payload: dict) -> tuple[int, dict]:
+        """POST ``payload`` to ``{endpoint}/chat/completions``; return ``(status, outer)``.
+
+        Raises ``requests.RequestException`` on connection failure (retryable).
+        Raises ``ValueError`` if the response body is not JSON (retryable as a
+        transient server hiccup). Override in tests to stub the HTTP layer.
+        """
+        url = f"{self.endpoint}/chat/completions"
+        resp = requests.post(url, json=payload, timeout=self.config.timeout)
+        try:
+            outer = resp.json()
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Oracle returned non-JSON body: {resp.text}") from e
+        return resp.status_code, outer
+
+    # ── public API ──
+
+    def generate(self, prompt: str,
+                 response_format: str = "json_object") -> OracleResult:
+        """Call the Oracle with caching + retry; return an ``OracleResult``.
+
+        Caching: identical prompts return the cached result with
+        ``cached=True`` (no HTTP call). Retries: up to ``max_retries`` with
+        exponential backoff on connection errors, non-200 HTTP, or non-JSON
+        bodies. A 200 with an unparseable JSON payload is NOT retried — the
+        model returned a response, just not valid JSON, and the caller needs
+        the raw content to debug it (mirrors BonsaiRelationExtractor).
+        """
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        cached = self.cache.get(prompt_hash)
+        if cached is not None:
+            cached.cached = True
+            return cached
+
+        payload = {
+            "model": self.config.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": response_format},
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
+
+        last_error: Optional[str] = None
+        for attempt in range(self.config.max_retries):
+            try:
+                start = time.time()
+                status, outer = self._post(payload)
+                elapsed = time.time() - start
+
+                if status != 200:
+                    body_text = json.dumps(outer) if isinstance(outer, dict) else str(outer)
+                    last_error = f"HTTP {status}: {body_text}"
+                    # 4xx (except 429) is a bad request — retrying won't fix it.
+                    if 400 <= status < 500 and status != 429:
+                        raise RuntimeError(
+                            f"Oracle endpoint {self.endpoint}/chat/completions "
+                            f"returned {last_error}"
+                        )
+                    raise _Retryable(last_error)
+
+                content, input_tokens, output_tokens = self._extract(outer)
+                try:
+                    data = self._parse_json(content)
+                except RuntimeError:
+                    # A parse failure with output at the max_tokens cap means the
+                    # response was truncated mid-JSON — not a malformed response
+                    # the caller needs to debug. Surface that clearly so the fix
+                    # (raise --oracle-max-tokens) is obvious.
+                    if output_tokens >= self.config.max_tokens:
+                        raise RuntimeError(
+                            f"Oracle response truncated at max_tokens="
+                            f"{self.config.max_tokens} (output_tokens="
+                            f"{output_tokens}); raise --oracle-max-tokens. "
+                            f"Raw tail: ...{content[-200:]!r}"
+                        ) from None
+                    raise
+                cost = (
+                    input_tokens / 1000 * self.config.cost_per_1k_input
+                    + output_tokens / 1000 * self.config.cost_per_1k_output
+                )
+                result = OracleResult(
+                    prompt=prompt,
+                    response=data,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost=cost,
+                    latency_seconds=elapsed,
+                    retries=attempt,
+                )
+                self.cache[prompt_hash] = result
+                self._cache_dirty = True
+                self.total_cost += cost
+                self.total_calls += 1
+                self.total_tokens += input_tokens + output_tokens
+                return result
+
+            except RuntimeError:
+                # Non-retryable (4xx, unparseable 200, malformed response) —
+                # surface verbatim so the caller can debug the raw output.
+                raise
+            except (requests.RequestException, ValueError, _Retryable) as e:
+                # Retryable: connection error, non-JSON body, 5xx, or 429.
+                last_error = last_error or f"{type(e).__name__}: {e}"
+                if attempt < self.config.max_retries - 1:
+                    time.sleep(self.config.retry_delay * (2 ** attempt))
+                    continue
+                break  # exhausted retries — fall through to the final RuntimeError
+
+        raise RuntimeError(
+            f"Oracle call failed after {self.config.max_retries} retries: {last_error}"
+        )
+
+    def generate_batch(
+        self,
+        prompts: list[str],
+        response_format: str = "json_object",
+        progress_callback: Optional[Callable[[int, int, OracleResult], None]] = None,
+    ) -> list[OracleResult]:
+        """Generate results for a batch of prompts (sequential, rate-limited).
+
+        ``progress_callback(done, total, result)`` is invoked after each call.
+        Rate-limited by ``config.batch_delay`` between calls. The on-disk cache
+        is flushed once at the end; long runs should also call ``flush_cache()``
+        at their own checkpoints so a mid-run crash keeps progress.
+        """
+        results: list[OracleResult] = []
+        try:
+            for i, prompt in enumerate(prompts):
+                result = self.generate(prompt, response_format)
+                results.append(result)
+                if progress_callback:
+                    progress_callback(i + 1, len(prompts), result)
+                if i < len(prompts) - 1 and self.config.batch_delay > 0:
+                    time.sleep(self.config.batch_delay)
+        finally:
+            self.flush_cache()
+        return results
+
+    def get_stats(self) -> dict:
+        """Usage statistics for the run."""
+        return {
+            "total_calls": self.total_calls,
+            "cached_calls": sum(1 for r in self.cache.values() if r.cached),
+            "total_tokens": self.total_tokens,
+            "total_cost": round(self.total_cost, 4),
+            "cache_size": len(self.cache),
+        }
+
+    # ── helpers ──
+
+    @staticmethod
+    def _extract(outer: dict) -> tuple[str, int, int]:
+        """Pull ``(content, input_tokens, output_tokens)`` from the chat response."""
+        try:
+            content = outer["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise RuntimeError(
+                f"Oracle response missing choices[0].message.content: {outer}"
+            ) from e
+        usage = outer.get("usage") or {}
+        input_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        output_tokens = int(usage.get("completion_tokens", 0) or 0)
+        return content, input_tokens, output_tokens
+
+    @staticmethod
+    def _parse_json(content: str) -> dict:
+        """Parse the model's JSON content into a dict.
+
+        Strips accidental ``` fences, then falls back to the outermost ``{...}``
+        span (handles leading/trailing prose). Raises ``RuntimeError`` with the
+        raw content when neither recovers a dict.
+
+        Deliberately does NOT salvage a nested inner object: the Oracle payload
+        is ONE object (unlike Bonsai's list-of-relation-objects, whose salvage
+        scanner that pattern was ported from). Under ``response_format:
+        json_object`` the model emits a single object, so a parse failure means
+        the response was truncated — and recovering a small inner fragment
+        (e.g. one ``extracted_relations`` entry) would silently return a
+        wrong label. A loud failure lets the caller raise ``max_tokens``.
+        """
+        body = (content or "").strip()
+        fence = _FENCE_RE.match(body)
+        if fence:
+            body = fence.group(1).strip()
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+        # Fallback: outermost {...} span (handles trailing/leading prose). Safe
+        # under json_object mode — the whole outermost {...} IS the payload.
+        start, end = body.find("{"), body.rfind("}")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(body[start : end + 1])
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+        raise RuntimeError(f"Oracle returned unparseable JSON: {content!r}") from None
+
+
+class _Retryable(Exception):
+    """Internal sentinel: retryable Oracle failure (connection / 5xx / 429)."""
+    pass

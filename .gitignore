@@ -15,6 +15,7 @@ data/corpora/
 data/pod_runs/*_extractions.jsonl
 data/pod_runs/memory_db/
 data/pod_runs/phase1b_scale/
+data/pod_runs/phase1c_*/
 .checkpoint.json
 *.wal
 manifest.dat
@@ -23,6 +24,11 @@ manifest.dat
 vector_index.faiss
 vector_index_ids.json
 vector_index_vectors.json
+
+# Phase 1d Oracle-generated training data (regenerable via scripts/generate_*_training_data.py)
+data/training/
+.oracle_cache.json
+*_checkpoint.json
 
 # RunPod verbose-ssh log captures (local only)
 vp_stdout.txt
