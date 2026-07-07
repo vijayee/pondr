@@ -30,6 +30,9 @@ data/training/
 .oracle_cache.json
 *_checkpoint.json
 
+# Phase 2a backbone pre-training checkpoints (regenerable via scripts/train_backbone.py / pretrain_backbone)
+checkpoints/
+
 # RunPod verbose-ssh log captures (local only)
 vp_stdout.txt
 vp_stderr.txt
