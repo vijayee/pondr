@@ -79,6 +79,65 @@ class ModeAGenerator:
             "model": self.model,
         }
 
+    def generate_with_routing(
+        self,
+        prompt: str,
+        conversation_history: Optional[list[dict]] = None,
+        max_context_tokens: Optional[int] = None,
+    ) -> dict:
+        """Generate using the subconscious Retrieval Gate (Phase 2b, opt-in).
+
+        Calls ``retriever.retrieve_with_routing`` and acts on the pathway:
+
+        - ``graph_retrieve`` / ``conscious_deliberation`` (supported): build the
+          context from the retrieved episodes and complete via the local Bonsai
+          endpoint (reuses ``_complete``). The gate's predicted ``model_size`` is
+          recorded in the result for the future model-size ladder — generation
+          itself still uses the single configured Bonsai model (the ladder is a
+          later phase; we don't fake a multi-model selection).
+        - ``ssm_direct`` / ``process_exec`` / ``tool_plan`` (unsupported): the
+          routed pathway has no executor wired yet, so ``response`` is ``None``
+          and ``supported=False`` — surfaced honestly, not faked.
+
+        Returns ``{"response", "route", "retrieved_episodes", "model_used",
+        "context_used", "supported"}``.
+        """
+        retrieval_result = self.retriever.retrieve_with_routing(
+            prompt, conversation_history=conversation_history
+        )
+        route = retrieval_result["route"]
+
+        if not retrieval_result["supported"]:
+            return {
+                "response": None,
+                "route": route,
+                "retrieved_episodes": [],
+                "model_used": None,
+                "context_used": None,
+                "supported": False,
+            }
+
+        episodes = retrieval_result.get("results", [])
+        context = retrieval_result.get("context") or self.retriever.build_context_string(
+            episodes, max_context_tokens
+        )
+        messages: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]
+        if conversation_history:
+            messages.extend(conversation_history[-10:])
+        messages.append({
+            "role": "user",
+            "content": f"Context from past conversations:\n{context}\n\nUser: {prompt}",
+        })
+        response = self._complete(messages)
+        return {
+            "response": response,
+            "route": route,
+            "retrieved_episodes": episodes,
+            "model_used": self.model,
+            "context_used": context,
+            "supported": True,
+        }
+
     def _complete(self, messages: list[dict]) -> str:
         """LLM completion over the local Bonsai endpoint; returns the content.
 

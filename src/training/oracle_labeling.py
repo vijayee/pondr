@@ -23,8 +23,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable
@@ -240,6 +242,14 @@ class OracleClient:
         self.total_calls = 0
         self.total_tokens = 0
         self._cache_dirty = False
+        # Guards the in-memory cache dict and the total_* stat counters, which
+        # are mutated from inside ``generate``. Concurrent batch generation
+        # (``generate_batch(max_workers>1)``) calls ``generate`` from several
+        # worker threads; the HTTP call itself runs OUTSIDE this lock so the
+        # calls actually parallelize — only the cache lookup/insert and the
+        # counter bumps are serialized. Default ``max_workers=1`` leaves the
+        # original sequential behavior byte-identical (the lock is uncontended).
+        self._lock = threading.Lock()
         if self.config.cache_path:
             self._load_cache()
 
@@ -284,22 +294,26 @@ class OracleClient:
         # the whole file, so filtering out cache-loaded records would drop them
         # from disk and defeat cross-run resume. The ``cached`` flag is an
         # in-memory marker only; ``_load_cache`` resets it on the next run.
-        payload = {
-            h: {
-                "prompt": r.prompt,
-                "response": r.response,
-                "input_tokens": r.input_tokens,
-                "output_tokens": r.output_tokens,
-                "cost": r.cost,
-                "latency_seconds": r.latency_seconds,
-                "retries": r.retries,
+        # Snapshot the payload under the lock so concurrent ``generate`` calls
+        # can't mutate the dict mid-serialization; the disk write itself runs
+        # outside the lock (brief, and holds no in-memory state).
+        with self._lock:
+            payload = {
+                h: {
+                    "prompt": r.prompt,
+                    "response": r.response,
+                    "input_tokens": r.input_tokens,
+                    "output_tokens": r.output_tokens,
+                    "cost": r.cost,
+                    "latency_seconds": r.latency_seconds,
+                    "retries": r.retries,
+                }
+                for h, r in self.cache.items()
             }
-            for h, r in self.cache.items()
-        }
+            self._cache_dirty = False
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f)
         tmp.replace(path)
-        self._cache_dirty = False
 
     # ── HTTP layer (isolated for tests) ──
 
@@ -332,7 +346,8 @@ class OracleClient:
         the raw content to debug it (mirrors BonsaiRelationExtractor).
         """
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        cached = self.cache.get(prompt_hash)
+        with self._lock:
+            cached = self.cache.get(prompt_hash)
         if cached is not None:
             cached.cached = True
             return cached
@@ -392,11 +407,15 @@ class OracleClient:
                     latency_seconds=elapsed,
                     retries=attempt,
                 )
-                self.cache[prompt_hash] = result
-                self._cache_dirty = True
-                self.total_cost += cost
-                self.total_calls += 1
-                self.total_tokens += input_tokens + output_tokens
+                with self._lock:
+                    # Cache insert + stat bumps are serialized; the HTTP call
+                    # above ran outside the lock so concurrent workers
+                    # parallelize on the network, not on this critical section.
+                    self.cache[prompt_hash] = result
+                    self._cache_dirty = True
+                    self.total_cost += cost
+                    self.total_calls += 1
+                    self.total_tokens += input_tokens + output_tokens
                 return result
 
             except RuntimeError:
@@ -420,26 +439,56 @@ class OracleClient:
         prompts: list[str],
         response_format: str = "json_object",
         progress_callback: Optional[Callable[[int, int, OracleResult], None]] = None,
+        max_workers: int = 1,
     ) -> list[OracleResult]:
-        """Generate results for a batch of prompts (sequential, rate-limited).
+        """Generate results for a batch of prompts, preserving input order.
 
-        ``progress_callback(done, total, result)`` is invoked after each call.
-        Rate-limited by ``config.batch_delay`` between calls. The on-disk cache
-        is flushed once at the end; long runs should also call ``flush_cache()``
-        at their own checkpoints so a mid-run crash keeps progress.
+        ``max_workers=1`` (default) is the original sequential, rate-limited path
+        — one ``generate`` call at a time, sleeping ``config.batch_delay`` between
+        calls. ``max_workers>1`` dispatches the calls across a
+        ``ThreadPoolExecutor`` so the network-bound Oracle calls overlap; results
+        are returned in the SAME order as ``prompts``. The cache dict and the
+        ``total_*`` counters are guarded by an internal lock (see ``generate``),
+        so concurrent workers only parallelize the HTTP waits, not the shared
+        state. ``progress_callback`` fires as each call completes (in completion
+        order, not input order); the cache is flushed once at the end.
+
+        ``batch_delay`` is only honored on the sequential path — with concurrent
+        workers there is no single "between calls" gap to sleep.
         """
-        results: list[OracleResult] = []
+        if max_workers <= 1:
+            results: list[OracleResult] = []
+            try:
+                for i, prompt in enumerate(prompts):
+                    result = self.generate(prompt, response_format)
+                    results.append(result)
+                    if progress_callback:
+                        progress_callback(i + 1, len(prompts), result)
+                    if i < len(prompts) - 1 and self.config.batch_delay > 0:
+                        time.sleep(self.config.batch_delay)
+            finally:
+                self.flush_cache()
+            return results
+
+        # Concurrent path. Submit all calls, then collect via ``as_completed`` in
+        # THIS thread (no cross-thread counter mutation): each result is placed
+        # at its input index so the returned list matches ``prompts`` order.
+        out: list[Optional[OracleResult]] = [None] * len(prompts)
+        done = 0
         try:
-            for i, prompt in enumerate(prompts):
-                result = self.generate(prompt, response_format)
-                results.append(result)
-                if progress_callback:
-                    progress_callback(i + 1, len(prompts), result)
-                if i < len(prompts) - 1 and self.config.batch_delay > 0:
-                    time.sleep(self.config.batch_delay)
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(self.generate, p, response_format): idx
+                          for idx, p in enumerate(prompts)}
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    res = fut.result()
+                    out[idx] = res
+                    done += 1
+                    if progress_callback:
+                        progress_callback(done, len(prompts), res)
         finally:
             self.flush_cache()
-        return results
+        return [r for r in out if r is not None]  # type: ignore[list-item]
 
     def get_stats(self) -> dict:
         """Usage statistics for the run."""

@@ -16,6 +16,9 @@ data/pod_runs/*_extractions.jsonl
 data/pod_runs/memory_db/
 data/pod_runs/phase1b_scale/
 data/pod_runs/phase1c_*/
+data/pod_runs/phase2a/
+data/pod_runs/phase2a_full/
+data/pod_runs/phase2b/
 .checkpoint.json
 *.wal
 manifest.dat

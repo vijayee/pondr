@@ -26,6 +26,7 @@ from src.training.generator_common import (  # noqa: E402
     write_report,
 )
 from src.training.prompts import jepa_routing_prompt  # noqa: E402
+from src.subconscious.routing import PATHWAYS as _PATHWAY_VOCAB  # noqa: E402
 
 AVAILABLE_DOMAINS = """
 - database: WaveDB, Postgres, HBTrie, SQL, configuration, performance
@@ -61,14 +62,73 @@ _TEMPLATES = [
     ("Design a new approach for {problem}", ["conscious_deliberation"]),
     ("Compare {domain_a} performance with {domain_b} reliability", ["graph_retrieve"]),
     ("How does {domain_a} architecture influence {domain_b} design?", ["conscious_deliberation"]),
+    ("Plan the sequence of tool calls needed to {task}", ["tool_plan"]),
+    ("Outline a multi-step tool strategy for {objective}", ["tool_plan"]),
 ]
 
-_ENTITIES = ["Alice", "Bob", "WaveDB", "Postgres", "Python", "HBTrie", "WAL", "API"]
-_TOPICS = ["database_design", "configuration", "performance", "security", "api_design"]
-_TONES = ["frustrated", "excited", "curious"]
-_EVENTS = ["morphisms", "the optimizer", "the refactor", "the deployment"]
-_DECISIONS = ["using WaveDB", "the DEBOUNCED choice", "the cost-based optimizer"]
-_PROBLEMS = ["sync mode configuration", "async performance", "encryption API"]
+# Vocabularies sized so the cross-product yields thousands of UNIQUE queries
+# (the first 5k run had only ~177 unique → the gate memorized strings instead
+# of generalizing). Each slot is in-domain (database/coding/robotics/
+# economics/ai_architecture/personal) so the Oracle routes plausibly.
+_ENTITIES = [
+    "Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Henry",
+    "WaveDB", "Postgres", "MongoDB", "Redis", "SQLite", "DuckDB",
+    "Python", "Rust", "Go", "TypeScript", "C++", "Julia",
+    "HBTrie", "Bonsai", "FAISS", "Triton", "TVM",
+    "the WAL", "the MVCC layer", "the query planner", "the replication log",
+    "the embedding model", "the SSM kernel", "the JEPA head", "the gate",
+    "llama-server", "Ollama", "Docker", "k8s", "nginx",
+    "the optimizer", "the compactor", "the checkpoint", "the index",
+]
+_TOPICS = [
+    "database_design", "configuration", "performance", "security", "api_design",
+    "concurrency", "replication", "indexing", "caching", "batching",
+    "serialization", "compaction", "memory_pressure", "latency", "throughput",
+    "crash_recovery", "schema_migration", "vector_search", "graph_traversal",
+    "encoding", "retrieval", "routing", "context_window", "tokenization",
+    "embedding_quality",
+]
+_TONES = ["frustrated", "excited", "curious", "skeptical", "confident",
+          "confused", "optimistic", "annoyed", "impressed", "worried"]
+_EVENTS = [
+    "morphisms", "the optimizer", "the refactor", "the deployment",
+    "the migration", "the outage", "the benchmark", "the rollout",
+    "the rollback", "the release", "the compaction", "the schema change",
+]
+_DECISIONS = [
+    "using WaveDB", "the DEBOUNCED choice", "the cost-based optimizer",
+    "the sub-block packing fix", "the MVCC redesign", "dropping FAISS",
+    "the SSM reference backend", "the chunk-size change", "the rebrand",
+    "the 2a skeleton", "the oracle labeling", "the retrieval gate",
+    "the local Bonsai endpoint", "the compact corpus",
+]
+_PROBLEMS = [
+    "sync mode configuration", "async performance", "encryption API",
+    "write amplification", "graph query segfault", "reopen data loss",
+    "scan corruption at scale", "WAL truncation", "Bonsai over-extraction",
+    "GLiNER CPU bottleneck", "MVCC read amplification", "sub-block packing",
+]
+_TASKS = [
+    "deploy the service", "migrate the database", "audit the dependencies",
+    "rotate the credentials", "rebuild the search index", "purge the queue",
+    "scale the workers", "snapshot the volume", "retrain the gate",
+    "compact the corpus", "rotate the logs", "restart the endpoint",
+    "validate the checkpoint", "provision a pod", "backfill the embeddings",
+    "warm the cache", "drain the node", "canary the release",
+    "roll back the migration", "re-provision the GPU",
+]
+_OBJECTIVES = [
+    "backing up the corpus", "scaling the cluster", "validating the release",
+    "provisioning a new node", "diagnosing the segfault", "reducing write amp",
+    "improving retrieval recall", "shrinking the DB footprint",
+    "automating the rollout", "auditing the access logs", "rebalancing shards",
+    "estimating model size", "planning the tool chain", "delegating to a bigger model",
+    "recovering the lost keys",
+]
+# Cross-domain comparison templates ("Compare {domain_a} performance with
+# {domain_b} reliability", "How does {domain_a} architecture influence
+# {domain_b} design?") only need a handful of contrasting domains; the full
+# 6-domain set lives in AVAILABLE_DOMAINS above and is labeled by the Oracle.
 _DOMAINS = ["database", "robotics", "economics"]
 
 
@@ -91,6 +151,8 @@ def _generate_diverse_queries(num_queries: int, seed: int = 0) -> list[dict]:
             event=rng.choice(_EVENTS),
             decision=rng.choice(_DECISIONS),
             problem=rng.choice(_PROBLEMS),
+            task=rng.choice(_TASKS),
+            objective=rng.choice(_OBJECTIVES),
             domain_a=rng.choice(_DOMAINS),
             domain_b=rng.choice(_DOMAINS),
         )
@@ -119,13 +181,27 @@ def main() -> int:
         return jepa_routing_prompt(item["query"], AVAILABLE_DOMAINS, AVAILABLE_PATHWAYS)
 
     def to_record(item, result, _idx):
-        return {"query": item["query"], "route": result.response,
+        # The Oracle is a reliable labeler for domains/skills/model_size/
+        # deliberation, but its PATHWAY label collapses to graph_retrieve
+        # (it re-labels most tool_plan/process_exec/ssm_direct intents as
+        # "needs retrieval") — a gate trained on those labels routes
+        # everything to graph_retrieve (verified). The template's expected
+        # pathway IS the routing intent by construction ("Plan the sequence
+        # of tool calls…" = tool_plan), so it is cleaner pathway ground
+        # truth. Use it as the training target; keep the Oracle's choice
+        # as oracle_pathway for audit. (Other fields stay Oracle-labeled.)
+        route = dict(result.response) if isinstance(result.response, dict) else {}
+        exp = item["expected_pathways"] or []
+        if exp and exp[0] in _PATHWAY_VOCAB:
+            route["oracle_pathway"] = route.get("pathway")
+            route["pathway"] = exp[0]
+        return {"query": item["query"], "route": route,
                 "expected_pathways": item["expected_pathways"], "cost": result.cost}
 
     records, stats = run_batches(
         oracle, items, build_prompt, to_record,
         output_dir, "routing", args.oracle_batch_size, args.resume,
-        progress_label="queries",
+        progress_label="queries", max_workers=args.oracle_max_workers,
     )
     write_jsonl(output_dir / "routing_pairs.jsonl", records)
 

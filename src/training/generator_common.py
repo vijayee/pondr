@@ -38,6 +38,11 @@ def add_oracle_args(parser) -> None:
     parser.add_argument("--oracle-batch-size", type=int, default=10,
                         help="Oracle calls per batch (progress/checkpoint granularity)")
     parser.add_argument("--oracle-timeout", type=float, default=_config.oracle_timeout)
+    parser.add_argument("--oracle-max-workers", type=int, default=1,
+                        help="Concurrent Oracle calls per batch (default 1 = sequential; "
+                             ">1 dispatches across a thread pool so network-bound calls "
+                             "overlap. Token cost is unchanged; only wall-clock shrinks. "
+                             "The cache + stat counters are lock-guarded so this is safe.")
 
 
 def make_oracle(args, output_dir: Path) -> OracleClient:
@@ -110,6 +115,7 @@ def run_batches(
     resume: bool,
     extra_stats: Optional[dict] = None,
     progress_label: str = "items",
+    max_workers: int = 1,
 ) -> tuple[list, dict]:
     """Drive the per-task Oracle batch loop with checkpointing.
 
@@ -134,7 +140,7 @@ def run_batches(
     for i in range(start_idx, len(items), batch_size):
         batch = items[i : i + batch_size]
         prompts = [build_prompt(it, i + j) for j, it in enumerate(batch)]
-        batch_results = oracle.generate_batch(prompts)
+        batch_results = oracle.generate_batch(prompts, max_workers=max_workers)
         for j, (it, result) in enumerate(zip(batch, batch_results)):
             records.append(to_record(it, result, i + j))
             stats["labeled"] += 1
