@@ -60,6 +60,49 @@ def _all_episode_ids(store) -> list[str]:
     return sorted(ids)
 
 
+def _successor_bound(prefix: str) -> str:
+    """Replicate ``graph_ops.c`` ``append_successor``: strip a trailing ``/`` then
+    append ``'0'`` (0x30 > '/'=0x2F). The bound is greater than any key sharing the
+    prefix whose next byte is the delimiter or an ASCII component, and less than
+    any key with a higher byte at that position — a tight, correct range end."""
+    p = prefix[:-1] if prefix.endswith("/") else prefix
+    return p + "0"
+
+
+def _load_follows_adjacency(store) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Load every ``follows`` edge in ONE PSO range scan -> (out_adj, in_adj).
+
+    ``out_adj[s]`` = ``[o, ...]`` for every ``(s, follows, o)`` triple, i.e. exactly
+    what ``.out("follows")(s)`` returns. ``in_adj[o]`` = ``[s, ...]``, i.e. exactly
+    what ``.in_("follows")(o)`` returns. Key order is PSO-sorted (by subject within
+    predicate), which matches the POS-sorted order ``.in_("follows")`` yields for a
+    fixed object, so successor selection is deterministic and identical to the
+    per-vertex path.
+
+    Replaces N per-vertex ``.out("follows")`` / ``.in_("follows")`` queries with
+    one batched load. Before the WaveDB seek-to-prefix fix (WaveDB 0.1.14) each
+    per-vertex range scan walked in-order from the leftmost leaf — ~838 ms/query
+    on this corpus, so the full 5,002-episode start-detection scan was ~70 min.
+    With the seek fix in place per-vertex ``.out`` is ~0.04 ms, so 5,002
+    per-vertex scans would be ~0.2 s — but this single PSO scan (~46 ms, both
+    out_adj AND in_adj in one pass) is still ~4x faster and avoids 5,002
+    iterator setups, so the batched load remains the preferred path. See
+    ``scripts/_probe_graph_query.py`` for the before/after benchmark.
+    """
+    start = "memory/pso/follows/"
+    end = _successor_bound(start)
+    out_adj: dict[str, list[str]] = {}
+    in_adj: dict[str, list[str]] = {}
+    for k, _ in store.db.create_read_stream(start=start, end=end):
+        # k = "memory/pso/follows/<subject>/<object>"
+        parts = k.split("/")
+        if len(parts) >= 5:
+            s, o = parts[3], parts[4]
+            out_adj.setdefault(s, []).append(o)
+            in_adj.setdefault(o, []).append(s)
+    return out_adj, in_adj
+
+
 def _stub_embedding(summary: str, dim: int = EMBED_DIM) -> list[float]:
     """Deterministic 384-dim 'embedding' from the summary hash.
 
@@ -98,37 +141,29 @@ def _get_embedding(store, eid: str, vs: VectorSearch | None,
     return vec
 
 
-def _successors(store, eid: str) -> list[str]:
+def _successors(eid: str, in_adj: dict[str, list[str]]) -> list[str]:
     """Episodes that follow ``eid`` in time (``.in_("follows")`` -> successors).
 
     The triple is ``(ep_N, follows, ep_{N-1})``, so ``in_("follows")`` from
-    ``ep_{N-1}`` returns ``ep_N`` (the next turn).
+    ``ep_{N-1}`` returns ``ep_N`` (the next turn). Read from the in-memory
+    adjacency built by ``_load_follows_adjacency`` instead of one graph query
+    per step.
     """
-    result = store.graph.query().vertex(eid).in_("follows").execute_sync()
-    try:
-        succ = [v for v in result.vertices]
-    finally:
-        result.close()
-    return succ
+    return in_adj.get(eid, [])
 
 
-def _is_chain_start(store, eid: str) -> bool:
+def _is_chain_start(eid: str, out_adj: dict[str, list[str]]) -> bool:
     """True if ``eid`` has no predecessor (no ``.out("follows")``)."""
-    result = store.graph.query().vertex(eid).out("follows").execute_sync()
-    try:
-        return len(result.vertices) == 0
-    finally:
-        result.close()
+    return eid not in out_adj
 
 
-def _walk_chain(store, start_id: str, max_len: int = 64) -> list[str]:
+def _walk_chain(start_id: str, in_adj: dict[str, list[str]], max_len: int = 64) -> list[str]:
     """Walk a follows chain forward from a start, guarding cycles."""
     chain = [start_id]
     current = start_id
     seen = {start_id}
     while len(chain) < max_len:
-        succ = _successors(store, current)
-        nxt = next((s for s in succ if s not in seen), None)
+        nxt = next((s for s in _successors(current, in_adj) if s not in seen), None)
         if nxt is None:
             break
         chain.append(nxt)
@@ -153,8 +188,9 @@ def main() -> int:
                         help="Cap the number of chain starts used (0 = all). For dev smoke.")
     parser.add_argument("--scan-limit", type=int, default=0,
                         help="Cap the number of episodes scanned for start-detection "
-                             "(0 = all). Per-vertex graph queries are ~50-100ms, so the full "
-                             "5,002-episode scan takes minutes; set e.g. 300 for a fast dev smoke.")
+                             "(0 = all). With the batched PSO adjacency load the full scan "
+                             "is ~3 s, so this is now only a dev-smoke convenience, not a "
+                             "performance escape hatch.")
     args = parser.parse_args()
 
     output_path = Path(args.output)
@@ -166,8 +202,17 @@ def main() -> int:
         all_ids = _all_episode_ids(store)
         print(f"Episodes with content: {len(all_ids)}")
 
+        # Load the full follows adjacency in ONE PSO scan (~46 ms for ~4k edges,
+        # post WaveDB seek fix). Still preferred over 5,002 per-vertex scans
+        # (~0.04 ms each post-seek) because one pass yields both out_adj and
+        # in_adj. See _load_follows_adjacency + _probe_graph_query.py.
+        out_adj, in_adj = _load_follows_adjacency(store)
+        edge_count = sum(len(v) for v in out_adj.values())
+        print(f"follows edges loaded (one PSO scan): {edge_count}  "
+              f"({len(out_adj)} subjects, {len(in_adj)} objects)")
+
         scan_ids = all_ids[: args.scan_limit] if args.scan_limit else all_ids
-        starts = [eid for eid in scan_ids if _is_chain_start(store, eid)]
+        starts = [eid for eid in scan_ids if _is_chain_start(eid, out_adj)]
         if args.limit:
             starts = starts[: args.limit]
         print(f"Chain starts (no predecessor): {len(starts)}")
@@ -178,7 +223,7 @@ def main() -> int:
         chains_dropped_no_emb = 0
 
         for start_id in starts:
-            chain = _walk_chain(store, start_id)
+            chain = _walk_chain(start_id, in_adj)
             if len(chain) < args.min_chain_length:
                 continue
             embs: list[tuple[str, list[float]]] = []
