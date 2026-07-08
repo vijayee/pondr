@@ -354,6 +354,54 @@ class HippocampalStore:
         keys = [k for k, _ in self.db.create_read_stream(start=start, end=end)]
         return [k.rsplit("/", 1)[-1] for k in keys]
 
+    # ---- JGS recurrent-state persistence (Phase 2c plumbing) ----
+
+    def save_jgs_state(self, user_id: str, blob: str, scope: str = "working_memory") -> None:
+        """Persist a serialized JGS recurrent-state snapshot for a user.
+
+        Phase 2c plumbing: the *mechanism* only. The ``when`` (save-trigger
+        policy) is decided by the orchestrator/session layer, not here. Working
+        Memory is per-user and cross-session — a user has working memory, and
+        the sessions live inside it — so the state is keyed by user (not by
+        session), mirroring the cross-session ``content/system/last_session``
+        pointer. ``scope`` lets multiple distinct JGS instances coexist under
+        one user (e.g. ``"working_memory"`` now, a future gate id later) — the
+        default is the only instance that persists in 2c.
+
+        ``blob`` is the NUL-free ASCII text produced by
+        ``src.subconscious.state_serializer.serialize``. It is written with a
+        single ``put_sync`` (a known key, so the sorted-insertion caveat that
+        governs the salience/entity keys does not apply). The blob must not
+        contain ``/``-split namespaces or NUL — ``state_serializer`` guarantees
+        this; we guard the user-supplied ``user_id``/``scope`` the same way
+        ``write_entity_salience_batch`` guards entity strings.
+        """
+        if "/" in user_id or "\x00" in user_id:
+            raise ValueError(f"invalid user_id for JGS state key: {user_id!r}")
+        if "/" in scope or "\x00" in scope or not scope:
+            raise ValueError(f"invalid scope for JGS state key: {scope!r}")
+        if not blob:
+            raise ValueError("JGS state blob is empty — refusing to store (load would read as None)")
+        if "\x00" in blob:
+            raise ValueError("JGS state blob contains a NUL byte — refusing to store")
+        self.db.put_sync(f"content/system/user/{user_id}/{scope}/state", blob)
+
+    def load_jgs_state(self, user_id: str, scope: str = "working_memory") -> Optional[str]:
+        """Return the serialized JGS state blob for ``user_id``/``scope``, or ``None``.
+
+        Inverse of :meth:`save_jgs_state`. ``None`` means no state has been saved
+        yet (fresh user) — the caller should ``reset_state`` a fresh instance
+        rather than restore. Single-key ``get_sync`` is safe on the compact
+        corpora (see the get_sync caveat in ``docs/Phase 1c.md`` §0.3).
+        """
+        if "/" in user_id or "\x00" in user_id:
+            raise ValueError(f"invalid user_id for JGS state key: {user_id!r}")
+        if "/" in scope or "\x00" in scope or not scope:
+            raise ValueError(f"invalid scope for JGS state key: {scope!r}")
+        raw = self.db.get_sync(f"content/system/user/{user_id}/{scope}/state")
+        blob = _b2s(raw)
+        return blob if blob else None
+
     # ---- lifecycle ----
 
     def close(self) -> None:
