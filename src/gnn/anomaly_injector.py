@@ -245,16 +245,19 @@ def inject_anomalies(
 
     Returns ``(corrupted_subgraph, planted)`` where ``planted`` is the ground-
     truth list of ``{node, type}`` records the rule detector should recover.
-    ``types`` defaults to all 9 ``ANOMALY_TYPES``; a type whose precondition
-    isn't met (e.g. no episode to duplicate) is silently skipped — its record
-    is simply absent from ``planted``.
+    ``types=None`` injects all 9 ``ANOMALY_TYPES``; ``types=[]`` injects NONE
+    (a clean-subgraph true-negative record — used by the generator's random-
+    subset policy, spec §2.5). An explicit non-empty list injects exactly those
+    types. A type whose precondition isn't met (e.g. no episode to duplicate) is
+    silently skipped — its record is simply absent from ``planted``.
 
     The input subgraph is NOT mutated (a deep copy is corrupted and returned).
     """
     rng = random.Random(seed)
     corrupted = copy.deepcopy(subgraph)
     planted: list[dict] = []
-    for t in (types or list(ANOMALY_TYPES)):
+    inject_types = list(ANOMALY_TYPES) if types is None else types
+    for t in inject_types:
         injector = _INJECTORS.get(t)
         if injector is not None:
             injector(corrupted, rng, planted)

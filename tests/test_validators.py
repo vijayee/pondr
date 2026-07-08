@@ -147,6 +147,28 @@ def test_validate_bonsai(tmp_path):
     assert res["relation_extraction"]["ok"] is True
 
 
+def test_validate_bonsai_anomaly_decision_pairs(tmp_path):
+    """Phase 3a Task 3 spec §2.5: anomaly_decision_pairs.jsonl validates on the
+    good shape and fails on a missing decision field."""
+    b = tmp_path / "bonsai"
+    _write(b / "anomaly_decision_pairs.jsonl", [
+        {"flagged_entity": "E:Alice", "retrieved_context": {"center": "E:Alice"},
+         "anomaly_type": "identity_drift", "decision": "ask_user",
+         "action": "ask a clarifying question", "reasoning": "disjoint topics"},
+    ])
+    res = validate_bonsai(b)
+    assert res["anomaly_decision"]["ok"] is True
+    assert res["anomaly_decision"]["lines"] == 1
+
+    # Missing ``decision`` → not ok (required top-level key absent).
+    _write(b / "anomaly_decision_pairs.jsonl",
+           [{"flagged_entity": "E:Alice", "retrieved_context": {},
+             "anomaly_type": "identity_drift", "action": "x", "reasoning": "r"}])
+    res2 = validate_bonsai(b)
+    assert res2["anomaly_decision"]["ok"] is False
+    assert res2["anomaly_decision"]["missing_keys"] == 1
+
+
 def test_validate_jepa(tmp_path):
     j = tmp_path / "jepa"
     _write(j / "routing_pairs.jsonl",
@@ -204,6 +226,11 @@ def test_record_keys_match_generator_outputs():
     # Bonsai
     assert RECORD_KEYS["query_planning_pairs"] == {"conversation_id", "training_pair"}
     assert RECORD_KEYS["relation_extraction_pairs"] == {"conversation_id", "relations"}
+    # Phase 3a Task 3 spec §2.5: anomaly_decision_pairs (Bonsai distillation).
+    assert RECORD_KEYS["anomaly_decision_pairs"] == {
+        "flagged_entity", "retrieved_context", "anomaly_type",
+        "decision", "action", "reasoning",
+    }
     # JEPA / gates / code_aware
     assert RECORD_KEYS["routing_pairs"] == {"query", "route"}
     assert RECORD_KEYS["uncertainty_detector"] == {"input", "label"}

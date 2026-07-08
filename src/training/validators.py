@@ -14,6 +14,10 @@ The expected shapes (from ``docs/Phase 1d.md`` and the generator outputs):
   ``{"conversation_id", "conversation_text", "training_pair": {"question","query","reasoning"}}``.
 - ``bonsai/relation_extraction_pairs.jsonl`` —
   ``{"conversation_id", "conversation_text", "relations": [...]}``.
+- ``bonsai/anomaly_decision_pairs.jsonl`` —
+  ``{"flagged_entity", "retrieved_context", "anomaly_type", "decision", "action",
+  "reasoning"}`` (Phase 3a Task 3 spec §2.5 — Oracle-distilled fix/ask_user/dismiss
+  demonstrations over injected anomalies, retrieve-then-prompt).
 - ``jepa/routing_pairs.jsonl`` — ``{"query", "route": {...}}``.
 - ``gates/{gate}.jsonl`` — ``{"input": {...}, "label": {...}}``.
 - ``code_aware/code_aware_examples.jsonl`` —
@@ -48,6 +52,10 @@ RECORD_KEYS: dict[str, set[str]] = {
     # Bonsai
     "query_planning_pairs": {"conversation_id", "training_pair"},
     "relation_extraction_pairs": {"conversation_id", "relations"},
+    "anomaly_decision_pairs": {
+        "flagged_entity", "retrieved_context", "anomaly_type",
+        "decision", "action", "reasoning",
+    },
     # JEPA
     "routing_pairs": {"query", "route"},
     # Gates
@@ -182,6 +190,10 @@ def validate_bonsai(bonsai_dir: Path) -> dict:
         "relation_extraction": validate_file(
             bonsai_dir / "relation_extraction_pairs.jsonl",
             required_keys=RECORD_KEYS["relation_extraction_pairs"],
+        ),
+        "anomaly_decision": validate_file(
+            bonsai_dir / "anomaly_decision_pairs.jsonl",
+            required_keys=RECORD_KEYS["anomaly_decision_pairs"],
         ),
     }
 

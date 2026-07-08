@@ -11,10 +11,10 @@ import json
 
 from src.training.prompts import (
     aspirational_model_prompt,
+    bonsai_anomaly_decision_prompt,
     bonsai_query_planning_prompt,
     bonsai_relation_extraction_prompt,
     code_aware_synthetic_prompt,
-    gnn_anomaly_prompt,
     gnn_cluster_prompt,
     gnn_link_prediction_prompt,
     gnn_ontology_prompt,
@@ -53,10 +53,17 @@ def test_gnn_link_prediction_prompt_embeds_subgraph():
     assert "negative_edges" in p
 
 
-def test_gnn_anomaly_prompt_embeds_subgraph():
-    p = gnn_anomaly_prompt('{"nodes": []}')
+def test_bonsai_anomaly_decision_prompt_embeds_inputs():
+    p = bonsai_anomaly_decision_prompt(
+        "E:Alice", {"nodes": [{"id": "E:Alice"}]}, "identity_drift"
+    )
     _assert_json_contract(p)
-    assert "anomal" in p.lower()
+    assert "E:Alice" in p
+    assert "identity_drift" in p
+    # The retrieve-then-prompt context is baked in.
+    assert "nodes" in p
+    # The decision/action/reasoning contract.
+    assert "decision" in p and "action" in p and "reasoning" in p
 
 
 def test_gnn_ontology_prompt_embeds_subgraph_and_ontology():

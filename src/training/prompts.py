@@ -13,6 +13,8 @@ salvage parser can recover the payload.
 
 from __future__ import annotations
 
+import json
+
 # ═══════════════════════════════════════════════════════════════
 # GNN TRAINING DATA
 # ═══════════════════════════════════════════════════════════════
@@ -110,30 +112,6 @@ Return ONLY valid JSON:
 ]}}"""
 
 
-def gnn_anomaly_prompt(subgraph_json: str) -> str:
-    """Prompt for GNN anomaly detection labels."""
-    return f"""You are labeling a memory graph for GNN training.
-Flag structural anomalies — patterns that don't fit a well-formed memory graph.
-
-Anomaly types:
-- ORPHAN_DECISION: Decision node with no 'madeBy' edge
-- MISSING_TEMPORAL: Gap in follows chain
-- CONTRADICTION: Two edges that cannot both be true
-- TYPE_VIOLATION: Edge connecting incompatible types
-- ISOLATED_CLUSTER: Subgraph with no external connections
-- DUPLICATE_DECISION: Same decision appears to be made twice
-
-SUBGRAPH:
-{subgraph_json}
-
-Return ONLY valid JSON:
-{{"anomalies": [
-    {{"type": "MISSING_TEMPORAL", "severity": "warning",
-     "description": "ep_007 follows ep_004 but ep_005-006 also follow ep_004",
-     "involved_nodes": ["ep_004", "ep_005", "ep_007"]}}
-]}}"""
-
-
 def gnn_ontology_prompt(subgraph_json: str, current_ontology: str) -> str:
     """Prompt for GNN ontology refinement labels."""
     return f"""You are labeling a memory graph for GNN training.
@@ -159,6 +137,67 @@ Return ONLY valid JSON:
 # ═══════════════════════════════════════════════════════════════
 # BONSAI TRAINING DATA
 # ═══════════════════════════════════════════════════════════════
+
+
+def bonsai_anomaly_decision_prompt(
+    flagged_entity: str, retrieved_context: dict, anomaly_type: str
+) -> str:
+    """Prompt for generating Bonsai anomaly-DECISION training pairs (spec §2.5).
+
+    This is **retrieve-then-prompt**: the Oracle demonstrates the fix/ask_user/dismiss
+    decision from the SAME context Bonsai will have at deploy (the radius-1 graph
+    neighborhood of the flagged node, retrieved from the store before the call) — so
+    Bonsai's fine-tuned decision is reproducible, not based on context only the teacher
+    sees. The Oracle is the teacher (we planted the drift, so the "correct" decision is
+    checkable against ``anomaly_type``); Bonsai is the student; the Oracle is NOT in the
+    deploy loop. Returns ONLY the three fields Bonsai must predict; the caller echoes
+    ``flagged_entity``/``retrieved_context``/``anomaly_type`` back into the pair record.
+    """
+    ctx_json = json.dumps(retrieved_context, ensure_ascii=False)
+    return f"""You are generating training data for a small local model (Bonsai) that decides
+what the memory system should DO about a flagged anomaly, given the same retrieved
+context the model will have at deploy.
+
+Anomaly types (the 9 structural head labels + the identity_drift review-flag):
+- contradictory_state: one entity carries two distinct live state values
+- duplicate_episode: two near-identical episode summaries (re-import / sync)
+- duplicate_decision: two near-identical decision records
+- orphan_decision: a decision node with no link edges (partial ingest)
+- detached_episode: an episode node with no link edges (partial ingest)
+- broken_follows: a follows edge pointing at a missing target
+- type_violation: an edge whose predicate domain/range doesn't match the endpoints
+- isolated_cluster: a connected component with no path to the query focus
+- stale_abstraction: a semantic-memory M: node abstracts a dead/missing episode
+- identity_drift: one entity name appears to refer to two different referents
+  (disjoint topic neighborhoods — often legitimate; genuinely semantic)
+
+Decisions (pick exactly one):
+- fix: the system can safely resolve this without bothering the user
+- ask_user: a human must clarify (ambiguous, costly, or genuinely semantic)
+- dismiss: this is legitimate structure, not an error worth touching
+
+Hippo actions (the concrete operation behind the decision; one short phrase):
+- fix duplicate_episode/duplicate_decision → "merge the duplicate into the original"
+- fix orphan_decision/detached_episode → "re-link the orphaned node to its episode/entities"
+- fix broken_follows → "re-link or delete the dangling follows edge"
+- fix type_violation → "rewire the edge to a kind that satisfies the ontology"
+- fix stale_abstraction → "repoint the abstraction at a live episode or retire the M: node"
+- fix contradictory_state → "supersede the older state, keep the latest"
+- ask_user identity_drift → "ask a clarifying question to split or confirm the entity"
+- dismiss isolated_cluster → "leave the legitimate separate-domain cluster alone"
+- ask_user (anything costly/ambiguous) → "ask the user before mutating the graph"
+
+FLAGGED ENTITY: {flagged_entity}
+ANOMALY TYPE: {anomaly_type}
+
+RETRIEVED CONTEXT (radius-1 neighborhood of the flagged node, as Bonsai sees it):
+{ctx_json}
+
+Decide what the system should do, then explain it. Default to "ask_user" when the
+fix could lose information and you are not sure.
+
+Return ONLY valid JSON:
+{{"decision": "fix|ask_user|dismiss", "action": "...", "reasoning": "..."}}"""
 
 
 def bonsai_query_planning_prompt(conversation_text: str, question: str) -> str:
