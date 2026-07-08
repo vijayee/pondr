@@ -287,6 +287,12 @@ A database you can talk to. The system retrieves relevant episodes, builds conte
 
 ### Phase 2c: Working Memory & Presentation
 
+> **Note:** "Phase 2c" here is the same body of work that the older Phase 1b/1c/2b docs and
+> `src/` comments call **"Phase 2.5."** The detailed, code-aligned plan lives in
+> `docs/Phase 2c.md` (with a §0 alignment-notes table correcting the original speculative
+> draft to the real `src/` codebase). Phase 2c adds **no training cost** (runtime-only; the
+> backbone is reused from 2a).
+
 **Goal:** Deploy the SSM instance that maintains continuous awareness, plus SSM chunking and the JEPA presentation gate.
 
 **Duration:** 3-4 days
@@ -859,6 +865,13 @@ Phase	Component	GPU	Provider	Hours	Cost
 7a	Disturbance Detector gate	RTX 4090	Vast.ai spot	10	$2.70
 7b	Intuition Module gate	RTX 4090	Vast.ai spot	10	$2.70
 **TOTAL**				**198**	**~$142**
+
+> **Phase 2c — no training cost:** Phase 2c (Working Memory, SSM Chunking, Presentation Gate)
+> is runtime-only. The JEPA-Gated SSM backbone is reused from Phase 2a; Working Memory and
+> the SSM Chunker have no training step; the Presentation Gate is heuristic in 2c (the learned
+> JGS gate is deferred until outcome signals are wired). No row is added above — 2c adds $0
+> to the training budget. The only compute is local inference, already covered by the Phase
+> 2a/2b hardware.
 
 ---
 
