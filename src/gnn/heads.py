@@ -168,22 +168,24 @@ class LinkPredHead(nn.Module):
                 return float((p.round() == y).mean())
 
 
-# ── 4. Anomaly-detection head (6-type multi-label) ──
-# The 6 anomaly types line up with ``prompts.gnn_anomaly_prompt``'s schema
-# (ORPHAN_DECISION, MISSING_TEMPORAL, CONTRADICTION, TYPE_VIOLATION,
-# ISOLATED_CLUSTER, DUPLICATE_DECISION) — snake_cased here. Index order is
-# load-bearing: the head's 6 output slots correspond to these in order.
-ANOMALY_TYPES: tuple[str, ...] = (
-    "orphan_decision", "missing_temporal", "contradiction",
-    "type_violation", "isolated_cluster", "duplicate_decision",
-)
+# ── 4. Anomaly-detection head (9-type multi-label) ──
+# The 9 anomaly types are owned by ``anomaly_rules.py`` (the rule detectors +
+# injector that produce the head's training labels — spec §2 of the sharded-
+# labeling design). Importing the canonical tuple here keeps the head's output
+# slots and the training labels aligned by construction. Index order is
+# load-bearing: the head's ``len(ANOMALY_TYPES)`` output slots correspond to
+# these in order. (The 6-type Oracle-prompt schema was superseded in Task 3 by
+# the injection-based 9-type taxonomy — see ``anomaly_rules.ANOMALY_TYPES``.)
+from .anomaly_rules import ANOMALY_TYPES
 
 
 class AnomalyHead(nn.Module):
     """Multi-label anomaly classifier over ``ANOMALY_TYPES``.
 
-    Target: the Oracle ``anomaly_labels`` flag vector per node
-    (``prompts.gnn_anomaly_prompt``). Output ``[N, 6]`` sigmoid probabilities.
+    Target: the per-node anomaly flag vector from the injection-based labels
+    (``anomaly_rules.node_label_vectors`` — spec §2; the Oracle
+    ``gnn_anomaly_prompt`` is no longer the head's label source). Output
+    ``[N, len(ANOMALY_TYPES)]`` sigmoid probabilities.
     """
 
     def __init__(self, hidden_dim: int, num_types: int = len(ANOMALY_TYPES), dropout: float = 0.1) -> None:

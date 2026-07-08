@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from src.memory.episode import Episode
 from src.memory.store import HippocampalStore
-from src.gnn import Consolidator, WaveDBGraphLoader, GNNModel
+from src.gnn import ANOMALY_TYPES, Consolidator, WaveDBGraphLoader, GNNModel
 
 
 def _populate(store, n=5):
@@ -41,7 +41,7 @@ def test_pipeline_encode_load_score_consolidate(tmp_path):
     out = model(data)
     n = data.x.shape[0]
     assert out["salience"].shape == (n,)
-    assert out["anomaly"].shape == (n, 6)
+    assert out["anomaly"].shape == (n, len(ANOMALY_TYPES))
     assert out["diffpool"].shape == (n, 8)
 
     # 3. a dry-run consolidation pass over the corpus produces a report and

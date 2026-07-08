@@ -206,7 +206,7 @@ class Consolidator:
 
     def _step_anomaly(self, data, out, report: dict) -> None:
         """Flag nodes whose anomaly logits exceed 0.5 on any type."""
-        anomaly = out["anomaly"]  # [N, 6]
+        anomaly = out["anomaly"]  # [N, len(ANOMALY_TYPES)]
         flags = (anomaly > 0.5).nonzero(as_tuple=False).tolist()
         for n, t in flags:
             report["anomalies"].append({

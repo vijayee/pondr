@@ -28,6 +28,7 @@ from torch_geometric.nn import GATConv
 
 from .heads import (
     AnomalyHead, DiffPoolHead, LinkPredHead, OntologyHead, SalienceHead,
+    ANOMALY_TYPES,
 )
 from .features import FEATURE_DIM, NODE_KINDS
 
@@ -66,7 +67,7 @@ class GNNModel(nn.Module):
         dropout: float = 0.1,
         predicate_vocab_size: int = 32,
         num_clusters: int = 16,
-        num_anomaly_types: int = 6,
+        num_anomaly_types: int = len(ANOMALY_TYPES),
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
