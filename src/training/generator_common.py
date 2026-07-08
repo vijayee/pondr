@@ -38,6 +38,12 @@ def add_oracle_args(parser) -> None:
     parser.add_argument("--oracle-batch-size", type=int, default=10,
                         help="Oracle calls per batch (progress/checkpoint granularity)")
     parser.add_argument("--oracle-timeout", type=float, default=_config.oracle_timeout)
+    parser.add_argument("--oracle-max-retries", type=int, default=OracleConfig().max_retries,
+                        help="Oracle call retries before giving up (default: %(default)s). A "
+                             "failed call becomes a skip-and-log sentinel (no labels for that "
+                             "item), NOT a crash -- lower this to fail fast on stalls in a "
+                             "long scale run; a fresh re-run re-attempts failures (cached "
+                             "successes are free).")
     parser.add_argument("--oracle-max-workers", type=int, default=1,
                         help="Concurrent Oracle calls per batch (default 1 = sequential; "
                              ">1 dispatches across a thread pool so network-bound calls "
@@ -57,6 +63,7 @@ def make_oracle(args, output_dir: Path) -> OracleClient:
         temperature=args.oracle_temperature,
         max_tokens=args.oracle_max_tokens,
         timeout=args.oracle_timeout,
+        max_retries=args.oracle_max_retries,
         cache_path=output_dir / ".oracle_cache.json",
     )
     return OracleClient(cfg)
@@ -143,6 +150,14 @@ def run_batches(
         batch_results = oracle.generate_batch(prompts, max_workers=max_workers)
         for j, (it, result) in enumerate(zip(batch, batch_results)):
             records.append(to_record(it, result, i + j))
+            # A failure sentinel (exhausted retries) carries empty labels + an
+            # ``error`` msg: count it as failed (NOT labeled), so the run
+            # survives a transient stall and the summary reports it honestly.
+            # A fresh re-run re-attempts it (failed calls are not cached, so a
+            # re-run hits the cache for successes and retries only failures).
+            if getattr(result, "error", None) is not None:
+                stats["failed"] += 1
+                continue
             stats["labeled"] += 1
             stats["total_cost"] += result.cost
             stats["total_input_tokens"] += result.input_tokens
@@ -152,9 +167,11 @@ def run_batches(
         save_checkpoint(checkpoint_path, records, i + len(batch))
         oracle.flush_cache()
         done = min(i + batch_size, len(items))
+        failed = stats.get("failed", 0)
+        failed_str = f" failed={failed}" if failed else ""
         print(f"  {task_name}: {done}/{len(items)} {progress_label} "
               f"(calls={oracle.total_calls} tokens={oracle.total_tokens} "
-              f"${oracle.total_cost:.4f})")
+              f"${oracle.total_cost:.4f}{failed_str})")
 
     stats["elapsed_seconds"] = round(time.time() - start_time, 2)
     if extra_stats:

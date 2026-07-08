@@ -196,7 +196,16 @@ class OracleConfig:
 
 @dataclass
 class OracleResult:
-    """Result of one Oracle API call (or a cache hit)."""
+    """Result of one Oracle API call (or a cache hit).
+
+    ``error`` is set ONLY by ``generate_batch`` when a call exhausted retries —
+    a per-call failure sentinel so one bad call cannot kill a multi-hour run
+    (``response`` is then an empty ``{}`` so downstream ``recombine_*`` /
+    ``label_tensors`` see "no labels for this item" and skip it honestly).
+    A failure is NEVER cached: a ``--resume`` re-run re-attempts it (a
+    transient timeout may succeed next time). Successful calls leave
+    ``error=None`` and are cached as before.
+    """
     prompt: str
     response: dict
     input_tokens: int
@@ -205,6 +214,7 @@ class OracleResult:
     latency_seconds: float
     retries: int
     cached: bool = False
+    error: Optional[str] = None
 
 
 class OracleClient:
@@ -446,12 +456,23 @@ class OracleClient:
 
         ``batch_delay`` is only honored on the sequential path — with concurrent
         workers there is no single "between calls" gap to sleep.
+
+        Resilience: a single call that exhausts retries (timeout / non-200 /
+        unparseable) does NOT raise out of here — it is returned as a failure
+        sentinel (``OracleResult.response={}``, ``error="..."``) at its input
+        index, so the batch always returns one result per prompt (no
+        misalignment of the caller's ``zip(items, results)``) and a multi-hour
+        run survives a transient stall. The caller counts failures via
+        ``result.error``.
         """
         if max_workers <= 1:
             results: list[OracleResult] = []
             try:
                 for i, prompt in enumerate(prompts):
-                    result = self.generate(prompt, response_format)
+                    try:
+                        result = self.generate(prompt, response_format)
+                    except Exception as exc:  # exhausted retries -> sentinel, don't kill the run
+                        result = self._failed_result(prompt, exc)
                     results.append(result)
                     if progress_callback:
                         progress_callback(i + 1, len(prompts), result)
@@ -472,14 +493,19 @@ class OracleClient:
                           for idx, p in enumerate(prompts)}
                 for fut in as_completed(futures):
                     idx = futures[fut]
-                    res = fut.result()
+                    try:
+                        res = fut.result()
+                    except Exception as exc:  # exhausted retries -> sentinel at its index
+                        res = self._failed_result(prompts[idx], exc)
                     out[idx] = res
                     done += 1
                     if progress_callback:
                         progress_callback(done, len(prompts), res)
         finally:
             self.flush_cache()
-        return [r for r in out if r is not None]  # type: ignore[list-item]
+        # Every index is filled (result or sentinel) — return as-is so the
+        # caller's zip(items, results) stays aligned (NO dropping None).
+        return out  # type: ignore[return-value]
 
     def get_stats(self) -> dict:
         """Usage statistics for the run."""
@@ -492,6 +518,27 @@ class OracleClient:
         }
 
     # ── helpers ──
+
+    def _failed_result(self, prompt: str, exc: BaseException) -> OracleResult:
+        """Build a per-call failure sentinel (see ``generate_batch`` docstring).
+
+        ``response={}`` so downstream consumers see "no labels for this item"
+        and skip it honestly; ``error`` carries the exhausted-retry message so
+        the caller can count + log failures. Not cached (a ``--resume`` re-run
+        re-attempts the prompt). ``retries`` is set to ``max_retries`` to flag
+        that the retry loop was exhausted, not that this is a fresh failure.
+        """
+        msg = f"{type(exc).__name__}: {exc}"
+        return OracleResult(
+            prompt=prompt,
+            response={},
+            input_tokens=0,
+            output_tokens=0,
+            cost=0.0,
+            latency_seconds=0.0,
+            retries=self.config.max_retries,
+            error=msg,
+        )
 
     @staticmethod
     def _extract(outer: dict) -> tuple[str, int, int]:

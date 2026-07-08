@@ -313,8 +313,8 @@ nodes with unique information not reachable through other paths.
 MEDIUM (0.3-0.7): moderate overlap, part of active but non-anchoring chains.
 LOW (<0.3): redundant/peripheral nodes, info available through other paths.
 
-Return ONLY valid JSON:
-{{"node_scores": {{"<node_id>": {{"salience": 0.0, "reason": "..."}}}}}}"""
+Return ONLY valid JSON — a bare float per node, no reasons, no prose:
+{{"node_scores": {{"<node_id>": 0.0}}}}"""
 
 
 def build_link_pred_shard_prompt(shard: dict) -> str:
@@ -347,11 +347,9 @@ context, causal/temporal order, co-occurring entities/topics, implied hierarchy.
 NEGATIVE edges (negative_edges): pairs that plausibly COULD share an edge given
 type/proximity but should NOT — unrelated domains, no shared context, far apart.
 
-Return ONLY valid JSON:
-{{"predicted_edges": [{{"subject": "...", "predicate": "related_to",
-   "object": "...", "confidence": 0.0, "evidence": "..."}}],
- "negative_edges": [{{"subject": "...", "predicate": "related_to",
-   "object": "...", "confidence": 0.0, "evidence": "..."}}]}}"""
+Return ONLY valid JSON — subject/object only, no predicate/confidence/evidence/prose:
+{{"predicted_edges": [{{"subject": "...", "object": "..."}}],
+ "negative_edges": [{{"subject": "...", "object": "..."}}]}}"""
 
 
 def build_ontology_shard_prompt(shard: dict, current_ontology_json: str) -> str:
@@ -377,11 +375,9 @@ CANDIDATE PAIRS ({len(shard["pairs"])}) — child → parent:
 PAIR NODES:
 {nodes_json}
 
-Return ONLY valid JSON:
-{{"suggested_edges": [{{"child": "...", "parent": "...", "confidence": 0.0,
-   "evidence": "..."}}],
- "misclassified": [{{"entity": "...", "current_class": "...",
-   "suggested_class": "...", "confidence": 0.0}}]}}"""
+Return ONLY valid JSON — child/parent (and entity/suggested_class) only, no confidence/evidence/prose:
+{{"suggested_edges": [{{"child": "...", "parent": "..."}}],
+ "misclassified": [{{"entity": "...", "suggested_class": "..."}}]}}"""
 
 
 def build_cluster_episode_prompt(ctx: dict) -> str:
