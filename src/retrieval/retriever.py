@@ -248,6 +248,35 @@ class HippocampalRetriever:
             out.append(ep)
         return out
 
+    def build_with_chunking(
+        self,
+        query: str,
+        episodes: list[dict],
+        presentation_plan,
+        working_memory=None,
+        ssm_chunker=None,
+        consumer: str = "bonsai",
+    ) -> tuple[str, "ChunkedContext"]:
+        """Phase 2c: chunk episodes per ``presentation_plan`` and build the context.
+
+        1. ``SSMChunker.chunk(episodes, plan)`` → ``ChunkedContext`` (primary full
+           text + compressed gist + secondary episode dicts for EXPAND).
+        2. ``ChunkedContextFormatter.format_for_llm(chunked, consumer, working_memory)``
+           → the context string for the generation model.
+
+        ``retrieve()`` / ``retrieve_with_routing()`` are unchanged (back-compat).
+        The chunker is injected (the orchestrator owns it) so this module does
+        NOT import the torch/subconscious chunker at module load.
+        """
+        if ssm_chunker is None:
+            raise RuntimeError("build_with_chunking requires an ssm_chunker")
+        from .chunked_context import ChunkedContextFormatter
+        chunked = ssm_chunker.chunk(episodes, presentation_plan)
+        formatter = ChunkedContextFormatter()
+        context = formatter.format_for_llm(chunked, consumer=consumer,
+                                           working_memory=working_memory)
+        return context, chunked
+
     def build_context_string(self, episodes: list[dict], max_tokens: Optional[int] = None) -> str:
         """Build a structured context string for Mode A generation.
 

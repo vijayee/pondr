@@ -138,6 +138,49 @@ class ModeAGenerator:
             "supported": True,
         }
 
+    def generate_with_working_memory(
+        self,
+        prompt: str,
+        conversation_history: Optional[list[dict]] = None,
+        max_context_tokens: Optional[int] = None,
+        session=None,
+        end_state: Optional[str] = None,
+        format_spec: Optional[dict] = None,
+        extract_schema: Optional[dict] = None,
+        model_size: Optional[str] = None,
+    ) -> dict:
+        """Phase 2c: full Working-Memory + chunking + presentation pipeline.
+
+        Delegates to the ``PonderOrchestrator.query()`` contract: it routes,
+        retrieves, updates working memory, plans presentation (both axes), and
+        dispatches on the end state. For ``ssm_direct``/``process_exec``/
+        ``tool_plan`` pathways (unsupported) returns ``supported=False`` —
+        honest, not faked (mirrors ``generate_with_routing``).
+
+        ``session`` is a ``PonderOrchestrator``. When ``session`` is None this
+        falls back to the plain ``generate`` path (no WM/chunking) so the method
+        is callable without a configured orchestrator.
+
+        Returns the orchestrator's result dict (see
+        ``PonderOrchestrator.query``). For ``direct``/``format``/``extract`` the
+        dict has no ``response`` (no LLM call); for ``synthesize`` it has
+        ``response`` (the Bonsai completion).
+        """
+        if session is None:
+            # No orchestrator configured — degrade to the plain Phase 1b path
+            # (no working memory / chunking / end-state dispatch).
+            return self.generate(prompt, conversation_history=conversation_history,
+                                 max_context_tokens=max_context_tokens)
+        return session.query(
+            prompt,
+            consumer="bonsai",
+            conversation_history=conversation_history,
+            end_state=end_state,
+            format_spec=format_spec,
+            extract_schema=extract_schema,
+            model_size=model_size,
+        )
+
     def _complete(self, messages: list[dict]) -> str:
         """LLM completion over the local Bonsai endpoint; returns the content.
 

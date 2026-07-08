@@ -1,7 +1,7 @@
 """Central configuration for the hippocampal memory system."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -96,6 +96,61 @@ class Config:
     data_dir: Path = Path("./data")
     sample_conversations: Path = Path("./data/sample_conversations.jsonl")
     corpora_dir: Path = Path("./data/corpora")
+
+
+# ── Phase 2c: Working Memory & Presentation ──
+# Config is dataclass-based (not YAML), matching the rest of the codebase. These
+# knobs are runtime-only — Phase 2c adds NO training cost (the backbone is reused
+# from 2a; Working Memory + SSM Chunker are runtime-only; the Presentation Gate is
+# heuristic, learned gate deferred). See docs/Phase 2c.md §9.
+
+
+@dataclass
+class WMConfig:
+    """Working Memory recurrent-state knobs (runtime, no training)."""
+    decay_alpha: float = 1.0   # post-step state forget factor; 1.0 = rely on SSM dynamics
+    lora_rank: int = 8        # matches INSTANCE_CONFIGS["working_memory"]
+
+
+@dataclass
+class ChunkerConfig:
+    """SSM Chunker primary/compressed split (runtime)."""
+    max_primary_tokens: int = 4096   # len(text)//4 estimate, summed over primary
+    max_primary_chunks: int = 5      # cap on primary (full-text) episodes
+
+
+@dataclass
+class PGConfig:
+    """Presentation Gate heuristic thresholds (axis a: chunking strategy)."""
+    direct_max_episodes: int = 3        # ≤ this + specific query → direct (no chunking)
+    chunked_min_episodes: int = 5       # above direct_max, below summary_only → chunked
+    summary_only_min_episodes: int = 20  # ≥ this OR summarization verb → summary_only
+    expand_threshold: float = 0.5        # confidence threshold for auto-EXPAND (Phase 4a reads it)
+
+
+@dataclass
+class PCConfig:
+    """Prompt compression for query planning (Task 5)."""
+    short_prompt_threshold: int = 500   # prompts ≤ this pass through byte-identical
+    bonsai_max_input: int = 2000         # hard cap (chars) for the planner prompt
+
+
+@dataclass
+class SessionConfig:
+    """Working-Memory session persistence (file-first; WaveDB-backed is optional)."""
+    state_dir: str = "data/sessions/"
+    auto_save_interval: int = 300   # seconds; the save TRIGGER policy is still open (memory)
+
+
+@dataclass
+class Phase2cConfig:
+    """Top-level Phase 2c config. All runtime; no training cost."""
+    working_memory: WMConfig = field(default_factory=WMConfig)
+    ssm_chunker: ChunkerConfig = field(default_factory=ChunkerConfig)
+    presentation_gate: PGConfig = field(default_factory=PGConfig)
+    prompt_compression: PCConfig = field(default_factory=PCConfig)
+    session: SessionConfig = field(default_factory=SessionConfig)
+    replay_capacity: int = 1000   # shared by chunking + end-state outcome/override buffers
 
 
 config = Config()

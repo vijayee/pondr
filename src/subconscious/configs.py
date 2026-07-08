@@ -66,6 +66,10 @@ class InstanceConfig:
 
 # The 8 cognitive functions that will be instantiated in Phases 2b-7b. Defined
 # here so Phase 2a can build + test the instance framework against all of them.
+# Phase 2c declares a 9th, ``presentation_gate`` — heuristic-only in 2c (the
+# learned JGS gate is deferred until outcome signals are wired live; see
+# docs/Phase 2c.md §5.1). Declared now so the instance registry stays consistent
+# and a future learned gate has a home; the heuristic planner does NOT use it.
 INSTANCE_CONFIGS: dict[str, InstanceConfig] = {
     "retrieval_gate": InstanceConfig(
         name="retrieval_gate",
@@ -77,6 +81,11 @@ INSTANCE_CONFIGS: dict[str, InstanceConfig] = {
         input_dim=384, output_dim=256,
         lora_rank=8,  # rich state
         gate_config=GateConfig(num_context_features=2),  # input_novelty, state_saturation
+    ),
+    "presentation_gate": InstanceConfig(
+        name="presentation_gate",
+        lora_rank=4,
+        gate_config=GateConfig(num_context_features=2),  # placeholder for the deferred learned gate
     ),
     "uncertainty_detector": InstanceConfig(
         name="uncertainty_detector",
