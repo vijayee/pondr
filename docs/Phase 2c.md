@@ -48,10 +48,17 @@ Phase 2c deploys three coupled subsystems that give the engine **continuous awar
 |---|---|---|
 | **Working Memory** | A `JGSInstance` whose recurrent state **persists across queries** (not reset per query) and absorbs retrieved episodes as embedding-steps | The system no longer starts from zero on each query — it has *presence* |
 | **SSM Chunking** | Compresses less-relevant retrieved episodes into the SSM recurrent state instead of raw text | Context windows are finite; this makes them *elastic* |
-| **Presentation Gate** | Decides how to present retrieved context (direct / chunked / summary_only + chunk counts) | The system *decides how to present*, not just *what to retrieve* |
+| **Presentation Gate** | Decides **how to present** retrieved context along **two axes** — (a) *chunking strategy* (direct / chunked / summary_only + chunk counts) and (b) *end state* (return results directly / format for another consumer / synthesize via LLM / extract structured data) | The system *decides how to present*, not just *what to retrieve* — and not every retrieval ends in an LLM call |
 
 They are built and tested together: Working Memory provides the state the Presentation Gate
-reads, and SSM Chunking is the mechanism the Presentation Gate orchestrates.
+reads, and SSM Chunking is the mechanism the Presentation Gate orchestrates. The Presentation
+Gate's **end-state axis** (b) is the chat's "do we always want the LLM to process the
+results?" answer — sometimes the results *are* the answer (direct return, no LLM), sometimes
+they are context for another consumer (format), sometimes they need LLM reasoning (synthesize),
+sometimes they need transformation to structured data (extract). Per the chat, this is an
+**explicit API with a heuristic default**: the caller may specify the end state; when they
+don't, the gate picks a default; a caller override is recorded as a training signal for the
+deferred learned gate.
 
 ### Prerequisites (status)
 
@@ -73,14 +80,16 @@ All paths corrected to the real `src/` layout. `[MODIFY]` = existing file change
 src/subconscious/
 ├── working_memory.py            # NEW — WorkingMemory(JGSInstance), persistent state
 ├── ssm_chunker.py                # NEW — SSMChunker, ChunkedContext, compress_episodes, expand
-├── presentation_gate.py         # NEW — PresentationGate (heuristic planner) + PresentationPlan
+├── presentation_gate.py         # NEW — PresentationGate + PresentationPlan + EndStatePlan
+│                                #        (heuristic chunking axis §5.2-5.4 + end-state axis §5.6)
 ├── state_serializer.py          # NEW — flatten/unflatten torch recurrent state <-> bytes
 ├── configs.py                    # [MODIFY] — add INSTANCE_CONFIGS["presentation_gate"]
 └── (instance.py, backbone.py, gate.py, lora.py, ssm.py — used as-is)
 src/retrieval/
 ├── retriever.py                  # [MODIFY] — add build_with_chunking(); reuse build_context_string
 ├── chunked_context.py            # NEW — ChunkedContext dataclass + ChunkedContextFormatter
-└── expand_handler.py             # NEW — ExpandHandler (chunking-level EXPAND)
+├── expand_handler.py             # NEW — ExpandHandler (chunking-level EXPAND)
+└── end_state.py                 # NEW — direct/format/synthesize/extract dispatch + extract handler
 src/generation/
 └── mode_a.py                     # [MODIFY] — add generate_with_working_memory()
 src/
@@ -89,7 +98,8 @@ src/
 tests/
 ├── test_working_memory.py        # NEW
 ├── test_ssm_chunker.py           # NEW
-├── test_presentation_gate.py     # NEW
+├── test_presentation_gate.py     # NEW — chunking axis (§5.2-5.4) + end-state axis (§5.6)
+├── test_end_state.py            # NEW — direct/format/synthesize/extract dispatch + override buffer
 ├── test_chunked_context.py       # NEW
 ├── test_expand_handler.py        # NEW
 └── integration/test_phase2c_pipeline.py  # NEW
@@ -354,6 +364,79 @@ Query-specificity is a cheap heuristic (presence of summarization keywords — "
 
 **Test file:** `tests/test_presentation_gate.py`
 
+### 5.6 End-state routing axis (direct / format / synthesize / extract)
+
+The chunking `strategy` above is **axis (a)**. The chat (`[144]`/`[146]`) adds a second,
+orthogonal **axis (b)**: *what to do with the retrieved results*. Not every retrieval
+should end in an LLM call. Four end states:
+
+| End state | When | LLM call? | Output |
+|---|---|---|---|
+| `direct` | The results *are* the answer ("What did Alice say about X?" → return the episode; "Show me the conversation about Y") | **No** | Episodes/summaries returned as-is |
+| `format` | Results are context for another consumer (a different model, a code generator, a tool) | No (formatting only) | A formatted context string/structure for the named consumer |
+| `synthesize` | Results need reasoning across episodes ("Why did we choose X over Y?") | Yes | Bonsai (or a larger model) generates a response |
+| `extract` | Results need transformation to structured data ("List all decisions as JSON"; "Create a dependency graph") | Cheap local extractor (not Bonsai) | Structured data (list / graph / table) |
+
+**Why an explicit API with a heuristic default (not a learned router).** Per `[145]`/`[146]`:
+the feedback signal for end-state routing is weak (the difference between `direct` and
+`synthesize` is latency/cost/format, not correctness — the user may be satisfied with
+either), so inferring an unobservable preference from implicit signals is fragile. The
+chat's resolution: **the API is the interface, JEPA is the optimization.** The caller may
+specify `end_state` explicitly; when they don't, a heuristic picks a default; a caller
+**override** is recorded and becomes the training signal for the future learned gate
+(same `ReplayBuffer` as the chunking outcomes — one buffer, two label fields).
+
+```python
+EndState = str  # "direct" | "format" | "synthesize" | "extract"
+
+@dataclass
+class EndStatePlan:
+    end_state: EndState
+    format_spec: Optional[dict] = None    # for "format": {"consumer": "bonsai"|"claude"|..., "purpose": ..., "max_tokens": ...}
+    extract_schema: Optional[dict] = None # for "extract": {"type": "list"|"graph"|"table", "item_type": ...}
+    model_size: Optional[str] = None      # for "synthesize": "bonsai" (only live model now)
+    jepa_default: bool = True             # True if the gate picked it; False if the caller overrode
+    rationale: str = ""
+
+class PresentationGate:
+    # ... (chunking axis from §5.2-5.4 unchanged) ...
+
+    def plan_end_state(self, query: str, retrieved_episodes: list[dict],
+                       working_memory: Optional[WorkingMemoryState] = None,
+                       caller_end_state: Optional[EndState] = None) -> EndStatePlan:
+        """Heuristic default when caller_end_state is None; else honor the caller.
+        Heuristic: 'direct' for show/who/when factual lookups with ≤3 episodes;
+        'extract' for list/graph/json verbs; 'synthesize' for why/how/compare reasoning
+        or >3 episodes; 'format' only when a non-bonsai consumer is named. Deterministic."""
+
+    def record_override(self, query: str, episodes: list[dict],
+                        jepa_predicted: EndState, caller_chose: EndState) -> None:
+        """Caller overrode the default → push (query, episodes-sig, predicted, chose) to the
+        ReplayBuffer as a training signal for the deferred learned end-state router. No-op
+        learning until that learned head exists; the buffer is the seed."""
+```
+
+**Integration with the orchestrator.** The orchestrator's `query()` (§8.1) accepts an
+optional `end_state` (+ `format_spec` / `extract_schema` / `model_size`). For `direct` it
+returns **without any model call**; for `format` it returns the formatted context (no model);
+for `extract` it uses a **cheap local span/regex extractor** (the same one §7 prompt
+compression uses — GLiNER if available, else a regex/titlecase fallback), **not** Bonsai;
+only `synthesize` calls the generation model. This is the first Hippo retrieval path that can
+answer without invoking Bonsai.
+
+**Acceptance criteria (axis b)**
+
+- [ ] `plan_end_state()` returns a valid `EndStatePlan` for any input (incl. empty episodes).
+- [ ] Heuristic default is deterministic for identical inputs.
+- [ ] `caller_end_state` is always honored when provided (`jepa_default=False`).
+- [ ] `record_override()` is called only on an actual override and appends to the buffer.
+- [ ] `direct` for a show/who/when factual lookup with ≤3 episodes (no LLM).
+- [ ] `extract` for a list/graph/json verb.
+- [ ] `synthesize` for a why/how/compare query or >3 episodes.
+- [ ] `plan_end_state()` (heuristic, no model) completes in < 1ms.
+
+**Test file:** `tests/test_presentation_gate.py` (extended)
+
 ---
 
 ## 6. Task 4 — Mode A Generation with Chunking
@@ -463,6 +546,16 @@ compressed state + key entities to Bonsai." But **Bonsai consumes text, not a st
 So compression = produce a **text** prompt ≤ `bonsai_max_input` (2000 chars) that preserves
 the planning-relevant signal (entities + recent focus), not a state vector.
 
+> **Mechanism note (vs. the planning chat).** The chat's sketch compresses the prompt by
+> chunking it, stepping each chunk through the SSM, and **decoding a summary from the SSM
+> state**. That decode step is not implementable here: the Phase 2a backbone is a JEPA
+> predictor with no text-decoder head (it predicts latent targets, not tokens). So this
+> task extracts key spans (GLiNER / regex) + a WM preamble + tail truncation to produce the
+> same *output* the chat intended — a ≤2000-char text summary Bonsai can plan from — without
+> requiring a decoder that does not exist. The SSM state still influences the result, via the
+> WM-metadata preamble (not as a vector fed to Bonsai). If a decoder head is added later, the
+> SSM-decode-the-summary path from the chat can be reconsidered.
+
 ### 7.2 Solution
 
 ```python
@@ -517,23 +610,37 @@ class PonderOrchestrator:
         self.sessions_dir = config.session.state_dir
 
     def query(self, user_prompt: str, consumer: str = "bonsai",
-              conversation_history: list[dict] | None = None) -> dict:
+              conversation_history: list[dict] | None = None,
+              end_state: Optional[EndState] = None,
+              format_spec: Optional[dict] = None,
+              extract_schema: Optional[dict] = None,
+              model_size: Optional[str] = None) -> dict:
         # 1. embed prompt; working_memory.update(prompt_emb)
         # 2. retrieval_gate.route_text(prompt, embedder, ctx from WM snapshot)
         # 3. compress_prompt_for_planning(prompt, WM snapshot); planner.plan(...)
         # 4. retriever.retrieve(structured_query)  (or retrieve_with_routing)
         # 5. for ep in episodes: working_memory.inject(embed(ep summary))
-        # 6. presentation_gate.plan(prompt, episodes, WM snapshot, route.pathway)
+        # 6. presentation_gate.plan(prompt, episodes, WM snapshot, route.pathway)        # axis (a) chunking
+        # 6b. es = presentation_gate.plan_end_state(prompt, episodes, WM snapshot,         # axis (b) end state
+        #                                            caller_end_state=end_state)
+        #     if caller overrode: presentation_gate.record_override(...) → ReplayBuffer
         # 7. ssm_chunker.chunk(episodes, plan) → ChunkedContext
         # 8. context = formatter.format_for_llm(chunked, consumer, WM snapshot)
-        # 9. response = mode_a._complete(context, conversation_history[-10:])
+        # 9. dispatch by es.end_state:
+        #    - "direct":   return {type:"direct", episodes, ...}                # NO LLM call
+        #    - "format":   return {type:"format", context, format_spec, ...}     # NO LLM call
+        #    - "extract":  return {type:"extract", data, schema, ...}             # cheap span extractor, NOT Bonsai
+        #    - "synthesize": response = mode_a._complete(context, conversation_history[-10:])
         #    return {response, route, retrieved_episodes, context_used, chunked,
-        #            working_memory_state: WM.snapshot(), presentation_plan, supported}
+        #            working_memory_state: WM.snapshot(), presentation_plan, end_state_plan, supported}
 ```
 
 For `ssm_direct`/`process_exec`/`tool_plan` pathways, return `supported=False` (no
 process/tool/System-2 infra — honest, mirroring 2b). `graph_retrieve`/`conscious_deliberation`
-run the full pipeline.
+run the full pipeline. The `direct`/`format` end states and (via a cheap local extractor) the
+`extract` end state return **without invoking Bonsai** — the first Hippo retrieval paths that
+answer without the generation model (the "database you can talk to" behavior from the chat).
+`synthesize` is the only end state that calls Bonsai.
 
 ### 8.2 StateSerializer
 
@@ -644,6 +751,11 @@ GPU (if available) meets the draft targets; CPU targets above are the test/basel
 | `test_session_persistence` | save → new orchestrator → load | WM state element-equal after round-trip |
 | `test_prompt_compression` | 2000-char prompt → planning | Bonsai-path receives ≤2000 chars; planning fields preserved |
 | `test_presentation_gate_buffer` | record outcomes → buffer grows | buffer length increases (no fake learning) |
+| `test_direct_return_no_llm` | `end_state="direct"` + 3 episodes | returns `{type:"direct", episodes}`, **no Bonsai call** (mode_a not invoked) |
+| `test_format_for_consumer` | `end_state="format"`, `format_spec={"consumer":"claude","max_tokens":4000}` | returns formatted context string, **no LLM call** |
+| `test_extract_to_json` | `end_state="extract"`, `extract_schema={"type":"list","item_type":"decision"}` | returns structured list from episodes (cheap extraction or span match, **no synthesis LLM**) |
+| `test_synthesize_calls_bonsai` | `end_state="synthesize"` (or unset) | `mode_a._complete` invoked once; response returned |
+| `test_end_state_override_records_to_buffer` | caller passes `end_state="extract"` while gate default was `"synthesize"` | `record_override` called; override ReplayBuffer grows by 1 (the training signal per [146]) |
 
 All tests offline: ReferenceSSM + stub embedder + tmp_path store (mirrors
 `tests/test_retriever.py` / `tests/test_retrieval_gate.py`). No GLiNER/Bonsai/WaveDB-on-pod
@@ -698,11 +810,12 @@ Task 9  ADRs                           (parallel with Task 8)
 |---|---|---|---|
 | `presentation_gate` learned gate has no data | High | Suboptimal presentation | Heuristic is the real logic; learned gate deferred; outcome buffer seeds future training. |
 | WM state drift over long sessions | Medium | Degraded retrieval | `decay_alpha` knob; add a drift-detection test (state-norm bound). |
-| ReferenceSSM dynamics don't actually "forget" gracefully | Medium | Old info dominates | `decay_alpha < 1.0` post-step forget factor; Mamba3 backend remains unavailable (build fails), so ReferenceSSM is the working path for 2c too. |
+| ReferenceSSM dynamics don't actually "forget" gracefully | Medium | Old info dominates | `decay_alpha < 1.0` is a **WM-state-tensor** tuning lever (post-step forget factor on the recurrent state). Note: the chat's *saturation / "don't overweight indefinitely"* concern (diminishing-returns, saturation detection, LLM-mediated importance, boost decay) is an **edge-level / graph** concern that belongs to Phase 3 GNN consolidation, **not** to `decay_alpha` on the SSM state — they are different forgetting mechanisms and must not be conflated. Mamba3 backend remains unavailable (build fails), so ReferenceSSM is the working path for 2c too. |
 | EXPAND latency | Low | UX | Expandable-episode full text cached in `ChunkedContext.expandable_ids` → store lookup; expand is one store.get + one SSM step. |
 | Prompt compression over-compresses → wrong planning | Medium | Wrong retrieval | 90%-same-planning regression test (§7.3); GLiNER gated behind a flag; cheap span extractor is default; fall back to truncation if entities sparse. |
 | bf16/autocast dtype-mix bug (deferred from 2a) | Medium | Can't train in bf16 | 2c adds no training; inference is float32. Not in scope. |
 | `scripts/train_backbone.py` still uncommitted (2a) | Low | None for 2c | Not touched in 2c. |
+| End-state routing feedback signal is weak (chat [146]) | High | Can't *learn* the end-state router from outcomes | Use an **explicit API with a heuristic default** (§5.6), not a learned router. The feedback loop for end-state choice is ambiguous (satisfaction doesn't distinguish `direct` from `synthesize`; the real difference is latency/cost/format, which are unobservable to the model). Caller overrides feed a `ReplayBuffer` that only seeds a *future* learned router once enough overrides accumulate; the heuristic stays the production default. This is the explicit-API-with-override principle from the chat, not a faked learned gate. |
 
 ---
 
@@ -713,6 +826,7 @@ Task 9  ADRs                           (parallel with Task 8)
 - [ ] WM state persists across queries within a session (verified).
 - [ ] SSM chunking splits episodes into primary/compressed correctly.
 - [ ] Presentation Gate selects the appropriate strategy for the 8 test scenarios.
+- [ ] **End-state routing** dispatches correctly: `direct`/`extract`/`format` return **without an LLM call**; only `synthesize` calls Bonsai; a caller override is recorded in the override `ReplayBuffer` (§5.6 / §8.1).
 - [ ] EXPAND loads full text of compressed episodes and updates WM.
 - [ ] Prompt compression activates for long prompts and preserves planning accuracy (90% test).
 - [ ] Full pipeline latency < 300ms (CPU, excl. LLM).
@@ -735,3 +849,9 @@ Task 9  ADRs                           (parallel with Task 8)
    feeds the GNN's salience scoring: frequently-expanded episodes should have higher salience.
 4. **Learned Presentation Gate** — the outcome `ReplayBuffer` populated in 2c is the training
    data for the deferred learned gate (Phase 3a+ or a dedicated 2c.1).
+5. **Learned end-state router** — the **override `ReplayBuffer`** (§5.6, populated whenever a
+   caller overrides the gate's end-state default) is the seed for the deferred *learned*
+   end-state router. Because the end-state feedback signal is weak (chat [146], §13 risk row),
+   this learned router is deferred far out — the explicit API + heuristic default stays the
+   production interface. The buffer is the only training signal available, so it must be
+   collected now even though learning is not.
