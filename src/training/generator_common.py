@@ -49,6 +49,13 @@ def add_oracle_args(parser) -> None:
                              ">1 dispatches across a thread pool so network-bound calls "
                              "overlap. Token cost is unchanged; only wall-clock shrinks. "
                              "The cache + stat counters are lock-guarded so this is safe.")
+    parser.add_argument("--oracle-think", choices=["none", "true", "false"], default="none",
+                        help="Ollama native /api/chat 'think' control (default none = OpenAI "
+                             "/v1 path, unchanged for DeepSeek). Set 'false' for qwen3 models: "
+                             "qwen3 thinking is ON by default and the /v1 endpoint can't disable "
+                             "it, so thinking eats the whole max_tokens budget and returns empty "
+                             "content (parse fail -> skip sentinel). 'false' routes through "
+                             "/api/chat with think=false so qwen3 emits the JSON directly.")
 
 
 def make_oracle(args, output_dir: Path) -> OracleClient:
@@ -64,6 +71,7 @@ def make_oracle(args, output_dir: Path) -> OracleClient:
         max_tokens=args.oracle_max_tokens,
         timeout=args.oracle_timeout,
         max_retries=args.oracle_max_retries,
+        think=None if args.oracle_think == "none" else (args.oracle_think == "true"),
         cache_path=output_dir / ".oracle_cache.json",
     )
     return OracleClient(cfg)

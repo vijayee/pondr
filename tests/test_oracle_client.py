@@ -228,6 +228,62 @@ def test_get_stats_reports_usage(tmp_path):
     assert stats["total_tokens"] == 30  # 2 calls * 15 tokens
 
 
+# ── native Ollama /api/chat path (think=False for qwen3) ──
+
+
+def _native_resp(content: str, inp: int = 10, out: int = 5, status: int = 200):
+    return status, {
+        "message": {"role": "assistant", "content": content},
+        "prompt_eval_count": inp,
+        "eval_count": out,
+        "done": True,
+    }
+
+
+def test_generate_native_chat_think_false_builds_native_payload(tmp_path):
+    """think=False builds an /api/chat payload (think/format/options), not OpenAI."""
+    captured = {}
+
+    def fake_post(payload):
+        captured["payload"] = payload
+        return _native_resp('{"predicted_edges": [], "negative_edges": []}')
+
+    c = _client(tmp_path, max_tokens=2048)
+    c.config.think = False
+    c._post = fake_post
+    r = c.generate("score these pairs")
+    assert r.error is None
+    assert r.response == {"predicted_edges": [], "negative_edges": []}
+    # native payload shape, NOT the OpenAI shape
+    p = captured["payload"]
+    assert p["think"] is False
+    assert p["format"] == "json"
+    assert p["stream"] is False
+    assert "response_format" not in p
+    assert p["options"]["num_predict"] == 2048
+    assert "max_tokens" not in p
+
+
+def test_generate_native_chat_parses_native_response_shape(tmp_path):
+    """_extract reads message.content + eval_count from the native /api/chat shape."""
+    c = _client(tmp_path)
+    c.config.think = False
+    c._post = lambda payload: _native_resp('{"k": 7}', inp=42, out=9)
+    r = c.generate("x")
+    assert r.response == {"k": 7}
+    assert r.input_tokens == 42
+    assert r.output_tokens == 9
+
+
+def test_generate_native_chat_missing_content_raises(tmp_path):
+    """A native response with no message.content surfaces a clear RuntimeError."""
+    c = _client(tmp_path)
+    c.config.think = False
+    c._post = lambda payload: (200, {"message": {}, "done": True})
+    with pytest.raises(RuntimeError, match="missing message.content"):
+        c.generate("x")
+
+
 # ── live path (gated) ──
 
 

@@ -189,6 +189,14 @@ class OracleConfig:
     retry_delay: float = _config.oracle_retry_delay
     batch_delay: float = _config.oracle_batch_delay
     timeout: float = _config.oracle_timeout
+    # Ollama native /api/chat "think" control. ``None`` (default) keeps the
+    # OpenAI-compatible /v1/chat/completions path (DeepSeek, tests, cached
+    # replay). Set ``False`` for qwen3 models: qwen3 thinking is ON by default
+    # and the /v1 endpoint cannot disable it (the /no_think cue is ignored), so
+    # thinking consumes the whole max_tokens budget and returns an EMPTY
+    # ``content`` -> parse fail -> failure sentinel. ``think=False`` routes
+    # through /api/chat which honors the flag, so qwen3 emits the JSON directly.
+    think: Optional[bool] = None
     cost_per_1k_input: float = 0.0
     cost_per_1k_output: float = 0.0
     cache_path: Optional[Path] = None  # on-disk prompt-hash cache for resume
@@ -319,13 +327,24 @@ class OracleClient:
     # ── HTTP layer (isolated for tests) ──
 
     def _post(self, payload: dict) -> tuple[int, dict]:
-        """POST ``payload`` to ``{endpoint}/chat/completions``; return ``(status, outer)``.
+        """POST ``payload`` to the Oracle endpoint; return ``(status, outer)``.
+
+        With ``think is None`` (default) targets the OpenAI-compatible
+        ``{endpoint}/chat/completions``. With ``think`` set, targets Ollama's
+        native ``{endpoint base}/api/chat`` (the ``/v1`` suffix is stripped) so
+        the ``think`` flag is honored.
 
         Raises ``requests.RequestException`` on connection failure (retryable).
         Raises ``ValueError`` if the response body is not JSON (retryable as a
         transient server hiccup). Override in tests to stub the HTTP layer.
         """
-        url = f"{self.endpoint}/chat/completions"
+        if self.config.think is None:
+            url = f"{self.endpoint}/chat/completions"
+        else:
+            base = self.endpoint.rstrip("/")
+            if base.endswith("/v1"):
+                base = base[:-3]
+            url = f"{base}/api/chat"
         resp = requests.post(url, json=payload, timeout=self.config.timeout)
         try:
             outer = resp.json()
@@ -353,13 +372,31 @@ class OracleClient:
             cached.cached = True
             return cached
 
-        payload = {
-            "model": self.config.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": response_format},
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-        }
+        if self.config.think is None:
+            payload = {
+                "model": self.config.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": response_format},
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,
+            }
+        else:
+            # Ollama native /api/chat payload. ``think`` (False) disables qwen3
+            # thinking; ``format:"json"`` is the JSON-mode toggle (num_predict
+            # is the output cap, the native equivalent of max_tokens). Built
+            # only on a cache miss, so cached DeepSeek replay is unaffected.
+            payload = {
+                "model": self.config.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "options": {
+                    "temperature": self.config.temperature,
+                    "num_predict": self.config.max_tokens,
+                },
+                "think": self.config.think,
+                "stream": False,
+            }
+            if response_format == "json_object":
+                payload["format"] = "json"
 
         last_error: Optional[str] = None
         for attempt in range(self.config.max_retries):
@@ -542,7 +579,23 @@ class OracleClient:
 
     @staticmethod
     def _extract(outer: dict) -> tuple[str, int, int]:
-        """Pull ``(content, input_tokens, output_tokens)`` from the chat response."""
+        """Pull ``(content, input_tokens, output_tokens)`` from the chat response.
+
+        Handles both shapes: OpenAI ``/v1`` (``choices[0].message.content`` +
+        ``usage``) and Ollama native ``/api/chat`` (``message.content`` +
+        ``prompt_eval_count``/``eval_count``). Detection is by top-level key so
+        a stubbed ``_post`` returning either shape parses correctly.
+        """
+        if "message" in outer and "choices" not in outer:
+            try:
+                content = outer["message"]["content"]
+            except (KeyError, TypeError) as e:
+                raise RuntimeError(
+                    f"Oracle native response missing message.content: {outer}"
+                ) from e
+            input_tokens = int(outer.get("prompt_eval_count", 0) or 0)
+            output_tokens = int(outer.get("eval_count", 0) or 0)
+            return content, input_tokens, output_tokens
         try:
             content = outer["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
