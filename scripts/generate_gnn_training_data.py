@@ -105,6 +105,12 @@ ONECALL_TASKS = [
     ("ontology", gnn_ontology_prompt, "ontology_labels.jsonl", True),
 ]
 
+# Cap on text-twin nodes added to a decision-pair context (``_local_neighborhood``).
+# Bounds the context on a dense corpus where many episodes share a short summary
+# ("Ok.", "Yes.") -- the injected ``_dup`` clone is one of them, but 50 near-dupes
+# would blow up the prompt. 8 keeps the duplicate evidence visible without spam.
+_TWIN_CAP = 8
+
 
 def _hydrate_episodes(traversal: GraphTraversal, sub: dict) -> dict:
     """Enrich an extracted subgraph's episode nodes with hydrated content
@@ -128,29 +134,69 @@ def _hydrate_episodes(traversal: GraphTraversal, sub: dict) -> dict:
 
 
 def _local_neighborhood(subgraph: dict, node: str) -> dict:
-    """Radius-1 neighborhood of ``node`` within ``subgraph`` — the retrieve-then-
-    prompt context Bonsai will have at deploy (spec §2.5).
+    """Decision-pair context: the flagged node + its radius-1 neighbors + the
+    anomaly evidence the teacher needs to decide fix/ask_user/dismiss (spec §2.5).
 
-    At deploy the consolidator extracts a subgraph from the store around a query
-    center, detects anomalies within it, and routes each flagged node to Bonsai
-    with its local neighborhood. Here we reproduce that: the flagged node + its
-    direct graph neighbors + the edges among them, taken from the
-    extracted+corrupted subgraph in memory. This works for injected/synthetic
-    nodes (e.g. ``ep_000001_dup``, ``ep_iso_...``, ``M:0003``) that exist in the
-    corrupted subgraph but NOT in the store — a fresh store BFS would return
-    nothing for them. Data edges (literal objects) are excluded.
+    At deploy the consolidator extracts a subgraph, detects anomalies, and routes
+    each flagged node to Bonsai with this context (built from the in-memory
+    corrupted subgraph so injected/synthetic nodes like ``ep_000001_dup`` /
+    ``M:0003`` that aren't in the store are visible). Pure radius-1 hid two kinds
+    of evidence, which made DeepSeek dismiss every planted duplicate (202/230
+    dismiss, 0 fix) and ask_user on every contradictory_state without seeing the
+    values -- the teacher reasoned correctly given a context that omitted the
+    proof:
+
+      - The duplicate TWIN. ``_inject_duplicate_episode`` / ``_decision`` mirror
+        the original's link edges so the clone shares the same entity neighbors
+        but has NO direct edge to the original -> the twin sits 2 hops away
+        (orig -> shared entity -> clone) and is absent from radius-1. We add any
+        node sharing the flagged node's ``summary`` (episodes) / ``text``
+        (decisions) -- the duplicate evidence. The twin's edges to the shared
+        entities are already captured (those entities are in the flagged node's
+        radius-1), so the teacher sees both episodes linking to the same entity.
+        Capped (``_TWIN_CAP``) so a dense corpus with many short summaries
+        ("Ok.", "Yes.") doesn't blow up the context.
+
+      - Literal DATA edges. The radius-1 walk filters on ``_is_node_id``, which
+        drops literal objects -- so an entity's ``state`` values (the
+        contradictory_state evidence) never reached the teacher. We keep data
+        edges (subject in the selected set, literal object) so state values /
+        text are visible.
+
+    The other anomaly types (orphan_decision, detached_episode, broken_follows,
+    type_violation, isolated_cluster, stale_abstraction) are local to radius-1
+    (a missing/dangling edge, an isolated node) and need no enrichment;
+    isolated_cluster is intended-dismiss by the prompt guidance anyway.
     """
     node_ids = {node}
+    # radius-1 NODE neighbors of the flagged node (data edges handled below).
     for e in subgraph["edges"]:
         s, o = e["subject"], e["object"]
         if s == node and _is_node_id(o):
             node_ids.add(o)
         elif o == node and _is_node_id(s):
             node_ids.add(s)
+    # Text-twins: nodes sharing the flagged node's salient text (episode summary
+    # / decision text) -- the duplicate evidence pure radius-1 missed. Capped +
+    # deterministic (sorted by id). We do NOT walk the twins' own neighbors: the
+    # shared entities are already in the set from the flagged node's radius-1,
+    # so the twin<->shared-entity edges are captured by the edge filter below.
+    flagged = next((n for n in subgraph["nodes"] if n["id"] == node), None)
+    if flagged:
+        key = ("summary" if flagged.get("type") == "episode"
+               else "text" if flagged.get("type") == "decision" else None)
+        if key and flagged.get(key):
+            twins = [n for n in subgraph["nodes"]
+                     if n["id"] != node and n.get(key) == flagged.get(key)]
+            for n in sorted(twins, key=lambda t: t["id"])[:_TWIN_CAP]:
+                node_ids.add(n["id"])
     nodes = [n for n in subgraph["nodes"] if n["id"] in node_ids]
+    # Edges among the selected nodes, KEEPING data edges (literal objects) so the
+    # teacher sees state values / text. Radius-1 dropped these via _is_node_id.
     edges = [
         e for e in subgraph["edges"]
-        if e["subject"] in node_ids and _is_node_id(e["object"]) and e["object"] in node_ids
+        if e["subject"] in node_ids
+        and (not _is_node_id(e["object"]) or e["object"] in node_ids)
     ]
     return {"center": node, "nodes": nodes, "edges": edges}
 

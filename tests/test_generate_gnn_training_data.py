@@ -156,11 +156,14 @@ def _subgraphs(store, pipe, radius=2) -> list[dict]:
 
 # ── _local_neighborhood (pure, synthetic-node-safe) ──
 
-def test_local_neighborhood_returns_center_and_neighbors():
+def test_local_neighborhood_includes_duplicate_twin_and_state_value():
+    """The decision-pair context must surface the anomaly evidence pure radius-1
+    hid: the duplicate TWIN (2 hops via a shared entity, same summary) and the
+    flagged node's literal data edges (state values). A prior radius-1-only
+    version returned no twin + dropped data edges -> DeepSeek dismissed every
+    planted duplicate (it couldn't see one) and ask_user'd every contradictory
+    state (it couldn't see the values)."""
     gen = _load_generator()
-    # Hand-built subgraph with an injected duplicate-episode clone (a SYNTHETIC
-    # node, ep_1_dup, that wouldn't survive a store BFS — the whole point of
-    # building context from the in-memory corrupted subgraph, not the store).
     sub = {
         "center": "ep_1", "radius": 1,
         "nodes": [
@@ -180,10 +183,68 @@ def test_local_neighborhood_returns_center_and_neighbors():
     assert nb["center"] == "ep_1_dup"
     ids = {n["id"] for n in nb["nodes"]}
     assert "ep_1_dup" in ids and "E:Alice" in ids
-    # ep_1 is NOT a direct neighbor of ep_1_dup (they only share E:Alice) → excluded.
-    assert "ep_1" not in ids
-    # Data edges (literal object "alive") are excluded.
-    assert all(e["predicate"] != "state" for e in nb["edges"])
+    # The twin ep_1 (shares summary "s" with the flagged ep_1_dup) IS now included
+    # -- it's 2 hops via E:Alice so radius-1 missed it; the teacher needs to see
+    # the duplicate to decide "fix".
+    assert "ep_1" in ids
+    # The twin's OWN neighbor T:db is NOT walked (we don't expand twins' radius-1)
+    # -> keeps the context bounded; the shared entity E:Alice is already present.
+    assert "T:db" not in ids
+    # Both the flagged->entity and twin->entity edges are kept (shared neighbor).
+    kept = {(e["subject"], e["predicate"], e["object"]) for e in nb["edges"]}
+    assert ("ep_1_dup", "has_entity", "E:Alice") in kept
+    assert ("ep_1", "has_entity", "E:Alice") in kept
+    # The twin's edge to its non-shared topic is dropped (T:db not in set).
+    assert ("ep_1", "has_topic", "T:db") not in kept
+    # The literal data edge (state "alive") IS now kept -- the teacher sees the value.
+    assert ("ep_1", "state", "alive") in kept
+
+
+def test_local_neighborhood_includes_contradictory_state_values():
+    """contradictory_state evidence is the entity's two literal ``state`` values
+    ("alive"/"dead"). Pure radius-1 dropped them (literal objects fail _is_node_id),
+    so the teacher saw only episode summaries and ask_user'd every time. The fix
+    keeps the flagged node's data edges."""
+    gen = _load_generator()
+    sub = {
+        "center": "ep_1", "radius": 1,
+        "nodes": [
+            {"id": "E:Armand", "type": "entity"},
+            {"id": "ep_1", "type": "episode", "summary": "talked to Armand"},
+        ],
+        "edges": [
+            {"subject": "ep_1", "predicate": "has_entity", "object": "E:Armand"},
+            {"subject": "E:Armand", "predicate": "state", "object": "alive"},
+            {"subject": "E:Armand", "predicate": "state", "object": "dead"},
+        ],
+    }
+    nb = gen._local_neighborhood(sub, "E:Armand")
+    ids = {n["id"] for n in nb["nodes"]}
+    assert ids == {"E:Armand", "ep_1"}  # entity + its episode neighbor
+    state_values = {e["object"] for e in nb["edges"] if e["predicate"] == "state"}
+    assert state_values == {"alive", "dead"}  # both contradictory values visible
+
+
+def test_local_neighborhood_caps_text_twins():
+    """A dense corpus has many episodes sharing a short summary ("Ok."); the
+    injected ``_dup`` clone is one of them. The twin set is capped so the context
+    doesn't blow up -- the clone is still included (sorted by id, the clone sorts
+    right after its original), plus up to _TWIN_CAP-1 others."""
+    gen = _load_generator()
+    nodes = [{"id": "ep_0", "type": "episode", "summary": "Ok."}]
+    # 12 same-summary siblings + the flagged node's own entity neighbor.
+    for i in range(1, 14):
+        nodes.append({"id": f"ep_{i}", "type": "episode", "summary": "Ok."})
+    nodes.append({"id": "E:Bob", "type": "entity"})
+    edges = [{"subject": "ep_0", "predicate": "has_entity", "object": "E:Bob"}]
+    sub = {"center": "ep_0", "radius": 1, "nodes": nodes, "edges": edges}
+    nb = gen._local_neighborhood(sub, "ep_0")
+    twins = {n["id"] for n in nb["nodes"] if n["id"].startswith("ep_")}
+    # flagged ep_0 + E:Bob + capped twins. 13 episodes share "Ok." (ep_0..ep_13);
+    # the cap bounds the twins (excl. flagged) -> total episode nodes <= 1 + cap.
+    assert "ep_0" in twins and "E:Bob" in {n["id"] for n in nb["nodes"]}
+    assert len(twins) <= 1 + gen._TWIN_CAP
+    assert len(twins) >= 2  # at least the flagged + one twin
 
 
 # ── _run_anomaly: 0 Oracle calls + valid label file ──
