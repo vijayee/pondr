@@ -379,6 +379,19 @@ A database you can talk to. The system retrieves relevant episodes, builds conte
 
 **Developmental stage:** GNN at INFANT.
 
+> **Implementation note (Phase 3a design doc, `docs/Phase 3a.md`):** Two spec-vs-reality
+> corrections grounded in the shipped codebase. (1) **The GNN-label pipeline was pre-shipped
+> by Phase 1d** — `scripts/generate_gnn_training_data.py` + the 5 prompts in
+> `src/training/prompts.py` + the validator already produce all 5 label files; a 3-subgraph
+> proof-of-concept exists on disk (~0.075% of the 4,000+ target). So 3a's "Oracle-generated
+> labels" deliverable is **regenerate-at-scale** (radius 3, 4,000 subgraphs, +negative edges
+> for link prediction), not build-from-scratch. (2) **Hardware provider:** the spec says
+> Vast.ai spot; the project's actual GPU path is **RunPod dashboard pods** (the RunPod MCP
+> `create-pod` SSH proxy is broken — pods are created via the dashboard). The ~$13 / 48h /
+> RTX 4090 budget is the anchor; the provider is RunPod. See `docs/Phase 3a.md` §0 for the
+> full alignment pass (deps greenfield, `abstracts`/semantic-memory storage greenfield, and
+> the EXPAND-frequency durability blocker inherited from 2c §15).
+
 ---
 
 ### Phase 3b: Forgetting System
