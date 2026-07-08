@@ -83,23 +83,31 @@ def validate_file(
     path: Path,
     required_keys: set[str],
     label_keys: Optional[set[str]] = None,
+    optional_label_keys: Optional[set[str]] = None,
 ) -> dict:
     """Validate one JSONL file's shape.
 
     ``required_keys``: top-level keys every record must have.
     ``label_keys``: optional keys that must be present in a nested ``labels``
     or ``route``/``label`` sub-dict (GNN ``labels``, etc.).
+    ``optional_label_keys``: keys whose PRESENCE is counted but not required
+    (e.g. link-prediction ``negative_edges`` — the regenerated-at-scale data
+    should have them, but the old positive-only PoC must still validate). The
+    count is returned as ``optional_present`` (a dict key→record-count); it does
+    NOT affect ``ok``.
 
     Returns ``{"path", "lines", "parse_errors", "missing_keys",
-    "label_missing", "ok"}``.
+    "label_missing", "ok", "optional_present"}``.
     """
     parse_errors: list[str] = []
     missing: int = 0
     label_missing: int = 0
     count: int = 0
+    optional_present: dict[str, int] = {k: 0 for k in (optional_label_keys or set())}
     if not path.exists():
         return {"path": str(path), "lines": 0, "parse_errors": [],
-                "missing_keys": 0, "label_missing": 0, "ok": False, "missing_file": True}
+                "missing_keys": 0, "label_missing": 0, "ok": False, "missing_file": True,
+                "optional_present": optional_present}
 
     for obj, err in iter_jsonl(path):
         if err is not None:
@@ -109,17 +117,29 @@ def validate_file(
         if not isinstance(obj, dict) or not required_keys <= obj.keys():
             missing += 1
             continue
+        nested = obj.get("labels") or obj.get("label") or obj.get("route") or {}
         if label_keys:
             # GNN records nest under "labels"; gates under "label"; JEPA
             # under "route". Pick whichever is present.
-            nested = obj.get("labels") or obj.get("label") or obj.get("route") or {}
             if not isinstance(nested, dict) or not label_keys <= nested.keys():
                 # For GNN ontology, "misclassified" may be absent if the Oracle
                 # found nothing — accept suggested_edges alone as a fallback.
                 if label_keys == GNN_LABEL_KEYS["ontology"]:
                     if isinstance(nested, dict) and "suggested_edges" in nested:
-                        continue
-                label_missing += 1
+                        pass
+                    else:
+                        label_missing += 1
+                else:
+                    label_missing += 1
+                # Still try to count optional keys even on a label-missing record.
+                nested = nested if isinstance(nested, dict) else {}
+        if optional_label_keys and isinstance(nested, dict):
+            for k in optional_label_keys:
+                v = nested.get(k)
+                if isinstance(v, list) and v:
+                    optional_present[k] = optional_present.get(k, 0) + 1
+                elif v not in (None, "", [], {}):
+                    optional_present[k] = optional_present.get(k, 0) + 1
 
     return {
         "path": str(path),
@@ -129,17 +149,26 @@ def validate_file(
         "label_missing": label_missing,
         "ok": count > 0 and not parse_errors and missing == 0 and label_missing == 0,
         "missing_file": False,
+        "optional_present": optional_present,
     }
 
 
 def validate_gnn(gnn_dir: Path) -> dict:
-    """Validate all five GNN label files."""
+    """Validate all five GNN label files.
+
+    For ``link_prediction``, also counts records carrying ``negative_edges``
+    (Phase 3a Task 3: SEAL/GAE need negatives). The count is reported in
+    ``out["link_prediction"]["optional_present"]["negative_edges"]``; it does
+    NOT gate ``ok`` so the old positive-only PoC data still validates.
+    """
     out: dict[str, dict] = {}
     for task, label_keys in GNN_LABEL_KEYS.items():
+        opt = {"negative_edges"} if task == "link_prediction" else None
         out[task] = validate_file(
             gnn_dir / f"{task}_labels.jsonl",
             required_keys=RECORD_KEYS[f"{task}_labels"],
             label_keys=label_keys,
+            optional_label_keys=opt,
         )
     return out
 

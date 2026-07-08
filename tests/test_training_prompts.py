@@ -48,6 +48,9 @@ def test_gnn_link_prediction_prompt_embeds_subgraph():
     p = gnn_link_prediction_prompt('{"edges": [{"s": "E:A", "p": "r", "o": "ep_1"}]}')
     _assert_json_contract(p)
     assert "predicted_edges" in p
+    # Phase 3a Task 3: the prompt now also requests negative edges (SEAL/GAE
+    # need them — positive-only labels collapse the head to "predict 1").
+    assert "negative_edges" in p
 
 
 def test_gnn_anomaly_prompt_embeds_subgraph():

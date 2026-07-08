@@ -19,6 +19,7 @@ data/pod_runs/phase1c_*/
 data/pod_runs/phase2a/
 data/pod_runs/phase2a_full/
 data/pod_runs/phase2b/
+data/pod_runs/phase3a/
 .checkpoint.json
 *.wal
 manifest.dat

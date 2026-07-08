@@ -420,12 +420,54 @@ def _one_episode_list():
 
 
 def test_record_outcome_grows_buffer(tmp_path):
-    """record_outcome appends to the gate's outcome buffer (no fake learning)."""
+    """record_outcome appends to the gate's outcome buffer (no fake learning).
+
+    Phase 3a Task 7: ``query()`` now auto-records an outcome with the measured
+    ``expand_count``, so one query leaves the buffer at 1; an explicit
+    ``record_outcome`` (e.g. a caller with a real satisfaction rating) appends a
+    second record.
+    """
     plan = {"entities": ["Alice"], "entity_mode": "union"}
     eps = [_ep("ep_001", entities=["Alice"], summary="Alice said use Postgres")]
     orch, store = _orchestrator(tmp_path, plan, eps)
     orch.query("What did Alice say?")
-    plan_a = orch.presentation_gate.plan("What did Alice say?", _one_episode_list(), None)
-    orch.record_outcome(plan_a, expand_count=0, unused_primary_count=0)
+    # query() auto-recorded one outcome with the measured expand_count.
     assert len(orch.presentation_gate.outcome_buffer) == 1
+    assert orch.presentation_gate.outcome_buffer.records[0]["expand_count"] == 0
+    plan_a = orch.presentation_gate.plan("What did Alice say?", _one_episode_list(), None)
+    orch.record_outcome(plan_a, expand_count=0, unused_primary_count=0,
+                        user_satisfaction=0.8)
+    assert len(orch.presentation_gate.outcome_buffer) == 2
+    store.close()
+
+# ── Phase 3a Task 7: durable EXPAND-frequency outcomes ──
+
+def test_outcomes_survive_restart_via_store(tmp_path):
+    """Auto-recorded outcomes persist across orchestrator restarts (2c §15 fix)."""
+    plan = {"entities": ["Alice"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Alice"], summary="Alice said use Postgres")]
+    orch, store = _orchestrator(tmp_path, plan, eps, user_id="alice")
+    # query() auto-records one outcome with the measured expand_count.
+    orch.query("What did Alice say?")
+    assert len(orch.presentation_gate.outcome_buffer) == 1
+    # Flush to the store.
+    blob = orch.save_outcomes("alice")
+    assert blob is not None
+    store.close()
+
+    # A fresh orchestrator on the same store + user auto-loads the buffers.
+    orch2, store2 = _orchestrator(tmp_path, plan, eps, user_id="alice")
+    assert len(orch2.presentation_gate.outcome_buffer) == 1
+    # The persisted outcome round-trips with its measured expand_count.
+    rec = orch2.presentation_gate.outcome_buffer.records[0]
+    assert rec["expand_count"] == 0
+    store2.close()
+
+
+def test_save_outcomes_returns_none_without_store_or_user(tmp_path):
+    plan = {"entities": ["Alice"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Alice"], summary="Alice said use Postgres")]
+    # No user_id → save_outcomes is a no-op (returns None).
+    orch, store = _orchestrator(tmp_path, plan, eps, user_id=None)
+    assert orch.save_outcomes() is None
     store.close()

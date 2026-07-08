@@ -97,6 +97,9 @@ class PonderOrchestrator:
         # Lazy: try to restore a saved session for this user (if a store is set).
         if store is not None and user_id is not None:
             self.load_session(user_id)
+            # Phase 3a Task 7: also restore the durable presentation-outcome
+            # buffers (EXPAND-frequency signal) so they survive restarts.
+            self.load_outcomes(user_id)
 
     # ── main entry ──
 
@@ -216,6 +219,25 @@ class PonderOrchestrator:
         result["presentation_plan"] = presentation_plan
         result["end_state_plan"] = end_state_plan
         result["supported"] = result.get("supported", True)
+
+        # Phase 3a Task 7: auto-record the presentation outcome with the
+        # MEASURED expand_count (the durable salience signal from 2c §15).
+        # ``unused_primary_count`` and ``user_satisfaction`` are NOT directly
+        # measured here (we don't observe which primary chunks the model attended
+        # to, nor collect a satisfaction rating) — they stay 0 (caller-supplied
+        # via ``record_outcome`` if available). ``expand_count`` is the real
+        # durable signal. Recording happens after every query so the buffer is
+        # populated without a caller remembering to call ``record_outcome``.
+        measured_expand = int(getattr(self.expand_handler, "expand_count", 0))
+        self.presentation_gate.record_outcome(
+            presentation_plan,
+            PresentationOutcome(
+                expand_count=measured_expand,
+                unused_primary_count=0,   # not measured (see above)
+                user_satisfaction=0.0,    # not measured (caller-supplied)
+            ),
+        )
+        result["measured_expand_count"] = measured_expand
         return result
 
     def _classify_query(self, prompt: str) -> str:
@@ -299,3 +321,37 @@ class PonderOrchestrator:
                 user_satisfaction=user_satisfaction,
             ),
         )
+
+    # ── presentation-outcome persistence (Phase 3a Task 7) ──
+
+    def save_outcomes(self, user_id: Optional[str] = None) -> Optional[str]:
+        """Persist the gate's outcome/override buffers to the store (durable signal).
+
+        Returns the blob, or ``None`` if no store or user is configured. The
+        save TRIGGER policy mirrors ``save_session`` — the caller decides when
+        (e.g. at session end / periodically); ``query()`` auto-records into the
+        in-memory buffer, and this method flushes it to disk.
+        """
+        sid = user_id or self.user_id
+        if sid is None or self.store is None:
+            return None
+        import json
+        blob = json.dumps(self.presentation_gate.serialize_buffers(), ensure_ascii=False)
+        self.store.save_presentation_outcomes(sid, blob)
+        return blob
+
+    def load_outcomes(self, user_id: Optional[str] = None) -> bool:
+        """Restore the gate's outcome/override buffers from the store. False if none."""
+        import json
+        sid = user_id or self.user_id
+        if sid is None or self.store is None:
+            return False
+        blob = self.store.load_presentation_outcomes(sid)
+        if not blob:
+            return False
+        try:
+            data = json.loads(blob)
+        except (ValueError, TypeError):
+            return False
+        self.presentation_gate.load_buffers(data)
+        return True

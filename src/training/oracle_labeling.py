@@ -10,12 +10,14 @@ examples — no live oracle (Bonsai) calls happen here. The pipeline:
    ``follows_session``) in BOTH directions, up to ``radius`` hops. Returns
    ``{"nodes": [...], "edges": [...]}`` with node types inferred from the id
    prefix (``E:``/``T:``/``A:``/``D:``/``S:``/``U:``/``ep_``).
-2. ``ORACLE_GNN_LABELING_PROMPT`` — the prompt that a future phase sends to the
-   local Bonsai server to label a subgraph (relevance / salience / link targets
-   for the GNN). Defined here, not invoked in 1b.
+2. The 5 labeling prompts (salience / cluster / link_prediction / anomaly /
+   ontology) live in ``src/training/prompts.py`` and are called by the runner;
+   they are NOT defined here. (A single-label ``ORACLE_GNN_LABELING_PROMPT`` used
+   to live here but was dead — it contradicted the 5-prompt library the generator
+   actually uses — and was removed in Phase 3a Task 3.)
 
-``scripts/generate_training_data.py`` is a thin runner that extracts subgraphs
-for a sample of episodes and writes them to JSONL.
+``scripts/generate_gnn_training_data.py`` is the runner that extracts subgraphs
+for a sample of episodes and labels them with that 5-prompt library (Phase 1d).
 """
 
 from __future__ import annotations
@@ -52,21 +54,11 @@ _NODE_PREDICATES = (
 )
 
 # Prompt for the oracle (local Bonsai) to label a subgraph for GNN training.
-# Slot {subgraph_json} receives the extract_subgraph output. Not invoked in 1b.
-ORACLE_GNN_LABELING_PROMPT = (
-    "You are labeling a memory subgraph for a graph neural network that ranks "
-    "which past episodes to recall for a future query.\n\n"
-    "Given a subgraph centered on an episode, output JSON with a `labels` list. "
-    "Each label is an object with:\n"
-    '  - "node": the node id,\n'
-    '  - "relevance": float in [0, 1] (how relevant this node is to the center '
-    "episode's topic),\n"
-    '  - "salience": float in [0, 1] (how memorable / surprising this node is),\n'
-    '  - "should_recall": boolean (whether an episode node should be retrieved '
-    "given the center).\n\n"
-    "Subgraph (JSON):\n{subgraph_json}\n\n"
-    "Return ONLY the JSON object."
-)
+# REMOVED in Phase 3a Task 3: the single-label ``ORACLE_GNN_LABELING_PROMPT``
+# that lived here was dead — it contradicted the 5-prompt library in
+# ``src/training/prompts.py`` (gnn_salience/cluster/link_prediction/anomaly/
+# ontology) that the generator actually uses. The 5-prompt library is the
+# source of truth. See ``build_labeling_prompt`` removal below too.
 
 
 def _node_type(node_id: str) -> str:
@@ -152,11 +144,10 @@ class OracleLabelingPipeline:
                       for (s, p, o) in edges],
         }
 
-    def build_labeling_prompt(self, center_id: str, radius: int = 3) -> str:
-        """Render the oracle labeling prompt for a subgraph (not sent in 1b)."""
-        import json
-        sub = self.extract_subgraph(center_id, radius=radius)
-        return ORACLE_GNN_LABELING_PROMPT.format(subgraph_json=json.dumps(sub))
+    # NOTE: ``build_labeling_prompt`` was removed in Phase 3a Task 3 along with
+    # the dead ``ORACLE_GNN_LABELING_PROMPT``. The live labeling prompts are the
+    # 5 functions in ``src/training/prompts.py``; the generator calls those
+    # directly with the subgraph JSON from ``extract_subgraph``.
 
 
 def sample_episode_centers(store: HippocampalStore, n: Optional[int] = None) -> list[str]:

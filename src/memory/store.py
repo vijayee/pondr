@@ -317,6 +317,43 @@ class HippocampalStore:
         """Globally-unique session id (``S:NNNN``)."""
         return f"S:{self._counter_next('session_counter'):04d}"
 
+    def next_memory_id(self) -> str:
+        """Globally-unique semantic-memory id (``M:NNNN``).
+
+        Phase 3a: semantic memories (DiffPool cluster abstractions) are ``M:``
+        nodes that ``abstracts`` their source episodes. Counter lives under
+        ``content/system/memory_counter`` like the episode/session counters.
+        """
+        return f"M:{self._counter_next('memory_counter'):04d}"
+
+    # ---- abstraction / default-query filtering (Phase 3a) ----
+
+    def is_abstracted(self, episode_id: str) -> bool:
+        """True if ``episode_id`` has been abstracted into a semantic memory.
+
+        Abstracted episodes stay retrievable (content untouched) but are
+        excluded from default queries (spec §371). Single ``get_sync`` on a
+        known key.
+        """
+        return _b2s(self.db.get_sync(f"content/ep/{episode_id}/abstracted")) == "1"
+
+    def default_episode_ids(self, include_abstracted: bool = False) -> list[str]:
+        """All episode ids, optionally excluding abstracted ones.
+
+        Default queries retrieve the non-abstracted set (spec §371). The
+        retrieval layer's enumeration delegates here so abstracted episodes are
+        excluded uniformly. ``include_abstracted=True`` opts in (e.g. an
+        explicit "show me everything including abstractions" path).
+        """
+        ids: set[str] = set()
+        for k, _ in self.db.create_read_stream(start="content/ep/", end="content/ep/\x7f"):
+            parts = k.split("/", 3)
+            if len(parts) >= 3 and parts[2]:
+                ids.add(parts[2])
+        if include_abstracted:
+            return sorted(ids)
+        return sorted(eid for eid in ids if not self.is_abstracted(eid))
+
     def open_session(self, user_id: str, session_id: str, started_at: str) -> None:
         """Open a chat session under a user.
 
@@ -399,6 +436,32 @@ class HippocampalStore:
         if "/" in scope or "\x00" in scope or not scope:
             raise ValueError(f"invalid scope for JGS state key: {scope!r}")
         raw = self.db.get_sync(f"content/system/user/{user_id}/{scope}/state")
+        blob = _b2s(raw)
+        return blob if blob else None
+
+    # ---- presentation outcome persistence (Phase 3a Task 7) ----
+
+    def save_presentation_outcomes(self, user_id: str, blob: str) -> None:
+        """Persist the serialized PresentationGate outcome/override buffers.
+
+        Phase 3a Task 7: the EXPAND-frequency salience signal (2c §15) was
+        in-memory only — ``presentation_gate.outcome_buffer``/``override_buffer``
+        were ``deque``s that died on restart and ``record_outcome`` was never
+        auto-invoked. This + :meth:`load_presentation_outcomes` make the signal
+        durable and cross-session, mirroring :meth:`save_jgs_state`. The blob is
+        the JSON from ``PresentationGate.serialize_buffers``.
+        """
+        if "/" in user_id or "\x00" in user_id:
+            raise ValueError(f"invalid user_id for outcome key: {user_id!r}")
+        if not blob or "\x00" in blob:
+            raise ValueError("presentation-outcome blob is empty or contains NUL")
+        self.db.put_sync(f"content/system/user/{user_id}/presentation_outcomes/state", blob)
+
+    def load_presentation_outcomes(self, user_id: str) -> Optional[str]:
+        """Return the serialized outcome-buffer blob for ``user_id``, or ``None``."""
+        if "/" in user_id or "\x00" in user_id:
+            raise ValueError(f"invalid user_id for outcome key: {user_id!r}")
+        raw = self.db.get_sync(f"content/system/user/{user_id}/presentation_outcomes/state")
         blob = _b2s(raw)
         return blob if blob else None
 

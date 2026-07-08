@@ -148,6 +148,17 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return len(self.records)
 
+    def to_list(self) -> list[dict]:
+        """JSON-safe snapshot of the records (for persistence)."""
+        return list(self.records)
+
+    @staticmethod
+    def from_list(records: list, capacity: int = 1000) -> "ReplayBuffer":
+        """Reconstruct a buffer from a persisted record list (capacity re-bounded)."""
+        buf = ReplayBuffer(capacity=capacity)
+        buf.records = deque(records or [], maxlen=capacity)
+        return buf
+
 
 class PresentationGate:
     """Heuristic presentation planner + outcome/override buffers.
@@ -351,6 +362,28 @@ class PresentationGate:
             "jepa_predicted": jepa_predicted,
             "caller_chose": caller_chose,
         })
+
+    # ── buffer persistence (Phase 3a Task 7: durable EXPAND-frequency signal) ──
+
+    def serialize_buffers(self) -> dict:
+        """JSON-safe snapshot of both ReplayBuffers for cross-session persistence.
+
+        The records are already JSON-safe dicts (``record_outcome`` /
+        ``record_override`` build them from primitives), so this is a direct
+        ``list(deque)``. Phase 3a Task 7 persists this so the EXPAND-frequency
+        salience signal survives restarts (the 2c §15 blocker).
+        """
+        return {
+            "capacity": self.outcome_buffer.capacity,
+            "outcome": self.outcome_buffer.to_list(),
+            "override": self.override_buffer.to_list(),
+        }
+
+    def load_buffers(self, data: dict) -> None:
+        """Restore both buffers from a ``serialize_buffers`` snapshot (in place)."""
+        cap = int(data.get("capacity", self.outcome_buffer.capacity))
+        self.outcome_buffer = ReplayBuffer.from_list(data.get("outcome", []), capacity=cap)
+        self.override_buffer = ReplayBuffer.from_list(data.get("override", []), capacity=cap)
 
 
 # ── helpers ──

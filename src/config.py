@@ -153,4 +153,61 @@ class Phase2cConfig:
     replay_capacity: int = 1000   # shared by chunking + end-state outcome/override buffers
 
 
+# ── Phase 3a: GNN Consolidator ──
+# Config is dataclass-based, matching the rest of the codebase. The GNN is the
+# one Phase-3a component with a training cost (Task 4, pod/RTX 4090); the rest
+# is runtime + the consolidation loop. See docs/Phase 3a.md §10.
+
+
+@dataclass
+class GNNConfig:
+    """GAT backbone + head architecture knobs (Task 2)."""
+    hidden_dim: int = 128        # GAT hidden; sized to the memory graph (~1e4-1e5 nodes)
+    num_heads: int = 4           # GAT attention heads per layer
+    num_layers: int = 3          # GAT layers
+    dropout: float = 0.1
+    # Node-feature dim. Episodes use the 384-dim embedder vector; other node
+    # kinds use a type-onehot ∪ optional embedding projected into this dim.
+    node_feature_dim: int = 384
+    # Predicate-vocabulary size for edge_attr onehot (snake_case graph predicates
+    # + the open Bonsai-relation bucket hashed into the last slot).
+    predicate_vocab_size: int = 32
+    ogb_pretrain: bool = True    # §1.3 decision 1: OGB-pretrain-then-transfer
+    ogb_dataset: str = "ogbn-arxiv"
+
+
+@dataclass
+class ConsolidationConfig:
+    """Nightly dream-state loop thresholds (Task 6)."""
+    accept_threshold: float = 0.85       # auto-accept predicted edges above this
+    bonsai_propose_threshold: float = 0.60  # propose to Bonsai between this and accept
+    prune_salience_below: float = 0.15   # archive edges below this salience
+    dry_run_default: bool = True         # --dry-run is the default; --apply mutates
+    wm_prioritized: bool = True          # score what's "in awareness" first
+
+
+@dataclass
+class ArchiveConfig:
+    """Archive subtree for pruned/abstracted content (never deleted)."""
+    subtree: str = "archive/"   # e.g. archive/edge/..., archive/ep/{eid}/...
+
+
+@dataclass
+class LabelGenConfig:
+    """Oracle label regeneration knobs (Task 3 — the run is Bonsai-gated)."""
+    num_subgraphs: int = 4000
+    subgraph_radius: int = 3
+    neg_edge_ratio: float = 1.0  # negatives per positive for link prediction
+
+
+@dataclass
+class Phase3aConfig:
+    """Top-level Phase 3a config."""
+    gnn: GNNConfig = field(default_factory=GNNConfig)
+    consolidation: ConsolidationConfig = field(default_factory=ConsolidationConfig)
+    archive: ArchiveConfig = field(default_factory=ArchiveConfig)
+    labels: LabelGenConfig = field(default_factory=LabelGenConfig)
+    checkpoint_dir: str = "data/pod_runs/phase3a/"   # gitignored
+
+
 config = Config()

@@ -102,6 +102,24 @@ def test_validate_gnn_all_good(tmp_path):
            [{"subgraph_id": "ep_1", "labels": {"suggested_edges": [], "misclassified": []}}])
     res = validate_gnn(gnn)
     assert all(res[t]["ok"] for t in res)
+    # Phase 3a Task 3: link_prediction reports an optional_present count for
+    # negative_edges (here 0 — the PoC data is positive-only). It must NOT gate
+    # ``ok``; positive-only data still validates.
+    assert res["link_prediction"]["optional_present"]["negative_edges"] == 0
+    assert res["link_prediction"]["ok"] is True
+
+
+def test_validate_gnn_counts_negative_edges_without_failing(tmp_path):
+    """Records carrying negative_edges are counted; positive-only still ok."""
+    gnn = tmp_path / "gnn"
+    _write(gnn / "link_prediction_labels.jsonl", [
+        {"subgraph_id": "ep_1", "labels": {"predicted_edges": [{"x": 1}], "negative_edges": [{"y": 1}]}},
+        {"subgraph_id": "ep_2", "labels": {"predicted_edges": [{"x": 2}]}},  # no negatives
+    ])
+    res = validate_gnn(gnn)
+    assert res["link_prediction"]["ok"] is True
+    assert res["link_prediction"]["optional_present"]["negative_edges"] == 1  # only ep_1
+    assert res["link_prediction"]["lines"] == 2
 
 
 def test_validate_gnn_ontology_accepts_suggested_edges_alone(tmp_path):

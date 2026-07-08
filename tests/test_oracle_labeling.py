@@ -12,7 +12,6 @@ import json
 from src.memory.episode import Episode
 from src.memory.store import HippocampalStore
 from src.training.oracle_labeling import (
-    ORACLE_GNN_LABELING_PROMPT,
     OracleLabelingPipeline,
     sample_episode_centers,
 )
@@ -134,23 +133,12 @@ def test_extract_subgraph_unknown_center_returns_self_only(tmp_path):
     store.close()
 
 
-# ── prompt + sampling ──
-
-
-def test_labeling_prompt_renders_subgraph(tmp_path):
-    store, pipe = _pipe(tmp_path)
-    store.encode_episode(_ep("ep_000001", entities=["Alice"]))
-    prompt = pipe.build_labeling_prompt("ep_000001", radius=1)
-    assert "{subgraph_json}" not in prompt
-    # The rendered subgraph JSON is embedded.
-    assert "ep_000001" in prompt
-    assert "E:Alice" in prompt
-    store.close()
-
-
-def test_labeling_prompt_constant_has_slots():
-    assert "{subgraph_json}" in ORACLE_GNN_LABELING_PROMPT
-    assert "should_recall" in ORACLE_GNN_LABELING_PROMPT
+# ── sampling ──
+# (The two ``test_labeling_prompt_*`` tests that exercised the dead
+# ``ORACLE_GNN_LABELING_PROMPT`` / ``build_labeling_prompt`` were removed in
+# Phase 3a Task 3 along with those symbols. The live labeling prompts are the
+# ``gnn_*`` functions in ``src/training/prompts.py``, tested in
+# ``tests/test_training_prompts.py``.)
 
 
 def test_sample_episode_centers_lists_all(tmp_path):

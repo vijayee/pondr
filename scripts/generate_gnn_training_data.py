@@ -84,10 +84,12 @@ def main() -> int:
     parser.add_argument("--output", default="data/training/gnn/", help="Output directory")
     parser.add_argument("--num-subgraphs", type=int, default=10,
                         help="Number of subgraphs to label (validate-slice default 10)")
-    parser.add_argument("--subgraph-radius", type=int, default=1,
-                        help="BFS radius (default 1: on a dense real corpus radius>=2 "
-                             "fans out to ~5000 nodes / 90s+ per subgraph — unusable. "
-                             "Raise only on a small/sparse graph.)")
+    parser.add_argument("--subgraph-radius", type=int, default=3,
+                        help="BFS radius (Phase 3a default 3, matching "
+                             "OracleLabelingPipeline.extract_subgraph and the §5 "
+                             "regen-at-scale target. On a dense real corpus radius>=2 "
+                             "fans out to ~5000 nodes / 90s+ per subgraph, so the "
+                             "fast dev validate-slice uses --subgraph-radius 1.)")
     parser.add_argument("--resume", action="store_true", help="Resume from per-task checkpoints")
     add_oracle_args(parser)
     args = parser.parse_args()

@@ -91,14 +91,14 @@ class VectorSearch:
     # ── episode enumeration ──
 
     def _all_episode_ids(self) -> list[str]:
-        """All episode ids via a content/ep/ scan (sorted, deduped)."""
-        ids: set[str] = set()
-        for k, _ in self.store.db.create_read_stream(start="content/ep/", end="content/ep/\x7f"):
-            # k = content/ep/{eid}/{field}; the eid is the 3rd component.
-            parts = k.split("/", 3)
-            if len(parts) >= 3 and parts[2]:
-                ids.add(parts[2])
-        return sorted(ids)
+        """All episode ids via a content/ep/ scan (sorted, deduped).
+
+        Delegates to ``store.default_episode_ids`` so abstracted episodes
+        (Phase 3a semantic memories) are excluded from the default retrieval
+        candidate set (spec §371). Pass ``include_abstracted=True`` on the
+        store helper to opt in.
+        """
+        return self.store.default_episode_ids(include_abstracted=False)
 
     def _summary_for(self, eid: str) -> str:
         ep = self.store.get_episode(eid)

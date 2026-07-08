@@ -70,16 +70,31 @@ Return ONLY valid JSON:
 
 
 def gnn_link_prediction_prompt(subgraph_json: str) -> str:
-    """Prompt for GNN link prediction labels."""
-    return f"""You are labeling a memory graph for GNN training.
-Identify edges that SHOULD exist but are not explicitly in the graph.
+    """Prompt for GNN link prediction labels (positive + negative edges).
 
-Look for:
+    SEAL/GAE need explicit negative edges, not just positives — a link-prediction
+    head trained on positive-only labels collapses to "predict 1 everywhere."
+    So the Oracle emits both ``predicted_edges`` (edges that SHOULD exist but
+    don't) and ``negative_edges`` (node pairs that plausibly COULD share an edge
+    but should NOT — unrelated entities/topics, non-adjacent episodes with no
+    shared context). Phase 3a Task 3 added the negative-edges field.
+    """
+    return f"""You are labeling a memory graph for GNN training.
+Identify edges that SHOULD exist but are not explicitly in the graph, AND node
+pairs that should NOT be linked (negative examples for link prediction).
+
+Look for POSITIVE edges (predicted_edges):
 - Entities that co-occur in similar contexts but have no direct edge
 - Episodes that share topics/entities but aren't linked
 - Hierarchical relationships implied by usage patterns
 - Causal relationships implied by temporal order
 - Contradictions between statements in different episodes
+
+Look for NEGATIVE edges (negative_edges) — pairs that plausibly COULD share an
+edge given their types/proximity but should NOT:
+- Entities from unrelated domains that happen to appear in the subgraph
+- Episodes far apart in time with no shared entities/topics
+- Topic/entity pairs with no semantic relationship
 
 SUBGRAPH:
 {subgraph_json}
@@ -88,6 +103,10 @@ Return ONLY valid JSON:
 {{"predicted_edges": [
     {{"subject": "Postgres", "predicate": "related_to", "object": "performance",
      "confidence": 0.82, "evidence": "Both appear in episodes about..."}}
+],
+ "negative_edges": [
+    {{"subject": "Postgres", "predicate": "related_to", "object": "WaveDB",
+     "confidence": 0.10, "evidence": "No shared context; unrelated domains"}}
 ]}}"""
 
 

@@ -112,14 +112,12 @@ class GraphTraversal:
         for a tone/topic-only query. The content scan is complete: every episode
         has a ``content/ep/{id}/summary`` key, so the unique ``content/ep/{id}/``
         prefixes enumerate all episodes regardless of their graph triples.
+
+        Delegates to ``store.default_episode_ids`` so abstracted episodes
+        (Phase 3a semantic memories) are excluded from the default retrieval
+        candidate set (spec §371).
         """
-        seen: set[str] = set()
-        for k, _ in self.db.create_read_stream(start="content/ep/", end="content/ep/\x7f"):
-            # k = content/ep/{eid}/{field}; the eid is the 3rd component.
-            parts = k.split("/", 3)
-            if len(parts) >= 3 and parts[2]:
-                seen.add(parts[2])
-        return sorted(seen)
+        return self.store.default_episode_ids(include_abstracted=False)
 
     # ── candidate-set construction (Python-side set ops) ──
 
