@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -155,3 +155,31 @@ class NodeFeatureBuilder:
         if not isinstance(emb, list) or not emb:
             return None
         return emb
+
+
+def training_feature_for(store: "HippocampalStore") -> Callable[[str], tuple[int, torch.Tensor]]:
+    """Feature function for training on a CORRUPTED subgraph (anomaly head, Task 4a).
+
+    ``NodeFeatureBuilder.feature_for`` degrades gracefully on ids NOT in the
+    store — an unknown episode gets a deterministic hash embedding, an unknown
+    kind gets a type-onehot — so it never raises for a synthetic injected node.
+    The one case worth special-handling is an injected ``{orig}_dup`` clone
+    (``anomaly_injector`` plants these for ``duplicate_episode`` and
+    ``duplicate_decision``): the clone is meant to look like its origin, so it
+    reuses the origin's REAL feature (embedding / salience) instead of a fresh
+    hash. That keeps the duplication signal STRUCTURAL (shared neighborhood +
+    shared feature) rather than a cheap feature-divergence artefact the head
+    could key on instead of learning the real structural signature. Other
+    synthetic nodes (``ep_iso_*`` isolated-cluster eps, ``M:000N`` stale
+    abstractions) have no origin to mirror — ``feature_for`` handles them
+    directly (hash / onehot), which is the correct weak feature for a node that
+    genuinely has no persisted content.
+    """
+    fb = NodeFeatureBuilder(store)
+
+    def _f(node_id: str) -> tuple[int, torch.Tensor]:
+        if node_id.endswith("_dup"):
+            return fb.feature_for(node_id[:-4])  # clone -> origin's real feature
+        return fb.feature_for(node_id)
+
+    return _f
