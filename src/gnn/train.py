@@ -308,7 +308,12 @@ def _losses_from_outputs(model, out: dict) -> dict[str, torch.Tensor]:
         d = out["salience"]
         dev = d["pred"].device
         m = d["mask"].to(dev)
-        losses["salience"] = SalienceHead.loss(d["pred"][m], d["target"][m].to(dev))
+        # salience_target builds target+mask on CPU (default device); move target
+        # to the pred's device BEFORE indexing -- indexing a CPU tensor with a
+        # cuda mask raises "indices should be on the same device". The old
+        # ``d["target"][m].to(dev)`` indexed first (crash) then moved (never ran).
+        tgt = d["target"].to(dev)
+        losses["salience"] = SalienceHead.loss(d["pred"][m], tgt[m])
     if "diffpool" in out:
         d = out["diffpool"]
         losses["diffpool"] = model.diffpool.loss(d["assign"], d["edge_index"])
@@ -325,7 +330,18 @@ def _losses_from_outputs(model, out: dict) -> dict[str, torch.Tensor]:
 
 
 def _accumulate_val(out: dict, acc: dict) -> None:
-    """Collect per-head (pred, target) tensors across val centers (CPU)."""
+    """Collect per-head (pred, target) tensors across val centers (CPU).
+
+    The salience mask stays on CPU here (it is NOT moved to the pred's device,
+    unlike the loss path in ``_losses_from_outputs``). This is deliberate, not
+    an oversight: ``cuda_tensor[cpu_bool_mask]`` is tolerated (the mask is
+    auto-moved to the tensor's device), and ``d["target"][m]`` is cpu[cpu] -- so
+    both indexings here are valid on GPU. The loss path moves the mask to cuda
+    because it indexes the CPU ``target`` there, and ``cpu_tensor[cuda_mask]``
+    RAISES ("indices should be on the same device") -- the GPU crash that fix
+    repaired. Don't "unify" the two paths by moving the mask here too: doing so
+    without also moving the target would turn ``d["target"][m]`` into the exact
+    cpu[cuda] crash. The asymmetry is correct."""
     if "salience" in out:
         d = out["salience"]
         m = d["mask"]
@@ -487,6 +503,51 @@ def train_gnn(
     head_steps: dict[str, int] = {h: 0 for h in HEADS}
     total_skipped: dict[str, int] = {"link_prediction": 0, "ontology": 0}
 
+    # Checkpoint dir + a save helper set up BEFORE the loop so we can write a
+    # best-so-far checkpoint at the end of every epoch. A 20-epoch pod run that
+    # only saves at the very end loses everything if the SSH session dies (SIGHUP)
+    # or the box reboots at epoch 19; per-epoch saves leave the latest state on
+    # disk so a crash never loses more than one epoch. The post-loop save below
+    # is the guaranteed-final overwrite (identical path, full wall-clock in meta).
+    ckpt_dir = Path(cfg.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    param_count = sum(p.numel() for p in model.parameters())
+
+    def _save(head_name: str, step_now: int, wall_now: float) -> Path:
+        state_dict = {k: v.detach().cpu().clone()
+                      for k, v in model.state_dict().items()}
+        path = ckpt_dir / f"{head_name}.pt"
+        torch.save(state_dict, path)
+        meta = {
+            "head": head_name, "step": step_now, "epochs": cfg.epochs,
+            "radius": radius, "device": str(device), "dtype": "float32",
+            "param_count": param_count, "wall_clock_s": wall_now,
+            "config": {
+                "hidden_dim": cfg.hidden_dim, "num_heads": cfg.num_heads,
+                "num_layers": cfg.num_layers, "lr": cfg.lr, "seed": cfg.seed,
+                "val_fraction": cfg.val_fraction, "head": cfg.head,
+                "backbone_checkpoint": cfg.backbone_checkpoint,
+            },
+            "val_metrics": {h: final_val.get(h) for h in tracked},
+            "best_val": {h: best_val[h] for h in tracked},
+            "best_step": {h: best_step[h] for h in tracked},
+            "skipped_endpoints": total_skipped,
+        }
+        with open(ckpt_dir / f"{head_name}.pt.meta.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        return path
+
+    def _save_all(step_now: int, wall_now: float) -> list[Path]:
+        # `all` -> all.pt + one self-contained .pt per head (consolidation loads
+        # by head name); a single-head run -> only that head's .pt (NOT all.pt,
+        # which would imply a joint run). Mirrors the pre-refactor branch.
+        if cfg.head == "all":
+            paths = [_save("all", step_now, wall_now)]
+            for h in ("salience", "link_prediction", "ontology", "cluster", "anomaly"):
+                paths.append(_save(h, step_now, wall_now))
+            return paths
+        return [_save(cfg.head, step_now, wall_now)]
+
     t0 = time.time()
     step = 0
     for epoch in range(cfg.epochs):
@@ -539,47 +600,25 @@ def train_gnn(
                 best_val[h] = v
                 best_step[h] = step
 
+        # Per-epoch checkpoint: overwrite all.pt (+ per-head) with the current
+        # state so a crash/SIGHUP at epoch N still leaves the epoch-N checkpoint
+        # on disk. Cheap (a handful of small saves, overwritten each epoch, vs.
+        # a multi-minute epoch) and the meta carries this epoch's val_metrics +
+        # the best-so-far tracking (same fields the final save will write).
+        _save_all(step, time.time() - t0)
+
         if progress_cb:
             mean_train = epoch_loss_sum / max(1, epoch_n)
             # Representative val for the print: the trained head's, else NaN.
             rep = final_val[tracked[0]] if tracked else None
             progress_cb(step, mean_train, float(rep) if rep is not None else float("nan"))
 
-    # ── checkpoints ── (raw state_dict, sidecar meta JSON)
-    ckpt_dir = Path(cfg.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    param_count = sum(p.numel() for p in model.parameters())
+    # ── checkpoints ── (raw state_dict, sidecar meta JSON). One final overwrite
+    # so the on-disk meta carries the exact final wall-clock; the per-epoch saves
+    # above already wrote the same paths each epoch (so a crash before here still
+    # leaves a usable checkpoint -- the whole point of the per-epoch saves).
     wall = time.time() - t0
-    final_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-    def _save(state_dict: dict, head_name: str) -> Path:
-        path = ckpt_dir / f"{head_name}.pt"
-        torch.save(state_dict, path)
-        meta = {
-            "head": head_name, "step": step, "epochs": cfg.epochs,
-            "radius": radius, "device": str(device), "dtype": "float32",
-            "param_count": param_count, "wall_clock_s": wall,
-            "config": {
-                "hidden_dim": cfg.hidden_dim, "num_heads": cfg.num_heads,
-                "num_layers": cfg.num_layers, "lr": cfg.lr, "seed": cfg.seed,
-                "val_fraction": cfg.val_fraction, "head": cfg.head,
-                "backbone_checkpoint": cfg.backbone_checkpoint,
-            },
-            "val_metrics": {h: final_val.get(h) for h in tracked},
-            "best_val": {h: best_val[h] for h in tracked},
-            "best_step": {h: best_step[h] for h in tracked},
-            "skipped_endpoints": total_skipped,
-        }
-        with open(ckpt_dir / f"{head_name}.pt.meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
-        return path
-
-    if cfg.head == "all":
-        paths = [_save(final_state, "all")]
-        for h in ("salience", "link_prediction", "ontology", "cluster", "anomaly"):
-            paths.append(_save(final_state, h))
-    else:
-        paths = [_save(final_state, cfg.head)]
+    paths = _save_all(step, wall)
 
     # ── honest notes ──
     notes: list[str] = []
