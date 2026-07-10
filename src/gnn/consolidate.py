@@ -47,6 +47,22 @@ log = logging.getLogger(__name__)
 # verifier turns it into a prompt and calls the Oracle/Bonsai endpoint.
 Verifier = Callable[[dict], bool]
 
+# Pair-scoring chunk size: the ontology "all" strategy scores up to
+# ~1512 entities x 377 classes = ~570k pairs at once. A [570k, 256] concat is a
+# ~580 MB transient; chunking to 50k keeps the peak ~50 MB without changing the
+# result (the head is stateless across pairs).
+_SCORE_CHUNK = 50_000
+# Histogram resolution: 100 width-0.01 buckets over [0,1] so the threshold sweep
+# is exact at the values that matter (0.05/0.15/0.85 are 0.01-boundaries) and the
+# salience cliff in [0.05, 0.10] is resolved. 100 ints/category is ~800 bytes.
+_HIST_BINS = 100
+
+
+def _chunked(seq, n: int):
+    """Yield successive ``n``-sized slices of ``seq`` (a list, not a tensor)."""
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
 
 class Consolidator:
     """One pass of dream-state consolidation over the memory graph."""
@@ -81,9 +97,8 @@ class Consolidator:
         self.loader = loader or WaveDBGraphLoader(store, radius=3)
         self.writer = SemanticMemoryWriter(store)
         self.allow_untrained_apply = allow_untrained_apply
-        # Max candidate non-edge pairs scored per subgraph (keeps the predict
-        # phase tractable — all-pairs is O(N²)).
-        self.max_candidates_per_subgraph = 16
+        # Candidate budgets live in self.cfg (linkpred_candidate_budget /
+        # ontology_*). See ConsolidationConfig for the per-knob rationale.
         # Lazy-cached class embeddings for the ontology head (two-encoder pair
         # classifier: entity emb from the backbone, class emb from the taxonomy
         # encoder over the live class DAG). Built on first _step_ontology call.
@@ -123,6 +138,18 @@ class Consolidator:
             "edges_accepted": [], "edges_unverified": [], "anomalies": [],
             "ontology_proposed": [], "pruned": [], "verifier_calls": 0,
             "verifier_accepted": 0,
+            # Binned score histograms (100 width-0.01 buckets, [0,1]) so a reader
+            # can sweep accept/bonsai/prune thresholds from ONE run without
+            # re-running (exact at 0.01-boundaries like 0.05/0.15/0.85).
+            # ontology/linkpred hold the raw sigmoid head scores;
+            # salience_endpoint holds the per-edge MAX endpoint salience (the
+            # binding constraint for the "prune if BOTH endpoints < thr" rule:
+            # prune iff this < thr). Buckets are int counts; tiny vs the
+            # per-proposal lists.
+            "score_distributions": {
+                "ontology": [0] * _HIST_BINS, "linkpred": [0] * _HIST_BINS,
+                "salience_endpoint": [0] * _HIST_BINS,
+            },
         }
 
         for center in centers:
@@ -212,6 +239,9 @@ class Consolidator:
             elif score >= self.cfg.bonsai_propose_threshold:
                 # No verifier configured: record as unverified, do NOT accept.
                 report["edges_unverified"].append(proposal)
+        self._accumulate_hist(
+            report["score_distributions"]["linkpred"],
+            link_scores, self.cfg.score_collect_bar)
 
     def _step_anomaly(self, data, out, report: dict) -> None:
         """Flag nodes whose anomaly logits exceed 0.5 on any type."""
@@ -229,9 +259,24 @@ class Consolidator:
         The ontology head is a TWO-encoder pair classifier: entity embeddings come
         from the episode backbone (``out["node_emb"]`` at the entity rows), class
         embeddings from the taxonomy encoder over the live class DAG. For each
-        entity in the subgraph we score it against a capped set of candidate
-        classes and record an ``entity -> class`` typing proposal above the
-        accept threshold.
+        entity in the subgraph we score it against a set of candidate classes
+        (selected by ``cfg.ontology_strategy``) and record an ``entity -> class``
+        typing proposal above the accept threshold.
+
+        Candidate strategies (``cfg.ontology_strategy``):
+          * ``all`` -- score every entity x class pair (chunked to bound memory).
+            The honest, complete option: surfaces the head's real high-confidence
+            typings. (The dry-run that found 0 proposals was the old rotation cap
+            sampling ~16 pairs and missing every true class; the head scores true
+            classes 0.93-0.98 when actually asked.)
+          * ``topk`` -- cheap embedding dot-product prefilter, then score the top
+            ``cfg.ontology_topk`` classes per entity with the trained head. Fast;
+            catches the true classes because both encoders encode the typing
+            signal (a heuristic prefilter -- can miss a pair the trained MLP
+            ranks high but the dot product ranks low; use ``all`` for exact).
+          * ``rotation`` -- legacy deterministic ``(k*7+j*3)%n_classes`` slice
+            bounded by ``cfg.ontology_candidate_budget`` (the old behavior). Kept
+            as a comparison baseline.
 
         HONEST scope (deferred, not faked): (a) class->class ``subClassOf``
         refinement -- no class->class labels exist, so this head does NOT propose
@@ -256,41 +301,95 @@ class Consolidator:
         if not ent_idx or n_classes == 0:
             return
 
-        # Candidate classes per entity: deterministic offset slice across the
-        # class DAG (no RNG needed; the head is record-only at cold start, and a
-        # fixed rotation keeps proposals reproducible). Capped total per subgraph
-        # to keep the score phase tractable -- the full entity x class sweep is
-        # the deploy target, not the cold-start loop.
-        per_entity = max(1, self.max_candidates_per_subgraph // len(ent_idx))
-        pairs: list[tuple[int, int]] = []
-        for k, ei in enumerate(ent_idx):
-            for j in range(per_entity):
-                ci = (k * 7 + j * 3) % n_classes   # deterministic spread across classes
-                pairs.append((ei, ci))
-                if len(pairs) >= self.max_candidates_per_subgraph:
-                    break
-            if len(pairs) >= self.max_candidates_per_subgraph:
-                break
+        pairs = self._ontology_candidates(out["node_emb"], ent_idx, n_classes)
         if not pairs:
             return
 
-        pair_index = torch.tensor(pairs, dtype=torch.long).t().contiguous()
+        node_emb = out["node_emb"]
+        accept = self.cfg.accept_threshold
+        hist = report["score_distributions"]["ontology"]
+        # Score in chunks to bound the ~580 MB [P,256] concat transient when "all"
+        # scores 1512 x 377 = ~570k pairs at once. Bin each chunk's scores straight
+        # into the histogram (streaming) -- avoids holding ~570k floats x 3
+        # subgraphs as a Python list; the head is stateless across pairs so the
+        # chunked result equals the all-at-once result.
+        for chunk in _chunked(pairs, _SCORE_CHUNK):
+            pair_index = torch.tensor(chunk, dtype=torch.long).t().contiguous()
+            with torch.no_grad():
+                scores = self.model.ontology(node_emb, self._class_emb, pair_index)
+            self._accumulate_hist(hist, scores, self.cfg.score_collect_bar)
+            for (ei, ci), score in zip(chunk, scores.tolist()):
+                if score >= accept:
+                    report["ontology_proposed"].append({
+                        "entity": node_ids[ei], "class": self._class_names[ci],
+                        "confidence": float(score),
+                    })
+
+    def _ontology_candidates(
+        self, node_emb: torch.Tensor, ent_idx: list[int], n_classes: int
+    ) -> list[tuple[int, int]]:
+        """Build the (entity_row, class_row) pairs to score, per ``ontology_strategy``."""
+        strategy = self.cfg.ontology_strategy
+        if strategy == "all":
+            return [(ei, ci) for ei in ent_idx for ci in range(n_classes)]
+        if strategy == "topk":
+            return self._ontology_topk_candidates(node_emb, ent_idx, n_classes)
+        if strategy == "rotation":
+            return self._ontology_rotation_candidates(ent_idx, n_classes)
+        raise ValueError(
+            f"unknown ontology_strategy {strategy!r} (expected all|topk|rotation)")
+
+    def _ontology_topk_candidates(
+        self, node_emb: torch.Tensor, ent_idx: list[int], n_classes: int
+    ) -> list[tuple[int, int]]:
+        """Prefilter classes per entity by embedding dot product; take top-k.
+
+        ``entity_emb @ class_emb.T`` -> ``[n_ent, n_classes]``; top-k per row. The
+        trained head then scores only those ~``n_ent * topk`` pairs (vs ``all``'s
+        ``n_ent * n_classes``). ~1 s; catches the true classes because both
+        encoders encode the typing signal.
+        """
+        k = min(self.cfg.ontology_topk, n_classes)
+        ent_rows = torch.tensor(ent_idx, dtype=torch.long, device=node_emb.device)
+        ent_emb = node_emb[ent_rows]                       # [n_ent, H]
         with torch.no_grad():
-            scores = self.model.ontology(out["node_emb"], self._class_emb, pair_index)
-        for (ei, ci), score in zip(pairs, scores.tolist()):
-            if score >= self.cfg.accept_threshold:
-                report["ontology_proposed"].append({
-                    "entity": node_ids[ei], "class": self._class_names[ci],
-                    "confidence": float(score),
-                })
+            sims = ent_emb @ self._class_emb.t()            # [n_ent, n_classes]
+        top = torch.topk(sims, k, dim=1).indices.tolist()  # [n_ent, k]
+        return [(ei, ci) for ei, cls_list in zip(ent_idx, top) for ci in cls_list]
+
+    def _ontology_rotation_candidates(
+        self, ent_idx: list[int], n_classes: int
+    ) -> list[tuple[int, int]]:
+        """Legacy deterministic ``(k*7+j*3)%n_classes`` slice, budget-capped.
+
+        Reproduces the pre-knob behavior exactly (kept as a comparison baseline).
+        """
+        budget = self.cfg.ontology_candidate_budget
+        per_entity = max(1, budget // len(ent_idx))
+        pairs: list[tuple[int, int]] = []
+        for k, ei in enumerate(ent_idx):
+            for j in range(per_entity):
+                pairs.append((ei, (k * 7 + j * 3) % n_classes))
+                if len(pairs) >= budget:
+                    break
+            if len(pairs) >= budget:
+                break
+        return pairs
 
     def _step_prune(self, data, out, report: dict) -> None:
         """Record low-salience edges for archival pruning."""
         sal = out["salience"]  # [N]
         # Prune an edge if BOTH endpoints score below the prune threshold (a
         # high-salience endpoint keeps the edge alive — it's still a useful link
-        # for that node).
+        # for that node). The binding constraint is the MAX endpoint salience
+        # (prune iff max(s,o) < thr), so the histogram records per-edge max --
+        # that lets prune-fraction be swept across thresholds from one run.
         thr = self.cfg.prune_salience_below
+        if data.edge_index.shape[1] > 0:
+            edge_max = sal[data.edge_index].max(dim=0).values  # [E]
+            self._accumulate_hist(
+                report["score_distributions"]["salience_endpoint"],
+                edge_max, self.cfg.score_collect_bar)
         for s, o in data.edge_index.t().tolist():
             if float(sal[s]) < thr and float(sal[o]) < thr:
                 report["pruned"].append({
@@ -336,6 +435,33 @@ class Consolidator:
 
     # ── helpers ──
 
+    @staticmethod
+    def _accumulate_hist(acc: list[int], scores: torch.Tensor, bar: float) -> None:
+        """Bin ``scores`` (clipped to [0,1]) into ``len(acc)`` equal buckets, in place.
+
+        The bin count is taken from ``len(acc)`` so callers pick the resolution
+        (the report uses 100 width-0.01 buckets so thresholds like 0.05/0.15/0.85
+        are exact 0.01-boundaries and the salience cliff in [0.05, 0.10] is
+        resolved -- 10 width-0.1 bins cannot). Bucket i covers
+        ``[i/n, (i+1)/n)`` for n = ``len(acc)``. Scores below ``bar`` are dropped
+        (``bar`` is the collection cutoff, not a bin boundary).
+
+        Note: scores are clipped to [0,1]. The salience head emits RAW logits (can
+        be slightly negative); clipping folds that tiny negative tail into bucket
+        0, which is correct for any prune threshold > 0 (negatives are prunable).
+        """
+        n = len(acc)
+        if n == 0 or scores.numel() == 0:
+            return
+        s = scores.detach().flatten().clamp(0.0, 1.0)
+        s = s[s >= bar]
+        if s.numel() == 0:
+            return
+        idx = (s * n).long().clamp(0, n - 1)
+        counts = torch.bincount(idx, minlength=n)
+        for b in range(n):
+            acc[b] += int(counts[b])
+
     def _wm_first(self, centers: list[str], wm_ids: set[str]) -> list[str]:
         """Order centers so WM-resident episodes come first (stable)."""
         return sorted(centers, key=lambda c: (c not in wm_ids, c))
@@ -347,7 +473,7 @@ class Consolidator:
 
         Same-kind pairs are more likely meaningful (entity-entity, episode-
         episode) than cross-kind, so bias the sample toward them. Caps at
-        ``max_candidates_per_subgraph``.
+        ``cfg.linkpred_candidate_budget``.
         """
         node_ids = data.node_id
         n = data.x.shape[0]
@@ -361,7 +487,7 @@ class Consolidator:
                     same_kind.append((i, j))
         # Deterministic take (no Math.random in workflows — but this is a normal
         # module; still, keep it deterministic for reproducible dev runs).
-        return same_kind[: self.max_candidates_per_subgraph]
+        return same_kind[: self.cfg.linkpred_candidate_budget]
 
 
 __all__ = ["Consolidator", "Verifier"]

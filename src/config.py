@@ -178,12 +178,37 @@ class GNNConfig:
 
 @dataclass
 class ConsolidationConfig:
-    """Nightly dream-state loop thresholds (Task 6)."""
+    """Nightly dream-state loop thresholds + candidate-sampling knobs (Task 6).
+
+    All fields are exposed as CLI flags in ``scripts/run_consolidation.py`` so a
+    consolidation run is tunable for efficacy and measurable against alternatives.
+    The threshold knobs (accept/bonsai/prune) are also sweepable from a SINGLE run
+    via the ``score_distributions`` histograms in the report (no re-run needed);
+    the strategy/budget knobs change WHICH pairs get scored, so comparing those
+    requires a re-run per value.
+    """
     accept_threshold: float = 0.85       # auto-accept predicted edges above this
     bonsai_propose_threshold: float = 0.60  # propose to Bonsai between this and accept
-    prune_salience_below: float = 0.15   # archive edges below this salience
+    prune_salience_below: float = 0.15   # archive edges where BOTH endpoints below this
     dry_run_default: bool = True         # --dry-run is the default; --apply mutates
     wm_prioritized: bool = True          # score what's "in awareness" first
+    # Ontology candidate sampling. The old code reused a link-pred cap of 16 here,
+    # but the real entity x class space is ~1512 x 377, so that cap sampled ~16
+    # pairs and missed every true class (0 proposals despite the head scoring
+    # true classes 0.93-0.98). "all" scores every pair (the honest, complete
+    # option -- chunked to bound memory); "topk" prefilters by embedding dot
+    # product then scores the top-k classes per entity (fast); "rotation" is the
+    # legacy deterministic slice kept as a comparison baseline.
+    ontology_strategy: str = "all"      # "all" | "topk" | "rotation"
+    ontology_topk: int = 10              # classes per entity for "topk"
+    ontology_candidate_budget: int = 16  # cap for "rotation" (legacy behavior)
+    # Link-prediction candidate budget (splits the old shared max_candidates cap;
+    # link-pred is O(N^2) over the subgraph, so this stays small by design).
+    linkpred_candidate_budget: int = 16
+    # Histogram collection: record every score >= this into 0.1-width bins so the
+    # report supports a threshold sweep without re-running. 0.0 collects all
+    # (bins are just 10 int counts per category -- tiny).
+    score_collect_bar: float = 0.0
 
 
 @dataclass

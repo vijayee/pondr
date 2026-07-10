@@ -23,6 +23,7 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 # Ensure ``src`` is importable when run as a bare script (pytest conftest
@@ -31,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch  # noqa: E402  (hard dep via src.gnn.*; imported here so _load_model's torch.load resolves at module scope)
 
-from src.config import config  # noqa: E402
+from src.config import ConsolidationConfig, Phase3aConfig, config  # noqa: E402
 from src.gnn.consolidate import Consolidator  # noqa: E402
 from src.gnn.model import GNNModel  # noqa: E402
 from src.memory.store import HippocampalStore  # noqa: E402
@@ -106,6 +107,30 @@ def main() -> int:
     parser.add_argument("--device", default="cpu", help="torch device (cpu | cuda)")
     parser.add_argument("--report", default=None,
                         help="Write the JSON report to this path")
+    # ── Consolidation knobs (override ConsolidationConfig defaults). All default
+    # to None so only explicitly-passed flags override -- ConsolidationConfig stays
+    # the source of truth, and Consolidator(config=ConsolidationConfig(...)) (the
+    # path the tests use) is unaffected. Threshold knobs (accept/bonsai/prune) are
+    # also sweepable from one run via the report's score_distributions histograms.
+    parser.add_argument("--accept-threshold", type=float, default=None,
+                        help="Auto-accept edges/ontology proposals above this (default 0.85)")
+    parser.add_argument("--bonsai-propose-threshold", type=float, default=None,
+                        help="Propose to Bonsai between this and accept (default 0.60)")
+    parser.add_argument("--prune-salience-below", type=float, default=None,
+                        help="Archive edges where BOTH endpoints below this (default 0.15)")
+    parser.add_argument("--ontology-strategy", default=None,
+                        choices=["all", "topk", "rotation"],
+                        help="Entity x class candidate selection (default all; "
+                             "all=score every pair chunked, topk=embedding prefilter, "
+                             "rotation=legacy budget slice)")
+    parser.add_argument("--ontology-topk", type=int, default=None,
+                        help="Classes per entity for --ontology-strategy topk (default 10)")
+    parser.add_argument("--ontology-budget", type=int, default=None,
+                        help="Cap for --ontology-strategy rotation (default 16)")
+    parser.add_argument("--linkpred-budget", type=int, default=None,
+                        help="Candidate non-edge pairs scored per subgraph (default 16)")
+    parser.add_argument("--collect-bar", type=float, default=None,
+                        help="Histogram collects scores >= this (default 0.0; bins are tiny)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -114,6 +139,20 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    # Build the ConsolidationConfig override from the non-None knobs only.
+    cfg = Phase3aConfig().consolidation
+    overrides = {
+        "accept_threshold": args.accept_threshold,
+        "bonsai_propose_threshold": args.bonsai_propose_threshold,
+        "prune_salience_below": args.prune_salience_below,
+        "ontology_strategy": args.ontology_strategy,
+        "ontology_topk": args.ontology_topk,
+        "ontology_candidate_budget": args.ontology_budget,
+        "linkpred_candidate_budget": args.linkpred_budget,
+        "score_collect_bar": args.collect_bar,
+    }
+    cfg = replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+
     store = HippocampalStore(args.db)
     try:
         model = _load_model(args.checkpoint, args.device) if args.checkpoint else None
@@ -121,7 +160,7 @@ def main() -> int:
         centers = args.centers.split(",") if args.centers else None
 
         cons = Consolidator(
-            store, model=model, verifier=verifier,
+            store, model=model, verifier=verifier, config=cfg,
             dry_run=(not args.apply), device=args.device,
             allow_untrained_apply=args.force_untrained,
         )
