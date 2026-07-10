@@ -41,10 +41,14 @@ coupling 3a to the still-flaky SSM stack.
 ### 5 heads, per-head losses
 
 `src/gnn/heads.py` — SalienceHead (MSE regression), DiffPoolHead (simplified
-DiffPool: cluster assignment + entropy + cluster-link preservation),
-LinkPredHead (GAE dot-product; SEAL subgraph features deferred), AnomalyHead
-(6-type multi-label BCE, types aligned to `gnn_anomaly_prompt`), OntologyHead
-(`subClassOf` pair classifier, BCE). Per-head training (Task 4) optimizes one
+DiffPool: cluster assignment + per-node entropy + cluster-link preservation +
+cluster-balance; the balance term is the anti-collapse fix — without it the
+global min of entropy+link is the trivial "every node -> one cluster" solution,
+loss 0 regardless of input), LinkPredHead (GAE dot-product; SEAL subgraph
+features deferred), AnomalyHead (9-type multi-label pos-weighted BCE; the
+pos-weight counters severe per-type node imbalance so BCE doesn't collapse to
+"predict no anomaly"), OntologyHead (two-encoder `subClassOf` pair classifier,
+BCE). Per-head training (Task 4) optimizes one
 loss at a time; the consolidation loop (Task 6) calls whichever heads it needs.
 
 ### OGB-pretrain-then-transfer, with direct-train fallback

@@ -112,9 +112,12 @@ NOT trained as a head label. A real user's graph will produce genuine cases occa
 those get Bonsai's retrieve-then-decide treatment, not an auto-fix.
 
 ### Cluster (DiffPool) — self-supervised, optional weak Oracle supervision
-- **Primary:** self-supervised. `DiffPoolHead.loss` (entropy + cluster-link preservation)
-  trains from graph structure — no Oracle labels needed. This is how DiffPool is normally
-  trained.
+- **Primary:** self-supervised. `DiffPoolHead.loss` (per-node entropy + cluster-link
+  preservation + cluster-balance) trains from graph structure — no Oracle labels needed.
+  The cluster-balance term is the anti-collapse fix: without it the loss's global minimum
+  is the trivial "every node -> one cluster" solution (entropy 0, link -log(1)=0), so the
+  val metric is clusters-used (higher = not collapsed), not per-node entropy (which
+  rewarded collapse). This is how DiffPool is normally trained.
 - **Optional weak supervision:** one Oracle call over an **episode-only context** (just
   the episode nodes + their shared entities/topics/timestamps, not all 10K nodes — fits
   in one call) using `gnn_cluster_prompt`. This gives a weak "which episodes should
@@ -178,9 +181,12 @@ per flagged candidate, with retrieval context), $0 and cached, generated as part
 - Recombination: concat `suggested_edges` + `misclassified`.
 
 ### Cluster (DiffPool) — self-supervised, optional weak Oracle supervision
-- **Primary:** self-supervised. `DiffPoolHead.loss` (entropy + cluster-link preservation)
-  trains from graph structure — no Oracle labels needed. This is how DiffPool is normally
-  trained.
+- **Primary:** self-supervised. `DiffPoolHead.loss` (per-node entropy + cluster-link
+  preservation + cluster-balance) trains from graph structure — no Oracle labels needed.
+  The cluster-balance term is the anti-collapse fix: without it the loss's global minimum
+  is the trivial "every node -> one cluster" solution (entropy 0, link -log(1)=0), so the
+  val metric is clusters-used (higher = not collapsed), not per-node entropy (which
+  rewarded collapse). This is how DiffPool is normally trained.
 - **Optional weak supervision:** one Oracle call over an **episode-only context** (just
   the episode nodes + their shared entities/topics/timestamps, not all 10K nodes — fits
   in one call) using `gnn_cluster_prompt`. This gives a weak "which episodes should

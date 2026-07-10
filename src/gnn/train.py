@@ -78,8 +78,10 @@ _HEAD_MODULE: dict[str, str] = {
 }
 
 # Per-head val metric + whether higher is better (for best-val tracking).
+# diffpool metric is clusters-used (higher = not collapsed); was per-node entropy
+# (lower better) which rewarded the degenerate all-nodes-one-cluster collapse.
 _HIGHER_BETTER: dict[str, bool] = {
-    "salience": False, "diffpool": False,        # MAE / entropy -- lower better
+    "salience": False, "diffpool": True,         # MAE lower / clusters-used higher
     "link_prediction": True, "ontology": True, "anomaly": True,  # AUC / acc / F1
 }
 

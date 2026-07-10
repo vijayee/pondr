@@ -93,33 +93,56 @@ class DiffPoolHead(nn.Module):
         assign: torch.Tensor,
         edge_index: torch.Tensor,
         entropy_weight: float = 0.1,
+        balance_weight: float = 1.0,
     ) -> torch.Tensor:
-        """DiffPool auxiliary loss: assignment entropy + cluster-link preservation."""
+        """DiffPool auxiliary loss: entropy + link preservation + cluster balance.
+
+        Three terms:
+        (a) Per-node entropy — push rows toward confident (one-hot) assignments.
+        (b) Cluster-link preservation — pull connected nodes into shared clusters.
+        (c) Cluster-balance — push the cluster-population marginal toward uniform,
+            so the head can't collapse every node into one cluster. Without (c) the
+            global minimum of (a)+(b) is the trivial collapse: all nodes -> one
+            cluster gives ent=0 AND link=-log(1)=0 -> loss 0, regardless of input.
+            (c) makes collapse cost ``balance_weight * log(K)`` and rewards balanced
+            use of all K clusters while (a) keeps each row confident — the desired
+            "confident but spread" outcome. (c) is ``sum(p_bar * log p_bar)`` over
+            the cluster marginal ``p_bar = assign.mean(0)``: minimized (=-log K)
+            when p_bar is uniform, = 0 when p_bar is one-hot (collapsed).
+        """
+        eps = 1e-12
         # (a) Entropy regularization — push rows toward confident (low-entropy)
         # assignments. ``-(p log p)`` averaged over nodes; we MINIMIZE entropy so
         # negate the standard entropy expression.
-        eps = 1e-12
         ent = -(assign * (assign + eps).log()).sum(dim=-1).mean()
         # (b) Cluster-link preservation: A_pool = Sᵀ A S should be dense where
         # the original graph had edges. Use the edge endpoints' assignment rows:
         # for each edge, the cluster-pair mass is assign[s] · assign[o]ᵀ; we want
-        # it high. Cross-entropy of the cluster-pair distribution vs uniform is a
-        # weak proxy; instead use the simpler ``-log(assign[s] · assign[o])``
-        # averaged over edges (pulls connected nodes into shared clusters).
+        # it high. ``-log(assign[s] · assign[o])`` averaged over edges (pulls
+        # connected nodes into shared clusters).
         if edge_index.shape[1] > 0:
             s, o = edge_index[0], edge_index[1]
             pair = (assign[s] * assign[o]).sum(dim=-1)  # [E]
             link = -(pair + eps).log().mean()
         else:
             link = torch.tensor(0.0, device=assign.device)
-        return link + entropy_weight * ent
+        # (c) Cluster-balance: penalize the marginal collapsing to one cluster.
+        pbar = assign.mean(dim=0)                         # [K] cluster marginal
+        balance = (pbar * (pbar + eps).log()).sum()       # -H(pbar); 0=collapsed, -logK=uniform
+        return link + entropy_weight * ent + balance_weight * balance
 
     @staticmethod
     def metric(assign: torch.Tensor) -> float:
-        """Mean assignment entropy (lower = more confident clusters)."""
+        """Distinct clusters populated (argmax). Higher = better; 1 = collapsed.
+
+        The old metric (mean per-node entropy) reported the degenerate all-nodes-
+        one-cluster solution as ~0 ("best") — entropy is minimized BY collapse.
+        Clusters-used directly opposes that: a useful clustering uses many clusters,
+        a collapsed one uses 1. Unsupervised head, so this is an anti-collapse
+        health signal, not a quality grade (no ground-truth clusters to score).
+        """
         with torch.no_grad():
-            eps = 1e-12
-            return -(assign * (assign + eps).log()).sum(dim=-1).mean().item()
+            return float(len(torch.unique(assign.argmax(dim=-1))))
 
 
 # ── 3. Link-prediction head (GAE) ──
@@ -202,17 +225,44 @@ class AnomalyHead(nn.Module):
         return torch.sigmoid(self.net(node_emb))
 
     @staticmethod
-    def loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return F.binary_cross_entropy(logits, target.float())
+    def loss(logits: torch.Tensor, target: torch.Tensor,
+             pos_weight_cap: float = 50.0) -> torch.Tensor:
+        """Pos-weighted BCE — counters severe per-type class imbalance.
+
+        The 9 anomaly types are wildly imbalanced at the node level: ``duplicate_
+        episode`` flags ~300 nodes/subgraph while 7 of 9 types flag 0-1. Plain BCE
+        on that collapses the head to "predict no anomaly" (the majority class).
+        Per-type ``pos_weight = (neg+1)/(pos+1)`` upweights the rare-positive term
+        so a missed positive costs more than a false positive; capped so a single
+        positive in 10k nodes doesn't blow the loss up 5000x. ``logits`` here are
+        sigmoid probabilities (the head's forward applies sigmoid), not pre-sigmoid.
+        """
+        eps = 1e-7
+        p = logits.clamp(min=eps, max=1.0 - eps)
+        pos = target.sum(dim=0)                                     # [T]
+        neg = (1.0 - target).sum(dim=0)                             # [T]
+        pos_w = ((neg + 1.0) / (pos + 1.0)).clamp(max=pos_weight_cap)  # [T], >=1
+        bce = -(pos_w * target * p.log() + (1.0 - target) * (1.0 - p).log())  # [N,T]
+        return bce.mean()
 
     @staticmethod
     def metric(logits: torch.Tensor, target: torch.Tensor) -> float:
-        """Per-type macro F1 (0 = no positives for that type)."""
+        """Macro F1 over types that have ANY positive in this eval set.
+
+        Types with zero positives in the eval set are EXCLUDED: F1 gives no credit
+        for true negatives, so a type with 0 positives contributes F1=0 to the
+        macro average no matter what the head does — it dragged the old all-9
+        macro to ~0.0037 even though 5-6 types simply had no planted anomalies to
+        find. Excluding them makes the metric reflect only the measurable types.
+        ``logits`` are sigmoid probabilities.
+        """
         with torch.no_grad():
             pred = (logits.cpu().numpy() > 0.5).astype(int)
             y = target.cpu().numpy().astype(int)
             f1s = []
             for t in range(y.shape[1]):
+                if y[:, t].sum() == 0:
+                    continue  # no positives -> unmeasurable, exclude
                 tp = int(((pred[:, t] == 1) & (y[:, t] == 1)).sum())
                 fp = int(((pred[:, t] == 1) & (y[:, t] == 0)).sum())
                 fn = int(((pred[:, t] == 0) & (y[:, t] == 1)).sum())
@@ -220,7 +270,7 @@ class AnomalyHead(nn.Module):
                 rec = tp / (tp + fn) if (tp + fn) else 0.0
                 f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
                 f1s.append(f1)
-            return float(sum(f1s) / max(1, len(f1s)))
+            return float(sum(f1s) / max(1, len(f1s))) if f1s else 0.0
 
 
 # ── 5. Ontology-typing head (two-encoder pair classifier) ──

@@ -167,3 +167,82 @@ def _toy_taxonomy_data(num_classes: int, hidden_dim: int):
         edges.append({"subject": f"Class{i}", "predicate": "subClassOf", "object": f"Class{i+1}"})
     sub = {"center": "Class0", "radius": 0, "nodes": nodes, "edges": edges}
     return data_from_subgraph(sub, _stub_feature_for)
+
+
+# ── DiffPool collapse-fix + Anomaly imbalance-fix (Phase 3a head rework) ──
+
+def test_diffpool_metric_counts_clusters_used_and_flags_collapse():
+    K = 4
+    # collapsed: every row -> cluster 0
+    collapsed = torch.zeros(8, K); collapsed[:, 0] = 1.0
+    # spread: rows evenly across all K clusters (one-hot, confident)
+    spread = torch.zeros(8, K)
+    for i in range(8):
+        spread[i, i % K] = 1.0
+    assert DiffPoolHead.metric(collapsed) == 1.0   # 1 cluster = collapsed
+    assert DiffPoolHead.metric(spread) == float(K)  # all K used = healthy
+
+
+def test_diffpool_balance_term_penalizes_collapse():
+    """On a 2-community graph, a community-aware assignment must beat the
+    all-in-one-cluster collapse — i.e. the balance term breaks the old global-min
+    collapse (which gave loss 0 regardless of input)."""
+    K = 4
+    # 4 nodes, two disjoint edges = two communities (0-1, 2-3).
+    edge_index = torch.tensor([[0, 1, 2, 3], [1, 0, 3, 2]])
+    # collapsed: all -> cluster 0 (one-hot)
+    collapsed = torch.zeros(4, K); collapsed[:, 0] = 1.0
+    # community-aware: {0,1}->0, {2,3}->1 (one-hot; connected nodes share a cluster)
+    community = torch.zeros(4, K)
+    community[0, 0] = community[1, 0] = 1.0
+    community[2, 1] = community[3, 1] = 1.0
+    dp = DiffPoolHead(16, num_clusters=K)
+    loss_collapse = dp.loss(collapsed, edge_index)
+    loss_community = dp.loss(community, edge_index)
+    # The community assignment uses 2 balanced clusters with link=0 -> lower loss
+    # than the collapse (link=0 but balance=0). Collapse is no longer the minimum.
+    assert loss_community.item() < loss_collapse.item()
+    # And the balance term alone is worse for collapse (0) than community (<0).
+    eps = 1e-12
+    bal_col = (collapsed.mean(0) * (collapsed.mean(0) + eps).log()).sum().item()
+    bal_com = (community.mean(0) * (community.mean(0) + eps).log()).sum().item()
+    assert bal_com < bal_col  # community marginal is more uniform -> lower (more negative)
+
+
+def test_anomaly_loss_upweights_rare_positives():
+    """A model that gets the rare positive wrong should pay MORE under pos-weighted
+    BCE than plain BCE — that's the whole point of rebalancing."""
+    T = len(ANOMALY_TYPES)
+    # 1 positive, N-1 negatives for every type (extreme imbalance).
+    target = torch.zeros(20, T); target[0, :] = 1.0
+    # Model predicts ~0.01 everywhere (confident "no anomaly" — the collapse mode).
+    pred = torch.full((20, T), 0.01, requires_grad=True)
+    weighted = AnomalyHead.loss(pred, target)
+    # plain BCE for comparison
+    import torch.nn.functional as F
+    plain = F.binary_cross_entropy(pred.clamp(1e-7, 1 - 1e-7), target)
+    # The single missed positive is upweighted -> weighted loss exceeds plain.
+    assert weighted.item() > plain.item()
+    # And it's finite + differentiable.
+    assert torch.isfinite(weighted)
+    weighted.backward()  # no error
+
+
+def test_anomaly_metric_excludes_zero_positive_types():
+    T = len(ANOMALY_TYPES)
+    # Type 0 has positives (perfectly predicted -> F1=1); type 1 has none.
+    logits = torch.zeros(10, T)
+    target = torch.zeros(10, T)
+    target[:3, 0] = 1.0            # 3 positives on type 0
+    logits[:3, 0] = 0.9            # predicted positive (correct)
+    logits[3:, 0] = 0.1            # predicted negative (correct, true negatives)
+    # type 1..T-1 have zero positives anywhere -> excluded from the macro.
+    m = AnomalyHead.metric(logits, target)
+    assert m == 1.0  # only type 0 is measurable, and it's perfectly predicted
+
+
+def test_anomaly_metric_zero_when_no_type_has_positives():
+    T = len(ANOMALY_TYPES)
+    logits = torch.full((10, T), 0.2)
+    target = torch.zeros(10, T)  # no positives at all -> nothing measurable
+    assert AnomalyHead.metric(logits, target) == 0.0
