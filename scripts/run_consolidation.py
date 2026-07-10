@@ -131,6 +131,18 @@ def main() -> int:
                         help="Candidate non-edge pairs scored per subgraph (default 16)")
     parser.add_argument("--collect-bar", type=float, default=None,
                         help="Histogram collects scores >= this (default 0.0; bins are tiny)")
+    # ── Anomaly head subgraph bound (the giant-subgraph fix). The anomaly step
+    # runs a SECOND bounded forward (radius-2 + fanout-cap) so the anomaly head
+    # is SERVED on the same bounded subgraph it TRAINED on (train/serve parity;
+    # serving it on the radius-3 giant would let duplicate_episode dominate
+    # again). The other 4 steps stay on the radius-3 subgraph. Defaults (None)
+    # inherit ConsolidationConfig (radius=2, cap=64); 0 cap = uncapped = the
+    # prior giant, for comparison.
+    parser.add_argument("--anomaly-radius", type=int, default=None,
+                        help="BFS radius for the anomaly step's second forward (default 2)")
+    parser.add_argument("--anomaly-fanout-cap", type=int, default=None,
+                        help="Per-node fanout cap for the anomaly step's subgraph (default 64; "
+                             "0 = uncapped = the prior 10,680-node-giant behavior)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -150,8 +162,16 @@ def main() -> int:
         "ontology_candidate_budget": args.ontology_budget,
         "linkpred_candidate_budget": args.linkpred_budget,
         "score_collect_bar": args.collect_bar,
+        "anomaly_subgraph_radius": args.anomaly_radius,
     }
     cfg = replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+    # Anomaly fanout-cap is handled separately: 0 = uncapped (None) is a LEGITIMATE
+    # override (the prior giant behavior, for comparison), so it must NOT be
+    # dropped by the "is not None" filter above. Only override when the flag was
+    # explicitly passed (default None -> inherit ConsolidationConfig.anomaly_fanout_cap).
+    if args.anomaly_fanout_cap is not None:
+        cfg = replace(cfg, anomaly_fanout_cap=(
+            args.anomaly_fanout_cap if args.anomaly_fanout_cap > 0 else None))
 
     store = HippocampalStore(args.db)
     try:

@@ -136,7 +136,14 @@ def _write_labels(store, pipe, labels_dir: Path, radius: int = 2) -> None:
                 },
             }) + "\n")
         with open(labels_dir / "quality_report.json", "w", encoding="utf-8") as f:
-            json.dump({"radius": radius, "total_subgraphs": len(centers)}, f)
+            json.dump({
+                "radius": radius, "total_subgraphs": len(centers),
+                # Anomaly head bound (giant-subgraph fix): the trainer reads these
+                # for the anomaly branch. Uncapped (null) here -- the toy graph
+                # has no entity hub, so the cap is a no-op and the reproduced
+                # corrupted subgraph matches the label-generation extraction.
+                "anomaly_radius": radius, "anomaly_fanout_cap": None,
+            }, f)
     finally:
         for h in handles.values():
             h.close()
@@ -297,3 +304,42 @@ def test_training_feature_for_dup_clone_reuses_origin(tmp_path):
         assert m_vec[m_kind].item() == 1.0  # type-onehot stamped
     finally:
         store.close()
+
+
+def test_read_anomaly_radius_cap_reads_report(tmp_path):
+    """``_read_anomaly_radius_cap`` reads the bound from quality_report.json,
+    honoring a null ``anomaly_fanout_cap`` (the uncapped sentinel)."""
+    from src.gnn.train import _read_anomaly_radius_cap
+
+    labels_dir = tmp_path / "labels"
+    labels_dir.mkdir()
+    with open(labels_dir / "quality_report.json", "w", encoding="utf-8") as f:
+        json.dump({"radius": 3, "anomaly_radius": 2, "anomaly_fanout_cap": 64}, f)
+    r, c = _read_anomaly_radius_cap(labels_dir, fb_radius=3, fb_cap=None)
+    assert (r, c) == (2, 64)
+
+    # null cap = uncapped (the --anomaly-fanout-cap 0 sentinel).
+    with open(labels_dir / "quality_report.json", "w", encoding="utf-8") as f:
+        json.dump({"radius": 3, "anomaly_radius": 2, "anomaly_fanout_cap": None}, f)
+    r, c = _read_anomaly_radius_cap(labels_dir, fb_radius=3, fb_cap=None)
+    assert (r, c) == (2, None)
+
+
+def test_read_anomaly_radius_cap_falls_back_when_absent(tmp_path):
+    """An old quality_report (pre-bound) has no anomaly fields -> fall back to
+    the global radius + None (uncapped) = the prior giant behavior. Backward
+    compat: an existing labels dir trains unchanged."""
+    from src.gnn.train import _read_anomaly_radius_cap
+
+    labels_dir = tmp_path / "labels"
+    labels_dir.mkdir()
+    with open(labels_dir / "quality_report.json", "w", encoding="utf-8") as f:
+        json.dump({"radius": 3, "total_subgraphs": 5}, f)  # no anomaly_* fields
+    r, c = _read_anomaly_radius_cap(labels_dir, fb_radius=3, fb_cap=None)
+    assert (r, c) == (3, None)
+
+    # No report at all -> fallback too.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    r, c = _read_anomaly_radius_cap(empty, fb_radius=3, fb_cap=None)
+    assert (r, c) == (3, None)

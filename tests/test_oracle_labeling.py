@@ -133,6 +133,77 @@ def test_extract_subgraph_unknown_center_returns_self_only(tmp_path):
     store.close()
 
 
+# ── fanout cap (giant-subgraph bound) ──
+
+
+def test_extract_subgraph_fanout_cap_bounds_hub(tmp_path):
+    """A high-degree entity hub shared by many episodes floods a radius-2
+    subgraph to ALL of them when uncapped. A fanout_cap bounds that flood: the
+    hub's aggregated neighbor list is truncated, so only a few sibling episodes
+    survive instead of the whole corpus. This is the giant-subgraph lever.
+    """
+    store, pipe = _pipe(tmp_path)
+    n = 20
+    for i in range(1, n + 1):
+        # Distinct user per episode -> distinct session, so the ONLY shared hub
+        # is the entity "Hub"; the flood is isolated to it.
+        store.encode_episode(_ep(f"ep_{i:06d}", entities=["Hub"], user=f"u{i}"))
+
+    # Uncapped radius-2: the shared entity hub reaches all n episodes.
+    uncapped = pipe.extract_subgraph("ep_000001", radius=2)
+    uncapped_eps = {x["id"] for x in uncapped["nodes"] if x["id"].startswith("ep_")}
+    assert len(uncapped_eps) == n
+    assert uncapped["fanout_cap"] is None  # uncapped records None
+
+    # Capped: the hub's fanout truncates, so far fewer siblings survive.
+    capped = pipe.extract_subgraph("ep_000001", radius=2, fanout_cap=4)
+    assert capped["fanout_cap"] == 4
+    capped_eps = {x["id"] for x in capped["nodes"] if x["id"].startswith("ep_")}
+    assert len(capped_eps) < n            # the flood is bounded
+    assert "ep_000001" in capped_eps      # the center always survives
+    store.close()
+
+
+def test_extract_subgraph_fanout_cap_none_reproduces_uncapped(tmp_path):
+    """fanout_cap=None (the default) is byte-for-byte the uncapped path: the
+    same node and edge sets as calling without the kwarg. No existing caller
+    changes behavior."""
+    store, pipe = _pipe(tmp_path)
+    for i in range(1, 21):
+        store.encode_episode(_ep(f"ep_{i:06d}", entities=["Hub"], user=f"u{i}"))
+
+    default = pipe.extract_subgraph("ep_000001", radius=2)
+    explicit_none = pipe.extract_subgraph("ep_000001", radius=2, fanout_cap=None)
+
+    nodes_default = {x["id"] for x in default["nodes"]}
+    nodes_none = {x["id"] for x in explicit_none["nodes"]}
+    assert nodes_default == nodes_none
+    edges_default = {(e["subject"], e["predicate"], e["object"])
+                     for e in default["edges"]}
+    edges_none = {(e["subject"], e["predicate"], e["object"])
+                  for e in explicit_none["edges"]}
+    assert edges_default == edges_none
+    store.close()
+
+
+def test_extract_subgraph_fanout_cap_is_deterministic(tmp_path):
+    """The sorted-first-K cap is seedless + platform-independent (Python string
+    sort), so two extractions of the same center+radius+cap yield the SAME node
+    set. This is load-bearing: the label generator and the trainer must walk the
+    same bounded subgraph or the per-node anomaly labels misalign.
+    """
+    store, pipe = _pipe(tmp_path)
+    for i in range(1, 21):
+        store.encode_episode(_ep(f"ep_{i:06d}", entities=["Hub"], user=f"u{i}"))
+
+    a = pipe.extract_subgraph("ep_000001", radius=2, fanout_cap=4)
+    b = pipe.extract_subgraph("ep_000001", radius=2, fanout_cap=4)
+    nodes_a = {x["id"] for x in a["nodes"]}
+    nodes_b = {x["id"] for x in b["nodes"]}
+    assert nodes_a == nodes_b
+    store.close()
+
+
 # ── sampling ──
 # (The two ``test_labeling_prompt_*`` tests that exercised the dead
 # ``ORACLE_GNN_LABELING_PROMPT`` / ``build_labeling_prompt`` were removed in

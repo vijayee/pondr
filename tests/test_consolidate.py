@@ -121,3 +121,73 @@ def test_ontology_proposals_have_entity_class_shape(tmp_path):
         assert isinstance(p["class"], str)
         assert 0.0 <= p["confidence"] <= 1.0
     store.close()
+
+
+def test_anomaly_step_runs_second_bounded_forward(tmp_path):
+    """The anomaly step runs on a SEPARATE bounded subgraph (radius-2 + fanout-cap)
+    -- the giant-subgraph fix -- while the other 4 steps stay on the radius-3
+    giant. So ``loader.load`` is called TWICE per center: once with the default
+    (radius-3, no cap) for cluster/link/ontology/prune, and once with the bounded
+    radius+cap for anomaly. Train/serve parity: the head is served on the same
+    bounded graph it trained on.
+    """
+    store = _store(tmp_path)
+    _populate(store, n=4)
+    cons = Consolidator(
+        store, dry_run=True,
+        config=ConsolidationConfig(
+            anomaly_subgraph_radius=2, anomaly_fanout_cap=8))
+    # Spy on loader.load to record the (radius, fanout_cap) of every call.
+    calls: list[tuple[str, object, object]] = []
+    orig_load = cons.loader.load
+
+    def spy_load(center_id, radius=None, fanout_cap=None):
+        calls.append((center_id, radius, fanout_cap))
+        return orig_load(center_id, radius=radius, fanout_cap=fanout_cap)
+    cons.loader.load = spy_load
+
+    rep = cons.run(limit=2)
+    assert rep["subgraphs_scored"] == 2
+    # Two calls per scored center: the radius-3 giant (cluster/link/ontology/
+    # prune) + the bounded anomaly forward.
+    assert len(calls) == 2 * 2
+    # For each center: one default-radius call (radius None -> loader default 3,
+    # cap None -> uncapped) and one bounded call (radius 2, cap 8).
+    for center in ("ep_000001", "ep_000002"):
+        center_calls = [c for c in calls if c[0] == center]
+        assert len(center_calls) == 2
+        caps = {c[2] for c in center_calls}
+        radii = {c[1] for c in center_calls}
+        # The bounded anomaly call passes radius=2 + cap=8 explicitly.
+        assert (2, 8) in {(c[1], c[2]) for c in center_calls}
+        # The other call is the giant (radius None / cap None -> loader defaults).
+        assert None in caps and None in radii
+    store.close()
+
+
+def test_anomaly_step_degenerate_guard_reuses_giant(tmp_path):
+    """When anomaly_subgraph_radius >= 3 AND the cap is None (uncapped), the
+    bounded subgraph IS the radius-3 giant the other steps already loaded, so
+    the anomaly step reuses it -- no second ``loader.load``. This is the
+    degenerate guard that preserves the prior behavior when a caller configures
+    the old bound (e.g. ``--anomaly-radius 3 --anomaly-fanout-cap 0``).
+    """
+    store = _store(tmp_path)
+    _populate(store, n=4)
+    cons = Consolidator(
+        store, dry_run=True,
+        config=ConsolidationConfig(
+            anomaly_subgraph_radius=3, anomaly_fanout_cap=None))
+    calls: list[tuple] = []
+    orig_load = cons.loader.load
+
+    def spy_load(center_id, radius=None, fanout_cap=None):
+        calls.append((center_id, radius, fanout_cap))
+        return orig_load(center_id, radius=radius, fanout_cap=fanout_cap)
+    cons.loader.load = spy_load
+
+    rep = cons.run(limit=2)
+    assert rep["subgraphs_scored"] == 2
+    # ONE call per center (the giant only) -- the guard skipped the second load.
+    assert len(calls) == 2
+    store.close()

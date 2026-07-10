@@ -161,7 +161,7 @@ class Consolidator:
                 out = self.model(data)
             self._step_cluster(data, out, report)
             self._step_predict(data, out, report)
-            self._step_anomaly(data, out, report)
+            self._step_anomaly_bounded(data, out, center, report)
             self._step_ontology(data, out, report)
             self._step_prune(data, out, report)
 
@@ -242,6 +242,39 @@ class Consolidator:
         self._accumulate_hist(
             report["score_distributions"]["linkpred"],
             link_scores, self.cfg.score_collect_bar)
+
+    def _step_anomaly_bounded(self, data, out, center, report: dict) -> None:
+        """Run the anomaly step on the SAME bounded subgraph the head trained on.
+
+        The anomaly head is the ONE head bounded in isolation (giant-subgraph
+        data-quality fix): it trained on radius-``cfg.anomaly_subgraph_radius`` +
+        ``cfg.anomaly_fanout_cap`` subgraphs, so serving it on the radius-3 giant
+        ``data``/``out`` (which the other 4 steps use) would re-introduce the
+        ``duplicate_episode`` flood the bound was meant to remove -- train/serve
+        skew. So this loads a second bounded subgraph for ``center`` and forwards
+        it, then flags anomalies on THAT output.
+
+        Degenerate guard: when ``anomaly_subgraph_radius >= 3`` AND the cap is
+        None (uncapped), the bounded subgraph IS the radius-3 giant -- the same
+        graph ``data`` already loaded. Skip the redundant second load+forward and
+        flag on the existing ``out`` (preserves the prior behavior exactly when a
+        caller configures the old bound, e.g. ``--anomaly-radius 3
+        --anomaly-fanout-cap 0``).
+        """
+        radius = self.cfg.anomaly_subgraph_radius
+        cap = self.cfg.anomaly_fanout_cap
+        if radius >= 3 and cap is None:
+            # Bounded subgraph == the radius-3 giant already loaded -> reuse it.
+            self._step_anomaly(data, out, report)
+            return
+        anom_data = self.loader.load(center, radius=radius, fanout_cap=cap)
+        if anom_data.x.shape[0] < 2:
+            # Too small to score (e.g. an isolated center under a tight cap) ->
+            # no anomalies this center; honest, not faked.
+            return
+        with torch.no_grad():
+            anom_out = self.model(anom_data)
+        self._step_anomaly(anom_data, anom_out, report)
 
     def _step_anomaly(self, data, out, report: dict) -> None:
         """Flag nodes whose anomaly logits exceed 0.5 on any type."""

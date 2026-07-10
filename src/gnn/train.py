@@ -177,6 +177,39 @@ def _read_radius(labels_dir: Path, fallback: int) -> int:
     return fallback
 
 
+def _read_anomaly_radius_cap(
+    labels_dir: Path, fb_radius: int, fb_cap: Optional[int]
+) -> tuple[int, Optional[int]]:
+    """Read the anomaly head's subgraph bound from ``quality_report.json``.
+
+    The anomaly head is bounded in isolation from the Oracle heads (giant-
+    subgraph data-quality fix): it trains on radius-``anomaly_radius`` subgraphs
+    with a per-node ``anomaly_fanout_cap`` (None = uncapped), while the Oracle
+    heads stay at the global ``radius`` (read by ``_read_radius``). The generator
+    writes both fields; this reads them so the trainer walks the SAME bounded
+    subgraph the labels were generated on (generator<->trainer alignment).
+
+    Falls back to ``fb_radius`` / ``fb_cap`` when the report is absent or the
+    fields are missing (e.g. an old report from before the bound existed ->
+    ``anomaly_radius`` falls back to the global radius, cap to None = uncapped,
+    reproducing the prior giant behavior). ``anomaly_fanout_cap`` may be null in
+    the report (the ``--anomaly-fanout-cap 0`` sentinel) -> uncapped.
+    """
+    p = Path(labels_dir) / "quality_report.json"
+    if p.exists():
+        try:
+            with open(p, encoding="utf-8") as f:
+                rep = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return fb_radius, fb_cap
+        r = rep.get("anomaly_radius")
+        c = rep.get("anomaly_fanout_cap")
+        radius = r if isinstance(r, int) and r > 0 else fb_radius
+        cap = c if (c is None or (isinstance(c, int) and c > 0)) else fb_cap
+        return radius, cap
+    return fb_radius, fb_cap
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # OGB pretrain-then-transfer (pod-only, DEFERRED)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -223,7 +256,8 @@ def _ogb_pretrain(model: GNNModel, device: torch.device) -> int:
 # per-step build + forward
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _build_inputs(cfg, sid, store, loader, pipe, feat_for, labels, radius):
+def _build_inputs(cfg, sid, store, loader, pipe, feat_for, labels, radius,
+                  anomaly_radius, anomaly_fanout_cap):
     """Build the clean + corrupted ``Data`` for one center + its per-head labels.
 
     The clean heads (salience / link / cluster / ontology) train on the CLEAN
@@ -231,6 +265,11 @@ def _build_inputs(cfg, sid, store, loader, pipe, feat_for, labels, radius):
     REPRODUCED corrupted subgraph. So a joint (``all``) step builds BOTH when
     anomaly labels exist for this center; a single-head step builds only what it
     needs (one store walk, not two).
+
+    ``radius`` is the Oracle-head BFS radius (uncapped); ``anomaly_radius`` /
+    ``anomaly_fanout_cap`` bound the anomaly head's subgraph in isolation (the
+    giant-subgraph fix) so the corrupted subgraph the anomaly labels were
+    generated on == the one trained on (generator<->trainer alignment).
     """
     sal_lbl = labels["salience"].get(sid)
     link_lbl = labels["link_prediction"].get(sid)
@@ -244,7 +283,8 @@ def _build_inputs(cfg, sid, store, loader, pipe, feat_for, labels, radius):
 
     corrupted_data = None
     if need_anom and an_lbl is not None:
-        sub = pipe.extract_subgraph(sid, radius=radius)
+        sub = pipe.extract_subgraph(
+            sid, radius=anomaly_radius, fanout_cap=anomaly_fanout_cap)
         enriched = enrich_subgraph(store, copy.deepcopy(sub))
         corrupted, _ = inject_anomalies(
             enriched, seed=an_lbl.get("seed", 0), types=an_lbl.get("types"),
@@ -474,6 +514,17 @@ def train_gnn(
         "anomaly": _load_labels(labels_dir / "anomaly_labels.jsonl"),
     }
     radius = _read_radius(labels_dir, fallback=3)
+    # Anomaly head subgraph bound (giant-subgraph fix): the anomaly head trains
+    # on a bounded radius-2 + fanout-capped subgraph while the Oracle heads stay
+    # at the global `radius` above. Falls back to `radius`/None (the prior
+    # uncapped giant) when the report predates the bound. Only the anomaly
+    # branch in _build_inputs uses these; the clean branch ignores them.
+    anomaly_radius, anomaly_fanout_cap = _read_anomaly_radius_cap(
+        labels_dir, fb_radius=radius, fb_cap=None)
+    if cfg.head in ("all", "anomaly"):
+        print(f"  anomaly subgraph bound: radius={anomaly_radius}, "
+              f"fanout_cap={anomaly_fanout_cap} (Oracle heads stay radius={radius} "
+              f"uncapped)", file=sys.stderr, flush=True)
 
     # Centers: union for `all`, the selected head's centers otherwise.
     if cfg.head == "all":
@@ -586,6 +637,12 @@ def train_gnn(
             "head": head_name, "step": step_now, "epochs": cfg.epochs,
             "radius": radius, "device": str(device), "dtype": "float32",
             "param_count": param_count, "wall_clock_s": wall_now,
+            # Anomaly head subgraph bound (giant-subgraph fix): the anomaly branch
+            # trains on a bounded radius+cap subgraph while the Oracle heads use
+            # `radius` above. Recorded so a checkpoint's training subgraph is
+            # auditable (null cap = uncapped = the prior giant).
+            "anomaly_radius": anomaly_radius,
+            "anomaly_fanout_cap": anomaly_fanout_cap,
             "config": {
                 "hidden_dim": cfg.hidden_dim, "num_heads": cfg.num_heads,
                 "num_layers": cfg.num_layers, "lr": cfg.lr, "seed": cfg.seed,
@@ -621,7 +678,8 @@ def train_gnn(
         epoch_n = 0
         for sid in train_ids:
             cdata, andata, sal_lbl, link_lbl, ont_lbl, an_lbl = _build_inputs(
-                cfg, sid, store, loader, pipe, feat_for, labels, radius)
+                cfg, sid, store, loader, pipe, feat_for, labels, radius,
+                anomaly_radius, anomaly_fanout_cap)
             out = _forward(model, cfg, cdata, andata, sal_lbl, link_lbl, ont_lbl,
                            an_lbl, device, seed=cfg.seed + step,
                            tax_data=tax_data, class_index=class_index)
@@ -650,7 +708,8 @@ def train_gnn(
             with torch.no_grad():
                 for sid in val_ids:
                     cdata, andata, sal_lbl, link_lbl, ont_lbl, an_lbl = _build_inputs(
-                        cfg, sid, store, loader, pipe, feat_for, labels, radius)
+                        cfg, sid, store, loader, pipe, feat_for, labels, radius,
+                        anomaly_radius, anomaly_fanout_cap)
                     out = _forward(model, cfg, cdata, andata, sal_lbl, link_lbl,
                                    ont_lbl, an_lbl, device, seed=cfg.seed + step,
                                    tax_data=tax_data, class_index=class_index)

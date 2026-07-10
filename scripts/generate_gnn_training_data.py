@@ -447,6 +447,25 @@ def main() -> int:
     parser.add_argument("--skip-anomaly-decision-pairs", action="store_true",
                         help="Skip the anomaly_decision_pairs Bonsai task (the anomaly head "
                              "labels are still written).")
+    parser.add_argument("--heads", nargs="+", default=["all"],
+                        help="Which heads to generate (default 'all' = salience link_prediction "
+                             "ontology cluster anomaly). The Oracle heads (salience/link/ontology/"
+                             "cluster) train on radius-3 uncapped subgraphs; anomaly is Oracle-FREE "
+                             "and gets its OWN bounded subgraphs (--anomaly-radius / --anomaly-fanout-"
+                             "cap). 'anomaly' alone regenerates ONLY the anomaly labels at the bounded "
+                             "radius/cap, leaving the cached Oracle-head labels untouched -- the cheap "
+                             "regen path ($0, no radius-3 giant extraction).")
+    parser.add_argument("--anomaly-radius", type=int, default=2,
+                        help="BFS radius for the anomaly head's subgraph (default 2 -- keeps the "
+                             "sibling-episode comparison set ep-has_entity-E-has_entity-ep_sibling "
+                             "without the radius-3 giant flood via entity hubs). The Oracle heads "
+                             "always use --subgraph-radius (default 3) uncapped.")
+    parser.add_argument("--anomaly-fanout-cap", type=int, default=64,
+                        help="Per-node BFS fanout cap for the anomaly head's subgraph (bounds the "
+                             "entity-hub flood that otherwise reaches thousands of episodes; 0 = "
+                             "uncapped = the prior 10,680-node-giant behavior, for comparison). The "
+                             "Oracle heads are always uncapped (their labels are cache-keyed by the "
+                             "node set).")
     add_oracle_args(parser)
     args = parser.parse_args()
 
@@ -455,6 +474,24 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     bonsai_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Which heads to generate. "all" -> every head. The Oracle heads
+    # (salience/link/ontology/cluster) share the radius-3 uncapped subgraphs; the
+    # anomaly head is Oracle-free and gets its OWN bounded subgraphs, so it is
+    # extracted separately (below). ``--heads anomaly`` regenerates ONLY anomaly
+    # (cheap: no radius-3 giant extraction, no Oracle calls) and leaves the
+    # cached Oracle-head label files untouched.
+    requested = set(args.heads)
+    valid = {"all", "salience", "link_prediction", "ontology", "cluster", "anomaly"}
+    unknown = requested - valid
+    if unknown:
+        parser.error(f"unknown --heads value(s): {sorted(unknown)} "
+                     f"(valid: {sorted(valid)})")
+    if "all" in requested:
+        requested = {"salience", "link_prediction", "ontology", "cluster", "anomaly"}
+    oracle_heads = {"salience", "link_prediction", "ontology", "cluster"}
+    # Resolve the anomaly fanout sentinel: 0 = uncapped (None) = the prior giant.
+    anomaly_cap = args.anomaly_fanout_cap if args.anomaly_fanout_cap > 0 else None
+
     store = HippocampalStore(args.db)
     try:
         pipe = OracleLabelingPipeline(store)
@@ -462,34 +499,71 @@ def main() -> int:
         oracle = make_oracle(args, output_dir)
 
         # ── 1. Extract subgraphs (deterministic; not Oracle-dependent) ──
-        print("Extracting subgraphs from memory graph...")
+        # The Oracle heads train on radius-3 uncapped subgraphs (their Oracle
+        # labels are cache-keyed by the node set; bounding them = cache miss =
+        # paid re-label). Anomaly is Oracle-free (inject->detect), so its
+        # subgraphs are bounded at --anomaly-radius / --anomaly-fanout-cap -- the
+        # giant-subgraph fix. Both use the SAME center list (episode ids) so the
+        # per-center labels join by subgraph_id and the trainer walks the same
+        # bounded subgraph the labels were generated on.
         centers = sample_episode_centers(store, n=args.num_subgraphs)
+
+        need_oracle_subs = bool(requested & oracle_heads)
+        need_anomaly_subs = "anomaly" in requested
+
         subgraphs: list[dict] = []
-        for c in centers:
-            sg = pipe.extract_subgraph(c, radius=args.subgraph_radius)
-            if len(sg["nodes"]) >= 3:  # minimum viable subgraph
-                subgraphs.append(sg)
-        # Hydrate episode content for the salience/link shard prompts (mutates
-        # in place; the anomaly path enriches a separate deepcopy).
-        for sg in subgraphs:
-            _hydrate_episodes(traversal, sg)
-        max_nodes = max((len(sg["nodes"]) for sg in subgraphs), default=0)
-        print(f"Extracted {len(subgraphs)} subgraphs (radius={args.subgraph_radius}, "
-              f"max nodes={max_nodes})")
+        max_nodes = 0
+        if need_oracle_subs:
+            print(f"Extracting Oracle-head subgraphs (radius={args.subgraph_radius})...")
+            for c in centers:
+                sg = pipe.extract_subgraph(c, radius=args.subgraph_radius)
+                if len(sg["nodes"]) >= 3:  # minimum viable subgraph
+                    subgraphs.append(sg)
+            # Hydrate episode content for the salience/link shard prompts (mutates
+            # in place; the anomaly path enriches a separate deepcopy).
+            for sg in subgraphs:
+                _hydrate_episodes(traversal, sg)
+            max_nodes = max((len(sg["nodes"]) for sg in subgraphs), default=0)
+            print(f"Extracted {len(subgraphs)} Oracle subgraphs (radius="
+                  f"{args.subgraph_radius}, max nodes={max_nodes})")
+
+        anomaly_subgraphs: list[dict] = []
+        if need_anomaly_subs:
+            print(f"Extracting anomaly subgraphs (radius={args.anomaly_radius}, "
+                  f"fanout_cap={anomaly_cap})...")
+            for c in centers:
+                sg = pipe.extract_subgraph(
+                    c, radius=args.anomaly_radius, fanout_cap=anomaly_cap)
+                if len(sg["nodes"]) >= 3:
+                    anomaly_subgraphs.append(sg)
+            anom_max = max((len(sg["nodes"]) for sg in anomaly_subgraphs), default=0)
+            print(f"Extracted {len(anomaly_subgraphs)} anomaly subgraphs (radius="
+                  f"{args.anomaly_radius}, cap={anomaly_cap}, max nodes={anom_max})")
 
         sharded = args.sharding == "on" or (
             args.sharding == "auto"
             and (args.subgraph_radius >= 2 or max_nodes > args.shard_threshold)
         )
-        print(f"Sharding: {args.sharding} -> {'sharded' if sharded else 'one-call'} "
-              f"(salience/link/ontology); anomaly=injection; cluster=self-supervised")
+        # Sharding only applies to the Oracle heads (salience/link/ontology); if
+        # none are requested the decision is moot -- report active=False honestly
+        # rather than a would-be-True that never engaged.
+        sharding_active = sharded if need_oracle_subs else False
+        if need_oracle_subs:
+            print(f"Sharding: {args.sharding} -> {'sharded' if sharded else 'one-call'} "
+                  f"(salience/link/ontology); cluster=self-supervised")
+        print(f"Anomaly: injection (0 Oracle calls) at radius={args.anomaly_radius}, "
+              f"cap={anomaly_cap}")
 
         ontology_json = json.dumps(SEED_ONTOLOGY, ensure_ascii=False)
         all_stats: dict = {}
+        decision_items: list[dict] = []
         start_time = time.time()
 
         # ── 2. Oracle-labelable heads: salience / link / ontology ──
         for task_name, prompt_fn, output_file, needs_ontology in ONECALL_TASKS:
+            if task_name not in requested:
+                all_stats[task_name] = {"skipped": True}
+                continue
             print(f"\n{'=' * 60}\nGenerating {task_name} labels...\n{'=' * 60}")
             if sharded:
                 if task_name == "salience":
@@ -518,34 +592,51 @@ def main() -> int:
                   f"${stats.get('total_cost', 0.0):.4f}")
 
         # ── 3. Cluster (DiffPool) — self-supervised or weakly supervised ──
-        print(f"\n{'=' * 60}\nGenerating cluster labels...\n{'=' * 60}")
-        _, cluster_stats = _run_cluster(oracle, subgraphs, output_dir, args)
-        all_stats["cluster"] = cluster_stats
-        print(f"  cluster: {'self-supervised (0 Oracle calls)' if not args.oracle_cluster_supervision else str(cluster_stats.get('labeled', 0)) + ' labels'}")
+        if "cluster" not in requested:
+            all_stats["cluster"] = {"skipped": True}
+        else:
+            print(f"\n{'=' * 60}\nGenerating cluster labels...\n{'=' * 60}")
+            _, cluster_stats = _run_cluster(oracle, subgraphs, output_dir, args)
+            all_stats["cluster"] = cluster_stats
+            print(f"  cluster: {'self-supervised (0 Oracle calls)' if not args.oracle_cluster_supervision else str(cluster_stats.get('labeled', 0)) + ' labels'}")
 
         # ── 4. Anomaly — Oracle-FREE injection labeling + decision items ──
-        print(f"\n{'=' * 60}\nGenerating anomaly labels (injection, 0 Oracle)...\n{'=' * 60}")
-        anomaly_records, decision_items, injection_stats = _run_anomaly(
-            subgraphs, store, output_dir, args)
-        all_stats["anomaly"] = {
-            "labeled": len(anomaly_records), "total_cost": 0.0,
-            "oracle_calls": 0, "decision_items": len(decision_items),
-            "injection": injection_stats,
-        }
-        print(f"  anomaly: {len(anomaly_records)} records (0 Oracle calls), "
-              f"{len(decision_items)} decision candidates")
+        if "anomaly" not in requested:
+            all_stats["anomaly"] = {"skipped": True}
+        else:
+            print(f"\n{'=' * 60}\nGenerating anomaly labels (injection, 0 Oracle)...\n{'=' * 60}")
+            anomaly_records, decision_items, injection_stats = _run_anomaly(
+                anomaly_subgraphs, store, output_dir, args)
+            all_stats["anomaly"] = {
+                "labeled": len(anomaly_records), "total_cost": 0.0,
+                "oracle_calls": 0, "decision_items": len(decision_items),
+                "injection": injection_stats,
+            }
+            print(f"  anomaly: {len(anomaly_records)} records (0 Oracle calls), "
+                  f"{len(decision_items)} decision candidates")
 
         # ── 5. anomaly_decision_pairs — Bonsai distillation data (spec §2.5) ──
-        print(f"\n{'=' * 60}\nGenerating anomaly_decision_pairs (Bonsai)...\n{'=' * 60}")
-        _, decision_stats = _run_anomaly_decision(oracle, decision_items, bonsai_output_dir, args)
-        all_stats["anomaly_decision"] = decision_stats
-        print(f"  anomaly_decision: {decision_stats.get('labeled', 0)} pairs, "
-              f"${decision_stats.get('total_cost', 0.0):.4f}")
+        if "anomaly" not in requested:
+            all_stats["anomaly_decision"] = {"skipped": True}
+        else:
+            print(f"\n{'=' * 60}\nGenerating anomaly_decision_pairs (Bonsai)...\n{'=' * 60}")
+            _, decision_stats = _run_anomaly_decision(oracle, decision_items, bonsai_output_dir, args)
+            all_stats["anomaly_decision"] = decision_stats
+            print(f"  anomaly_decision: {decision_stats.get('labeled', 0)} pairs, "
+                  f"${decision_stats.get('total_cost', 0.0):.4f}")
 
         report = {
-            "total_subgraphs": len(subgraphs),
+            "total_subgraphs": len(subgraphs) if need_oracle_subs else len(anomaly_subgraphs),
             "radius": args.subgraph_radius,
-            "sharding": {"mode": args.sharding, "active": sharded,
+            # Anomaly head subgraph bound (the giant-subgraph fix). The trainer
+            # reads these for the anomaly branch; the other 4 heads use "radius"
+            # above. ALWAYS written (both --heads modes) so a later regen can't
+            # drop the fields the trainer reads. anomaly_fanout_cap is null when
+            # uncapped (the --anomaly-fanout-cap 0 sentinel).
+            "anomaly_radius": args.anomaly_radius,
+            "anomaly_fanout_cap": anomaly_cap,
+            "heads": sorted(requested),
+            "sharding": {"mode": args.sharding, "active": sharding_active,
                          "shard_size": args.shard_size,
                          "max_candidate_pairs": args.max_candidate_pairs,
                          "shard_threshold": args.shard_threshold, "max_nodes": max_nodes},

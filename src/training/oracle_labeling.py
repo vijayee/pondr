@@ -81,10 +81,24 @@ class OracleLabelingPipeline:
         self.store = store
         self.graph = store.graph
 
-    def _get_neighbors(self, node_id: str) -> list[tuple[str, str, str]]:
+    def _get_neighbors(
+        self, node_id: str, fanout_cap: Optional[int] = None
+    ) -> list[tuple[str, str, str]]:
         """Return ``(neighbor_id, predicate, direction)`` for all node-to-node
         edges incident to ``node_id``. direction is "out" (node→neighbor) or
         "in" (neighbor→node) — recorded so the caller can orient the edge.
+
+        ``fanout_cap`` bounds the per-node fanout: when set, the aggregated
+        neighbor list (all 9 predicates, both directions) is truncated to the
+        first ``fanout_cap`` entries by ``sorted()`` node-id. This caps the
+        high-degree entity hubs that would otherwise flood a radius-2 subgraph
+        (one entity shared by thousands of episodes returns all of them).
+        Low-degree nodes (fewer neighbors than the cap) are untouched, so only
+        hubs truncate. The ``sorted()``-first-K selection is deterministic and
+        platform-independent (seedless), so two callers extract the SAME node
+        set for a given center — load-bearing: the label generator and the
+        trainer must walk the same bounded subgraph or the per-node anomaly
+        labels misalign. ``None`` (default) = uncapped = exact prior behavior.
         """
         out: list[tuple[str, str, str]] = []
         for pred in _NODE_PREDICATES:
@@ -99,16 +113,29 @@ class OracleLabelingPipeline:
                     result.close()
                 for nb in neighbors:
                     out.append((nb, pred, direction))
+        if fanout_cap is not None and len(out) > fanout_cap:
+            # Deterministic truncation: sort by neighbor id so the same node
+            # yields the same capped neighbor set on every call (and across
+            # the generator and trainer). A hub shared by thousands of
+            # episodes thus contributes a stable slice of siblings rather than
+            # the whole flood.
+            out = sorted(out, key=lambda t: t[0])[:fanout_cap]
         return out
 
-    def extract_subgraph(self, center_id: str, radius: int = 3) -> dict:
+    def extract_subgraph(
+        self, center_id: str, radius: int = 3, fanout_cap: Optional[int] = None
+    ) -> dict:
         """BFS from ``center_id`` up to ``radius`` hops over node-to-node edges.
 
-        Returns ``{"center": center_id, "radius": radius, "nodes": [...],
-        "edges": [...]}`` where each node is ``{"id", "type", "depth"}`` (depth
-        = hop distance from the center) and each edge is ``{"subject",
+        Returns ``{"center": center_id, "radius": radius, "fanout_cap", "nodes":
+        [...], "edges": [...]}`` where each node is ``{"id", "type", "depth"}``
+        (depth = hop distance from the center) and each edge is ``{"subject",
         "predicate", "object"}`` with directions normalized so subject→object
         matches the stored triple orientation.
+
+        ``fanout_cap`` (default ``None``) bounds each node's fanout during the
+        BFS — see ``_get_neighbors``. ``None`` reproduces the prior uncapped
+        behavior exactly (no caller changes, no test breakage).
         """
         nodes: dict[str, dict] = {
             center_id: {"id": center_id, "type": _node_type(center_id), "depth": 0}
@@ -124,7 +151,7 @@ class OracleLabelingPipeline:
             visited.add(node_id)
             if depth >= radius:
                 continue
-            for nb, pred, direction in self._get_neighbors(node_id):
+            for nb, pred, direction in self._get_neighbors(node_id, fanout_cap):
                 # Orient the edge so subject→object reflects stored direction:
                 # "out" means node_id → nb; "in" means nb → node_id.
                 if direction == "out":
@@ -139,6 +166,7 @@ class OracleLabelingPipeline:
         return {
             "center": center_id,
             "radius": radius,
+            "fanout_cap": fanout_cap,
             "nodes": list(nodes.values()),
             "edges": [{"subject": s, "predicate": p, "object": o}
                       for (s, p, o) in edges],

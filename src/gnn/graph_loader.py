@@ -149,17 +149,36 @@ class WaveDBGraphLoader:
         store: "HippocampalStore",
         radius: int = 3,
         predicate_vocab_size: int = PREDICATE_VOCAB,
+        fanout_cap: Optional[int] = None,
     ) -> None:
         self.store = store
         self.radius = radius
         self.predicate_vocab_size = predicate_vocab_size
+        # Per-node BFS fanout cap (see OracleLabelingPipeline._get_neighbors):
+        # ``None`` = uncapped = the prior 10,680-node-giant behavior. A set cap
+        # bounds the high-degree entity hubs so radius-2 subgraphs don't flood
+        # to ~5,000 unrelated episodes. Default ``None`` keeps every existing
+        # caller on the uncapped path (no behavior change).
+        self.fanout_cap = fanout_cap
         self._pipe = OracleLabelingPipeline(store)
         self._features = NodeFeatureBuilder(store)
 
-    def load(self, center_id: str, radius: Optional[int] = None) -> Data:
-        """Load the radius-``r`` subgraph around ``center_id`` as PyG ``Data``."""
+    def load(
+        self,
+        center_id: str,
+        radius: Optional[int] = None,
+        fanout_cap: Optional[int] = None,
+    ) -> Data:
+        """Load the radius-``r`` subgraph around ``center_id`` as PyG ``Data``.
+
+        ``radius``/``fanout_cap`` override the instance defaults when given; both
+        fall back to the instance value (and the instance ``fanout_cap`` defaults
+        to ``None`` = uncapped). The loader and the Phase-1d label generator walk
+        the same bounded subgraph for a given center + radius + cap.
+        """
         r = self.radius if radius is None else radius
-        sub = self._pipe.extract_subgraph(center_id, radius=r)
+        c = self.fanout_cap if fanout_cap is None else fanout_cap
+        sub = self._pipe.extract_subgraph(center_id, radius=r, fanout_cap=c)
         return data_from_subgraph(
             sub,
             self._features.feature_for,

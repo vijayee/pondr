@@ -3,6 +3,7 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
 @dataclass
@@ -209,6 +210,16 @@ class ConsolidationConfig:
     # report supports a threshold sweep without re-running. 0.0 collects all
     # (bins are just 10 int counts per category -- tiny).
     score_collect_bar: float = 0.0
+    # Anomaly head subgraph bound (the giant-subgraph data-quality fix). The
+    # other 4 heads stay radius-3 uncapped (their Oracle labels are cached and
+    # cache-keyed by the node set; bounding them = cache miss = paid re-label).
+    # Anomaly is Oracle-free (inject->detect), so its subgraph is bounded in
+    # isolation: radius-2 keeps the sibling-episode comparison set (ep -has_entity-
+    # E: -has_entity- ep_sibling is 2 hops) and fanout_cap stops the entity hub from
+    # flooding to thousands of unrelated episodes. radius-3 + None cap reproduces
+    # the prior giant behavior (degenerate guard in consolidate.py).
+    anomaly_subgraph_radius: int = 2
+    anomaly_fanout_cap: Optional[int] = 64
 
 
 @dataclass
@@ -223,6 +234,14 @@ class LabelGenConfig:
     num_subgraphs: int = 4000
     subgraph_radius: int = 3
     neg_edge_ratio: float = 1.0  # negatives per positive for link prediction
+    # Anomaly head subgraph bound (mirror of ConsolidationConfig's fields; the
+    # generator and the consolidator are separate flows so the two configs each
+    # carry the anomaly radius/cap). The generator writes these into
+    # quality_report.json; the trainer reads them so the bounded subgraph used to
+    # extract == the bounded subgraph used to train. Defaults match the
+    # consolidation defaults (radius=2, cap=64).
+    anomaly_subgraph_radius: int = 2
+    anomaly_fanout_cap: Optional[int] = 64
 
 
 @dataclass
