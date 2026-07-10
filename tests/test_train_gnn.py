@@ -100,11 +100,16 @@ def _write_labels(store, pipe, labels_dir: Path, radius: int = 2) -> None:
                     "negative_edges": [{"subject": "E:Bob", "object": "E:Alice"}],
                 },
             }) + "\n")
+            # Ontology labels are entity->class typing: ``child``/``entity`` is
+            # a real E: node in the subgraph, ``parent``/``suggested_class`` is a
+            # bare class NAME that exists in the seeded taxonomy (Person/Topic --
+            # both in SEED_ONTOLOGY, so build_taxonomy_data enumerates them and
+            # class_index resolves them to taxonomy rows).
             handles["ontology"].write(json.dumps({
                 "subgraph_id": sid,
                 "labels": {
-                    "suggested_edges": [{"child": "E:Alice", "parent": "T:db"}],
-                    "misclassified": [],
+                    "suggested_edges": [{"child": "E:Alice", "parent": "Person"}],
+                    "misclassified": [{"entity": "E:Bob", "suggested_class": "Topic"}],
                 },
             }) + "\n")
             # Cluster is self-supervised (empty labels, 0 Oracle) -> the diffpool
@@ -171,6 +176,82 @@ def test_train_gnn_head_all_tiny(tmp_path):
                                               "ontology", "anomaly"}
         # Salience had real labels -> a real val metric (not None).
         assert summary["final_val"]["salience"] is not None
+        # Ontology: the two-encoder path resolves E:Alice->Person + E:Bob->Topic
+        # against the seeded taxonomy (Person/Topic are SEED_ONTOLOGY classes, so
+        # build_taxonomy_data enumerates them) -> pairs scoreable -> a REAL val
+        # metric, not None (the bug this rework fixes: the old single-encoder head
+        # resolved 0/23 -> untrained).
+        assert summary["final_val"]["ontology"] is not None
+        assert summary["head_steps"]["ontology"] > 0
+        # The taxonomy encoder weights are in the checkpoint, and a fresh
+        # GNNModel strict-loads it (the consolidation loader's contract).
+        assert any(k.startswith("taxonomy.") for k in state)
+        fresh2 = GNNModel(hidden_dim=32, num_heads=2, num_layers=2,
+                          predicate_vocab_size=32, num_clusters=16)
+        fresh2.load_state_dict(torch.load(all_pt, map_location="cpu", weights_only=True))
+    finally:
+        store.close()
+
+
+def test_train_gnn_head_ontology_only(tmp_path):
+    """``--head ontology`` trains the taxonomy encoder + the ontology head (the
+    cheap CPU path to a trained ontology head without re-running the GPU backbone
+    -- backbone cold-starts here since no --backbone-checkpoint)."""
+    store = _seed_store(tmp_path)
+    try:
+        pipe = OracleLabelingPipeline(store)
+        labels_dir = tmp_path / "labels"
+        ckpt_dir = tmp_path / "ckpt_ont"
+        _write_labels(store, pipe, labels_dir, radius=2)
+
+        summary = train_gnn(_toy_cfg(ckpt_dir, head="ontology"), store, labels_dir)
+
+        # Single-head run writes exactly one checkpoint (ontology.pt, NOT all.pt).
+        assert len(summary["checkpoints"]) == 1
+        assert Path(ckpt_dir / "ontology.pt").exists()
+        # The ontology head + taxonomy encoder actually trained (steps > 0).
+        assert summary["head_steps"]["ontology"] > 0
+        # Pairs resolved against the seeded taxonomy -> a real val metric.
+        assert summary["final_val"]["ontology"] is not None
+        # The taxonomy encoder weights are in ontology.pt (single-head .pt still
+        # carries the full state_dict, per the checkpoint contract).
+        state = torch.load(ckpt_dir / "ontology.pt", map_location="cpu", weights_only=True)
+        assert any(k.startswith("taxonomy.") for k in state)
+        # Only the ontology head was tracked; other heads untouched.
+        assert set(summary["final_val"]) == {"ontology"}
+        assert summary["head_steps"]["salience"] == 0
+    finally:
+        store.close()
+
+
+def test_train_gnn_head_ontology_with_backbone_checkpoint(tmp_path):
+    """``--head ontology --backbone-checkpoint all.pt`` loads a backbone
+    checkpoint, freezes input_proj + GAT layers, and refines the taxonomy encoder
+    + ontology head on top. Exercises the strict=False backbone-load path (a
+    pre-taxonomy GPU all.pt would load with only taxonomy.* keys missing)."""
+    store = _seed_store(tmp_path)
+    try:
+        pipe = OracleLabelingPipeline(store)
+        labels_dir = tmp_path / "labels"
+        _write_labels(store, pipe, labels_dir, radius=2)
+
+        # First: a joint run to produce a backbone checkpoint (all.pt carries the
+        # full state_dict, including the taxonomy encoder).
+        all_dir = tmp_path / "ckpt_all"
+        train_gnn(_toy_cfg(all_dir, head="all"), store, labels_dir)
+        all_pt = all_dir / "all.pt"
+        assert all_pt.exists()
+
+        # Then: --head ontology --backbone-checkpoint all.pt. Backbone frozen; the
+        # taxonomy encoder + ontology head refine on top.
+        ont_dir = tmp_path / "ckpt_ont_bb"
+        cfg = _toy_cfg(ont_dir, head="ontology")
+        cfg.backbone_checkpoint = str(all_pt)
+        summary = train_gnn(cfg, store, labels_dir)
+
+        assert Path(ont_dir / "ontology.pt").exists()
+        assert summary["head_steps"]["ontology"] > 0
+        assert summary["final_val"]["ontology"] is not None
     finally:
         store.close()
 

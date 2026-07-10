@@ -223,15 +223,35 @@ class AnomalyHead(nn.Module):
             return float(sum(f1s) / max(1, len(f1s)))
 
 
-# ── 5. Ontology-refinement head ──
+# ── 5. Ontology-typing head (two-encoder pair classifier) ──
 class OntologyHead(nn.Module):
-    """Proposes ``subClassOf`` edges as a pair classifier.
+    """Entity->class typing as a pair classifier over TWO encoders.
 
-    Score(u, v) = sigmoid(MLP(concat(emb[u], emb[v]))). Target: the Oracle
-    ``ontology_labels`` proposed-hierarchy pairs
-    (``prompts.gnn_ontology_prompt``). The ontology is materialized as real
-    ``subClassOf`` triples at ``store._seed_ontology``, so this head has a real
-    edge set to refine; Bonsai-gated before any proposed edge is written (Task 6).
+    ``score(entity, class) = sigmoid(MLP(concat(emb_entity, emb_class)))`` where
+    ``emb_entity`` comes from the episode GAT backbone (the entity's row in the
+    episode subgraph) and ``emb_class`` comes from the taxonomy encoder over the
+    live class DAG (``TaxonomyEncoder`` in ``model.py``). The two endpoints live
+    in DIFFERENT graphs -- an episode entity and a taxonomy class share no
+    subgraph (entities have ``in_episode`` edges; classes have only class-to-
+    class ``subClassOf`` edges; the entity->class membership edge is what this
+    head predicts, so it cannot also be the path that feeds it). A single
+    per-subgraph ``node_emb`` cannot hold both, hence the two-encoder design.
+
+    Target: the Oracle ``ontology_labels`` -- ``suggested_edges`` (child=entity,
+    parent=class) AND ``misclassified`` (entity, suggested_class) are BOTH
+    entity->class typing labels, unified by ``label_tensors.ontology_target``.
+
+    Open-vocabulary: the class side is the live class DAG, not a fixed table. A
+    new class discovered at runtime is added to the DAG with a parent
+    ``subClassOf`` edge; the taxonomy encoder produces an embedding for it next
+    pass via message passing from its parent -- no retraining of this head's
+    ``net`` is needed to score a new class (vision sec 5.3).
+
+    Honest scope (deferred, NOT faked): (a) class->class ``subClassOf`` refinement
+    -- no class->class labels exist, so this head does not propose taxonomy edges;
+    (b) new-class creation is a Bonsai-gated consolidation ACTION, not a head
+    output; (c) Bonsai gating on the ontology step is not wired (only link-pred
+    calls the verifier today) -- consolidation records proposals but writes none.
     """
 
     def __init__(self, hidden_dim: int, dropout: float = 0.1) -> None:
@@ -244,14 +264,21 @@ class OntologyHead(nn.Module):
         )
 
     def forward(
-        self, node_emb: torch.Tensor, pair_index: torch.Tensor
+        self,
+        entity_emb: torch.Tensor,
+        class_emb: torch.Tensor,
+        pair_index: torch.Tensor,
     ) -> torch.Tensor:
-        """Score the node pairs in ``pair_index`` ``[2, P]`` → ``[P]`` probs."""
+        """Score the entity/class pairs in ``pair_index`` ``[2, P]`` -> ``[P]``.
+
+        ``pair_index[0]`` indexes ``entity_emb`` (episode subgraph rows);
+        ``pair_index[1]`` indexes ``class_emb`` (taxonomy DAG rows).
+        """
         if pair_index.shape[1] == 0:
-            return torch.zeros(0, device=node_emb.device)
-        u, v = pair_index[0], pair_index[1]
-        cat = torch.cat([node_emb[u], node_emb[v]], dim=-1)
-        return torch.sigmoid(self.net(cat).squeeze(-1))
+            return torch.zeros(0, device=entity_emb.device)
+        e = entity_emb[pair_index[0]]
+        c = class_emb[pair_index[1]]
+        return torch.sigmoid(self.net(torch.cat([e, c], dim=-1)).squeeze(-1))
 
     @staticmethod
     def loss(scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:

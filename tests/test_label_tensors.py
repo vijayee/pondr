@@ -5,9 +5,10 @@ No store, no model -- the builders are pure ``(Data, labels) -> tensor``. The
 function used in ``test_gnn_model.py``, plus hand-built label dicts in the
 authoritative schema the regenerated label files carry. Each test asserts one
 builder behavior in isolation: salience mask + values, link-pred pos/neg +
-bare-name endpoint resolution + skip-and-count, ontology suggested+sampled
-negatives + misclassified-not-a-pair, anomaly scatter (and the clean-subgraph
-all-zero true-negative case), and seeded train/val split.
+bare-name endpoint resolution + skip-and-count, ontology entity->class
+unification (suggested_edges + misclassified) + seeded negatives +
+class-not-in-DAG skip + class_vocab scan, anomaly scatter (and the clean-
+subgraph all-zero true-negative case), and seeded train/val split.
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ from src.gnn.anomaly_rules import ANOMALY_TYPE_INDEX, ANOMALY_TYPES
 from src.gnn.features import NODE_KIND_INDEX, NODE_KINDS, _hash_embedding, infer_kind
 from src.gnn.graph_loader import data_from_subgraph
 from src.gnn.label_tensors import (
-    anomaly_target, linkpred_pairs, ontology_pairs, salience_target, split_centers,
+    anomaly_target, class_vocab, linkpred_pairs, ontology_target, salience_target,
+    split_centers,
 )
 
 
@@ -159,30 +161,104 @@ def test_linkpred_pairs_falls_back_when_all_provided_negatives_unresolvable():
 
 # ── ontology ──
 
-def test_ontology_pairs_suggested_and_sampled_negatives():
+# A toy class_index: class NAME -> taxonomy-encoder row (built by the trainer
+# from the live class DAG; here it's a pure lookup so ontology_target is unit-
+# testable with no store).
+_Toy_CLASS_INDEX = {"Person": 0, "Topic": 1, "Concept": 2}
+
+
+def test_ontology_target_unifies_suggested_and_misclassified():
+    """Both label kinds are entity->class typing: unify into (entity_row,
+    class_row) positives + seeded (entity, other_class) negatives."""
     data = _toy_data()
-    labels = {"suggested_edges": [{"child": "E:Alice", "parent": "T:db"}],
-              "misclassified": []}
-    pt = ontology_pairs(data, labels, seed=3)
+    labels = {
+        "suggested_edges": [{"child": "E:Alice", "parent": "Person"}],
+        "misclassified": [{"entity": "E:Bob", "suggested_class": "Topic"}],
+    }
+    pt = ontology_target(data, labels, _Toy_CLASS_INDEX, seed=3)
     assert pt.edge_index is not None
     lbls = pt.labels.tolist()
-    assert 1.0 in lbls and 0.0 in lbls  # suggested positive + sampled negatives
-    # First pair is the suggested child->parent (label 1).
-    s, o = pt.edge_index[0].tolist(), pt.edge_index[1].tolist()
-    assert (s[0], o[0]) == (_row(data, "E:Alice"), _row(data, "T:db"))
-    assert lbls[0] == 1.0
+    assert 1.0 in lbls and 0.0 in lbls  # two positives + sampled negatives
+    # Row 0 indexes entity rows in data.node_id; row 1 indexes class rows.
+    ent_rows = pt.edge_index[0].tolist()
+    cls_rows = pt.edge_index[1].tolist()
+    # First two pairs are the positives (suggested then misclassified).
+    assert (ent_rows[0], cls_rows[0]) == (_row(data, "E:Alice"), 0)  # Person
+    assert (ent_rows[1], cls_rows[1]) == (_row(data, "E:Bob"), 1)     # Topic
+    assert lbls[0] == 1.0 and lbls[1] == 1.0
+    # Negatives reference real entity rows + real class rows only.
+    for er, cr in zip(ent_rows[2:], cls_rows[2:]):
+        assert er in range(len(data.node_id))
+        assert cr in _Toy_CLASS_INDEX.values()
+    assert pt.skipped == 0
 
 
-def test_ontology_pairs_misclassified_not_a_pair():
-    """``misclassified`` carries a class NAME, not a node id, so it can't form a
-    scoreable pair -- skipped honestly, not fabricated."""
+def test_ontology_target_bare_name_entity_resolution():
+    """The entity side may be a bare name (Oracle paraphrase); ``_resolve``
+    strips the prefix and matches against data.node_id."""
     data = _toy_data()
-    labels = {"suggested_edges": [],
-              "misclassified": [{"entity": "E:Alice", "suggested_class": "T:db"}]}
-    pt = ontology_pairs(data, labels, seed=0)
-    # No suggested positives -> no negatives sampled (n=0) -> no pairs.
+    labels = {"suggested_edges": [{"child": "Alice", "parent": "Person"}],
+              "misclassified": []}
+    pt = ontology_target(data, labels, _Toy_CLASS_INDEX, seed=0)
+    assert pt.edge_index is not None
+    assert pt.edge_index[0].tolist()[0] == _row(data, "E:Alice")
+    assert pt.edge_index[1].tolist()[0] == 0  # Person
+
+
+def test_ontology_target_skips_class_not_in_dag():
+    """A class name absent from ``class_index`` (an Oracle-suggested class not
+    yet Bonsai-promoted to a seed-anchored subClassOf edge) can't form a
+    scoreable pair -- skipped + counted, not fabricated."""
+    data = _toy_data()
+    labels = {"suggested_edges": [{"child": "E:Alice", "parent": "Nonexistent"}],
+              "misclassified": []}
+    pt = ontology_target(data, labels, _Toy_CLASS_INDEX, seed=0)
+    # No resolvable positives -> no negatives sampled (n=0) -> no pairs.
     assert pt.edge_index is None
-    assert pt.skipped == 1  # the one misclassified record, counted honestly
+    assert pt.skipped == 1
+
+
+def test_ontology_target_empty_returns_none():
+    data = _toy_data()
+    pt = ontology_target(data, {"suggested_edges": [], "misclassified": []},
+                         _Toy_CLASS_INDEX, seed=0)
+    assert pt.edge_index is None
+    assert pt.skipped == 0
+
+
+def test_ontology_target_dedupes_same_entity_class_pair():
+    """The same entity->class pair appearing in both kinds is ONE positive."""
+    data = _toy_data()
+    labels = {
+        "suggested_edges": [{"child": "E:Alice", "parent": "Person"}],
+        "misclassified": [{"entity": "E:Alice", "suggested_class": "Person"}],
+    }
+    pt = ontology_target(data, labels, _Toy_CLASS_INDEX, seed=0)
+    # Exactly one positive (deduped), plus sampled negatives.
+    pos = pt.labels.tolist().count(1.0)
+    assert pos == 1
+
+
+def test_class_vocab_scans_labels(tmp_path):
+    """``class_vocab`` reads the distinct class names from both label kinds."""
+    import json
+    p = tmp_path / "ontology_labels.jsonl"
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"subgraph_id": "ep_1", "labels": {
+            "suggested_edges": [{"child": "E:A", "parent": "Person"}],
+            "misclassified": [{"entity": "E:B", "suggested_class": "Topic"}],
+        }}) + "\n")
+        f.write(json.dumps({"subgraph_id": "ep_2", "labels": {
+            "suggested_edges": [{"child": "E:C", "parent": "Concept"}],
+            "misclassified": [],
+        }}) + "\n")
+    names = class_vocab(tmp_path)
+    assert names == ["Concept", "Person", "Topic"]  # sorted distinct
+
+
+def test_class_vocab_missing_file_is_empty(tmp_path):
+    """A missing ontology_labels.jsonl -> empty list (head never trainable)."""
+    assert class_vocab(tmp_path) == []
 
 
 # ── anomaly ──

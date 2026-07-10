@@ -33,6 +33,7 @@ from .graph_loader import WaveDBGraphLoader
 from .heads import ANOMALY_TYPES
 from .model import GNNModel
 from .semantic_memory import SemanticMemoryWriter
+from .taxonomy_graph import build_taxonomy_data
 
 if TYPE_CHECKING:
     from ..config import ConsolidationConfig
@@ -83,6 +84,14 @@ class Consolidator:
         # Max candidate non-edge pairs scored per subgraph (keeps the predict
         # phase tractable — all-pairs is O(N²)).
         self.max_candidates_per_subgraph = 16
+        # Lazy-cached class embeddings for the ontology head (two-encoder pair
+        # classifier: entity emb from the backbone, class emb from the taxonomy
+        # encoder over the live class DAG). Built on first _step_ontology call.
+        # The class DAG is fixed for the run; the (eval, no_grad) class_emb is
+        # reused across subgraphs. ``_class_names`` aligns class_emb rows to
+        # bare class names for the recorded proposals.
+        self._class_emb: Optional[torch.Tensor] = None
+        self._class_names: Optional[list[str]] = None
 
     # ── main pass ──
 
@@ -215,30 +224,63 @@ class Consolidator:
             })
 
     def _step_ontology(self, data, out, report: dict) -> None:
-        """Propose subClassOf edges for high ontology-score pairs (Bonsai-gated)."""
+        """Score entity vs candidate classes; record high-confidence typing proposals.
+
+        The ontology head is a TWO-encoder pair classifier: entity embeddings come
+        from the episode backbone (``out["node_emb"]`` at the entity rows), class
+        embeddings from the taxonomy encoder over the live class DAG. For each
+        entity in the subgraph we score it against a capped set of candidate
+        classes and record an ``entity -> class`` typing proposal above the
+        accept threshold.
+
+        HONEST scope (deferred, not faked): (a) class->class ``subClassOf``
+        refinement -- no class->class labels exist, so this head does NOT propose
+        taxonomy edges (it scores entity->class typing, not class hierarchy); (b)
+        new-class creation is a Bonsai-gated consolidation ACTION, not a head
+        output; (c) Bonsai gating on the ontology step is not wired (only
+        link-pred calls the verifier today) -- proposals are RECORDED only; ``_apply``
+        writes no ontology edges. The vision-complete path (Bonsai-gated promotion
+        of entity->class to a real ``instanceOf``/membership edge, + new-class
+        creation) is future work; the cold-start loop records proposals honestly.
+        """
+        if self._class_emb is None:
+            tax_data, _ = build_taxonomy_data(self.store)
+            tax_data = tax_data.to(self.device)
+            with torch.no_grad():
+                self._class_emb = self.model.encode_taxonomy(tax_data)
+            self._class_names = list(tax_data.node_id)
+
         node_ids = data.node_id
-        # Score entity/topic pairs as candidate subClassOf children→parents.
-        et_idx = [i for i, nid in enumerate(node_ids)
-                  if nid.startswith("E:") or nid.startswith("T:")]
-        if len(et_idx) < 2:
+        ent_idx = [i for i, nid in enumerate(node_ids) if nid.startswith("E:")]
+        n_classes = self._class_emb.shape[0]
+        if not ent_idx or n_classes == 0:
             return
-        pairs = []
-        for i in range(len(et_idx)):
-            for j in range(i + 1, len(et_idx)):
-                pairs.append((et_idx[i], et_idx[j]))
+
+        # Candidate classes per entity: deterministic offset slice across the
+        # class DAG (no RNG needed; the head is record-only at cold start, and a
+        # fixed rotation keeps proposals reproducible). Capped total per subgraph
+        # to keep the score phase tractable -- the full entity x class sweep is
+        # the deploy target, not the cold-start loop.
+        per_entity = max(1, self.max_candidates_per_subgraph // len(ent_idx))
+        pairs: list[tuple[int, int]] = []
+        for k, ei in enumerate(ent_idx):
+            for j in range(per_entity):
+                ci = (k * 7 + j * 3) % n_classes   # deterministic spread across classes
+                pairs.append((ei, ci))
                 if len(pairs) >= self.max_candidates_per_subgraph:
                     break
             if len(pairs) >= self.max_candidates_per_subgraph:
                 break
         if not pairs:
             return
+
         pair_index = torch.tensor(pairs, dtype=torch.long).t().contiguous()
         with torch.no_grad():
-            scores = self.model.ontology(out["node_emb"], pair_index)
-        for (s, o), score in zip(pairs, scores.tolist()):
+            scores = self.model.ontology(out["node_emb"], self._class_emb, pair_index)
+        for (ei, ci), score in zip(pairs, scores.tolist()):
             if score >= self.cfg.accept_threshold:
                 report["ontology_proposed"].append({
-                    "child": node_ids[s], "parent": node_ids[o],
+                    "entity": node_ids[ei], "class": self._class_names[ci],
                     "confidence": float(score),
                 })
 

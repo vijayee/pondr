@@ -6,7 +6,7 @@ import torch
 
 from src.gnn.graph_loader import data_from_subgraph, PREDICATE_VOCAB
 from src.gnn.features import FEATURE_DIM, NODE_KIND_INDEX, infer_kind, _hash_embedding, NODE_KINDS
-from src.gnn.model import GNNModel, InputProjection
+from src.gnn.model import GNNModel, InputProjection, TaxonomyEncoder
 from src.gnn.heads import (
     SalienceHead, DiffPoolHead, LinkPredHead, AnomalyHead, OntologyHead, ANOMALY_TYPES,
 )
@@ -58,7 +58,7 @@ def test_input_projection_uses_per_kind_layer():
     assert used == 3
 
 
-def test_model_forward_produces_all_five_head_shapes():
+def test_model_forward_produces_head_shapes():
     model = GNNModel(hidden_dim=64, num_heads=2, num_layers=2,
                      predicate_vocab_size=PREDICATE_VOCAB, num_clusters=4)
     model.eval()
@@ -69,7 +69,10 @@ def test_model_forward_produces_all_five_head_shapes():
     assert out["diffpool"].shape == (n, 4)
     assert out["linkpred"].shape == (e,)
     assert out["anomaly"].shape == (n, len(ANOMALY_TYPES))
-    assert out["ontology"].shape == (e,)
+    # Ontology is a two-encoder head (entity emb from this backbone + class emb
+    # from the taxonomy encoder over the class DAG); a single-graph forward has
+    # no class DAG, so it cannot score ontology pairs -> None (not faked).
+    assert out["ontology"] is None
     assert out["node_emb"].shape == (n, 64)
 
 
@@ -84,11 +87,18 @@ def test_each_head_loss_is_differentiable():
     dp = model.diffpool.loss(assign, data.edge_index)
     lp = model.linkpred.loss(out["linkpred"], torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0][:e]))
     an = model.anomaly.loss(out["anomaly"], torch.zeros(n, len(ANOMALY_TYPES)))
-    ont = model.ontology.loss(out["ontology"], torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0][:e]))
+    # Ontology: two-encoder pair classifier. Build a small class DAG Data and
+    # score entity rows against class rows through the taxonomy encoder.
+    tax = _toy_taxonomy_data(num_classes=3, hidden_dim=32)
+    class_emb = model.encode_taxonomy(tax)
+    pair_index = torch.tensor([[0, 1, 2], [0, 1, 2]])  # entity row -> class row
+    ont_scores = model.ontology(out["node_emb"][:3], class_emb, pair_index)
+    ont = model.ontology.loss(ont_scores, torch.tensor([1.0, 0.0, 1.0]))
     total = sal + dp + lp + an + ont
     total.backward()
-    # At least the backbone + the heads we exercised have gradients.
+    # The backbone, the heads, AND the taxonomy encoder all received gradients.
     assert sum(1 for p in model.parameters() if p.grad is not None) > 0
+    assert any(p.grad is not None for p in model.taxonomy.parameters())
 
 
 def test_salience_and_anomaly_heads_metric_ranges():
@@ -120,9 +130,40 @@ def test_diffpool_assignment_is_row_softmax():
 
 
 def test_ontology_head_scores_pairs():
+    """Two-encoder pair classifier: entity emb (episode rows) x class emb
+    (taxonomy rows) -> per-pair typing score."""
     ont = OntologyHead(16)
-    node_emb = torch.randn(4, 16)
-    pairs = torch.tensor([[0, 1], [2, 3]])
-    scores = ont(node_emb, pairs)
-    assert scores.shape == (2,)
+    entity_emb = torch.randn(4, 16)   # episode subgraph rows
+    class_emb = torch.randn(3, 16)    # taxonomy DAG rows
+    # pair_index[0] -> entity row, pair_index[1] -> class row
+    pairs = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 0]])
+    scores = ont(entity_emb, class_emb, pairs)
+    assert scores.shape == (4,)
     assert (scores >= 0).all() and (scores <= 1).all()
+
+
+def test_taxonomy_encoder_produces_class_embeddings():
+    """The taxonomy encoder GATs over the class DAG -> [C, hidden] embeddings
+    (open-vocabulary: a new class node gets an embedding via message passing
+    from its parent edge, no fixed class table)."""
+    enc = TaxonomyEncoder(hidden_dim=16, num_heads=2, num_layers=2)
+    tax = _toy_taxonomy_data(num_classes=5, hidden_dim=16)
+    emb = enc.encode(tax.x, tax.edge_index, tax.node_kind)
+    assert emb.shape == (5, 16)
+    # Message passing ran (not a no-op): two classes with different structure
+    # should not produce identical embeddings.
+    assert not torch.allclose(emb[0], emb[1])
+
+
+def _toy_taxonomy_data(num_classes: int, hidden_dim: int):
+    """A tiny class DAG: ``num_classes`` bare-name class nodes linked by a
+    ``subClassOf`` chain (c0 <- c1 <- c2 ...), bidirectional, in the
+    ``data_from_subgraph`` shape the taxonomy builder emits."""
+    nodes = [{"id": f"Class{i}", "type": "unknown", "depth": i} for i in range(num_classes)]
+    edges = []
+    for i in range(num_classes - 1):
+        # child Class(i+1) subClassOf parent Classi; both orientations.
+        edges.append({"subject": f"Class{i+1}", "predicate": "subClassOf", "object": f"Class{i}"})
+        edges.append({"subject": f"Class{i}", "predicate": "subClassOf", "object": f"Class{i+1}"})
+    sub = {"center": "Class0", "radius": 0, "nodes": nodes, "edges": edges}
+    return data_from_subgraph(sub, _stub_feature_for)

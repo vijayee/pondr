@@ -60,9 +60,11 @@ from .features import training_feature_for
 from .graph_loader import WaveDBGraphLoader, data_from_subgraph
 from .heads import AnomalyHead, DiffPoolHead, LinkPredHead, OntologyHead, SalienceHead
 from .label_tensors import (
-    anomaly_target, linkpred_pairs, ontology_pairs, salience_target, split_centers,
+    anomaly_target, class_vocab, linkpred_pairs, ontology_target, salience_target,
+    split_centers,
 )
 from .model import GNNModel
+from .taxonomy_graph import build_taxonomy_data
 
 HEADS: tuple[str, ...] = ("salience", "diffpool", "link_prediction", "ontology", "anomaly")
 HEAD_CHOICES: tuple[str, ...] = ("all", "salience", "link_prediction", "ontology", "cluster", "anomaly")
@@ -252,11 +254,17 @@ def _build_inputs(cfg, sid, store, loader, pipe, feat_for, labels, radius):
 
 
 def _forward(model, cfg, clean_data, corrupted_data, sal_lbl, link_lbl, ont_lbl,
-             an_lbl, device, seed):
+             an_lbl, device, seed, tax_data, class_index):
     """Run the backbone + the heads selected by ``cfg.head`` that have usable
     labels this step. Returns ``{head: {pred, target, ...}}`` for the heads with
     usable labels (the trainer sums their losses / accumulates their val preds;
-    absent heads are simply skipped)."""
+    absent heads are simply skipped).
+
+    ``tax_data`` is the class DAG ``Data`` (built once, on ``device``) and
+    ``class_index`` maps class name -> taxonomy row; both are used only by the
+    ontology head, whose class embeddings come from the taxonomy encoder (run
+    here WITH grad each step so the encoder trains alongside the head).
+    """
     out: dict[str, dict] = {}
 
     if clean_data is not None:
@@ -282,10 +290,16 @@ def _forward(model, cfg, clean_data, corrupted_data, sal_lbl, link_lbl, ont_lbl,
                     "target": pt.labels.to(device), "skipped": pt.skipped,
                 }
         if cfg.head in ("all", "ontology") and ont_lbl is not None:
-            pt = ontology_pairs(clean_data, ont_lbl, seed=seed)
+            pt = ontology_target(clean_data, ont_lbl, class_index, seed=seed)
             if pt.edge_index is not None:
+                # Two-encoder pair classifier: entity emb from the episode
+                # backbone (node_emb), class emb from the taxonomy encoder
+                # (recomputed each step WITH grad so it trains). The taxonomy
+                # encoder is cheap (377 nodes, 2 layers) vs. an episode radius-3
+                # subgraph, so recomputing per step is negligible.
+                class_emb = model.encode_taxonomy(tax_data)
                 out["ontology"] = {
-                    "pred": model.ontology(node_emb, pt.edge_index.to(device)),
+                    "pred": model.ontology(node_emb, class_emb, pt.edge_index.to(device)),
                     "target": pt.labels.to(device), "skipped": pt.skipped,
                 }
 
@@ -404,9 +418,11 @@ def _build_optimizer(model: GNNModel, cfg: GNNTrainConfig) -> torch.optim.Optimi
 
     ``all``: everything trainable. ``<one>``: the selected head + the backbone
     (the backbone is frozen when a ``--backbone-checkpoint`` was loaded, so its
-    params drop out via ``requires_grad``). Other heads aren't called in
-    single-head mode -> no gradients -> excluded so they don't clutter the
-    optimizer state.
+    params drop out via ``requires_grad``). The ontology head's class embeddings
+    come from the taxonomy encoder, so a ``--head ontology`` run must also train
+    it (the taxonomy encoder is NOT frozen by a backbone checkpoint -- only
+    ``input_proj`` + ``layers`` are). Other heads aren't called in single-head
+    mode -> no gradients -> excluded so they don't clutter the optimizer state.
     """
     if cfg.head == "all":
         params = [p for p in model.parameters() if p.requires_grad]
@@ -415,8 +431,15 @@ def _build_optimizer(model: GNNModel, cfg: GNNTrainConfig) -> torch.optim.Optimi
         head_ids = {id(p) for p in head_mod.parameters()}
         backbone_ids = {id(p) for p in model.input_proj.parameters()} | \
                        {id(p) for p in model.layers.parameters()}
+        extra_ids: set[int] = set()
+        if cfg.head == "ontology":
+            # The taxonomy encoder produces the ontology head's class side;
+            # it must train in a --head ontology run (it is NOT part of the
+            # frozen backbone).
+            extra_ids |= {id(p) for p in model.taxonomy.parameters()}
         params = [p for p in model.parameters() if p.requires_grad
-                  and (id(p) in head_ids or id(p) in backbone_ids)]
+                  and (id(p) in head_ids or id(p) in backbone_ids
+                       or id(p) in extra_ids)]
     return torch.optim.AdamW(params, lr=cfg.lr)
 
 
@@ -478,11 +501,25 @@ def train_gnn(
     ).to(device)
     if cfg.backbone_checkpoint:
         state = torch.load(cfg.backbone_checkpoint, map_location=device, weights_only=True)
-        model.load_state_dict(state)  # strict=True; a full state_dict
+        # strict=False: a backbone checkpoint from before the taxonomy encoder
+        # existed (e.g. the GPU ``all.pt`` from #125) has NO ``taxonomy.*`` keys.
+        # Those stay at init (random) and train fresh in this run. Any OTHER
+        # missing/unexpected key means the checkpoint is genuinely incompatible
+        # -- fail loud rather than silently loading a partial backbone.
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        bad_missing = [k for k in missing if not k.startswith("taxonomy.")]
+        assert not bad_missing, (
+            f"backbone checkpoint {cfg.backbone_checkpoint} missing unexpected "
+            f"keys (not the taxonomy encoder): {bad_missing}")
+        assert not unexpected, (
+            f"backbone checkpoint {cfg.backbone_checkpoint} has unexpected keys: "
+            f"{unexpected}")
         for p in model.input_proj.parameters():
             p.requires_grad = False
         for p in model.layers.parameters():
             p.requires_grad = False
+        # The taxonomy encoder is NOT part of the frozen backbone -- it trains
+        # in this run (it had no weights in the old checkpoint to freeze anyway).
         print(f"  backbone loaded from {cfg.backbone_checkpoint} (frozen) "
               f"-- refining head={cfg.head}", file=sys.stderr, flush=True)
     if cfg.ogb_pretrain:
@@ -492,6 +529,31 @@ def train_gnn(
     pipe = OracleLabelingPipeline(store)
     loader = WaveDBGraphLoader(store, radius=radius, predicate_vocab_size=cfg.predicate_vocab_size)
     feat_for = training_feature_for(store)
+
+    # Taxonomy DAG for the ontology head's class side. Built ONCE (the live class
+    # set is fixed for the run; the taxonomy encoder weights change each step but
+    # the graph structure doesn't). ``class_index`` maps each class name seen in
+    # the labels to its row in the taxonomy Data so ``ontology_target`` can form
+    # (entity_row, class_row) pairs. Classes in the labels but NOT in the live
+    # DAG (an Oracle-invented name that hasn't been Bonsai-promoted) are absent
+    # from ``class_index`` -> ``ontology_target`` skips them + counts (honest).
+    # Only built for runs that actually score ontology (all / ontology) -- a
+    # salience-only run doesn't pay the ~754-query class-DAG enumeration.
+    if cfg.head in ("all", "ontology"):
+        tax_data, name_to_row = build_taxonomy_data(store)
+        tax_data = tax_data.to(device)
+        class_names = class_vocab(labels_dir)
+        class_index = {name: name_to_row[name]
+                       for name in class_names if name in name_to_row}
+        dropped_classes = [n for n in class_names if n not in name_to_row]
+        if dropped_classes:
+            print(f"  NOTE: {len(dropped_classes)} ontology class name(s) not in the "
+                  f"live DAG -- skipped (e.g. {dropped_classes[:3]}). These are "
+                  f"Oracle-suggested classes not yet Bonsai-promoted to a seed-"
+                  f"anchored subClassOf edge.", file=sys.stderr, flush=True)
+    else:
+        tax_data = None
+        class_index = {}
 
     # Which heads to track best-val for. `all` tracks all 5; a single-head run
     # tracks its head (cluster -> diffpool) only.
@@ -559,7 +621,8 @@ def train_gnn(
             cdata, andata, sal_lbl, link_lbl, ont_lbl, an_lbl = _build_inputs(
                 cfg, sid, store, loader, pipe, feat_for, labels, radius)
             out = _forward(model, cfg, cdata, andata, sal_lbl, link_lbl, ont_lbl,
-                           an_lbl, device, seed=cfg.seed + step)
+                           an_lbl, device, seed=cfg.seed + step,
+                           tax_data=tax_data, class_index=class_index)
             for h in ("link_prediction", "ontology"):
                 if h in out:
                     total_skipped[h] += out[h]["skipped"]
@@ -587,7 +650,8 @@ def train_gnn(
                     cdata, andata, sal_lbl, link_lbl, ont_lbl, an_lbl = _build_inputs(
                         cfg, sid, store, loader, pipe, feat_for, labels, radius)
                     out = _forward(model, cfg, cdata, andata, sal_lbl, link_lbl,
-                                   ont_lbl, an_lbl, device, seed=cfg.seed + step)
+                                   ont_lbl, an_lbl, device, seed=cfg.seed + step,
+                                   tax_data=tax_data, class_index=class_index)
                     _accumulate_val(out, acc)
             val_metrics = _metrics_from_accumulators(acc)
         else:
@@ -635,8 +699,9 @@ def train_gnn(
         notes.append(f"link_prediction: {total_skipped['link_prediction']} label "
                      "endpoint(s) didn't resolve to subgraph nodes (skipped, not truncated).")
     if total_skipped["ontology"]:
-        notes.append(f"ontology: {total_skipped['ontology']} label endpoint(s) / "
-                     "misclassified records didn't yield a scoreable node pair (skipped).")
+        notes.append(f"ontology: {total_skipped['ontology']} label endpoint(s) "
+                     "didn't yield a scoreable entity->class pair (entity not in "
+                     "subgraph, or class not in the live DAG) -- skipped, not truncated.")
     if not val_ids:
         notes.append("no validation centers (val_fraction too small for the center "
                      "count) -- all val metrics are None.")

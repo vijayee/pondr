@@ -13,9 +13,10 @@ from .graph_loader import WaveDBGraphLoader, PREDICATE_VOCAB, KNOWN_PREDICATES
 from .heads import (
     SalienceHead, DiffPoolHead, LinkPredHead, AnomalyHead, OntologyHead, ANOMALY_TYPES,
 )
-from .model import GNNModel, InputProjection
+from .model import GNNModel, InputProjection, TaxonomyEncoder
 from .semantic_memory import SemanticMemoryWriter
 from .consolidate import Consolidator
+from .taxonomy_graph import build_taxonomy_graph, build_taxonomy_data
 
 __all__ = [
     "NodeFeatureBuilder",
@@ -27,7 +28,8 @@ __all__ = [
     "KNOWN_PREDICATES",
     "SalienceHead", "DiffPoolHead", "LinkPredHead", "AnomalyHead", "OntologyHead",
     "ANOMALY_TYPES",
-    "GNNModel", "InputProjection",
+    "GNNModel", "InputProjection", "TaxonomyEncoder",
     "SemanticMemoryWriter",
     "Consolidator",
+    "build_taxonomy_graph", "build_taxonomy_data",
 ]

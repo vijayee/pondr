@@ -18,11 +18,14 @@ once per run — no silent truncation).
 
 Negative sampling: the link-pred record carries Oracle ``negative_edges``;
 when it doesn't (old positive-only PoC data), we sample same-kind non-edge
-negatives IN CODE so the BCE head doesn't collapse to "predict 1". Ontology
-labels NEVER carry negatives (``misclassified`` holds a class NAME, not a node
-id, so it can't form a scoreable pair — skipped honestly), so ontology
-negatives are always sampled in-code from entity/topic non-edge pairs. Both
-samplers are seeded -> deterministic, reproducible runs.
+negatives IN CODE so the BCE head doesn't collapse to "predict 1". The ontology
+head is a TWO-encoder pair classifier (entity emb from the episode backbone +
+class emb from the taxonomy encoder over the live class DAG), so
+``ontology_target`` unifies ``suggested_edges`` (child=entity, parent=class) and
+``misclassified`` (entity, suggested_class) into ``(entity_row, class_row)``
+positives and samples ``(entity, other class)`` negatives in-code (seeded) --
+an entity not labeled with class X is a structural true negative. Both samplers
+are seeded -> deterministic, reproducible runs.
 """
 
 from __future__ import annotations
@@ -223,52 +226,160 @@ def linkpred_pairs(data, labels: dict, *, seed: int = 0) -> _PairTarget:
     return _PairTarget(edge_index, labels_t, skipped)
 
 
-def ontology_pairs(data, labels: dict, *, seed: int = 0) -> _PairTarget:
-    """Ontology-refinement target pairs from ``suggested_edges``.
+def class_vocab(labels_dir) -> list[str]:
+    """Distinct class names seen across ``ontology_labels.jsonl``.
 
-    Positives (label 1) = ``suggested_edges`` (child->parent, both resolved to
-    rows). ``misclassified`` is NOT used: it carries a class NAME
-    (``suggested_class``), not a node id, so it can't form a scoreable node pair
-    — skipped honestly rather than fabricating a pair from a class string.
-    Negatives (label 0) are always sampled in-code (entity/topic non-edge pairs,
-    seeded) since the labels never carry ontology negatives — without them the
-    pair-classifier BCE would collapse to "predict 1". Returns a ``_PairTarget``;
-    ``edge_index`` is None when zero usable pairs survived (no suggested_edges
-    AND no sampleable negatives).
+    Scans every record's ``suggested_edges[].parent`` and
+    ``misclassified[].suggested_class`` and returns the sorted distinct class
+    names. These are the train-time candidate classes -- the set the labels
+    actually exercise. (Deploy can score an entity against the FULL live class
+    DAG, including classes not seen during labeling -- the taxonomy encoder
+    generalizes to them via their parent edges; ``class_vocab`` only bounds the
+    labeled training signal.) A missing file -> empty list (a head whose labels
+    weren't regenerated is just never trainable -- honest, not an error).
+    """
+    from pathlib import Path
+    import json as _json
+
+    p = Path(labels_dir) / "ontology_labels.jsonl"
+    names: set[str] = set()
+    if not p.exists():
+        return []
+    with open(p, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                rec = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            labels = rec.get("labels") or {}
+            for item in labels.get("suggested_edges") or []:
+                name = item.get("parent")
+                if name:
+                    names.add(name)
+            for item in labels.get("misclassified") or []:
+                name = item.get("suggested_class")
+                if name:
+                    names.add(name)
+    return sorted(names)
+
+
+def _sample_ontology_negatives(
+    data,
+    class_rows: list[int],
+    n: int,
+    seed: int,
+    exclude: set[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Seeded in-code sampler of (entity_row, other_class_row) negative pairs.
+
+    An entity not labeled with class X is a true negative for the (entity, X)
+    pair -- structural and free (no Oracle negatives needed). Picks pairs among
+    the subgraph's E:/T: nodes and the class DAG's rows that are NOT in
+    ``exclude`` (the positives). Deterministic via ``seed`` -> reproducible.
+    Returns up to ``n`` pairs (fewer if the candidate pool is small -- honest,
+    not padded with junk).
+    """
+    if n <= 0 or not class_rows:
+        return []
+    ids = data.node_id
+    ent_rows = [i for i, nid in enumerate(ids)
+                if nid.startswith("E:") or nid.startswith("T:")]
+    if not ent_rows:
+        return []
+    rng = random.Random(seed)
+    out: list[tuple[int, int]] = []
+    out_set: set[tuple[int, int]] = set()
+    attempts = 0
+    max_attempts = n * 40
+    while len(out) < n and attempts < max_attempts:
+        attempts += 1
+        e = rng.choice(ent_rows)
+        c = rng.choice(class_rows)
+        pair = (e, c)
+        if pair in exclude or pair in out_set:
+            continue
+        out_set.add(pair)
+        out.append(pair)
+    return out
+
+
+def ontology_target(
+    data,
+    labels: dict,
+    class_index: dict[str, int],
+    *,
+    seed: int = 0,
+) -> _PairTarget:
+    """Entity->class typing target pairs from ``suggested_edges`` + ``misclassified``.
+
+    Both label kinds are entity->class typing labels (``suggested_edges``:
+    child=entity, parent=class; ``misclassified``: entity, suggested_class) --
+    unify them into ``(entity_row, class_row)`` positive pairs. The entity
+    resolves via ``data.node_id`` (full id then bare name, via ``_resolve`` --
+    entities ARE in the episode subgraph via ``in_episode``); the class resolves
+    via ``class_index`` (class NAME -> taxonomy-encoder row, built by the trainer
+    from the live class DAG). Unresolved entities or classes not in the live DAG
+    are SKIPPED and counted (honest, not fabricated into a pair from a string).
+
+    Negatives (label 0) are sampled in-code over ``(entity_row, other_class_row)``
+    pairs not in the positives (seeded, reproducible) so the pair-classifier BCE
+    can't collapse to "predict 1". Returns a ``_PairTarget``; ``edge_index`` is
+    ``[2, P]`` with row 0 = entity row in ``data.node_id``, row 1 = class row in
+    the taxonomy encoder. ``edge_index`` is None when zero usable pairs survived
+    (no resolvable positives AND no sampleable negatives).
     """
     labels = labels or {}
     id_to_idx, name_to_idx = _build_name_index(data.node_id)
-    src: list[int] = []
-    dst: list[int] = []
+    ent_rows: list[int] = []
+    cls_rows: list[int] = []
     lbl: list[float] = []
     skipped = 0
+    seen: set[tuple[int, int]] = set()
+
+    def _add(entity_name, class_name) -> None:
+        nonlocal skipped
+        if not entity_name or not class_name:
+            skipped += 1
+            return
+        e = _resolve(entity_name, id_to_idx, name_to_idx)
+        if e is None:
+            skipped += 1
+            return
+        c = class_index.get(class_name)
+        if c is None:
+            # Class not in the live DAG (e.g. an Oracle-invented name that
+            # hasn't been promoted) -- can't form a scoreable pair: skip+count.
+            skipped += 1
+            return
+        if (e, c) in seen:
+            return  # dedupe the same entity->class pair across the two kinds
+        seen.add((e, c))
+        ent_rows.append(e)
+        cls_rows.append(c)
+        lbl.append(1.0)
 
     for item in labels.get("suggested_edges") or []:
-        c = _resolve(item.get("child"), id_to_idx, name_to_idx)
-        p = _resolve(item.get("parent"), id_to_idx, name_to_idx)
-        if c is None or p is None or c == p:
-            skipped += 1
-            continue
-        src.append(c); dst.append(p); lbl.append(1.0)
+        _add(item.get("child"), item.get("parent"))
+    for item in labels.get("misclassified") or []:
+        _add(item.get("entity"), item.get("suggested_class"))
 
-    # Count misclassified records we deliberately didn't turn into pairs (so the
-    # skip log is honest about WHY they were skipped, not just "unresolved").
-    skipped += len(labels.get("misclassified") or [])
-
-    n_pos = len(src)
-    exclude = {(s, o) for s, o in zip(src, dst)} | {(o, s) for s, o in zip(src, dst)}
-    negatives = _sample_pair_negatives(
-        data, n=max(n_pos, 1) if n_pos else 0, seed=seed,
-        exclude=exclude, candidate_kinds=("entity", "topic"), same_kind=False,
+    n_pos = len(ent_rows)
+    negatives = _sample_ontology_negatives(
+        data, list(set(class_index.values())), n=n_pos, seed=seed, exclude=seen,
     )
-    for s, o in negatives:
-        src.append(s); dst.append(o); lbl.append(0.0)
+    for e, c in negatives:
+        ent_rows.append(e)
+        cls_rows.append(c)
+        lbl.append(0.0)
 
-    if not src:
+    if not ent_rows:
         return _PairTarget(None, None, skipped)
-    pair_index = torch.tensor([src, dst], dtype=torch.long)
+    edge_index = torch.tensor([ent_rows, cls_rows], dtype=torch.long)
     labels_t = torch.tensor(lbl, dtype=torch.float32)
-    return _PairTarget(pair_index, labels_t, skipped)
+    return _PairTarget(edge_index, labels_t, skipped)
 
 
 def anomaly_target(data, labels: dict) -> torch.Tensor:
@@ -318,6 +429,6 @@ def split_centers(
 
 
 __all__ = [
-    "salience_target", "linkpred_pairs", "ontology_pairs",
+    "salience_target", "linkpred_pairs", "ontology_target", "class_vocab",
     "anomaly_target", "split_centers",
 ]

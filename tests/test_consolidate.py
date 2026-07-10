@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.config import ConsolidationConfig
 from src.memory.episode import Episode
 from src.memory.store import HippocampalStore
 from src.gnn import Consolidator
@@ -92,4 +93,31 @@ def test_wm_prioritization_orders_resident_centers_first(tmp_path):
                              wm_ids={"ep_000001"})
     # ep_000001 is WM-resident → first; the rest keep stable order.
     assert ordered[0] == "ep_000001"
+    store.close()
+
+
+def test_ontology_proposals_have_entity_class_shape(tmp_path):
+    """The ontology step records ``{entity, class, confidence}`` typing proposals
+    (entity->class, the two-encoder pair classifier's output) -- NOT the old
+    ``{child, parent}`` shape from the single-encoder design. A low accept
+    threshold forces every scored pair to be recorded so the shape is observable
+    even with an untrained (random) model."""
+    store = _store(tmp_path)
+    _populate(store)
+    # accept_threshold=0.0 -> every scored entity/class pair is recorded (the
+    # untrained model's scores are arbitrary; this makes the proposals non-empty
+    # so we can assert their shape, not their quality).
+    cons = Consolidator(store, dry_run=True,
+                        config=ConsolidationConfig(accept_threshold=0.0))
+    rep = cons.run(limit=3)
+    assert rep["subgraphs_scored"] == 3
+    props = rep["ontology_proposed"]
+    assert len(props) > 0  # entities were scored against candidate classes
+    for p in props:
+        # New two-encoder shape: entity (an E: node) + class (a bare class name
+        # from the taxonomy DAG) + confidence.
+        assert set(p) == {"entity", "class", "confidence"}
+        assert p["entity"].startswith("E:")
+        assert isinstance(p["class"], str)
+        assert 0.0 <= p["confidence"] <= 1.0
     store.close()
