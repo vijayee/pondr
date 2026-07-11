@@ -40,7 +40,13 @@ from ..memory.forgetting import (
     compose_utility,
     should_archive,
 )
-from ..memory.edge_meta import batch_update_edge_meta
+from ..memory.edge_meta import (
+    archived_edge_delete_op,
+    edge_meta_key,
+    edge_meta_put_op,
+    record_archived_edge_op,
+    scan_archived_edges,
+)
 
 if TYPE_CHECKING:
     from ..config import ConsolidationConfig
@@ -134,6 +140,10 @@ class Consolidator:
         self._forget_updates: list[tuple[str, str, str, dict]] = []
         self._forget_node_salience: dict[str, float] = {}
         self._ontology_deprecate: list[str] = []
+        # A1 deep-archive: edges soft-archived >deep_archive_days ago that
+        # ``_apply`` physically removes. Populated by ``_step_deep_archive``
+        # (read-only scan, runs in dry-run too so the report shows candidates).
+        self._deep_archive_candidates: list[tuple[str, str, str, str]] = []
 
     # ── main pass ──
 
@@ -191,10 +201,22 @@ class Consolidator:
                 "reconsolidated": [],
                 # Phase 3b step 9: ontology decay. Discovered classes unseen for
                 # ``ontology_decay_days`` that were deprecated this run. Each
-                # entry is ``{class, parent, last_seen}`` (parent is the
-                # subClassOf parent the deprecated class's entities would
-                # reassign to -- a no-op today, no entity->class typing edges).
+                # entry is ``{class, parent, last_seen, reassigned}``: ``parent``
+                # is the ``subClassOf`` parent the deprecated class's
+                # ``instanceOf`` entities reassign to; ``reassigned`` (added by
+                # ``_apply``) is the count moved. Live-but-dormant: seed classes
+                # are never decay-deprecated (decay targets discovered classes
+                # only), so this rarely fires until discovered-class typing
+                # (A5/Bonsai) lands.
                 "ontology_deprecated": [],
+                # A1 deep-archive: soft-archived edges aged past
+                # ``deep_archive_days`` that ``_apply`` physically removes (live
+                # graph edge deleted + recoverable ``archive/edge/...`` JSON
+                # written + orphaned sidecar + consumed index entry deleted).
+                # Populated by ``_step_deep_archive`` (read-only; runs in dry-run
+                # too). Each entry is ``{subject, predicate, object, archived_at,
+                # age_days}``.
+                "deep_archived": [],
             },
         }
         # Per-run accumulators consumed by ``_apply`` (record-only during scoring;
@@ -205,6 +227,10 @@ class Consolidator:
         # deprecation (recorded here; ``_apply`` writes the state). Each entry
         # is the class-name key component (see ``store.scan_classes``).
         self._ontology_deprecate: list[str] = []
+        # A1 deep-archive: edges soft-archived >deep_archive_days ago that
+        # ``_apply`` physically removes. Populated by ``_step_deep_archive``
+        # (read-only scan, runs in dry-run too so the report shows candidates).
+        self._deep_archive_candidates: list[tuple[str, str, str, str]] = []
 
         for center in centers:
             data = self.loader.load(center)
@@ -226,6 +252,13 @@ class Consolidator:
         # writes the deprecation. A no-op on the seed-only ontology (no
         # discovered classes exist; promotion is a deferred Bonsai-gated path).
         self._step_ontology_decay(report)
+
+        # A1 deep-archive: GLOBAL pass after scoring. Scans the archived-edge
+        # index for soft-archived edges aged past ``deep_archive_days`` and
+        # stashes them on ``self._deep_archive_candidates``; ``_apply`` (when
+        # not dry-run) physically removes them. Read-only, so it runs in dry-run
+        # too -- the report lists candidates without mutating.
+        self._step_deep_archive(report)
 
         # Apply phase: only when not dry-run. (Per-subgraph steps above only
         # RECORD proposals; mutations happen here so a dry run never writes.)
@@ -544,6 +577,9 @@ class Consolidator:
             meta["utility_score"] = compose_utility(meta, struct, now_ts)
             if should_archive(meta, utility_prune_below=self.cfg.utility_prune_below):
                 meta["state"] = "archived"
+                # A1 deep-archive: stamp when the edge was soft-archived so the
+                # deep-archive sweep can age it past ``deep_archive_days``.
+                meta["archived_at"] = now_ts
                 forget["archived"].append({
                     "subject": s_id, "predicate": pred, "object": o_id,
                     "utility_score": meta["utility_score"],
@@ -586,8 +622,20 @@ class Consolidator:
         # entity's structural salience so the retrieval hot path (step 10) can
         # compose it into get_entity_salience. 3a-prune precedence is already
         # enforced in _step_forget (pruned edges never entered _forget_updates).
+        # A1 deep-archive: for edges this pass soft-archived (state=='archived'
+        # with a stamped archived_at), the SAME batch also writes the
+        # archived-edge index entry so the deep-archive sweep can later age them
+        # -- the index value carries the original (s,p,o) so the sweep recovers
+        # edge identity even when key components are hashed.
         if self._forget_updates:
-            batch_update_edge_meta(self.store, self._forget_updates)
+            ops: list[dict] = []
+            for s, p, o, meta in self._forget_updates:
+                ops.append(edge_meta_put_op(s, p, o, meta))
+                if meta.get("state") == "archived" and meta.get("archived_at"):
+                    ops.append(
+                        record_archived_edge_op(s, p, o, meta["archived_at"])
+                    )
+            self.store.db.batch_sync(ops)
         for node_id, score in self._forget_node_salience.items():
             self.store.persist_node_salience(node_id, score)
         # Phase 3b step 8: anomaly -> reconsolidation. Only HIGH-confidence
@@ -613,16 +661,46 @@ class Consolidator:
             # Phase 3b step 9: ontology decay. Stamp ``last_seen`` for every
             # class the ontology head proposed a typing to this run (the
             # class-use signal), then deprecate the discovered classes the
-            # decay pass flagged. Reassignment is a documented no-op (no
-            # entity->class typing edges today).
+            # decay pass flagged. Reassignment rewrites each deprecated
+            # class's ``instanceOf`` entities to the ``subClassOf`` parent
+            # (live-but-dormant -- seed classes are never decay-deprecated).
             now_ts = _dream_now()
             seen_classes = {p["class"] for p in report["ontology_proposed"]}
             for class_name in seen_classes:
                 self.store.persist_class_last_seen(class_name, now_ts)
+            reassigned_counts: dict[str, int] = {}
             for class_key in self._ontology_deprecate:
                 self.store.set_class_state(class_key, "deprecated")
                 parent = self._class_parent(class_key)
-                self._reassign_entities_from_deprecated_class(class_key, parent)
+                reassigned_counts[class_key] = (
+                    self._reassign_entities_from_deprecated_class(class_key, parent)
+                )
+            for entry in report["forgetting"].get("ontology_deprecated", []):
+                entry["reassigned"] = reassigned_counts.get(entry["class"], 0)
+            # A1 deep-archive: physically remove soft-archived edges aged past
+            # ``deep_archive_days``. For each candidate the sweep stashed, write
+            # the recoverable ``archive/edge/...`` JSON + delete the live graph
+            # edge (one atomic batch via ``archive_edge``), then delete the
+            # orphaned sidecar and the consumed archived-edge index entry in
+            # one cleanup batch. The archive record carries the ORIGINAL
+            # soft-archive timestamp (``when``) so a deep-archived edge keeps its
+            # age, not the removal time.
+            if self._deep_archive_candidates:
+                cleanup_ops: list[dict] = []
+                days = self.cfg.deep_archive_days
+                for s, p, o, archived_at in self._deep_archive_candidates:
+                    self.writer.archive_edge(
+                        s, p, o,
+                        reason=f"deep-archive (>{days} days)",
+                        when=archived_at,
+                        remove_from_graph=True,
+                    )
+                    cleanup_ops.append(
+                        {"type": "del", "key": edge_meta_key(s, p, o)}
+                    )
+                    cleanup_ops.append(archived_edge_delete_op(s, p, o))
+                if cleanup_ops:
+                    self.store.db.batch_sync(cleanup_ops)
 
     def _find_predicate(self, subject: str, object_: str) -> Optional[str]:
         """Recover the predicate of a stored ``(subject, ?, object)`` triple."""
@@ -759,6 +837,60 @@ class Consolidator:
                 "class": class_key, "parent": parent, "last_seen": last_seen,
             })
 
+    # ── A1 deep-archive sweep (read-only; runs in dry-run too) ──
+
+    def _step_deep_archive(self, report: dict) -> None:
+        """Flag soft-archived edges aged past ``deep_archive_days`` for removal.
+
+        Scans the ``content/archived_edge/`` index (one entry per soft-archived
+        edge, written by ``_apply`` when it persists a ``state='archived'``
+        sidecar). Each entry's value carries the original ``(s,p,o)`` +
+        ``archived_at`` -- the value (not the key) holds the edge identity, so
+        the sweep recovers it even when a key component was hashed by
+        ``safe_edge_component``. An edge whose ``archived_at`` is older than
+        ``deep_archive_days`` is appended to ``self._deep_archive_candidates``
+        for ``_apply`` to physically remove (live graph edge deleted +
+        recoverable ``archive/edge/...`` JSON written + orphaned sidecar +
+        consumed index entry deleted).
+
+        Read-only: safe in dry-run (the report lists candidates without
+        mutating). Disabled when ``deep_archive_days is None`` (the
+        ``--deep-archive-days 0`` -> None sentinel). Legacy index entries with
+        a missing/empty ``archived_at`` (edges soft-archived before this field
+        shipped) are skipped -- they can't be aged, so they are NOT
+        retroactively deep-archived (conservative; documented in Phase 3b.md).
+        Gated on the master ``forgetting_enabled`` flag.
+        """
+        from ..config import config as _master_config
+        if not _master_config.forgetting_enabled:
+            return
+        threshold = self.cfg.deep_archive_days
+        if threshold is None or threshold <= 0:
+            return  # disabled (the 0 -> None sentinel)
+        now_ts = _dream_now()
+        try:
+            now_dt = datetime.strptime(now_ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            return  # unparseable clock -> skip the sweep (defensive)
+        for s, p, o, archived_at in scan_archived_edges(self.store):
+            if not archived_at:
+                continue  # legacy entry -> not aged (conservative)
+            try:
+                a_dt = datetime.strptime(
+                    archived_at, "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue  # unparseable timestamp -> leave alone (defensive)
+            age_days = (now_dt - a_dt).days
+            if age_days < threshold:
+                continue
+            self._deep_archive_candidates.append((s, p, o, archived_at))
+            report["forgetting"]["deep_archived"].append({
+                "subject": s, "predicate": p, "object": o,
+                "archived_at": archived_at, "age_days": age_days,
+            })
+
     def _class_parent(self, class_name: str) -> "Optional[str]":
         """The deprecated class's ``subClassOf`` parent (for reassignment)."""
         r = self.store.graph.query().vertex(class_name).out("subClassOf").execute_sync()
@@ -770,21 +902,42 @@ class Consolidator:
 
     def _reassign_entities_from_deprecated_class(self, class_name: str,
                                                   parent: "Optional[str]") -> int:
-        """Reassign entities typed to a deprecated class to its parent.
+        """Reassign entities typed to a deprecated class to its ``subClassOf`` parent.
 
-        HONEST no-op today: the ontology head's entity->class typings are
-        RECORDED only (``_step_ontology``), never written as graph edges -- so
-        there are no entity->class typing edges to reassign. This is the hook
-        for when Bonsai-gated promotion lands typing edges: it would find
-        ``(entity, instanceOf, class_name)`` edges and rewrite each to the
-        parent, superseding the old typing. Returns the (zero) count of
-        reassigned entities for the report.
+        Live (A3): queries ``(entity, instanceOf, class_name)`` edges and
+        rewrites each to the parent -- one atomic batch per class writes
+        ``(ent, instanceOf, parent)`` and deletes ``(ent, instanceOf,
+        class_name)``. Returns the count of reassigned entities for the report.
+
+        Live-but-dormant today: the seed classes are NEVER decay-deprecated
+        (they have no ``content/class/`` entry -- decay targets DISCOVERED
+        classes only, a deferred Bonsai-gated promotion path), so this rarely
+        fires. GLiNER2 types entities to the three broad seed subclasses
+        (Person/Project/Technology); the real partition-bridging payoff (and
+        non-seed typing) needs discovered-class typing (A5/Bonsai, excluded).
+        The mechanism ships so promotion lands into a reassignment-ready
+        namespace. When ``parent`` is None (no ``subClassOf`` parent) the
+        entities are left typed to the deprecated class rather than orphaned.
         """
-        # No typing edge predicate is written today; the skeleton documents
-        # the future reassignment. When ``instanceOf`` edges land, this becomes:
-        #   for ent in vertex(class).in_("instanceOf"):
-        #       write (ent, instanceOf, parent); mark old typing superseded
-        return 0
+        if parent is None:
+            return 0  # no parent to reassign to -> don't orphan the entities
+        r = (self.store.graph.query().vertex(class_name)
+             .in_("instanceOf").execute_sync())
+        try:
+            entities = list(r.vertices)
+        finally:
+            r.close()
+        if not entities:
+            return 0
+        ops: list[dict] = []
+        for ent in entities:
+            # Rewrite the typing to the parent + drop the old typing, atomically.
+            ops += self.store.graph.expand_triple(ent, "instanceOf", parent)
+            ops += self.store.graph.expand_triple(
+                ent, "instanceOf", class_name, delete=True)
+        if ops:
+            self.store.db.batch_sync(ops)
+        return len(entities)
 
     # ── helpers ──
 

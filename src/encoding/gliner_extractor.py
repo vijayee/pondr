@@ -77,6 +77,15 @@ _STABLE_SCHEMA: dict[str, Any] = {
     ],
 }
 
+# A3: GLiNER2 entity category -> seed ontology class (Entity subclasses, see
+# ontology.CONVERSATIONAL_CLASSES: Entity -> [Person, Project, Technology,
+# Concept]). Drives the ``instanceOf`` typing edges the encoder emits.
+_CATEGORY_TO_CLASS: dict[str, str] = {
+    "person": "Person",
+    "project": "Project",
+    "technology": "Technology",
+}
+
 
 def _as_list(v) -> list:
     """Coerce a GLiNER2 classification result to a list of strings.
@@ -146,6 +155,8 @@ class GLiNERExtractor:
         Returns:
             {
                 "entities": ["Alice", "WaveDB", "HBTrie"],
+                "entity_classes": {"Alice": "Person", "WaveDB": "Project",
+                                   "HBTrie": "Technology"},
                 "topics": ["WAL config", "storage layer"],
                 "tones": ["frustrated", "curious"],
                 "decisions": ["go with DEBOUNCED"],
@@ -181,16 +192,26 @@ class GLiNERExtractor:
         )
 
         ents: dict = result.get("entities", {}) or {}
-        entities: list[str] = []
+        # A3: preserve each entity's GLiNER2 category as a seed-class typing
+        # (person->Person, project->Project, technology->Technology) so the
+        # encoder can emit ``(E:entity, instanceOf, Class)`` edges. First
+        # category wins if a span appears under two (rare); open-discovery
+        # entities (GLiNER-Decoder, merged in ``extract``) stay untyped.
+        entity_classes: dict[str, str] = {}
         for category in ("person", "project", "technology"):
-            entities.extend(ents.get(category, []) or [])
+            cls = _CATEGORY_TO_CLASS[category]
+            for span in (ents.get(category, []) or []):
+                if span and span not in entity_classes:
+                    entity_classes[span] = cls
+        entities = list(entity_classes.keys())
 
         decisions = [d for d in (ents.get("decision", []) or []) if d]
         topics = [t for t in (ents.get("topic", []) or []) if t]
         tones = [t for t in _as_list(result.get("tones")) if t and t != "none"]
 
         return {
-            "entities": list(set(entities)),
+            "entities": entities,
+            "entity_classes": entity_classes,
             "topics": topics,
             "tones": tones,
             "decisions": decisions,

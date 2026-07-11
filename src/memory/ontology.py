@@ -79,6 +79,14 @@ CONVERSATIONAL_PROPERTIES: dict[str, dict[str, str]] = {
     "supersedes":   {"domain": "Episode",    "range": "Episode"},  # reconsolidation
     "superseded_by": {"domain": "Episode",   "range": "Episode"},  # back-pointer of reconsolidation
     "subClassOf":   {"domain": "Entity",    "range": "Entity"},    # taxonomy edges
+    # A3: entity -> class typing edge (E:Alice instanceOf Person). Bridges the
+    # entity partition and the class DAG so ontology-decay reassignment can find
+    # a deprecated class's entities at the graph layer. CamelCase in the graph
+    # (kept as-is like subClassOf); the BFS does NOT traverse it (not in
+    # _NODE_PREDICATES), so it is invisible to the GNN subgraph today -- the
+    # partition-bridging benefit is a future-retrain step (add to _NODE_PREDICATES
+    # + re-label), not a 3b deliverable. Declared Entity->Entity like subClassOf.
+    "instanceOf":   {"domain": "Entity",    "range": "Entity"},    # entity -> class typing
     # ── User / Session hierarchy (global chat history) ──
     # A User owns Sessions; a Session contains Episodes. `follows` chains
     # episodes WITHIN a session; `follows_session` chains a user's sessions

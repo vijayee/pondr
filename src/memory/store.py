@@ -147,6 +147,14 @@ class HippocampalStore:
         for entity in episode.entities:
             ops += self.graph.expand_triple(eid, "has_entity", f"E:{entity}")
             ops += self.graph.expand_triple(f"E:{entity}", "in_episode", eid)
+            # A3: entity -> class typing edge (E:Alice instanceOf Person) when
+            # the extractor assigned a seed class. Bridges the entity partition
+            # and the class DAG so ontology-decay reassignment can find a
+            # deprecated class's entities at the graph layer. Skipped for
+            # open-discovery entities (untyped) and pre-A3 episodes.
+            cls = episode.entity_classes.get(entity)
+            if cls:
+                ops += self.graph.expand_triple(f"E:{entity}", "instanceOf", cls)
         for topic in episode.topics:
             ops += self.graph.expand_triple(eid, "has_topic", f"T:{topic}")
         for tone in episode.tones:

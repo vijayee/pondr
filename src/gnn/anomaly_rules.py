@@ -107,11 +107,11 @@ _NODE_PREFIXES: tuple[str, ...] = tuple(p for p, _ in _KIND_CLASS) + ("M:",)
 def _to_graph_predicate(name: str) -> str:
     """Ontology property key → graph predicate form.
 
-    ``subClassOf`` is camelCase in the graph (kept as-is); everything else is
-    camelCase→snake_case (``hasEntity``→``has_entity``). Already-snake keys
-    (``has_session``, ``defined_in``) pass through unchanged.
+    ``subClassOf`` and ``instanceOf`` are camelCase in the graph (kept as-is);
+    everything else is camelCase→snake_case (``hasEntity``→``has_entity``).
+    Already-snake keys (``has_session``, ``defined_in``) pass through unchanged.
     """
-    if name == "subClassOf":
+    if name in ("subClassOf", "instanceOf"):
         return name
     # Insert ``_`` before each uppercase letter (not at start), then lowercase.
     return re.sub(r"(?<!^)([A-Z])", r"_\1", name).lower()

@@ -23,6 +23,11 @@ class Episode:
     summary: str
     full_text: str
     entities: list[str] = field(default_factory=list)
+    # A3: entity span -> seed ontology class (Person/Project/Technology) for
+    # emitting ``(E:entity, instanceOf, Class)`` typing edges. Empty for
+    # pre-A3 episodes + open-discovery entities (untyped until Bonsai
+    # promotion); the encoder emits instanceOf only for entries present here.
+    entity_classes: dict[str, str] = field(default_factory=dict)
     topics: list[str] = field(default_factory=list)
     tones: list[str] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
@@ -105,6 +110,7 @@ class Episode:
             summary=summary,
             full_text=full_text,
             entities=extracted.get("entities", []),
+            entity_classes=extracted.get("entity_classes", {}),
             topics=extracted.get("topics", []),
             tones=extracted.get("tones", []),
             decisions=extracted.get("decisions", []),

@@ -80,6 +80,11 @@ def default_meta() -> dict:
         "retrieval_timestamps": [],
         "saturation_flags": 0,
         "validity_end": None,
+        # A1 deep-archive: when this edge was soft-archived (state='archived').
+        # The deep-archive sweep ages on this to decide physical removal
+        # (>deep_archive_days). None for current/never-archived edges and for
+        # edges soft-archived before this field shipped (legacy -> not aged).
+        "archived_at": None,
     }
 
 

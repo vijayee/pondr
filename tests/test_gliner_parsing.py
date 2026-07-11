@@ -99,3 +99,38 @@ def test_extract_stable_handles_missing_categories():
     assert result["decisions"] == []
     assert result["topics"] == []
     assert result["tones"] == []
+
+
+def test_extract_stable_preserves_entity_classes():
+    """A3: each entity's GLiNER2 category is preserved as a seed-class typing
+    (person->Person, project->Project, technology->Technology) so the encoder
+    can emit ``(E:entity, instanceOf, Class)`` edges. First category wins when
+    a span appears under two categories."""
+    ext = _offline_extractor({
+        "entities": {
+            "person": ["Alice"],
+            "project": ["WaveDB"],
+            "technology": ["HBTrie"],
+            "decision": ["go with DEBOUNCED"],  # not an entity class
+            "topic": ["WAL config"],            # not an entity class
+        },
+        "tones": ["neutral"],
+    })
+    result = ext._extract_stable("ignored by stub")
+    assert result["entity_classes"] == {
+        "Alice": "Person", "WaveDB": "Project", "HBTrie": "Technology",
+    }
+    # Every entity has a class; decisions/topics are NOT in entity_classes.
+    assert set(result["entity_classes"]) == set(result["entities"])
+
+
+def test_extract_stable_first_category_wins():
+    """A span appearing under two categories keeps the first-iterated category's
+    class (person before project before technology)."""
+    ext = _offline_extractor({
+        "entities": {"person": ["Mercury"], "project": ["Mercury"]},
+        "tones": [],
+    })
+    result = ext._extract_stable("ignored by stub")
+    assert result["entity_classes"] == {"Mercury": "Person"}
+    assert result["entities"] == ["Mercury"]  # deduped

@@ -149,8 +149,7 @@ def main() -> int:
     # (reconsolidation_count>=3 across >=15 days) are canonical constants in
     # ``src/memory/forgetting.py`` (the pure decay module), NOT CLI knobs -- the
     # worked-example fidelity gate (step 1) pinned them; exposing them invites
-    # breaking the 0.010->0.0060->0.0018 repro. The deep-archive tier (>365d
-    # physical remove) is deferred (no consumer yet) so has no flag.
+    # breaking the 0.010->0.0060->0.0018 repro.
     parser.add_argument("--forget", action=argparse.BooleanOptionalAction, default=None,
                         help="Toggle the forgetting system master gate (default on; --no-forget "
                              "makes the system behave as if forgetting were never deployed)")
@@ -163,6 +162,16 @@ def main() -> int:
     parser.add_argument("--anomaly-resolve-threshold", type=float, default=None,
                         help="contradictory_state score at/above which the resolver auto-"
                              "supersedes (default 0.8; below = record-only)")
+    # A1 deep-archive tier. Soft-archive (state='archived', in-place) always
+    # ships; this is the deep tier -- physically remove edges soft-archived
+    # more than this many days ago (write a recoverable archive/edge/... JSON,
+    # delete the live edge + orphaned sidecar + consumed index entry). 0 =
+    # disabled (the 0 -> None sentinel), so it must NOT be dropped by the
+    # "is not None" filter on overrides -- handled separately below like
+    # --anomaly-fanout-cap.
+    parser.add_argument("--deep-archive-days", type=int, default=None,
+                        help="Physically remove edges soft-archived more than this many days ago "
+                             "(default 365; the deep tier on top of soft-archive; 0 = disabled)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -201,6 +210,13 @@ def main() -> int:
     if args.anomaly_fanout_cap is not None:
         cfg = replace(cfg, anomaly_fanout_cap=(
             args.anomaly_fanout_cap if args.anomaly_fanout_cap > 0 else None))
+    # A1 deep-archive: 0 = disabled (None) is a LEGITIMATE override, so it must
+    # NOT be dropped by the "is not None" filter above. Only override when the
+    # flag was explicitly passed (default None -> inherit
+    # ConsolidationConfig.deep_archive_days).
+    if args.deep_archive_days is not None:
+        cfg = replace(cfg, deep_archive_days=(
+            args.deep_archive_days if args.deep_archive_days > 0 else None))
 
     store = HippocampalStore(args.db)
     try:

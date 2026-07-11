@@ -251,6 +251,14 @@ class ConsolidationConfig:
     # triples), so this is a no-op on the seed-only ontology today; the
     # mechanism ships so promotion lands into a decay-ready namespace.
     ontology_decay_days: int = 30
+    # A1 deep-archive tier. A soft-archived edge (``state='archived'``) whose
+    # ``archived_at`` is older than this many days is PHYSICALLY removed: the live
+    # graph edge is deleted and a recoverable ``archive/edge/...`` JSON record is
+    # written (reusing the 3a hard-prune format), then the orphaned sidecar +
+    # consumed ``content/archived_edge/`` index entry are deleted. ``None`` (via
+    # ``--deep-archive-days 0``) disables the sweep. Soft-archive (in-place,
+    # excluded from default queries) always ships; this is the deep tier.
+    deep_archive_days: Optional[int] = 365
 
 
 @dataclass

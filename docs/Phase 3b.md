@@ -27,8 +27,8 @@ way `docs/Phase 3a.md` §0 does. Implementation followed the **Reality** column.
 | "utility_score = 0.4*access_frequency + 0.6*structural_salience" (compose at retrieval) | **Runtime composition reuses the trained 3a heads — no retrain.** `structural_salience` = the trained `SalienceHead` output, **sigmoid'd + clipped to [0,1]** before persisting (raw logits would break the composition math — risk R4). `utility_score` is computed in code at dream-pass time; the author's "salience head ingests retrieval features as model inputs" is a **deferred lever** (salience-head retrain + re-label), documented here, not in 3b scope. 3b ships the "combined, not competing" intent at $0. |
 | The decay formula (worked example `0.010 -> 0.0060 -> 0.0018`) | **Fidelity-gated.** Step 1 re-read the exact decay passages (`The_Ponder_Engine_Chat.json` [98]/[100]) and pinned the formula in the pure module `src/memory/forgetting.py` before writing tests: diminishing-returns boost `0.05*signal * 1/(1+0.3*reconsolidation_count)`, saturation (>5/24h), 7-day-half-life boost decay, one-time LTP promotion (x0.3) at `reconsolidation_count>=3` across `>=15` days. The worked example is the unit-test gate (risk R2). |
 | "Contradiction -> reconsolidate" (the anomaly head resolves contradictions) | **The anomaly head only flags; it does not resolve.** Its record is `{node, type, score}` — no state values, no source episodes, no old-vs-new ordering. A new **resolver** (`Consolidator._resolve_contradictory_state`) re-derives what it can from the graph (>=2 distinct entity `state` values + source episodes ordered by timestamp) and supersedes the oldest by the latest via an E->E `supersedes` chain. Best-effort, **high-confidence only** (`score >= anomaly_resolve_threshold=0.8`); low-confidence is record-only (the head over-fires on the giant subgraph). The data model carries no value->episode provenance, so the resolver assumes the latest-asserting episode is current truth — honest caveat, risk R6. |
-| "Prune the ontology" (decay unused classes) | **Seed classes are never decay-eligible.** The seed writes only `subClassOf` graph triples, no `content/class/` entry, so `scan_classes` never returns them. Decay targets DISCOVERED classes (runtime-invented labels promoted via Bonsai — a deferred path). The mechanism ships so promotion lands into a decay-ready namespace, but it is a **no-op on the seed-only ontology today**; entity->class typing edges don't exist yet, so the reassignment step is a documented no-op skeleton. |
-| "Archive >365d -> physically remove + archive JSON" (deep-archive tier) | **Deferred.** The soft tier (`state='archived'`, in-place, excluded from default queries) ships. The deep-archive tier (>365d physical remove + `archive/edge/...` JSON) is a future namespace-growth mitigation (risk R8) with no consumer yet, so no `deep_archive_days` config knob was added (a knob with no consumer is dead config). |
+| "Prune the ontology" (decay unused classes) | **Seed classes are never decay-eligible.** The seed writes only `subClassOf` graph triples, no `content/class/` entry, so `scan_classes` never returns them. Decay targets DISCOVERED classes (runtime-invented labels promoted via Bonsai — a deferred path). The mechanism ships so promotion lands into a decay-ready namespace, but it is a **no-op on the seed-only ontology today**. Entity->class typing edges (`instanceOf`, A3) now exist — GLiNER2's person/project/technology categories are preserved through extract -> Episode -> encode as `(E:entity, instanceOf, Class)` edges to the Person/Project/Technology seed classes — and the reassignment step is **wired live** (queries `vertex(class).in_("instanceOf")`, rewrites each entity's typing to the `subClassOf` parent, returns the count). It is **live-but-dormant**: seed classes are never decay-deprecated, so it rarely fires until discovered-class typing (A5/Bonsai) lands. The real payoff — bridging the entity partition and the class partition (the root cause of the ontology head being untrained, per memory `hippo-ontology-head-rootcause`) — is a **future-retrain** benefit: `instanceOf` is NOT in `_NODE_PREDICATES` (the BFS traversal set), so it is invisible to GNN subgraphs today. |
+| "Archive >365d -> physically remove + archive JSON" (deep-archive tier) | **Shipped (A1 follow-up).** The soft tier (`state='archived'`, in-place, excluded from default queries) ships. The deep-archive tier (edges archived >`deep_archive_days`, default 365) physically removes the live graph edge via `archive_edge(..., remove_from_graph=True)` — reusing the 3a hard-prune `archive/edge/...` JSON record (`{subject, predicate, object, reason, archived_at}`) — and deletes the orphaned sidecar + the consumed index entry, all in one atomic `batch_sync`. A durable `content/archived_edge/{s}/{p}/{o}` index (value stores original `(s,p,o)` + `archived_at`, recoverable even when key components are hashed by `safe_edge_component`) is written by the soft-archive path and scanned by the `_step_deep_archive` sweep. Edges archived before this change (no index entry / `archived_at=None`) are not retroactively deep-archived (conservative). `--deep-archive-days 0` disables. |
 | (Implicit) retrieval is read-only | **Retrieval now writes (the hot-path contract change).** The retrieval-time boost hook (step 5) writes `access_count++` / decay reduction to matched-edge sidecars in one `batch_sync` after results are scored. **Non-blocking:** log+continue on write failure (never break retrieval on a sidecar write). RMW concurrency caveat: `access_count++` is a read-modify-write; under concurrent queries increments can be lost (same single-user assumption 2c makes — acceptable, documented). Risk R1. |
 | 3a hard-prune vs. 3b soft-archive collide | **3a hard-prune takes precedence (risk R5).** In `_step_forget`, an edge already in `report["pruned"]` (3a will delete it) is skipped, so 3b never writes a sidecar for a doomed edge. |
 
@@ -45,12 +45,17 @@ way `docs/Phase 3a.md` §0 does. Implementation followed the **Reality** column.
 ### What is new in 3b (greenfield)
 
 `src/memory/forgetting.py` (pure decay math), `src/memory/edge_meta.py` (sidecar
-CRUD + module-level `safe()` hasher extracted from `semantic_memory.py`),
-`set_episode_state` / per-edge sidecar / `persist_node_salience` / class-decay
-store paths, the two retrieval filter layers, the retrieval-time boost hook, the
-`_step_forget` dream pass + apply, the anomaly resolver, ontology decay,
-`orchestrator.forget` / `reconsolidate`, the `superseded_by` ontology property,
-and the `--forget` / threshold CLI knobs. (No new ADRs: this doc carries the §0
+CRUD + module-level `safe()` hasher extracted from `semantic_memory.py` + the
+`content/archived_edge/` index for the deep-archive sweep), `set_episode_state`
+/ per-edge sidecar / `persist_node_salience` / class-decay store paths, the two
+retrieval filter layers, the retrieval-time boost hook, the `_step_forget` dream
+pass + apply, the anomaly resolver, ontology decay (with the live
+`_reassign_entities_from_deprecated_class` `instanceOf` rewriter), the A1
+`_step_deep_archive` deep-archive sweep + `archive_edge` physical-removal path,
+the A3 `instanceOf` typing plumbing (GLiNER2 category -> `Episode.entity_classes`
+-> `(E:entity, instanceOf, Class)` edge), `orchestrator.forget` /
+`reconsolidate`, the `superseded_by` ontology property, and the `--forget` /
+threshold CLI knobs (incl. `--deep-archive-days`). (No new ADRs: this doc carries the §0
 alignment notes + risk register that an ADR would; the 3a ADRs 008/009 cover the
 shared GNN + semantic-memory storage 3b builds on.)
 
@@ -86,14 +91,27 @@ Two execution sites + one user trigger:
 - **No model retrain.** Structural salience is the trained head output
   sigmoid'd; the "salience head ingests retrieval features as model inputs"
   lever is deferred (would need a retrain + re-label).
-- **No deep-archive physical removal** (>365d). Soft-archive (in-place
-  `state='archived'`) ships; deep-archive is a future namespace-growth tier.
+- **Deep-archive physical removal is shipped but conservative.** Soft-archive
+  (in-place `state='archived'`) ships; the deep tier (>`deep_archive_days`,
+  default 365) physically removes via a recoverable `archive/edge/...` JSON record
+  + sidecar/index cleanup, gated on `forgetting_enabled` and the threshold. Edges
+  archived before the A1 change (no index entry / `archived_at=None`) are not
+  retroactively deep-archived. `--deep-archive-days 0` disables.
 - **Ontology decay is a no-op on the seed ontology.** Discovered-class promotion
   (Bonsai-gated) is deferred; the mechanism ships ready for it. Entity->class
-  reassignment is a documented no-op (no typing edges yet).
-- **The anomaly resolver is best-effort.** No value->episode provenance in the
-  data model; the resolver assumes latest-asserting = current truth.
-  High-confidence flags only; low-confidence is record-only.
+  reassignment (`instanceOf`) is **live-but-dormant**: the query + rewrite is
+  wired (A3), but seed classes are never decay-deprecated, so it rarely fires
+  until discovered-class typing (A5/Bonsai) lands.
+- **The anomaly resolver is best-effort and wired-but-dormant in production
+  (A2, deferred).** No value->episode provenance in the data model; the resolver
+  re-derives what it can from entity `(E:..., state, value)` edges. **But no
+  production path writes those edges** — only the training injector
+  (`anomaly_injector.py`) does — so the resolver always returns `None` in
+  production today. It assumes latest-asserting = current truth;
+  high-confidence flags only; low-confidence is record-only. Revisit trigger:
+  an entity-state assertion extraction path lands (most likely via doc-ingestion
+  #17 — Jira/Linear status fields, Confluence page states — or a new Bonsai
+  `has_state` relation). See memory `hippo-3b-a2-anomaly-resolver-dormant`.
 - **LTP thresholds are canonical constants**, not config knobs
   (`forgetting.py`: `LTP_RETRIEVAL_COUNT=3`, `LTP_WINDOW_DAYS=15`). Exposing them
   invites breaking the worked-example fidelity gate; they stay pinned.
@@ -108,16 +126,16 @@ Two execution sites + one user trigger:
 | Path | Role |
 |---|---|
 | `src/memory/forgetting.py` | Pure decay/composition math (no store). Worked-example unit tests. |
-| `src/memory/edge_meta.py` | Sidecar CRUD: `get/update/batch_update_edge_meta`; module-level `safe()` hasher. |
+| `src/memory/edge_meta.py` | Sidecar CRUD: `get/update/batch_update_edge_meta`; module-level `safe()` hasher; `content/archived_edge/` index (`archived_edge_key`, `record_archived_edge_op`, `archived_edge_delete_op`, `scan_archived_edges`) for the deep-archive sweep. |
 | `src/memory/store.py` | `set_episode_state`, episode/edge filters, `persist_node_salience`, composed `get_entity_salience` (mention x recency x structural), class-decay helpers (`scan_classes`, `persist_class_last_seen`, `set_class_state`, ...). |
 | `src/memory/ontology.py` | `supersedes` + new `superseded_by` (Episode->Episode back-pointer). |
 | `src/retrieval/graph_traversal.py` | Edge-level filter in `_get_episodes_by_*`; retrieval-time boost hook; `signal` threading. |
 | `src/retrieval/retriever.py` | `signal` param threaded to traversal. |
 | `src/orchestrator.py` | `query(signal=...)`, `forget(episode)`, `reconsolidate(old, new)`. |
-| `src/gnn/consolidate.py` | `_step_forget` + apply (edge-meta, anomaly->reconsolidation, ontology decay); sigmoid+persist node salience; report `forgetting` section. |
-| `src/gnn/semantic_memory.py` | `supersede_episode` (E->E chain + state/validity); extracted `safe()`. |
-| `src/config.py` | `forgetting_enabled` (master gate); `utility_prune_below`, `anomaly_resolve_threshold`, `ontology_decay_days`. |
-| `scripts/run_consolidation.py` | `--forget/--no-forget`, `--utility-prune-below`, `--ontology-decay-days`, `--anomaly-resolve-threshold`. |
+| `src/gnn/consolidate.py` | `_step_forget` + apply (edge-meta, anomaly->reconsolidation, ontology decay); `_step_deep_archive` deep-archive sweep (A1); live `_reassign_entities_from_deprecated_class` `instanceOf` rewriter (A3); sigmoid+persist node salience; report `forgetting` section (incl. `deep_archived`). |
+| `src/gnn/semantic_memory.py` | `supersede_episode` (E->E chain + state/validity); extracted `safe()`; `archive_edge` (deep-archive physical-removal primitive). |
+| `src/config.py` | `forgetting_enabled` (master gate); `utility_prune_below`, `anomaly_resolve_threshold`, `ontology_decay_days`, `deep_archive_days`. |
+| `scripts/run_consolidation.py` | `--forget/--no-forget`, `--utility-prune-below`, `--ontology-decay-days`, `--anomaly-resolve-threshold`, `--deep-archive-days`. |
 | `scripts/compute_entity_salience.py` | Persists `last_mentioned_ts` (max-mention timestamp per entity) for cheap recency. |
 | `tests/test_forgetting.py` | Decay math vs. the worked example (`0.010->0.0060->0.0018`). |
 | `tests/test_edge_meta.py` | Sidecar CRUD + key hashing (incl. `/`-bearing ids) + batch atomicity. |
@@ -129,6 +147,8 @@ Two execution sites + one user trigger:
 | `tests/test_anomaly_reconsolidation.py` | Resolver + apply hook (high vs. low confidence). |
 | `tests/test_ontology_decay.py` | Class `last_seen` stamping + decay deprecates stale discovered classes. |
 | `tests/test_entity_salience_compose.py` | Composed salience (mention x structural x recency) + cold-start fallback. |
+| `tests/test_deep_archive.py` | A1: archived-edge index write on soft-archive + deep-archive sweep (age threshold, skip-under, skip-`archived_at=None`, dry-run no-mutate, `0`=disabled, forgetting-disabled skip). |
+| `tests/test_instance_of.py` | A3: `instanceOf` typing-edge emission from `entity_classes` + live reassignment to the `subClassOf` parent (no-typing, no-parent, multi-entity). |
 
 ---
 
@@ -174,7 +194,8 @@ byte-identical to Phase 1c, so a fresh corpus and the GNN cold-start prior
 - **R7 default-query semantics:** gated on `forgetting_enabled` (default True);
   archived excluded from default, available historically. **Managed.**
 - **R8 per-edge namespace growth:** lazy-create bounds it; deep-archive tier
-  deferred. **Managed (monitor in Phase 5).**
+  shipped (A1, consumes its index entry on removal). **Resolved (monitor index
+  growth in Phase 5).**
 
 ---
 
@@ -193,9 +214,21 @@ byte-identical to Phase 1c, so a fresh corpus and the GNN cold-start prior
 - [x] CLI knobs (`--forget`, `--utility-prune-below`, `--ontology-decay-days`,
       `--anomaly-resolve-threshold`).
 - [x] de-wonk audit (this doc + memory update); commit on user request.
-- [ ] **Consolidation dry-run on the 23-center slice** with a trained checkpoint
-      (verification §5 of the plan) — empirical, deferred to the next GPU/pod
-      opportunity (the trained `all_fixed.pt` is local; the slice is on disk).
+- [x] **Consolidation dry-run on the 23-center slice** with a trained checkpoint
+      (verification §5 of the plan). Ran
+      `python scripts/run_consolidation.py --checkpoint
+      data/pod_runs/phase3a/all_fixed.pt --db
+      data/pod_runs/phase3a/ingest_db_dialogsum_backfilled --limit 23 --report
+      data/pod_runs/phase3a/consol_23center.json` (dry-run, no `--apply`).
+      `trained: true`, `subgraphs_scored: 23`; the `forgetting` section carried
+      the new `deep_archived` key (A1 — the sweep ran clean; `deep_archived: 0`
+      is honest: nothing on the backfilled corpus is archived >365d yet).
+      `edges_seen: 308544`, `archived: 0`, `reconsolidated: 0`,
+      `ontology_deprecated: 0`; `ontology_proposed: 1013817` + `pruned: 510865`
+      reflect the giant-subgraph data-quality issue already documented (memory
+      `hippo-phase3a-head-fixes`); `anomalies: 87`, `abstracts: 108`,
+      `edges_proposed: 368`, `edges_accepted: 0`. No `apply_skipped`, no errors.
+      Report at `data/pod_runs/phase3a/consol_23center.json`.
 
 ---
 
@@ -209,6 +242,7 @@ byte-identical to Phase 1c, so a fresh corpus and the GNN cold-start prior
 - **Empirical forgetting signal (Phase 5):** whether real corpora produce
   meaningful disuse/contradiction is for Phase 5; 3b ships the mechanisms.
 - **Deferred levers (honest):** salience-head retrain (retrieval features as model
-  inputs); discovered-class promotion (Bonsai-gated); deep-archive physical
-  removal (>365d); the process-metadata carve-out (chat [109,110] -> Phase 6
-  Procedural Memory).
+  inputs); discovered-class promotion (Bonsai-gated, which also activates the
+  `instanceOf` reassignment); the anomaly-resolver production trigger (A2 — an
+  entity-state assertion extraction path, likely via doc-ingestion #17); the
+  process-metadata carve-out (chat [109,110] -> Phase 6 Procedural Memory).

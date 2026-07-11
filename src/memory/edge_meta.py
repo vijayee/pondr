@@ -18,7 +18,11 @@ actually used/decayed get a sidecar.
 Key hashing reuses ``store.safe_edge_component`` (hashes any component with
 ``/`` or NUL), so ``content/edge/...`` never collides with the live graph key
 ``memory/spo/{s}/{p}/{o}`` (literal slash) or the archive key
-``archive/edge/{s}/{p}/{o}``.
+``archive/edge/{s}/{p}/{o}``. The A1 deep-archive aging index lives in a fourth
+namespace, ``content/archived_edge/{s}/{p}/{o}`` (one entry per soft-archived
+edge, scanned by the deep-archive sweep); its value stores the original
+``(s,p,o)`` so the sweep recovers edge identity even when key components are
+hashed.
 
 RMW caveat: ``set_edge_state`` and the retrieval-time boost do a
 read-modify-write on the blob. Like ``store._counter_next``, this is NOT atomic
@@ -46,6 +50,10 @@ __all__ = [
     "batch_update_edge_meta",
     "set_edge_state",
     "is_edge_current",
+    "archived_edge_key",
+    "record_archived_edge_op",
+    "archived_edge_delete_op",
+    "scan_archived_edges",
 ]
 
 
@@ -55,6 +63,71 @@ def edge_meta_key(subject: str, predicate: str, object: str) -> str:
         f"content/edge/{safe_edge_component(subject)}/"
         f"{safe_edge_component(predicate)}/{safe_edge_component(object)}"
     )
+
+
+def archived_edge_key(subject: str, predicate: str, object: str) -> str:
+    """``content/archived_edge/{s}/{p}/{o}`` -- the A1 deep-archive aging index.
+
+    One entry per soft-archived edge, written when ``_apply`` persists the
+    ``state='archived'`` sidecar. The deep-archive sweep scans this namespace to
+    age edges past ``deep_archive_days`` without scanning/parsing every sidecar.
+    The key hashes ``/``-bearing components like ``edge_meta_key``; the VALUE
+    (``record_archived_edge_op``) stores the ORIGINAL ``(s,p,o)`` so the sweep
+    can act on the edge even when the key components are hashed (unreversible).
+    """
+    return (
+        f"content/archived_edge/{safe_edge_component(subject)}/"
+        f"{safe_edge_component(predicate)}/{safe_edge_component(object)}"
+    )
+
+
+def record_archived_edge_op(
+    subject: str, predicate: str, object: str, archived_at: str
+) -> dict:
+    """A ``batch_sync`` put-op for one archived-edge index entry (no store access).
+
+    The value JSON carries the original ``(subject, predicate, object)`` plus the
+    soft-archive ``archived_at`` timestamp. Including ``(s,p,o)`` in the value (not
+    just the key) is what makes the sweep recover the edge identity when a key
+    component was hashed by ``safe_edge_component``.
+    """
+    return {
+        "type": "put",
+        "key": archived_edge_key(subject, predicate, object),
+        "value": json.dumps(
+            {"subject": subject, "predicate": predicate, "object": object,
+             "archived_at": archived_at},
+            ensure_ascii=False,
+        ),
+    }
+
+
+def archived_edge_delete_op(subject: str, predicate: str, object: str) -> dict:
+    """A ``batch_sync`` delete-op for one archived-edge index entry (consumed)."""
+    return {"type": "del", "key": archived_edge_key(subject, predicate, object)}
+
+
+def scan_archived_edges(store: "HippocampalStore"):
+    """Yield ``(subject, predicate, object, archived_at)`` for every index entry.
+
+    Read-only namespace scan of ``content/archived_edge/``. ``archived_at`` may be
+    ``None``/empty for legacy entries written before the timestamp shipped; the
+    caller (the deep-archive sweep) skips those (can't age them).
+    """
+    start = "content/archived_edge/"
+    for key, value in store.db.create_read_stream(start=start, end=start + "\x7f"):
+        raw = _b2s(value)
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        s = rec.get("subject")
+        p = rec.get("predicate")
+        o = rec.get("object")
+        if s and p and o:
+            yield (s, p, o, rec.get("archived_at"))
 
 
 def get_edge_meta(
