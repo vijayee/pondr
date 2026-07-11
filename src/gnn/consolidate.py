@@ -25,15 +25,22 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from .graph_loader import WaveDBGraphLoader
+from .graph_loader import WaveDBGraphLoader, KNOWN_PREDICATES
 from .heads import ANOMALY_TYPES
 from .model import GNNModel
 from .semantic_memory import SemanticMemoryWriter
 from .taxonomy_graph import build_taxonomy_data
+from ..memory.forgetting import (
+    apply_dream_state,
+    compose_utility,
+    should_archive,
+)
+from ..memory.edge_meta import batch_update_edge_meta
 
 if TYPE_CHECKING:
     from ..config import ConsolidationConfig
@@ -56,6 +63,20 @@ _SCORE_CHUNK = 50_000
 # is exact at the values that matter (0.05/0.15/0.85 are 0.01-boundaries) and the
 # salience cliff in [0.05, 0.10] is resolved. 100 ints/category is ~800 bytes.
 _HIST_BINS = 100
+
+# Phase 3b: the dream pass decays utility on the same forward association edges
+# the retrieval-time boost strengthens (has_entity/has_topic/has_tone) -- the
+# three retrieval axes. Reverse edges (in_episode/has_session) are store-internal
+# duplicates the retrieval path never keys sidecars on, so they are skipped to
+# avoid double-processing one relationship. The predicate is recovered from
+# edge_attr's one-hot argmax (known predicates map back to their string).
+_FORGET_PREDICATES = ("has_entity", "has_topic", "has_tone")
+_PREDICATE_INDEX = {p: i for i, p in enumerate(KNOWN_PREDICATES)}
+
+
+def _dream_now() -> str:
+    """UTC now as an ISO-8601 ``Z`` timestamp (the dream-pass clock)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _chunked(seq, n: int):
@@ -107,6 +128,12 @@ class Consolidator:
         # bare class names for the recorded proposals.
         self._class_emb: Optional[torch.Tensor] = None
         self._class_names: Optional[list[str]] = None
+        # Per-run accumulators consumed by ``_apply``. Defaults live here so a
+        # direct ``_apply`` call (tests) works without ``run()``; ``run()`` resets
+        # them at the top of each pass so a reused Consolidator starts clean.
+        self._forget_updates: list[tuple[str, str, str, dict]] = []
+        self._forget_node_salience: dict[str, float] = {}
+        self._ontology_deprecate: list[str] = []
 
     # ── main pass ──
 
@@ -150,7 +177,34 @@ class Consolidator:
                 "ontology": [0] * _HIST_BINS, "linkpred": [0] * _HIST_BINS,
                 "salience_endpoint": [0] * _HIST_BINS,
             },
+            # Phase 3b forgetting dream-pass accounting. ``edge_updates`` /
+            # ``node_salience`` are NOT carried here (the per-edge meta dicts are
+            # bulky); they accumulate on ``self._forget_*`` and ``_apply``
+            # consumes them. The report keeps lightweight counts + the archived
+            # edge list for observability.
+            "forgetting": {
+                "edges_seen": 0, "boosted": 0, "archived": [], "ltp": 0,
+                # Phase 3b step 8: anomaly->reconsolidation. Each entry is
+                # ``{entity, old, new}`` -- a high-confidence
+                # ``contradictory_state`` flag the resolver turned into an
+                # E->E ``supersedes`` chain (old episode superseded by new).
+                "reconsolidated": [],
+                # Phase 3b step 9: ontology decay. Discovered classes unseen for
+                # ``ontology_decay_days`` that were deprecated this run. Each
+                # entry is ``{class, parent, last_seen}`` (parent is the
+                # subClassOf parent the deprecated class's entities would
+                # reassign to -- a no-op today, no entity->class typing edges).
+                "ontology_deprecated": [],
+            },
         }
+        # Per-run accumulators consumed by ``_apply`` (record-only during scoring;
+        # ``_apply`` does the writes so a dry run never mutates).
+        self._forget_updates: list[tuple[str, str, str, dict]] = []
+        self._forget_node_salience: dict[str, float] = {}
+        # Phase 3b step 9: discovered classes the decay pass flagged for
+        # deprecation (recorded here; ``_apply`` writes the state). Each entry
+        # is the class-name key component (see ``store.scan_classes``).
+        self._ontology_deprecate: list[str] = []
 
         for center in centers:
             data = self.loader.load(center)
@@ -164,6 +218,14 @@ class Consolidator:
             self._step_anomaly_bounded(data, out, center, report)
             self._step_ontology(data, out, report)
             self._step_prune(data, out, report)
+            self._step_forget(data, out, report)
+
+        # Phase 3b step 9: ontology decay is a GLOBAL pass (not per-center) --
+        # run once after scoring. Records discovered classes unseen for
+        # ``ontology_decay_days`` on ``self._ontology_deprecate``; ``_apply``
+        # writes the deprecation. A no-op on the seed-only ontology (no
+        # discovered classes exist; promotion is a deferred Bonsai-gated path).
+        self._step_ontology_decay(report)
 
         # Apply phase: only when not dry-run. (Per-subgraph steps above only
         # RECORD proposals; mutations happen here so a dry run never writes.)
@@ -430,6 +492,72 @@ class Consolidator:
                     "salience_s": float(sal[s]), "salience_o": float(sal[o]),
                 })
 
+    def _step_forget(self, data, out, report: dict) -> None:
+        """Phase 3b dream-pass: decay utility + soft-archive stale edges.
+
+        For each forward association edge (has_entity/has_topic/has_tone -- the
+        edges the retrieval-time boost strengthens), apply ``on_dream_state``
+        (drift the decay rate back toward baseline + fade utility_score over the
+        disuse interval) and RECOMPOSE ``utility_score`` from
+        ``0.4*access_frequency + 0.6*structural_salience`` where
+        ``structural_salience`` is the object node's SalienceHead output,
+        sigmoid'd + clipped to [0,1] (the head emits raw logits). A current edge
+        whose recomposed utility drops below ``utility_prune_below`` is
+        soft-archived (``state='archived'`` -- excluded from default queries via
+        the edge-level filter, NOT deleted).
+
+        Records the computed sidecar updates on ``self._forget_updates`` and
+        entity structural-salience on ``self._forget_node_salience``; ``_apply``
+        persists them (so a dry run never writes). The 3a hard-prune takes
+        precedence: an edge already in ``report["pruned"]`` (3a will delete it) is
+        skipped here so 3b doesn't write a sidecar for a doomed edge (R5
+        coexistence). Gated on the master ``forgetting_enabled`` flag.
+        """
+        from ..config import config as _master_config
+        if not _master_config.forgetting_enabled:
+            return
+        sal = out["salience"]  # [N] raw logits
+        # 3a-prune precedence: edges 3a will hard-delete are skipped (R5).
+        pruned_set = {(p["subject"], p["object"]) for p in report["pruned"]}
+        now_ts = _dream_now()
+        node_ids = data.node_id
+        forget = report["forgetting"]
+        # Map edge_attr rows back to predicate strings (known predicates only).
+        edge_pred = []
+        if data.edge_index.shape[1] > 0:
+            pred_idx = data.edge_attr.argmax(dim=-1).tolist()
+            for idx in pred_idx:
+                edge_pred.append(KNOWN_PREDICATES[idx] if idx < len(KNOWN_PREDICATES) else None)
+        for e, (s, o) in enumerate(data.edge_index.t().tolist()):
+            pred = edge_pred[e] if e < len(edge_pred) else None
+            if pred not in _FORGET_PREDICATES:
+                continue
+            s_id, o_id = node_ids[s], node_ids[o]
+            if (s_id, o_id) in pruned_set:
+                continue  # 3a hard-prune wins; don't sidecar a doomed edge
+            forget["edges_seen"] += 1
+            # structural_salience = object node's head output, sigmoid'd + clipped.
+            struct = float(torch.clamp(torch.sigmoid(sal[o]), 0.0, 1.0))
+            meta = self.store.get_edge_meta(s_id, pred, o_id)
+            had_history = bool(meta.get("retrieval_timestamps"))
+            meta = apply_dream_state(meta, now_ts=now_ts)
+            meta["utility_score"] = compose_utility(meta, struct, now_ts)
+            if should_archive(meta, utility_prune_below=self.cfg.utility_prune_below):
+                meta["state"] = "archived"
+                forget["archived"].append({
+                    "subject": s_id, "predicate": pred, "object": o_id,
+                    "utility_score": meta["utility_score"],
+                })
+            if had_history:
+                forget["boosted"] += 1
+            if meta.get("ltp_phase") == "late":
+                forget["ltp"] += 1
+            self._forget_updates.append((s_id, pred, o_id, meta))
+            # Record entity structural salience for _apply to persist (entities
+            # only; topics/tones are in-memory at composition time).
+            if o_id.startswith("E:"):
+                self._forget_node_salience[o_id] = struct
+
     # ── apply (mutates; only when not dry-run) ──
 
     def _apply(self, report: dict) -> None:
@@ -453,6 +581,48 @@ class Consolidator:
             if pred:
                 self.writer.archive_edge(p["subject"], pred, p["object"],
                                           reason="low salience (prune)")
+        # Phase 3b forgetting: persist the dream-pass edge-meta updates (utility
+        # decay + soft-archive state) in one atomic batch, and persist each
+        # entity's structural salience so the retrieval hot path (step 10) can
+        # compose it into get_entity_salience. 3a-prune precedence is already
+        # enforced in _step_forget (pruned edges never entered _forget_updates).
+        if self._forget_updates:
+            batch_update_edge_meta(self.store, self._forget_updates)
+        for node_id, score in self._forget_node_salience.items():
+            self.store.persist_node_salience(node_id, score)
+        # Phase 3b step 8: anomaly -> reconsolidation. Only HIGH-confidence
+        # ``contradictory_state`` flags are resolved (the head over-fires on the
+        # giant subgraph; low-confidence stays record-only). The resolver is
+        # best-effort (see ``_resolve_contradictory_state``); when it returns a
+        # pair, the old episode is superseded by the new one (E->E chain).
+        from ..config import config as _master_config
+        if _master_config.forgetting_enabled:
+            for anom in report["anomalies"]:
+                if anom.get("type") != "contradictory_state":
+                    continue
+                if anom.get("score", 0.0) < self.cfg.anomaly_resolve_threshold:
+                    continue  # low-confidence -> record-only
+                resolved = self._resolve_contradictory_state(anom["node"])
+                if resolved is None:
+                    continue
+                old_ep, new_ep = resolved
+                self.writer.supersede_episode(new_ep, old_ep)
+                report["forgetting"]["reconsolidated"].append({
+                    "entity": anom["node"], "old": old_ep, "new": new_ep,
+                })
+            # Phase 3b step 9: ontology decay. Stamp ``last_seen`` for every
+            # class the ontology head proposed a typing to this run (the
+            # class-use signal), then deprecate the discovered classes the
+            # decay pass flagged. Reassignment is a documented no-op (no
+            # entity->class typing edges today).
+            now_ts = _dream_now()
+            seen_classes = {p["class"] for p in report["ontology_proposed"]}
+            for class_name in seen_classes:
+                self.store.persist_class_last_seen(class_name, now_ts)
+            for class_key in self._ontology_deprecate:
+                self.store.set_class_state(class_key, "deprecated")
+                parent = self._class_parent(class_key)
+                self._reassign_entities_from_deprecated_class(class_key, parent)
 
     def _find_predicate(self, subject: str, object_: str) -> Optional[str]:
         """Recover the predicate of a stored ``(subject, ?, object)`` triple."""
@@ -465,6 +635,156 @@ class Consolidator:
             finally:
                 r.close()
         return None
+
+    # ── Phase 3b step 8: anomaly -> reconsolidation resolver ──
+
+    def _resolve_contradictory_state(
+        self, entity_id: str
+    ) -> "Optional[tuple[str, str]]":
+        """Resolve a ``contradictory_state`` flag into an (old, new) episode pair.
+
+        The anomaly head flags an entity as carrying >1 distinct live ``state``
+        value but gives no values, source episodes, or ordering (the record is
+        ``{node, type, score}`` only). This resolver re-derives what it can from
+        the graph:
+
+        1. Confirm the contradiction: scan ``(entity, state, ?literal)`` out-edges
+           and collect DISTINCT literal values. <2 distinct values means the
+           head over-fired (no real contradiction) -> return ``None``.
+        2. Find the entity's source episodes (``(ep, has_entity, entity)`` ->
+           ``vertex(entity).in_("has_entity")``). <2 episodes means the
+           contradiction can't be attributed to specific assertions -> ``None``.
+        3. Order those episodes by timestamp (``get_episode(eid).timestamp``,
+           ISO-8601 string sort = chronological for same-format stamps). The
+           latest-asserting is "new" (the current truth), the earliest is "old".
+
+        HONEST caveat (documented in Phase 3b.md §0): the data model carries NO
+        value->episode provenance -- a ``state`` edge does not record which
+        episode asserted it. So the resolver assumes the latest-asserting
+        episode is the current truth and supersedes the earliest. That is a
+        best-effort heuristic, only run on HIGH-confidence flags (the apply path
+        gates on ``cfg.anomaly_resolve_threshold``); low-confidence flags stay
+        record-only. ``contradictory_state`` is entity-scoped (the injector
+        plants on ``E:``), so non-entity nodes return ``None``.
+        """
+        if not entity_id.startswith("E:"):
+            return None
+        graph = self.store.graph
+        # 1. distinct live state values on the entity.
+        state_values: set[str] = set()
+        r = graph.query().vertex(entity_id).out("state").execute_sync()
+        try:
+            for v in r.vertices:
+                # state objects are literals (not node ids); dedup them.
+                state_values.add(v)
+        finally:
+            r.close()
+        if len(state_values) < 2:
+            return None  # head over-fired; no real contradiction
+        # 2. source episodes that mention the entity.
+        ep_ids: list[str] = []
+        r = graph.query().vertex(entity_id).in_("has_entity").execute_sync()
+        try:
+            ep_ids = [v for v in r.vertices if isinstance(v, str) and v.startswith("ep_")]
+        finally:
+            r.close()
+        if len(ep_ids) < 2:
+            return None  # can't attribute the contradiction to >=2 assertions
+        # 3. order by timestamp; latest = new, earliest = old.
+        stamped: list[tuple[str, str]] = []
+        for eid in ep_ids:
+            ep = self.store.get_episode(eid)
+            if ep is None:
+                continue
+            stamped.append((ep.timestamp or "", eid))
+        if len(stamped) < 2:
+            return None
+        stamped.sort(key=lambda t: t[0])
+        old_ep = stamped[0][1]
+        new_ep = stamped[-1][1]
+        if old_ep == new_ep:
+            return None
+        return (old_ep, new_ep)
+
+    # ── Phase 3b step 9: ontology decay ──
+
+    def _step_ontology_decay(self, report: dict) -> None:
+        """Flag DISCOVERED classes unseen for ``ontology_decay_days`` for deprecation.
+
+        A class is "seen" when the ontology head proposes an entity->class
+        typing for it (``_apply`` stamps ``content/class/{c}/last_seen`` from
+        ``report["ontology_proposed"]``). A DISCOVERED class (one with a
+        ``content/class/{c}/discovered`` marker -- written by the deferred
+        Bonsai-gated promotion path, NOT a seed class) whose ``last_seen`` is
+        older than ``ontology_decay_days`` is recorded on
+        ``self._ontology_deprecate`` for ``_apply`` to deprecate.
+
+        Seed classes are NEVER eligible: the seed writes only ``subClassOf``
+        graph triples (no ``content/class/`` entry), so they don't appear in
+        ``scan_classes``. That gate keeps decay off the seed ontology -- the
+        mechanism ships so promotion lands into a decay-ready namespace, but
+        today this is a no-op (no discovered classes exist). Gated on the
+        master ``forgetting_enabled`` flag.
+        """
+        from ..config import config as _master_config
+        if not _master_config.forgetting_enabled:
+            return
+        threshold_days = self.cfg.ontology_decay_days
+        now_ts = _dream_now()
+        try:
+            now_dt = datetime.strptime(now_ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            return  # unparseable clock -> skip decay (defensive)
+        for class_key in self.store.scan_classes():
+            # Only DISCOVERED classes are decay-eligible (seed classes have no
+            # content/class entry; this also skips classes merely touched by
+            # a last_seen stamp without a discovered marker).
+            if not self.store.is_class_discovered(class_key):
+                continue
+            if self.store.class_state(class_key) != "current":
+                continue  # already deprecated/archived
+            last_seen = self.store.class_last_seen(class_key)
+            if not last_seen:
+                continue  # never seen -> don't deprecate on a cold start
+            try:
+                last_dt = datetime.strptime(last_seen, "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                continue  # unparseable timestamp -> leave alone (defensive)
+            if (now_dt - last_dt.replace(tzinfo=timezone.utc)).days < threshold_days:
+                continue
+            self._ontology_deprecate.append(class_key)
+            parent = self._class_parent(class_key)
+            report["forgetting"]["ontology_deprecated"].append({
+                "class": class_key, "parent": parent, "last_seen": last_seen,
+            })
+
+    def _class_parent(self, class_name: str) -> "Optional[str]":
+        """The deprecated class's ``subClassOf`` parent (for reassignment)."""
+        r = self.store.graph.query().vertex(class_name).out("subClassOf").execute_sync()
+        try:
+            parents = list(r.vertices)
+        finally:
+            r.close()
+        return parents[0] if parents else None
+
+    def _reassign_entities_from_deprecated_class(self, class_name: str,
+                                                  parent: "Optional[str]") -> int:
+        """Reassign entities typed to a deprecated class to its parent.
+
+        HONEST no-op today: the ontology head's entity->class typings are
+        RECORDED only (``_step_ontology``), never written as graph edges -- so
+        there are no entity->class typing edges to reassign. This is the hook
+        for when Bonsai-gated promotion lands typing edges: it would find
+        ``(entity, instanceOf, class_name)`` edges and rewrite each to the
+        parent, superseding the old typing. Returns the (zero) count of
+        reassigned entities for the report.
+        """
+        # No typing edge predicate is written today; the skeleton documents
+        # the future reassignment. When ``instanceOf`` edges land, this becomes:
+        #   for ent in vertex(class).in_("instanceOf"):
+        #       write (ent, instanceOf, parent); mark old typing superseded
+        return 0
 
     # ── helpers ──
 

@@ -143,6 +143,26 @@ def main() -> int:
     parser.add_argument("--anomaly-fanout-cap", type=int, default=None,
                         help="Per-node fanout cap for the anomaly step's subgraph (default 64; "
                              "0 = uncapped = the prior 10,680-node-giant behavior)")
+    # ── Phase 3b forgetting knobs. ``--forget/--no-forget`` toggles the master
+    # gate (``config.forgetting_enabled``, read by the consolidator); the three
+    # thresholds override ConsolidationConfig defaults. LTP thresholds
+    # (reconsolidation_count>=3 across >=15 days) are canonical constants in
+    # ``src/memory/forgetting.py`` (the pure decay module), NOT CLI knobs -- the
+    # worked-example fidelity gate (step 1) pinned them; exposing them invites
+    # breaking the 0.010->0.0060->0.0018 repro. The deep-archive tier (>365d
+    # physical remove) is deferred (no consumer yet) so has no flag.
+    parser.add_argument("--forget", action=argparse.BooleanOptionalAction, default=None,
+                        help="Toggle the forgetting system master gate (default on; --no-forget "
+                             "makes the system behave as if forgetting were never deployed)")
+    parser.add_argument("--utility-prune-below", type=float, default=None,
+                        help="Soft-archive a current edge whose composed utility_score drops "
+                             "below this (default 0.1; archived, NOT deleted)")
+    parser.add_argument("--ontology-decay-days", type=int, default=None,
+                        help="Deprecate discovered classes unseen for this many days (default 30; "
+                             "seed classes are never eligible)")
+    parser.add_argument("--anomaly-resolve-threshold", type=float, default=None,
+                        help="contradictory_state score at/above which the resolver auto-"
+                             "supersedes (default 0.8; below = record-only)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -163,8 +183,17 @@ def main() -> int:
         "linkpred_candidate_budget": args.linkpred_budget,
         "score_collect_bar": args.collect_bar,
         "anomaly_subgraph_radius": args.anomaly_radius,
+        # Phase 3b forgetting thresholds (ConsolidationConfig fields).
+        "utility_prune_below": args.utility_prune_below,
+        "ontology_decay_days": args.ontology_decay_days,
+        "anomaly_resolve_threshold": args.anomaly_resolve_threshold,
     }
     cfg = replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+    # Phase 3b master gate: the consolidator reads ``config.forgetting_enabled``
+    # from the global singleton, so override it here (process-scoped) when the
+    # flag is explicitly passed. Default (None) leaves the config default (True).
+    if args.forget is not None:
+        config.forgetting_enabled = args.forget
     # Anomaly fanout-cap is handled separately: 0 = uncapped (None) is a LEGITIMATE
     # override (the prior giant behavior, for comparison), so it must NOT be
     # dropped by the "is not None" filter above. Only override when the flag was

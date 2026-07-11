@@ -367,6 +367,40 @@ def test_compute_entity_salience_script(tmp_path):
     store.close()
 
 
+def test_compute_entity_salience_script_main_persists_last_mentioned_ts(tmp_path, monkeypatch):
+    """The batch script's ``main()`` persists ``last_mentioned_ts`` as the MAX
+    mention timestamp per entity (Phase 3b step 10), so the retrieval hot path
+    can compute recency without a per-query ``get_episode`` lookup."""
+    from src.memory.store import _b2s
+    import scripts.compute_entity_salience as ces
+
+    store, _ = _traversal(tmp_path)
+    # Alice mentioned across 3 episodes with increasing timestamps; the latest
+    # (ep_003) is the max. Bob once.
+    store.encode_episode(_ep("ep_001", entities=["Alice"], ts="2026-05-01T00:00:00"))
+    store.encode_episode(_ep("ep_002", entities=["Alice"], ts="2026-06-01T00:00:00"))
+    store.encode_episode(_ep("ep_003", entities=["Alice"], ts="2026-07-01T00:00:00"))
+    store.encode_episode(_ep("ep_004", entities=["Bob"], ts="2026-04-01T00:00:00"))
+    db_path = str(tmp_path / "db")
+    store.close()
+
+    monkeypatch.setattr("sys.argv", ["compute_entity_salience.py", "--db", db_path])
+    rc = ces.main()
+    assert rc == 0
+
+    store2 = HippocampalStore(db_path)
+    try:
+        # last_mentioned_ts is the verbatim episode timestamp (max per entity).
+        assert _b2s(store2.db.get_sync("content/entity/Alice/last_mentioned_ts")) == \
+            "2026-07-01T00:00:00"
+        assert _b2s(store2.db.get_sync("content/entity/Bob/last_mentioned_ts")) == \
+            "2026-04-01T00:00:00"
+        # mention_count + last_mentioned (episode id) still written (back-compat).
+        assert _b2s(store2.db.get_sync("content/entity/Alice/mention_count")) == "3"
+    finally:
+        store2.close()
+
+
 # ── temporal date-range (Phase 1c) ──
 
 

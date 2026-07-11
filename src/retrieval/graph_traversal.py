@@ -29,11 +29,17 @@ and is a placeholder ranker; the Phase 3 GNN consolidator replaces it.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from ..config import config as _config
 from ..memory.store import HippocampalStore
+
+# Phase 3b retrieval-time boost (lazy import inside the hook to keep the
+# module-import graph acyclic and avoid loading forgetting machinery on the
+# cold path where forgetting_enabled is False).
+_LOG = logging.getLogger(__name__)
 
 # Axis weights from docs/Phase 1b.md §query-scoring. Recency is applied to the
 # candidate's ordinal rank within the result set (newest = highest), a stand-in
@@ -85,24 +91,54 @@ class GraphTraversal:
         finally:
             result.close()
 
+    def _filter_current_edges(
+        self, episode_ids: list[str], predicate: str, obj: str
+    ) -> list[str]:
+        """Edge-level forgetting filter (Phase 3b).
+
+        Drop episodes whose ``(ep, predicate, obj)`` association has been
+        deprecated/superseded/archived in its per-edge sidecar. This is the
+        EDGE granularity (vs the episode-level filter in
+        ``store.default_episode_ids``): a single stale ``(ep, has_entity,
+        E:Alice)`` edge excludes the episode from an Alice query but NOT from a
+        Bob query -- the episode stays live for its other associations. The
+        episode's graph triple is NOT deleted (deprecate, don't delete); only
+        the sidecar state marks it stale.
+
+        Gated on ``config.forgetting_enabled`` (default True). A missing sidecar
+        (the common cold-start case -- no edge has been touched by forgetting)
+        means ``current``, so the filter is a no-op until something is actually
+        deprecated. One ``get_sync`` point lookup per candidate edge.
+        """
+        if not _config.forgetting_enabled:
+            return episode_ids
+        return [
+            eid for eid in episode_ids
+            if self.store.is_edge_current(eid, predicate, obj)
+        ]
+
     def _get_episodes_by_entity(self, entity: str) -> list[str]:
         """Episodes that mention ``entity`` — ``E:{entity} --out:in_episode--> ep``.
 
         The store writes the reverse edge ``(E:{entity}, in_episode, eid)`` for
         entities (topic/tone/decision only write the forward ``(eid, has_*,
         leaf)`` edge), so the lookup follows ``in_episode`` OUT of ``E:{entity}``,
-        not into it.
+        not into it. The Phase 3b edge-level filter then drops episodes whose
+        ``(ep, has_entity, E:{entity})`` association is deprecated/superseded.
         """
         q = self.graph.query().vertex(f"E:{entity}").out("in_episode")
-        return self._exec_vertices(q)
+        eps = self._exec_vertices(q)
+        return self._filter_current_edges(eps, "has_entity", f"E:{entity}")
 
     def _get_episodes_by_topic(self, topic: str) -> list[str]:
         q = self.graph.query().vertex(f"T:{topic}").in_("has_topic")
-        return self._exec_vertices(q)
+        eps = self._exec_vertices(q)
+        return self._filter_current_edges(eps, "has_topic", f"T:{topic}")
 
     def _get_episodes_by_tone(self, tone: str) -> list[str]:
         q = self.graph.query().vertex(f"A:{tone}").in_("has_tone")
-        return self._exec_vertices(q)
+        eps = self._exec_vertices(q)
+        return self._filter_current_edges(eps, "has_tone", f"A:{tone}")
 
     def _get_all_episode_ids(self) -> list[str]:
         """All episode ids — scan the content namespace (complete).
@@ -169,7 +205,24 @@ class GraphTraversal:
         if candidates is None:
             # No axis specified — start from all episodes.
             return set(self._get_all_episode_ids())
-        return candidates
+        # Phase 3b: the no-axis path goes through ``_get_all_episode_ids`` ->
+        # ``default_episode_ids`` which already excludes deprecated/superseded
+        # episodes. The axis path builds candidates from graph lookups, which
+        # bypass that filter -- so drop episode-level-deprecated episodes here.
+        # (Edge-level deprecation is already handled per-axis in
+        # ``_get_episodes_by_*``; this is the episode-level pass.)
+        return self._filter_active_episodes(candidates)
+
+    def _filter_active_episodes(self, episode_ids: set[str]) -> set[str]:
+        """Episode-level forgetting filter on an axis-derived candidate set.
+
+        Drops episodes whose lifecycle state is ``deprecated``/``superseded`` or
+        whose ``validity_end`` is set. Gated on ``config.forgetting_enabled``;
+        a no-op until something is actually deprecated.
+        """
+        if not _config.forgetting_enabled:
+            return episode_ids
+        return {eid for eid in episode_ids if self.store.is_episode_active(eid)}
 
     # ── follows chain (temporal order) ──
 
@@ -434,7 +487,7 @@ class GraphTraversal:
 
     # ── public entry point ──
 
-    def retrieve(self, query_plan: dict, limit: Optional[int] = None) -> list[dict]:
+    def retrieve(self, query_plan: dict, limit: Optional[int] = None, signal: Optional[str] = None) -> list[dict]:
         """Run a query plan against the graph and return ranked episode dicts.
 
         The plan is the output of the query planner (or a literal dict in tests):
@@ -446,11 +499,19 @@ class GraphTraversal:
         Each result dict carries content (summary/text/timestamp) plus the
         graph-side fields hydrated from the index (entities/topics/tones/
         decisions/session_id/user_id/follows) and a ``score``.
+
+        ``signal`` (Phase 3b) is the LLM-mediated importance signal threaded from
+        the orchestrator (``important``/``routine``/``satisfied``/``frustration``
+        /``correction``) used by the retrieval-time boost hook. Defaults to the
+        plan's ``signal`` field, then ``"routine"``. The boost is NON-BLOCKING:
+        a sidecar write failure is logged and never breaks retrieval.
         """
         entities = query_plan.get("entities") or []
         topics = query_plan.get("topics") or []
         tones = query_plan.get("tones") or []
         entity_mode = query_plan.get("entity_mode", "union")
+        if signal is None:
+            signal = query_plan.get("signal") or "routine"
         temporal_filter = query_plan.get("temporal_filter")
         temporal_after = query_plan.get("temporal_after")
         temporal_before = query_plan.get("temporal_before")
@@ -491,4 +552,86 @@ class GraphTraversal:
         hydrated = [self._hydrate(eid) for eid in candidates]
         scored = self._score_candidates(hydrated, entities, topics, tones)
         scored.sort(key=lambda r: r["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+
+        # Phase 3b: strengthen the edges this retrieval actually matched. The
+        # data is cleanest here -- results are scored, limited, and hydrated with
+        # the matched entities/topics/tones. Fire AFTER results are in hand so a
+        # sidecar write can never delay or break the answer. Non-blocking.
+        self._apply_retrieval_boost(results, entities, topics, tones, signal)
+        return results
+
+    def _apply_retrieval_boost(
+        self,
+        results: list[dict],
+        query_entities: list[str],
+        query_topics: list[str],
+        query_tones: list[str],
+        signal: str,
+    ) -> None:
+        """Retrieval-time forgetting boost (Phase 3b, hot path).
+
+        For each returned result, find the ``(ep, predicate, obj)`` edges that
+        matched this query (entity/topic/tone axes), and apply
+        ``forgetting.apply_retrieval_boost`` to each edge's sidecar -- the
+        ``on_retrieve`` strengthening that makes memories persist with use. All
+        touched edges land in ONE ``batch_sync`` (one RMW read pass, one write
+        batch). Non-blocking: any failure is logged and swallowed so retrieval
+        never breaks on a sidecar write.
+
+        Gated on ``config.forgetting_enabled``. ``access_count++`` is a
+        read-modify-write on the sidecar; under concurrent queries increments
+        can be lost (the same single-user assumption 2c makes -- documented in
+        ``docs/Phase 3b.md``).
+        """
+        if not _config.forgetting_enabled:
+            return
+        if not results:
+            return
+        # Lazy import keeps the forgetting machinery off the cold path and the
+        # module-import graph acyclic.
+        from ..memory.edge_meta import batch_update_edge_meta, get_edge_meta
+        from ..memory.forgetting import apply_retrieval_boost
+
+        ent_set = {e.lower() for e in query_entities}
+        top_set = {t.lower() for t in query_topics}
+        ton_set = {a.lower() for a in query_tones}
+        if not (ent_set or top_set or ton_set):
+            return  # no-axis query: nothing matched an edge to boost
+
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        updates: list[tuple[str, str, str, dict]] = []
+        for r in results:
+            eid = r["episode_id"]
+            # Hydration strips the E:/T:/A: prefix (graph_traversal._hydrate);
+            # re-prepend it to recover the graph-triple object the sidecar keys on.
+            for e in r["entities"]:
+                if e.lower() in ent_set:
+                    obj = f"E:{e}"
+                    meta = get_edge_meta(self.store, eid, "has_entity", obj)
+                    updates.append((
+                        eid, "has_entity", obj,
+                        apply_retrieval_boost(meta, llm_signal=signal, now_ts=now_ts),
+                    ))
+            for t in r["topics"]:
+                if t.lower() in top_set:
+                    obj = f"T:{t}"
+                    meta = get_edge_meta(self.store, eid, "has_topic", obj)
+                    updates.append((
+                        eid, "has_topic", obj,
+                        apply_retrieval_boost(meta, llm_signal=signal, now_ts=now_ts),
+                    ))
+            for a in r["tones"]:
+                if a.lower() in ton_set:
+                    obj = f"A:{a}"
+                    meta = get_edge_meta(self.store, eid, "has_tone", obj)
+                    updates.append((
+                        eid, "has_tone", obj,
+                        apply_retrieval_boost(meta, llm_signal=signal, now_ts=now_ts),
+                    ))
+        if not updates:
+            return
+        try:
+            batch_update_edge_meta(self.store, updates)
+        except Exception as exc:  # non-blocking: never break retrieval
+            _LOG.warning("retrieval boost write failed (%d edges): %s", len(updates), exc)

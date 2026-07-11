@@ -92,6 +92,13 @@ class Config:
     saturation_threshold: int = 5
     boost_half_life_days: float = 7.0
     min_decay_rate: float = 0.001
+    # Phase 3b: master gate. When True the default-query filters exclude
+    # deprecated/superseded episodes and deprecated/superseded/archived edges,
+    # and the consolidation dream pass applies utility decay. When False the
+    # system behaves as if forgetting were never deployed (everything current).
+    # Default True: the filters are a no-op until something is actually
+    # deprecated, so a fresh corpus is unaffected.
+    forgetting_enabled: bool = True
 
     # ── Paths ──
     data_dir: Path = Path("./data")
@@ -220,6 +227,30 @@ class ConsolidationConfig:
     # the prior giant behavior (degenerate guard in consolidate.py).
     anomaly_subgraph_radius: int = 2
     anomaly_fanout_cap: Optional[int] = 64
+    # Phase 3b forgetting dream-pass knobs. The decay math itself lives in
+    # ``src/memory/forgetting.py`` (canonical constants); these are the
+    # consolidation-side thresholds. ``utility_prune_below`` is the soft-archive
+    # cutoff: a current edge whose composed ``utility_score`` drops below this is
+    # set to ``state='archived'`` (excluded from default queries, NOT deleted).
+    utility_prune_below: float = 0.1
+    # Anomaly -> reconsolidation auto-resolve cutoff (Phase 3b step 8). A
+    # ``contradictory_state`` anomaly whose head score is >= this is handed to
+    # the resolver (which confirms >=2 distinct entity ``state`` values in the
+    # graph, finds the entity's source episodes, and supersedes the oldest by
+    # the latest). Below this the flag is record-only -- the head over-fires
+    # on the giant subgraph, so low-confidence contradictions are NOT auto-
+    # superseded (honest: the resolver is best-effort; the data model carries
+    # no value->episode provenance, so the resolver assumes the latest-asserting
+    # episode is the current truth).
+    anomaly_resolve_threshold: float = 0.8
+    # Ontology decay (Phase 3b step 9). A DISCOVERED class (runtime-invented
+    # label promoted via Bonsai -- a deferred path) whose ``last_seen`` is older
+    # than this many days is deprecated (``content/class/{c}/state =
+    # "deprecated"``). Seed classes are NEVER decay-eligible (they have no
+    # ``content/class/`` entry -- the seed writes only ``subClassOf`` graph
+    # triples), so this is a no-op on the seed-only ontology today; the
+    # mechanism ships so promotion lands into a decay-ready namespace.
+    ontology_decay_days: int = 30
 
 
 @dataclass

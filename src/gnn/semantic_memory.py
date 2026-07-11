@@ -37,8 +37,9 @@ if TYPE_CHECKING:
 
 # ``_b2s`` decodes WaveDB bytes→str ('' for missing). It's a module-level helper
 # in ``store.py`` (not a method), so import it rather than reaching through the
-# store instance.
-from ..memory.store import _b2s
+# store instance. ``safe_edge_component`` hashes ``/``-bearing key components
+# (shared with ``memory.edge_meta``'s sidecar key builder).
+from ..memory.store import _b2s, safe_edge_component
 
 
 def _utc_now() -> str:
@@ -108,8 +109,41 @@ class SemanticMemoryWriter:
         return mid
 
     def supersede(self, new_memory_id: str, old_memory_id: str) -> None:
-        """Record that ``new_memory_id`` supersedes ``old_memory_id``."""
+        """Record that ``new_memory_id`` supersedes ``old_memory_id`` (M->M)."""
         ops = self.store.graph.expand_triple(new_memory_id, "supersedes", old_memory_id)
+        self.store.db.batch_sync(ops)
+
+    def supersede_episode(
+        self,
+        new_episode_id: str,
+        old_episode_id: str,
+        *,
+        when: Optional[str] = None,
+    ) -> None:
+        """Record that episode ``new`` supersedes episode ``old`` (E->E, Phase 3b).
+
+        Writes the MVCC supersession chain atomically in ONE ``batch_sync``:
+
+        * ``(new, supersedes, old)`` graph edge (forward chain link).
+        * ``(old, superseded_by, new)`` graph edge (back-pointer for queries
+          that want "what replaced this?"). ``superseded_by`` is added to
+          ``CONVERSATIONAL_PROPERTIES`` in the same change.
+        * ``content/ep/{old}/state = "superseded"`` +
+          ``content/ep/{old}/validity_end = <ts>`` (the old episode stops
+          appearing in default queries; it is NOT deleted).
+
+        The new episode's own state/validity is left untouched (it stays
+        ``current``). This only records the relationship; it does not create
+        the new episode (the caller encodes that separately).
+        """
+        ts = when or _utc_now()
+        ops: list[dict] = []
+        ops += self.store.graph.expand_triple(new_episode_id, "supersedes", old_episode_id)
+        ops += self.store.graph.expand_triple(old_episode_id, "superseded_by", new_episode_id)
+        ops.append({"type": "put", "key": f"content/ep/{old_episode_id}/state",
+                     "value": "superseded"})
+        ops.append({"type": "put", "key": f"content/ep/{old_episode_id}/validity_end",
+                     "value": ts})
         self.store.db.batch_sync(ops)
 
     def get_abstract(self, memory_id: str) -> Optional[dict]:
@@ -185,12 +219,10 @@ class SemanticMemoryWriter:
     @staticmethod
     def _archive_key(subject: str, predicate: str, object: str) -> str:
         """``archive/edge/{s}/{p}/{o}``, hashing any ``/``-bearing component."""
-        import hashlib
-        def safe(part: str) -> str:
-            return part if "/" not in part and "\x00" not in part else (
-                "h_" + hashlib.sha256(part.encode("utf-8")).hexdigest()[:16]
-            )
-        return f"archive/edge/{safe(subject)}/{safe(predicate)}/{safe(object)}"
+        return (
+            f"archive/edge/{safe_edge_component(subject)}/"
+            f"{safe_edge_component(predicate)}/{safe_edge_component(object)}"
+        )
 
 
 __all__ = ["SemanticMemoryWriter"]

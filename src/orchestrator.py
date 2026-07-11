@@ -112,6 +112,7 @@ class PonderOrchestrator:
         format_spec: Optional[dict] = None,
         extract_schema: Optional[dict] = None,
         model_size: Optional[str] = None,
+        signal: str = "routine",
     ) -> dict:
         """Run the full 2c pipeline and return the result dict.
 
@@ -119,6 +120,11 @@ class PonderOrchestrator:
         LLM call; only ``synthesize`` (or the default when no end_state is
         specified) calls Bonsai. A caller override of the gate's end-state
         default is recorded to the override ReplayBuffer.
+
+        ``signal`` (Phase 3b) is the caller's affective/task signal
+        (``important``/``routine``/``correction``/...) threaded through to the
+        retrieval-boost hook so query-matched edges strengthen with use. Defaults
+        to ``"routine"`` (a no-op until something is actually retrieved).
         """
         # 1. embed prompt; update WM (state persists across queries).
         prompt_emb = self.working_memory.embed([user_prompt])[0]
@@ -142,7 +148,7 @@ class PonderOrchestrator:
         gate = getattr(self.retriever, "gate", None) if self.retriever is not None else None
         if gate is not None:
             routing_result = self.retriever.retrieve_with_routing(
-                plan_prompt, conversation_history=conversation_history
+                plan_prompt, conversation_history=conversation_history, signal=signal,
             )
             route = routing_result["route"]
             pathway = route.pathway
@@ -158,7 +164,7 @@ class PonderOrchestrator:
             episodes = routing_result.get("results", [])
         else:
             episodes = self.retriever.retrieve(
-                plan_prompt, conversation_history=conversation_history
+                plan_prompt, conversation_history=conversation_history, signal=signal,
             )
 
         # 4. inject each retrieved episode into WM as a gist step.
@@ -302,6 +308,46 @@ class PonderOrchestrator:
     def expand(self, episode_id: str, chunked) -> tuple[str, WorkingMemoryState]:
         """EXPAND a compressed episode: load full text + inject into WM."""
         return self.expand_handler.handle_expand(episode_id, chunked)
+
+    # ── Phase 3b: active-forget + reconsolidation API ──
+
+    def forget(self, episode_id: str, validity_end: "Optional[str]" = None) -> None:
+        """Active-forget an episode: deprecate, never delete.
+
+        Sets ``content/ep/{eid}/state = "deprecated"`` (+ ``validity_end`` if
+        given) via ``store.set_episode_state``. The episode stops appearing in
+        default queries (the ``default_episode_ids`` state/validity filter) and
+        in axis queries (``is_episode_active``); its content + graph triples
+        are untouched, so it stays retrievable via ``include_inactive=True`` and
+        reversible (a subsequent ``set_episode_state(..., "current")`` revives
+        it). No store configured is a no-op (WM-only orchestrator).
+        """
+        if self.store is None:
+            return
+        self.store.set_episode_state(episode_id, "deprecated", validity_end=validity_end)
+
+    def reconsolidate(
+        self,
+        old_episode_id: str,
+        new_episode_id: str,
+        validity_end: "Optional[str]" = None,
+    ) -> None:
+        """Record that ``new_episode_id`` supersedes ``old_episode_id``.
+
+        Writes the MVCC supersession chain atomically: the ``supersedes`` (new
+        -> old) + ``superseded_by`` (old -> new) graph edges and the old
+        episode's ``state="superseded"`` + ``validity_end``. The old episode
+        drops out of default/axis queries; the new one (encoded by the caller)
+        stays ``current``. Contradiction-resolution and active reconsolidation
+        both land here. No store configured is a no-op. See
+        ``SemanticMemoryWriter.supersede_episode``.
+        """
+        if self.store is None:
+            return
+        from .gnn.semantic_memory import SemanticMemoryWriter
+        SemanticMemoryWriter(self.store).supersede_episode(
+            new_episode_id, old_episode_id, when=validity_end,
+        )
 
     # ── outcome recording ──
 

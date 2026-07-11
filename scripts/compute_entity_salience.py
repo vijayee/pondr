@@ -60,16 +60,24 @@ def main() -> int:
 
     counts: Counter[str] = Counter()
     last_ep: dict[str, str] = {}
+    last_ep_ts: dict[str, str] = {}  # Phase 3b: max-mention timestamp per entity
     n_triples = 0
     nul_keys = 0
     for entity, eid in _iter_entity_episode_pairs(store):
         counts[entity] += 1
         last_ep[entity] = eid  # last-seen wins; scan order is trie order
+        # Phase 3b step 10: track the LATEST mention timestamp per entity so the
+        # retrieval hot path can compute recency without a per-query get_episode.
+        ep = store.get_episode(eid)
+        if ep and ep.timestamp:
+            prev = last_ep_ts.get(entity)
+            if prev is None or ep.timestamp > prev:
+                last_ep_ts[entity] = ep.timestamp
         n_triples += 1
         if "\x00" in eid or "\x00" in entity:
             nul_keys += 1
 
-    store.write_entity_salience_batch(dict(counts), last_ep)
+    store.write_entity_salience_batch(dict(counts), last_ep, last_ep_ts)
 
     print(f"Scanned {n_triples} has_entity triples; salience for {len(counts)} entities.")
     print(f"NUL-bearing keys skipped in scan: {nul_keys}")

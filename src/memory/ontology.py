@@ -77,6 +77,7 @@ CONVERSATIONAL_PROPERTIES: dict[str, dict[str, str]] = {
     "contradicts":  {"domain": "Statement", "range": "Statement"},
     "follows":      {"domain": "Episode",    "range": "Episode"},
     "supersedes":   {"domain": "Episode",    "range": "Episode"},  # reconsolidation
+    "superseded_by": {"domain": "Episode",   "range": "Episode"},  # back-pointer of reconsolidation
     "subClassOf":   {"domain": "Entity",    "range": "Entity"},    # taxonomy edges
     # ── User / Session hierarchy (global chat history) ──
     # A User owns Sessions; a Session contains Episodes. `follows` chains

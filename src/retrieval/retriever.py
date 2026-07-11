@@ -97,6 +97,7 @@ class HippocampalRetriever:
         prompt: str,
         conversation_history: list[dict] | None = None,
         use_semantic: bool = True,
+        signal: str = "routine",
     ) -> list[dict]:
         """Retrieve relevant episodes for a natural-language prompt.
 
@@ -108,13 +109,17 @@ class HippocampalRetriever:
             use_semantic: Fall back to semantic search if graph traversal
                 returns fewer than 3 results. No-op until Phase F (no vector
                 index yet) — kept wired so Phase F only fills in the hook.
+            signal: The caller's affective/task signal (Phase 3b forgetting —
+                ``important``/``routine``/``correction``/...), threaded to the
+                traversal's retrieval-boost hook so matched edges strengthen
+                with use. Defaults to ``"routine"`` (no-op for cold-start).
 
         Returns:
             Ranked list of episode dicts (see ``GraphTraversal.retrieve`` for
             the shape), highest score first.
         """
         query_plan = self.planner.plan(prompt, conversation_history)
-        results = self.traversal.retrieve(query_plan)
+        results = self.traversal.retrieve(query_plan, signal=signal)
 
         if use_semantic and len(results) < 3:
             semantic_results = self._semantic_fallback(prompt, query_plan)
@@ -127,13 +132,13 @@ class HippocampalRetriever:
 
         return results
 
-    def retrieve_with_plan(self, query_plan: dict) -> list[dict]:
+    def retrieve_with_plan(self, query_plan: dict, signal: str = "routine") -> list[dict]:
         """Traverse directly with a caller-supplied plan (skips the planner).
 
         Lets tests exercise the traverse→load path deterministically without
         the planner (or its server fallback) in the loop.
         """
-        return self.traversal.retrieve(query_plan)
+        return self.traversal.retrieve(query_plan, signal=signal)
 
     # ── Phase 2b: subconscious routing ──
 
@@ -142,6 +147,7 @@ class HippocampalRetriever:
         prompt: str,
         conversation_history: list[dict] | None = None,
         use_semantic: bool = True,
+        signal: str = "routine",
     ) -> dict:
         """Retrieve with the subconscious Retrieval Gate consulted first.
 
@@ -181,7 +187,7 @@ class HippocampalRetriever:
 
         if route.pathway in ("graph_retrieve", "conscious_deliberation"):
             results = self.retrieve(prompt, conversation_history=conversation_history,
-                                    use_semantic=use_semantic)
+                                    use_semantic=use_semantic, signal=signal)
             context = self.build_context_string(results) if results else None
             return {
                 "type": route.pathway,
