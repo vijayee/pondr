@@ -68,11 +68,19 @@ def main() -> int:
         last_ep[entity] = eid  # last-seen wins; scan order is trie order
         # Phase 3b step 10: track the LATEST mention timestamp per entity so the
         # retrieval hot path can compute recency without a per-query get_episode.
-        ep = store.get_episode(eid)
-        if ep and ep.timestamp:
+        # Load by unit type: the has_entity POS scan now includes documents
+        # (docs emit ``(doc, has_entity, E:x)``); a ``doc_`` id has no episode
+        # content, so use the document's ``ingested_at`` instead of get_episode.
+        if eid.startswith("doc_"):
+            doc = store.get_document(eid, load_bodies=False)
+            ts = doc.ingested_at if doc is not None else None
+        else:
+            ep = store.get_episode(eid)
+            ts = ep.timestamp if ep is not None else None
+        if ts:
             prev = last_ep_ts.get(entity)
-            if prev is None or ep.timestamp > prev:
-                last_ep_ts[entity] = ep.timestamp
+            if prev is None or ts > prev:
+                last_ep_ts[entity] = ts
         n_triples += 1
         if "\x00" in eid or "\x00" in entity:
             nul_keys += 1

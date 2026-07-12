@@ -603,6 +603,13 @@ class GraphTraversal:
         updates: list[tuple[str, str, str, dict]] = []
         for r in results:
             eid = r["episode_id"]
+            # Documents are exempt from the forgetting system: skip doc-owned
+            # results so no retrieval-boost sidecar is ever written for a
+            # document edge. In Phase 1 ``retrieve()`` returns episodes only
+            # (docs are not yet wired through retrieval), so this is defensive
+            # for the Phase-2 integration that will mix docs into the results.
+            if eid.startswith("doc_"):
+                continue
             # Hydration strips the E:/T:/A: prefix (graph_traversal._hydrate);
             # re-prepend it to recover the graph-triple object the sidecar keys on.
             for e in r["entities"]:

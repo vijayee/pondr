@@ -16,11 +16,15 @@ layer first.
 
 import json
 import math
+import os
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Optional
 
 from wavedb import GraphLayer, WaveDB, WaveDBConfig
 
+from .blob_store import BlobStore, blob_hash
+from .document import Document, DocumentSection
 from .episode import Episode
 from .ontology import SEED_ONTOLOGY
 
@@ -72,6 +76,17 @@ class HippocampalStore:
         self.db_path = db_path  # exposed so retrieval can load a persisted vector index
         # "memory" is the subtree prefix the graph layer lives under.
         self.graph = GraphLayer("memory", self.db)
+        # Cold, content-addressed blob store for document section bodies. LAZY:
+        # opened on first document op so episode-only workloads (consolidation,
+        # salience compute, retrieval) never create a second WaveDB instance.
+        # Sibling of the memory db by default (data/memory_db -> data/document_db)
+        # so a single data dir holds both; overridable via the config dict.
+        self._blob: Optional[BlobStore] = None
+        self._blob_db_path = (
+            (config.get("document_db_path") if config else None)
+            or os.path.join(os.path.dirname(db_path.rstrip("/").rstrip("\\")), "document_db")
+        )
+        self._blob_lru_mb = (config.get("document_store_lru_mb") if config else None) or 16
         self._seed_ontology()
 
     # ---- ontology ----
@@ -794,12 +809,398 @@ class HippocampalStore:
         blob = _b2s(raw)
         return blob if blob else None
 
+    # ---- documents (ingestion; task #17) ----
+    #
+    # Documents are a peer top-level unit to episodes, with a hot/cold split:
+    # small metadata + graph pointers live HERE in the memory (hot) store;
+    # section bodies live in the content-addressed cold store (BlobStore).
+    # Identity is keyed by ``source_path`` (the ``doc_by_source`` index) so
+    # re-ingesting a source UPDATES in place rather than duplicating -- explicit
+    # ingest, no file watcher (user directive). Documents are EXEMPT from the
+    # 3b forgetting system: no state/validity/salience fields, and the ``doc_``
+    # id prefix is the ownership signal the decay sweeps skip by prefix.
+    #
+    # Content-key layout (hot store):
+    #   content/doc/{id}/{field}            doc-level metadata
+    #   content/doc/{id}/sec/{sid}/{field}  per-section metadata + blob_hash ref
+    #   content/doc/{id}/section_ids        JSON list (enumerates sections for
+    #                                      update/delete edge cleanup)
+    #   content/doc_by_source/{safe(path)}  source_path -> doc_id (upsert index)
+    # Bodies + embeddings live in the cold store (blob/body/{hash},
+    # blob/refs/{hash}); only the blob_hash ref is stored here.
+
+    _DOC_FIELDS = (
+        "title", "source_type", "source_path", "authors", "ingested_at",
+        "created_at", "language", "metadata", "entities", "topics",
+        "citations", "relations", "section_ids",
+    )
+    _SEC_FIELDS = (
+        "heading", "level", "parent", "blob_hash", "entities", "topics",
+        "embedding",
+    )
+
+    def _blob_store(self) -> BlobStore:
+        """Lazily open + memoize the cold blob store.
+
+        Episode-only workloads (consolidation, salience compute, retrieval)
+        never touch a document and so never open the second WaveDB instance --
+        the blob store is created on first document op, not at store init.
+        """
+        if self._blob is None:
+            self._blob = BlobStore(self._blob_db_path, lru_memory_mb=self._blob_lru_mb)
+        return self._blob
+
+    def next_document_id(self) -> str:
+        """Globally-unique, monotonically-increasing document id (``doc_NNNNNN``).
+
+        Counter lives under ``content/system/document_counter`` beside the
+        episode/session/memory counters (same RMW caveat as ``next_episode_id``).
+        """
+        return f"doc_{self._counter_next('document_counter'):06d}"
+
+    def document_id_by_source(self, source_path: str) -> Optional[str]:
+        """Resolve upsert identity: the doc id for ``source_path``, or ``None``.
+
+        The ``doc_by_source`` index is keyed by ``safe_edge_component(path)``
+        (a source path contains ``/`` and would otherwise split the key into
+        the wrong namespace; the hash folds it to one component). Re-ingesting
+        the same source string resolves to the same key -> the same doc id ->
+        an in-place UPDATE rather than a duplicate.
+        """
+        raw = _b2s(self.db.get_sync(
+            f"content/doc_by_source/{safe_edge_component(source_path)}"))
+        return raw or None
+
+    def _document_graph_ops(self, doc: Document, delete: bool) -> list[dict]:
+        """Build expand_triple ops for a doc's graph pointers (put or delete).
+
+        Triples (per the ingestion plan): ``(doc, instanceOf, Document)``,
+        ``(doc, has_entity, E:x)`` + ``(E:x, appears_in_doc, doc)``,
+        ``(doc, has_topic, T:t)``, ``(doc, has_section, sid)``,
+        ``(sid, child_of, parent)``, ``(sid, has_entity, E:x)``,
+        ``(doc, cites, target)``, plus each Bonsai ``relations`` triple. The
+        four document-specific predicates (``has_section``/``child_of``/
+        ``appears_in_doc``/``cites``) are snake_case hash-tail predicates,
+        checkpoint-safe + GNN-invisible until retrain (the A3 ``instanceOf``
+        template). Reversing a put uses the SAME ``(s, p, o)`` with
+        ``delete=True`` so the SPO/POS/OSP index entries all come out.
+        """
+        ops: list[dict] = []
+
+        def emit(s: str, p: str, o: str) -> None:
+            ops.extend(self.graph.expand_triple(s, p, o, delete=delete))
+
+        emit(doc.id, "instanceOf", "Document")
+        for e in doc.entities:
+            emit(doc.id, "has_entity", f"E:{e}")
+            emit(f"E:{e}", "appears_in_doc", doc.id)
+        for t in doc.topics:
+            emit(doc.id, "has_topic", f"T:{t}")
+        for sec in doc.sections:
+            emit(doc.id, "has_section", sec.id)
+            if sec.parent_section:
+                emit(sec.id, "child_of", sec.parent_section)
+            for e in sec.entities:
+                emit(sec.id, "has_entity", f"E:{e}")
+        for target in doc.citations:
+            emit(doc.id, "cites", target)
+        for rel in doc.relations:
+            emit(rel["subject"], rel["predicate"], rel["object"])
+        return ops
+
+    def _document_metadata_ops(self, doc: Document) -> list[dict]:
+        """Build the hot-store content puts for a doc's metadata + sections."""
+        ops: list[dict] = []
+        d = f"content/doc/{doc.id}"
+
+        def put(key: str, value) -> None:
+            ops.append({"type": "put", "key": key, "value": value})
+
+        put(f"{d}/title", doc.title)
+        put(f"{d}/source_type", doc.source_type)
+        put(f"{d}/source_path", doc.source_path)
+        put(f"{d}/authors", json.dumps(doc.authors))
+        put(f"{d}/ingested_at", doc.ingested_at)
+        if doc.created_at:
+            put(f"{d}/created_at", doc.created_at)
+        if doc.language:
+            put(f"{d}/language", doc.language)
+        put(f"{d}/metadata", json.dumps(doc.metadata))
+        put(f"{d}/entities", json.dumps(doc.entities))
+        put(f"{d}/topics", json.dumps(doc.topics))
+        put(f"{d}/citations", json.dumps(doc.citations))
+        put(f"{d}/relations", json.dumps(doc.relations))
+        put(f"{d}/section_ids", json.dumps([s.id for s in doc.sections]))
+        for sec in doc.sections:
+            s = f"{d}/sec/{sec.id}"
+            put(f"{s}/heading", sec.heading)
+            put(f"{s}/level", str(sec.level))
+            put(f"{s}/parent", sec.parent_section or "")
+            put(f"{s}/blob_hash", sec.blob_hash or "")
+            put(f"{s}/entities", json.dumps(sec.entities))
+            put(f"{s}/topics", json.dumps(sec.topics))
+            if sec.embedding is not None:
+                put(f"{s}/embedding", json.dumps(sec.embedding))
+        # Upsert index (overwritten in place on update; same key for the same
+        # source_path, so the put is idempotent across re-ingests).
+        put(f"content/doc_by_source/{safe_edge_component(doc.source_path)}", doc.id)
+        return ops
+
+    def _document_delete_content_ops(
+        self, doc_id: str, section_ids: list[str]
+    ) -> list[dict]:
+        """Build del ops for a doc's known hot-store content keys.
+
+        Deletes every doc-level field + every per-section field for the given
+        section ids. Used by update (delete-then-rewrite, so removed sections'
+        keys don't linger) and by delete (full removal). The ``doc_by_source``
+        index lives under a different key and is handled by the caller.
+        """
+        ops: list[dict] = [{"type": "del", "key": f"content/doc/{doc_id}/{f}"}
+                           for f in self._DOC_FIELDS]
+        for sid in section_ids:
+            for f in self._SEC_FIELDS:
+                ops.append({"type": "del", "key": f"content/doc/{doc_id}/sec/{sid}/{f}"})
+        return ops
+
+    def encode_document(self, doc: Document, *, update: bool = False) -> None:
+        """Store a document's metadata + graph pointers + section bodies.
+
+        Hot/cold split (the user's LRU concern): section BODIES go to the cold
+        content-addressed BlobStore (``put_blob``, idempotent = dedup); the hot
+        memory store keeps only small metadata + graph pointers + a
+        ``blob_hash`` ref per section. The memory-store writes (metadata +
+        graph) are ONE atomic ``batch_sync``, mirroring ``encode_episode``;
+        the blob writes precede it (a blob must exist before its hash is
+        referenced). Cross-store atomicity is NOT possible (two WaveDB
+        instances); on a memory-batch failure the blobs are orphaned and GC'd
+        later by ``BlobStore.gc_zero_ref`` -- acceptable for the single-
+        threaded first slice, documented in the plan.
+
+        Upsert (``update=True``): the doc.id is the REUSED id (the pipeline
+        resolved it via ``document_id_by_source``). The old sections' blob
+        hashes are loaded (without their bodies) to compute a refcount DELTA --
+        unchanged sections keep their ref (and, in Phase 2, their embedding),
+        removed sections drop theirs, new/changed sections get one. The old
+        hot-store keys + graph edges are deleted, then the new set written,
+        all in the one memory batch. ``doc_by_source`` is overwritten in place.
+        """
+        bs = self._blob_store()
+        # Load the OLD doc once (update path): reused for BOTH the refcount
+        # delta (step 2) and the delete-then-rewrite ops (step 3), so a re-
+        # ingest reads the prior metadata a single time, not twice.
+        old_doc: Optional[Document] = None
+        if update:
+            old_doc = self.get_document(doc.id, load_bodies=False)
+        # 1. Hash each new section's body + write its blob (idempotent = dedup
+        #    across documents AND across re-ingests of the same doc).
+        for sec in doc.sections:
+            sec.blob_hash = blob_hash(sec.content)
+            bs.put_blob(sec.blob_hash, sec.content)
+        # 2. Refcount delta vs the old section hashes (CREATE: old is empty).
+        old_hashes: list[str] = (
+            [s.blob_hash for s in old_doc.sections if s.blob_hash]
+            if old_doc is not None else []
+        )
+        new_counts = Counter(s.blob_hash for s in doc.sections if s.blob_hash)
+        old_counts = Counter(old_hashes)
+        # NOTE: ``Counter`` ``+``/``-`` silently drop non-positive counts, so a
+        # removed section's hash (delta < 0) would be dropped and ``decr_ref``
+        # never called -- a refcount leak that orphans shared blobs. Compute
+        # the delta with a plain dict so negative entries survive.
+        delta = {h: new_counts[h] - old_counts[h]
+                 for h in set(new_counts) | set(old_counts)}
+        for h, n in delta.items():
+            if n > 0:
+                for _ in range(n):
+                    bs.incr_ref(h)
+            elif n < 0:
+                for _ in range(-n):
+                    bs.decr_ref(h)
+        # 3. ONE atomic memory batch: delete old content + graph edges, write
+        #    new content + graph edges + the upsert index.
+        ops: list[dict] = []
+        if old_doc is not None:
+            ops += self._document_delete_content_ops(
+                doc.id, [s.id for s in old_doc.sections])
+            ops += self._document_graph_ops(old_doc, delete=True)
+        ops += self._document_metadata_ops(doc)
+        ops += self._document_graph_ops(doc, delete=False)
+        self.db.batch_sync(ops)
+
+    def get_document(
+        self, doc_id: str, load_bodies: bool = True
+    ) -> Optional[Document]:
+        """Load a document's metadata + sections from the hot (+ cold) store.
+
+        Mirrors ``get_episode``. Doc-level + per-section metadata + graph
+        pointers' refs (``blob_hash``) come from the hot store; section BODIES
+        are pulled from the cold store keyed by ``blob_hash`` -- but only when
+        ``load_bodies`` is set (a cold pull, kept out of the hot LRU by the
+        split). ``load_bodies=False`` is the update/delete path: it recovers
+        the section structure + blob hashes without the cold pull. Graph
+        structure (entities/topics/relations/citations) is read back from the
+        hot-store metadata fields (written at encode), not re-queried from the
+        graph layer. Returns ``None`` for a missing doc (no title key).
+        """
+        title = _b2s(self.db.get_sync(f"content/doc/{doc_id}/title"))
+        if not title:
+            return None
+        source_type = _b2s(self.db.get_sync(f"content/doc/{doc_id}/source_type")) or "text"
+        source_path = _b2s(self.db.get_sync(f"content/doc/{doc_id}/source_path"))
+        authors_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/authors"))
+        ingested_at = _b2s(self.db.get_sync(f"content/doc/{doc_id}/ingested_at"))
+        created_at = _b2s(self.db.get_sync(f"content/doc/{doc_id}/created_at")) or None
+        language = _b2s(self.db.get_sync(f"content/doc/{doc_id}/language")) or None
+        metadata_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/metadata"))
+        entities_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/entities"))
+        topics_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/topics"))
+        citations_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/citations"))
+        relations_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/relations"))
+        section_ids_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/section_ids"))
+
+        def _loads(raw, default):
+            try:
+                return json.loads(raw) if raw else default
+            except (ValueError, TypeError):
+                return default
+
+        bs = self._blob_store() if load_bodies else None
+        sections: list[DocumentSection] = []
+        for sid in _loads(section_ids_raw, []):
+            s = f"content/doc/{doc_id}/sec/{sid}"
+            blob_hash = _b2s(self.db.get_sync(f"{s}/blob_hash")) or None
+            content = ""
+            if load_bodies and blob_hash:
+                body = bs.get_blob(blob_hash)
+                content = body if body is not None else ""
+            embedding = None
+            emb_raw = _b2s(self.db.get_sync(f"{s}/embedding"))
+            if emb_raw:
+                embedding = _loads(emb_raw, None)
+            sections.append(DocumentSection(
+                id=sid,
+                heading=_b2s(self.db.get_sync(f"{s}/heading")),
+                level=int(_b2s(self.db.get_sync(f"{s}/level")) or "1"),
+                content=content,
+                parent_section=_b2s(self.db.get_sync(f"{s}/parent")) or None,
+                entities=_loads(_b2s(self.db.get_sync(f"{s}/entities")), []),
+                topics=_loads(_b2s(self.db.get_sync(f"{s}/topics")), []),
+                embedding=embedding,
+                blob_hash=blob_hash,
+            ))
+
+        return Document(
+            id=doc_id,
+            source_type=source_type,
+            source_path=source_path,
+            title=title,
+            ingested_at=ingested_at,
+            sections=sections,
+            authors=_loads(authors_raw, []),
+            created_at=created_at,
+            language=language,
+            metadata=_loads(metadata_raw, {}),
+            entities=_loads(entities_raw, []),
+            topics=_loads(topics_raw, []),
+            relations=_loads(relations_raw, []),
+            citations=_loads(citations_raw, []),
+        )
+
+    def default_document_ids(self) -> list[str]:
+        """All document ids (scan ``content/doc/``).
+
+        Documents are NOT forgotten, so there is no state/validity filter --
+        a deleted document's metadata is gone, so it simply doesn't appear.
+        Parallel to ``default_episode_ids`` but simpler. The scan range
+        ``content/doc/`` .. ``content/doc/\\x7f`` excludes
+        ``content/doc_by_source`` by trie ordering (``_`` 0x5F > ``/`` 0x2F,
+        so the by-source index sorts beyond the range's end key).
+        """
+        ids: set[str] = set()
+        for k, _ in self.db.create_read_stream(
+            start="content/doc/", end="content/doc/\x7f"
+        ):
+            parts = k.split("/", 3)
+            if len(parts) < 3 or not parts[2]:
+                continue
+            ids.add(parts[2])
+        return sorted(ids)
+
+    def documents_by_entity(self, entity: str) -> list[str]:
+        """Document ids that link a given entity (``(doc, has_entity, E:x)``).
+
+        Scans the POS index ``memory/pos/has_entity/E:{entity}/`` and keeps
+        ``doc_`` subjects. Store-level findability for Phase 1; the full
+        ``GraphTraversal.retrieve()`` integration is Phase 2.
+        """
+        return self._documents_by_pos("has_entity", f"E:{entity}")
+
+    def documents_by_topic(self, topic: str) -> list[str]:
+        """Document ids that carry a given topic (``(doc, has_topic, T:t)``)."""
+        return self._documents_by_pos("has_topic", f"T:{topic}")
+
+    def _documents_by_pos(self, predicate: str, obj: str) -> list[str]:
+        start = f"memory/pos/{predicate}/{obj}/"
+        end = f"memory/pos/{predicate}/{obj}/\x7f"
+        out: list[str] = []
+        for k, _ in self.db.create_read_stream(start=start, end=end):
+            # k = memory/pos/{predicate}/{obj}/{subject}
+            subj = k.rsplit("/", 1)[-1]
+            if subj.startswith("doc_"):
+                out.append(subj)
+        return sorted(set(out))
+
+    def delete_document(self, doc_id: str) -> bool:
+        """Real removal of a document + its sections (no archive record).
+
+        The user's "deleted, not archived" directive: the doc's hot metadata,
+        per-section metadata, graph edges, and ``doc_by_source`` index entry
+        are all deleted in ONE atomic ``batch_sync``, and each section's blob
+        refcount is DECREMENTED (shared-blob safety: a blob may back more than
+        one document, so the body is NOT physically deleted here -- zero-ref
+        orphans are left for ``BlobStore.gc_zero_ref`` to sweep). Returns
+        ``False`` if the doc was already absent (idempotent), ``True`` if
+        removed. A lightweight audit tombstone is intentionally NOT written
+        (honest delete, per the plan's default).
+        """
+        doc = self.get_document(doc_id, load_bodies=False)
+        if doc is None:
+            return False
+        ops: list[dict] = []
+        ops += self._document_delete_content_ops(
+            doc_id, [s.id for s in doc.sections])
+        ops += self._document_graph_ops(doc, delete=True)
+        ops.append({"type": "del",
+                    "key": f"content/doc_by_source/{safe_edge_component(doc.source_path)}"})
+        self.db.batch_sync(ops)
+        # Decrement each section's blob refcount AFTER the memory batch (the
+        # doc is no longer findable); zero-ref blobs are orphaned, not deleted
+        # (shared-blob safety). ``--gc-blobs`` sweeps them later.
+        bs = self._blob_store()
+        for sec in doc.sections:
+            if sec.blob_hash:
+                bs.decr_ref(sec.blob_hash)
+        return True
+
+    def gc_blobs(self) -> int:
+        """Sweep zero-refcount orphan blobs from the cold store. Returns count."""
+        return self._blob_store().gc_zero_ref()
+
     # ---- lifecycle ----
 
     def close(self) -> None:
-        # Close the graph layer first: the binding's WaveDB.close() refuses to
-        # destroy the database while the graph layer's subtree reference is open.
+        # Close children before the db: the binding's WaveDB.close() refuses
+        # to destroy the database while child handles are open. The graph
+        # layer is always open; the blob store is opened lazily and may be
+        # None for episode-only workloads.
         try:
             self.graph.close()
         finally:
-            self.db.close()
+            if self._blob is not None:
+                try:
+                    self._blob.close()
+                finally:
+                    self.db.close()
+            else:
+                self.db.close()

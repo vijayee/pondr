@@ -519,9 +519,17 @@ class Consolidator:
                 report["score_distributions"]["salience_endpoint"],
                 edge_max, self.cfg.score_collect_bar)
         for s, o in data.edge_index.t().tolist():
+            s_id, o_id = data.node_id[s], data.node_id[o]
+            # Documents are exempt from forgetting (no decay/archive/delete):
+            # skip edges with a doc-owned endpoint. There is no predicate
+            # filter in _step_prune, so BOTH endpoints are guarded -- a
+            # ``(E:x, appears_in_doc, doc)`` edge has the doc as object.
+            # Ownership is the ``doc_`` id prefix (the ``ep_`` convention).
+            if s_id.startswith("doc_") or o_id.startswith("doc_"):
+                continue
             if float(sal[s]) < thr and float(sal[o]) < thr:
                 report["pruned"].append({
-                    "subject": data.node_id[s], "object": data.node_id[o],
+                    "subject": s_id, "object": o_id,
                     "salience_s": float(sal[s]), "salience_o": float(sal[o]),
                 })
 
@@ -566,6 +574,11 @@ class Consolidator:
             if pred not in _FORGET_PREDICATES:
                 continue
             s_id, o_id = node_ids[s], node_ids[o]
+            # Documents are exempt from forgetting: a doc-owned ``has_entity`` /
+            # ``has_topic`` edge is never soft-archived -> never enters the
+            # deep-archive index. Ownership is the ``doc_`` id prefix.
+            if s_id.startswith("doc_") or o_id.startswith("doc_"):
+                continue
             if (s_id, o_id) in pruned_set:
                 continue  # 3a hard-prune wins; don't sidecar a doomed edge
             forget["edges_seen"] += 1
@@ -876,6 +889,11 @@ class Consolidator:
         for s, p, o, archived_at in scan_archived_edges(self.store):
             if not archived_at:
                 continue  # legacy entry -> not aged (conservative)
+            # Defensive: doc-owned edges are never soft-archived (the forget
+            # sweep skips them by prefix), so they are never in this index --
+            # but guard anyway in case a pre-exemption sidecar lingers.
+            if s.startswith("doc_"):
+                continue
             try:
                 a_dt = datetime.strptime(
                     archived_at, "%Y-%m-%dT%H:%M:%SZ"

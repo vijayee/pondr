@@ -412,6 +412,13 @@ DEVELOPMENT_CLASSES: dict[str, list[str]] = {
         "Wiki", "Manual", "Tutorial", "Playbook",
         "Runbook", "README", "Changelog", "License",
     ],
+    # DocumentSection is the leaf chunk of an ingested document -- the
+    # retrieval unit (one embedding + one content-addressed blob). It is a
+    # part of a Document, not a kind of Document, so it is a peer leaf class
+    # (like Statement), not a Document subclass. Declared explicitly so it is
+    # a real node the document predicates (has_section / child_of) can point
+    # at. See ``store.encode_document`` + the ingestion plan.
+    "DocumentSection": [],
     "Knowledge": [
         "BestPractice", "AntiPattern", "LessonLearned",
         "Pattern", "Convention", "Standard",
@@ -439,6 +446,28 @@ DEVELOPMENT_PROPERTIES: dict[str, dict[str, str]] = {
     "documented_in":      {"domain": "CodeArtifact", "range": "Document"},
     "follows_practice":   {"domain": "CodeArtifact", "range": "BestPractice"},
     "avoids":             {"domain": "CodeArtifact", "range": "AntiPattern"},
+
+    # ── Document ingestion (task #17) ──
+    # Structure of an ingested document: ``has_section`` links a Document to
+    # its leaf chunks; ``child_of`` preserves the section hierarchy the parser
+    # saw; ``appears_in_doc`` is the entity->document back-pointer (so a doc
+    # is findable from either end); ``cites`` is a doc-level citation edge
+    # (target resolved to a Document node in Phase 4; a literal target today).
+    # All four are SNAKE_CASE -> ``_to_graph_predicate`` handles them with no
+    # special-casing. They are hash-tail predicates -- intentionally NOT in
+    # ``KNOWN_PREDICATES`` (graph_loader) or ``_NODE_PREDICATES``
+    # (oracle_labeling), so the trained GNN checkpoint is unaffected (the A3
+    # ``instanceOf`` template): documents get no GNN structural scoring until a
+    # retrain. ``has_entity``/``has_topic`` ARE known predicates, so doc nodes
+    # WILL enter future GNN subgraph extractions -- the cross-unit bridging win,
+    # a retrain-time distribution shift, NOT a checkpoint-load break.
+    # NOTE: ``contradicts`` already exists as Statement->Statement (above); the
+    # flat property dict-merge would silently overwrite it, so document
+    # contradiction detection (Phase 4) uses a DISTINCT predicate, not this one.
+    "has_section":    {"domain": "Document",         "range": "DocumentSection"},
+    "child_of":       {"domain": "DocumentSection", "range": "DocumentSection"},
+    "appears_in_doc": {"domain": "Entity",          "range": "Document"},
+    "cites":          {"domain": "Document",        "range": "Document"},
 
     # ── Communication ──
     "delivers":           {"domain": "Channel",      "range": "Message"},

@@ -105,6 +105,17 @@ class Config:
     sample_conversations: Path = Path("./data/sample_conversations.jsonl")
     corpora_dir: Path = Path("./data/corpora")
 
+    # ── Document ingestion (task #17) ──
+    # Cold, content-addressed blob store for document section bodies -- a
+    # SECOND WaveDB instance separate from the hot memory store (db_path) so
+    # large chunk bodies never flush the memory store's 100MB LRU. The store
+    # defaults to a sibling of db_path when these are unset; these make the
+    # paths explicit + overridable.
+    document_db_path: str = "./data/document_db"
+    document_store_lru_mb: int = 16
+    # Ingestion knobs (structure-based chunking leaf sizing + blob hashing).
+    ingestion: "IngestionConfig" = field(default_factory=lambda: IngestionConfig())
+
 
 # ── Phase 2c: Working Memory & Presentation ──
 # Config is dataclass-based (not YAML), matching the rest of the codebase. These
@@ -291,6 +302,26 @@ class Phase3aConfig:
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     labels: LabelGenConfig = field(default_factory=LabelGenConfig)
     checkpoint_dir: str = "data/pod_runs/phase3a/"   # gitignored
+
+
+@dataclass
+class IngestionConfig:
+    """Document/record ingestion knobs (task #17, RAG-replacement pillar).
+
+    Structure-based chunking leaf sizing (the chat's HierarchicalChunker gap):
+    ``max_section_tokens`` sub-splits an oversized section on paragraph
+    boundaries so each leaf is one-embedding-pass + retrieval-sized (default
+    512 = the embedder's cap); ``min_section_tokens`` merges a too-small leaf
+    into its parent (default 64). ``semantic_split_threshold`` is reserved for
+    the Phase-2 embedding-based semantic-boundary splitter (needs the lazy
+    embedder) and is a no-op until set. ``blob_hash_algo`` is the
+    content-addressed key for the cold store (``sha256[:16]``).
+    """
+
+    max_section_tokens: int = 512
+    min_section_tokens: int = 64
+    semantic_split_threshold: Optional[float] = None
+    blob_hash_algo: str = "sha256[:16]"
 
 
 config = Config()
