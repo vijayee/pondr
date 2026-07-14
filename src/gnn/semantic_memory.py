@@ -145,6 +145,13 @@ class SemanticMemoryWriter:
         ops.append({"type": "put", "key": f"content/ep/{old_episode_id}/validity_end",
                      "value": ts})
         self.store.db.batch_sync(ops)
+        # Remove the superseded episode from the in-DB vector index (best-
+        # effort). supersede_episode writes state="superseded" DIRECTLY -- it
+        # does NOT route through HippocampalStore.set_episode_state -- so this
+        # is a separate hook, not a double-fire. Without it, reconsolidation +
+        # anomaly-driven supersession (Consolidator._apply) would leave the old
+        # episode searchable via the semantic fallback.
+        self.store._unindex_embedding(old_episode_id)
 
     def get_abstract(self, memory_id: str) -> Optional[dict]:
         """Read a semantic memory back. ``None`` if it doesn't exist."""

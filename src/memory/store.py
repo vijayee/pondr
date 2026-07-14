@@ -29,6 +29,18 @@ from .episode import Episode
 from .ontology import SEED_ONTOLOGY
 
 
+def _has_vector_layer() -> bool:
+    """True if the installed wavedb exposes the native VectorLayer (>=0.2.0).
+
+    Gated so Hippo keeps working on old WaveDB (<0.2.0) and in the offline test
+    suite (no vector build needed): when False, ``HippocampalStore`` leaves
+    ``self.vector_layer = None`` and the retriever falls back to the FAISS
+    ``VectorSearch`` path.
+    """
+    import wavedb
+    return hasattr(wavedb, "VectorLayer")
+
+
 def _b2s(v) -> str:
     """Decode a WaveDB value (bytes) to str; '' for missing/None."""
     if v is None:
@@ -87,6 +99,26 @@ class HippocampalStore:
             or os.path.join(os.path.dirname(db_path.rstrip("/").rstrip("\\")), "document_db")
         )
         self._blob_lru_mb = (config.get("document_store_lru_mb") if config else None) or 16
+        # Native in-DB vector index (WaveDB VectorLayer, wavedb>=0.2.2). Opened
+        # on the SAME database_t as self.db (VectorLayer.open shares it and
+        # registers with db._open_subtrees), so it must close before db.close()
+        # (see close()). FLAT/COSINE is exact + training-free; IVF graduation
+        # is a later config flip + one train() call, not wired here. Gated on
+        # vector_index_enabled + the installed wavedb exposing VectorLayer; when
+        # absent, self.vector_layer stays None and the retriever falls back to
+        # the FAISS VectorSearch path.
+        self.vector_layer = None
+        self._vector_dim = None
+        if (config.get("vector_index_enabled", True) if config else True) and _has_vector_layer():
+            from wavedb import VectorLayer, Format, IndexType, Distance, Runtime
+            dim = (config.get("embedding_dim", 384) if config else 384)
+            self.vector_layer = VectorLayer.open(
+                "episodes",
+                self.db,
+                fmt=Format(IndexType.FLAT, dim, Distance.COSINE),
+                rt=Runtime(top_k=10, sync_only=1),
+            )
+            self._vector_dim = dim
         self._seed_ontology()
 
     # ---- ontology ----
@@ -210,6 +242,13 @@ class HippocampalStore:
             ops += self.graph.expand_triple(eid, "at_time", episode.timestamp)
 
         self.db.batch_sync(ops)
+        # Live upsert into the in-DB vector index. The VectorLayer insert is
+        # its own atomic op on the same database_t -- it cannot ride in the
+        # content batch_sync above -- so it happens after, best-effort. This
+        # closes the FAISS-sidecar "not updated live" caveat: a newly encoded
+        # episode is immediately searchable via search_sync, no offline rebuild.
+        if episode.summary_embedding:
+            self._index_embedding(eid, episode.summary_embedding, episode.summary or "")
 
     # ---- retrieve ----
 
@@ -287,16 +326,47 @@ class HippocampalStore:
             messages=messages,
         )
 
+    def _index_embedding(self, eid: str, vec, summary: str = "") -> None:
+        """Best-effort upsert of an episode embedding into the in-DB vector index.
+
+        The single chokepoint for embedding writes: called from
+        ``encode_episode`` (the live path) and ``set_summary_embedding`` (the
+        backfill path used by ``build_vector_index.py``). Best-effort + logged
+        + never raises -- a vector-index hiccup must never fail an episode
+        encode (mirrors ``_persist_exchange``'s philosophy). An episode with a
+        missing vector entry is still fully retrievable via the graph path.
+        """
+        import sys
+        if self.vector_layer is None:
+            return
+        # Dim guard: the layer was opened at self._vector_dim (384 for bge-
+        # small). insert_sync sends the vector to C without an explicit length
+        # (the C layer reads fmt.dim floats), so a short vector (e.g. a stub
+        # embedder's 64-dim vector in a test) would over-read or mismatch.
+        # Skip silently on mismatch -- best-effort, and keeps stub-embedder
+        # tests noise-free. The real embedder always matches.
+        if self._vector_dim is not None and len(vec) != self._vector_dim:
+            return
+        try:
+            self.vector_layer.insert_sync(eid, vec, metadata=(summary or "").encode("utf-8"))
+        except Exception as e:  # noqa: BLE001 - vector index is best-effort
+            print(f"[vector-index-fail] {eid}: {e}", file=sys.stderr)
+
     def set_summary_embedding(self, episode_id: str, embedding: list[float]) -> None:
         """Backfill an episode's summary embedding (Phase F vector index build).
 
         Writes ``content/ep/{episode_id}/embedding`` so ``get_episode`` and
-        ``VectorSearch`` can read it back without re-running the encoder.
+        ``VectorSearch`` can read it back without re-running the encoder. Also
+        upserts into the in-DB VectorLayer (when enabled), so the offline bulk
+        build populates BOTH the FAISS sidecar and the in-DB index in one pass.
         """
         import json
         self.db.put_sync(
             f"content/ep/{episode_id}/embedding",
             json.dumps(embedding),
+        )
+        self._index_embedding(
+            episode_id, embedding, self.get_episode(episode_id).summary or ""
         )
 
     # ---- entity salience (Phase 1c + Phase 3b composition) ----
@@ -577,6 +647,27 @@ class HippocampalStore:
 
     # ---- episode-level forgetting state (Phase 3b) ----
 
+    def _unindex_embedding(self, eid: str) -> None:
+        """Best-effort removal of an episode embedding from the in-DB vector index.
+
+        The single delete chokepoint, called from ``set_episode_state`` when an
+        episode is deprecated/superseded. ``delete_sync`` on an absent id is a
+        no-op, so the lack of a ``doc_`` guard here is harmless (``doc_*`` ids
+        are never ``ep_*`` and the vector layer only holds ``ep_*``). Best-effort
+        + logged + never raises -- a vector-index hiccup must never fail a state
+        change. NOTE: ``SemanticMemoryWriter.supersede_episode`` writes
+        ``state="superseded"`` directly (NOT via this method), so it calls this
+        helper itself; hooking only ``set_episode_state`` would miss
+        reconsolidation/anomaly-driven supersession.
+        """
+        import sys
+        if self.vector_layer is None:
+            return
+        try:
+            self.vector_layer.delete_sync(eid)
+        except Exception as e:  # noqa: BLE001 - vector index is best-effort
+            print(f"[vector-index-fail] delete {eid}: {e}", file=sys.stderr)
+
     def set_episode_state(
         self, episode_id: str, state: str, validity_end: "str | None" = None
     ) -> None:
@@ -588,6 +679,13 @@ class HippocampalStore:
         which ``default_episode_ids`` reads to exclude the episode from default
         queries. The episode is NOT deleted -- its content stays retrievable via
         ``include_inactive=True`` and its graph triples are untouched.
+
+        When the in-DB vector layer is enabled, a deprecated/superseded episode
+        is also removed from the vector index immediately (the FAISS sidecar
+        could not delete; this closes that caveat), best-effort via
+        ``_unindex_embedding``. A later revival to ``"current"`` re-inserts on
+        its next encode (rare; not auto-reinserted here -- avoids a re-embed
+        cost on a rare path).
 
         Note: the graph triple ``(eid, "state", old_state)`` written at encode
         is NOT updated here; retrieval ``_hydrate`` does not read it, and the
@@ -605,6 +703,8 @@ class HippocampalStore:
                 "value": validity_end,
             })
         self.db.batch_sync(ops)
+        if state in ("deprecated", "superseded"):
+            self._unindex_embedding(episode_id)
 
     def episode_state(self, episode_id: str) -> str:
         """The episode's lifecycle state (``"current"`` if never set)."""
@@ -1208,8 +1308,11 @@ class HippocampalStore:
         # Close children before the db: the binding's WaveDB.close() refuses
         # to destroy the database while child handles are open. The graph
         # layer is always open; the blob store is opened lazily and may be
-        # None for episode-only workloads.
+        # None for episode-only workloads; the vector layer (VectorLayer.open
+        # shares self.db's database_t) is opened in __init__ when enabled.
         try:
+            if self.vector_layer is not None:
+                self.vector_layer.close()
             self.graph.close()
         finally:
             if self._blob is not None:

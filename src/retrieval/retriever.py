@@ -77,7 +77,19 @@ class HippocampalRetriever:
         self._outcome_trainer = None  # lazily built on first record_outcome
 
     def _try_load_vector_index(self) -> None:
-        """Attach + load a persisted VectorSearch index if one exists."""
+        """Attach a vector backend for the semantic fallback.
+
+        Prefers the in-DB WaveDB VectorLayer (``store.vector_layer``) via the
+        ``WavedbVectorStore`` adapter when the store opened one -- the index is
+        maintained live by the store (insert on encode, delete on forget), so
+        there is nothing to load. Falls back to the persisted FAISS
+        ``VectorSearch`` sidecar (``{db}/vector_index_ids.json``) when the
+        layer is absent/disabled (old wavedb or ``vector_index_enabled=False``).
+        """
+        if getattr(self.store, "vector_layer", None) is not None:
+            from .wavedb_vector_store import WavedbVectorStore
+            self.vector_search = WavedbVectorStore(self.store)
+            return
         from pathlib import Path
         from .vector_search import VectorSearch
         ids_path = Path(self.store.db_path) / VectorSearch.IDS_NAME

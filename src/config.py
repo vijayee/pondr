@@ -53,6 +53,15 @@ class Config:
     # larger BGE/e5 model for quality at the cost of pod memory.
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     vector_index_type: str = "faiss"  # faiss | usearch
+    # Native in-DB vector index (WaveDB VectorLayer, wavedb>=0.2.2). When True
+    # AND the installed wavedb exposes VectorLayer, HippocampalStore opens a
+    # FLAT/COSINE index over episode summary embeddings and maintains it live
+    # (insert on encode, delete on forget/supersede), closing the FAISS-sidecar
+    # "not updated live / can't delete" caveats. When False (or old wavedb) the
+    # retriever falls back to the FAISS VectorSearch path. dim must match the
+    # embedding model above (bge-small = 384).
+    vector_index_enabled: bool = True
+    embedding_dim: int = 384
 
     # ── Phase 1b: Mode A generation ──
     # Default to the local Bonsai server's model (same GGUF as bonsai_model) so

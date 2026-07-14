@@ -54,7 +54,9 @@ def _ep(eid, summary, entities=None, topics=None, tones=None):
     )
 
 
-def _store(tmp_path):
+def _store(tmp_path, **cfg):
+    if cfg:
+        return HippocampalStore(str(tmp_path / "db"), config=cfg)
     return HippocampalStore(str(tmp_path / "db"))
 
 
@@ -251,8 +253,13 @@ def test_retriever_semantic_disabled_when_no_index(tmp_path):
 
 
 def test_retriever_auto_loads_persisted_index(tmp_path):
-    """auto_load_index=True attaches a persisted VectorSearch."""
-    store = _store(tmp_path)
+    """auto_load_index=True attaches a persisted VectorSearch (FAISS fallback).
+
+    The in-DB WaveDB VectorLayer is DISABLED here so the FAISS fallback path is
+    exercised in isolation (when the layer is enabled, the retriever prefers
+    the WavedbVectorStore adapter -- covered in test_wavedb_vector_store.py).
+    """
+    store = _store(tmp_path, vector_index_enabled=False)
     store.encode_episode(_ep("ep_001", "wal config pain"))
     db = str(tmp_path / "db")
     vs = VectorSearch(store, embedder=_BowEmbedder())
@@ -260,7 +267,7 @@ def test_retriever_auto_loads_persisted_index(tmp_path):
     vs.save(db)
     store.close()
 
-    store2 = _store(tmp_path)
+    store2 = _store(tmp_path, vector_index_enabled=False)
     retr = HippocampalRetriever(store2, auto_load_index=True)
     assert retr.vector_search is not None
     # On the pod the auto-loaded VectorSearch lazy-loads sentence-transformers
@@ -272,8 +279,8 @@ def test_retriever_auto_loads_persisted_index(tmp_path):
 
 
 def test_auto_load_index_missing_is_noop(tmp_path):
-    """No persisted index → auto_load leaves vector_search None (no error)."""
-    store = _store(tmp_path)
+    """No persisted index + in-DB layer disabled -> auto_load leaves vector_search None."""
+    store = _store(tmp_path, vector_index_enabled=False)
     retr = HippocampalRetriever(store, auto_load_index=True)
     assert retr.vector_search is None
     store.close()
