@@ -82,11 +82,93 @@ class HippocampalEncoder:
         self.session_id = None
         self.last_episode_id = None
 
-    def encode_turn(self, user_message: str, assistant_response: str) -> Episode:
+    def _extract(self, full_text: str, *, degrade_on_extract_fail: bool) -> dict:
+        """GLiNER extraction with optional graceful degradation.
+
+        ``degrade_on_extract_fail=False`` (default, corpus path) re-raises so
+        ``scripts/process_corpus.py``'s per-conversation isolation handles the
+        failure exactly as before. ``degrade_on_extract_fail=True`` (live path)
+        extends the existing Bonsai-degrades-to-empty philosophy to GLiNER: a
+        transient hiccup yields empty extraction rather than dropping the turn,
+        so a live exchange still persists (retrievable via no-axis + the
+        backfilled embedding).
+        """
+        try:
+            return self.gliner.extract(full_text)
+        except Exception as e:  # noqa: BLE001 - intentional broad guard
+            if not degrade_on_extract_fail:
+                raise
+            print(f"[gliner-fail] degrade_on_extract_fail: {e}", file=sys.stderr)
+            return {
+                "entities": [], "entity_classes": {}, "topics": [],
+                "tones": [], "decisions": [], "discovered": [],
+            }
+
+    def _extract_relations(self, full_text: str, episode_id: str) -> list[dict]:
+        """Bonsai relation extraction; degrades to ``[]`` on any failure.
+
+        Relations are supplementary -- an episode with no relations is still
+        fully usable for entity/topic/tone/decision + semantic retrieval -- so
+        a Bonsai failure (unparseable JSON from over-extraction truncation,
+        transient server error) degrades to empty relations rather than failing
+        the turn. This keeps one hiccup from dropping a whole conversation's
+        episodes.
+        """
+        try:
+            return self.bonsai.extract(full_text)
+        except Exception as e:  # noqa: BLE001 - intentional broad guard
+            print(f"[bonsai-fail] {episode_id}: {e}", file=sys.stderr)
+            return []
+
+    def _apply_overrides_and_store(
+        self, episode: Episode, *, salience, utility_decay_rate,
+        summary_embedding, embedder,
+    ) -> None:
+        """Apply caller-supplied overrides, then store atomically.
+
+        ``salience`` / ``utility_decay_rate`` set the episode's persistence
+        levers (the forgetting dream pass fades ``utility_score *= (1 -
+        decay_rate)**days``). The embedding: an explicit ``summary_embedding``
+        wins; else if an ``embedder`` callable is given, backfill it from the
+        episode summary so the live episode is semantically retrievable without
+        a separate FAISS rebuild (the graph path surfaces it immediately). The
+        embedder returns one vector per text (lists, numpy arrays, or 1-D
+        tensors all coerce to ``list[float]`` for JSON persistence).
+        """
+        if salience is not None:
+            episode.salience = salience
+        if utility_decay_rate is not None:
+            episode.utility_decay_rate = utility_decay_rate
+        if summary_embedding is not None:
+            episode.summary_embedding = summary_embedding
+        elif embedder is not None:
+            vec = embedder([episode.summary])[0]
+            episode.summary_embedding = [float(x) for x in vec]
+        self.store.encode_episode(episode)
+
+    def encode_turn(
+        self,
+        user_message: str,
+        assistant_response: str,
+        *,
+        salience: Optional[float] = None,
+        utility_decay_rate: Optional[float] = None,
+        summary_embedding: Optional[list[float]] = None,
+        embedder=None,
+        degrade_on_extract_fail: bool = False,
+        origin: str = "corpus",
+    ) -> Episode:
         """Encode a single conversation turn.
 
         Requires an open session (call ``start_session`` first, or use
         ``encode_conversation`` which manages the session lifecycle).
+
+        Keyword-only overrides (all optional; defaults preserve the corpus
+        behavior): ``salience`` / ``utility_decay_rate`` set the persistence
+        levers, ``summary_embedding`` / ``embedder`` backfill the semantic
+        embedding, ``degrade_on_extract_fail`` makes a GLiNER hiccup degrade to
+        empty extraction instead of failing the turn, ``origin`` tags the
+        episode source (``"corpus"`` default / ``"live"``).
         """
         if self.session_id is None:
             raise RuntimeError("encode_turn requires an open session; call start_session() first.")
@@ -94,23 +176,9 @@ class HippocampalEncoder:
         episode_id = self.store.next_episode_id()
         full_text = f"User: {user_message}\nAssistant: {assistant_response}"
 
-        # 1. Extract entities, topics, tones, decisions (+ open discovery).
-        extracted = self.gliner.extract(full_text)
+        extracted = self._extract(full_text, degrade_on_extract_fail=degrade_on_extract_fail)
+        relations = self._extract_relations(full_text, episode_id)
 
-        # 2. Extract relations. Bonsai is a small Q2 model and occasionally
-        #    returns unparseable JSON (over-extraction -> max_tokens truncation,
-        #    transient server errors). Relations are supplementary -- an episode
-        #    with no relations is still fully usable for entity/topic/tone/
-        #    decision + semantic retrieval -- so a Bonsai failure degrades to
-        #    empty relations rather than failing the turn. This keeps one hiccup
-        #    from dropping a whole conversation's episodes.
-        try:
-            relations = self.bonsai.extract(full_text)
-        except Exception as e:  # noqa: BLE001 - intentional broad guard
-            print(f"[bonsai-fail] {episode_id}: {e}", file=sys.stderr)
-            relations = []
-
-        # 3. Create episode, scoped to the current user/session.
         episode = Episode.from_extraction(
             episode_id=episode_id,
             user_message=user_message,
@@ -120,12 +188,64 @@ class HippocampalEncoder:
             follows=self.last_episode_id,
             user_id=self.user_id,
             session_id=self.session_id,
+            origin=origin,
         )
 
-        # 4. Store atomically (content + graph index in one batch_sync).
-        self.store.encode_episode(episode)
+        self._apply_overrides_and_store(
+            episode, salience=salience, utility_decay_rate=utility_decay_rate,
+            summary_embedding=summary_embedding, embedder=embedder,
+        )
         self.last_episode_id = episode_id
+        return episode
 
+    def encode_messages(
+        self,
+        messages: list[dict],
+        *,
+        origin: str = "corpus",
+        salience: Optional[float] = None,
+        utility_decay_rate: Optional[float] = None,
+        summary_embedding: Optional[list[float]] = None,
+        embedder=None,
+        degrade_on_extract_fail: bool = False,
+    ) -> Episode:
+        """Encode a turn from already-role-tagged segments (the live path).
+
+        ``messages`` is the OpenAI Chat Completions shape (``{role, content,
+        ...}``) -- the same shape the orchestrator receives as
+        ``conversation_history``. Extraction runs over the joined ``full_text``
+        (so GLiNER/Bonsai see the same text the corpus path would), the episode
+        is built via ``Episode.from_messages`` (which derives ``full_text`` +
+        ``summary`` from the segments), then the same override/store path as
+        ``encode_turn``. One encode pipeline, two entry points.
+
+        Requires an open session (call ``start_session`` first).
+        """
+        if self.session_id is None:
+            raise RuntimeError("encode_messages requires an open session; call start_session() first.")
+
+        episode_id = self.store.next_episode_id()
+        full_text = Episode._join_messages(messages)
+
+        extracted = self._extract(full_text, degrade_on_extract_fail=degrade_on_extract_fail)
+        relations = self._extract_relations(full_text, episode_id)
+
+        episode = Episode.from_messages(
+            episode_id=episode_id,
+            messages=messages,
+            extracted=extracted,
+            relations=relations,
+            follows=self.last_episode_id,
+            user_id=self.user_id,
+            session_id=self.session_id,
+            origin=origin,
+        )
+
+        self._apply_overrides_and_store(
+            episode, salience=salience, utility_decay_rate=utility_decay_rate,
+            summary_embedding=summary_embedding, embedder=embedder,
+        )
+        self.last_episode_id = episode_id
         return episode
 
     def encode_conversation(self, turns: list[tuple[str, str]]) -> list[Episode]:

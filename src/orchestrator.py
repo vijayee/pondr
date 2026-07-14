@@ -21,16 +21,21 @@ process/tool/System-2 infra): return ``supported=False`` (honest, mirroring 2b).
 ``graph_retrieve``/``conscious_deliberation`` run the full pipeline.
 
 Session save/load reuses the shipped ``state_serializer`` + ``HippocampalStore``
-(per-user cross-session; the save TRIGGER policy is still open —
-docs/Phase 2c.md §15, memory hippo-phase-2c-status). File-first so tests need no
-WaveDB; WaveDB-backed persistence is optional (pass a ``store``).
+(per-user cross-session). The runtime gap is closed (2026-07-14): ``query``
+now persists each (prompt, response) exchange as a new episode via an injected
+``HippocampalEncoder`` (always-encode by default; ``auto_persist=False`` opts
+out; ``end_conversation`` closes the conversation session). Pure DI -- the
+caller that wants live-encode constructs and injects the encoder; no encoder
+injected (tests, WM-only) -> no-op. File-first so tests need no WaveDB;
+WaveDB-backed persistence is optional (pass a ``store``).
 """
 
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .config import Phase2cConfig
 from .generation.mode_a import ModeAGenerator
@@ -47,6 +52,24 @@ from .subconscious.state_serializer import (
     deserialize, serialize, snapshot_from_instance,
 )
 from .subconscious.working_memory import WorkingMemory, WorkingMemoryState
+
+if TYPE_CHECKING:
+    from .encoding.encoder import HippocampalEncoder
+
+
+# Signal -> persistence profile (2026-07-14). The ``signal`` arg modulates HOW
+# strongly a live-encoded episode persists, not WHETHER (always-encode is the
+# default; ``auto_persist=False`` opts out). ``utility_decay_rate`` is the lever
+# the forgetting dream pass fades (``utility_score *= (1 - decay_rate)**days``);
+# ``salience`` feeds the heuristic scorer + entity-salience compose. Unknown
+# signals fall back to the ``routine`` defaults (the Episode field defaults).
+_SIGNAL_PROFILES = {
+    "important":   {"salience": 0.8, "decay_rate": 0.005},   # persists longest
+    "routine":     {"salience": 0.5, "decay_rate": 0.01},    # Episode defaults
+    "satisfied":   {"salience": 0.7, "decay_rate": 0.008},
+    "correction":  {"salience": 0.6, "decay_rate": 0.008},
+    "frustration": {"salience": 0.3, "decay_rate": 0.03},    # fades fastest
+}
 
 
 class PonderOrchestrator:
@@ -68,12 +91,21 @@ class PonderOrchestrator:
         mode_a: ModeAGenerator,
         config: Phase2cConfig,
         user_id: Optional[str] = None,
+        encoder: Optional[HippocampalEncoder] = None,
     ) -> None:
         self.store = store
         self.retriever = retriever
         self.mode_a = mode_a
         self.config = config
         self.user_id = user_id
+        # Live-encode (2026-07-14): persist each exchange as an episode. The
+        # encoder is injected (DI pattern, like retriever/mode_a/embedder) -- a
+        # caller that wants live-encode constructs a ``HippocampalEncoder`` and
+        # passes it here; ``query(auto_persist=True)`` then encodes every
+        # exchange. ``None`` (tests, WM-only) -> no-op. Pure DI (no lazy heavy
+        # construction) so ``query()`` never loads GLiNER unless a real encoder
+        # was explicitly wired in.
+        self._encoder = encoder
 
         # The cross-query Working Memory (persistent state). embedder injected so
         # WM can embed episodes/queries on demand.
@@ -113,6 +145,7 @@ class PonderOrchestrator:
         extract_schema: Optional[dict] = None,
         model_size: Optional[str] = None,
         signal: str = "routine",
+        auto_persist: bool = True,
     ) -> dict:
         """Run the full 2c pipeline and return the result dict.
 
@@ -123,8 +156,16 @@ class PonderOrchestrator:
 
         ``signal`` (Phase 3b) is the caller's affective/task signal
         (``important``/``routine``/``correction``/...) threaded through to the
-        retrieval-boost hook so query-matched edges strengthen with use. Defaults
-        to ``"routine"`` (a no-op until something is actually retrieved).
+        retrieval-boost hook so query-matched edges strengthen with use, AND
+        modulating how strongly the live-encoded episode persists (salience +
+        decay rate; see ``_SIGNAL_PROFILES``). Defaults to ``"routine"`` (a
+        no-op until something is actually retrieved).
+
+        ``auto_persist`` (default True) encodes the (prompt, response) exchange
+        as a new episode after the response is built (closes the runtime gap --
+        the system learns from use). Set False to opt out. Best-effort: a
+        persistence failure is logged and never loses the response. The encoded
+        episode id (when persisted) is returned as ``result["persisted_episode_id"]``.
         """
         # 1. embed prompt; update WM (state persists across queries).
         prompt_emb = self.working_memory.embed([user_prompt])[0]
@@ -244,6 +285,13 @@ class PonderOrchestrator:
             ),
         )
         result["measured_expand_count"] = measured_expand
+
+        # 2026-07-14: close the runtime gap -- persist the (prompt, response)
+        # exchange as a new episode so the system learns from use. Always-encode
+        # by default; ``auto_persist=False`` opts out. Best-effort: a persistence
+        # failure never loses the response the user already has.
+        if auto_persist:
+            self._persist_exchange(user_prompt, result, signal)
         return result
 
     def _classify_query(self, prompt: str) -> str:
@@ -257,14 +305,87 @@ class PonderOrchestrator:
             return "summarization"
         return "factual"
 
+    # ── live-encode: persist each exchange as an episode (2026-07-14) ──
+
+    def _get_encoder(self):
+        """Return the injected HippocampalEncoder, or ``None``.
+
+        ``None`` when no encoder was injected (tests, WM-only orchestrator) --
+        ``_persist_exchange`` then no-ops. Pure DI: the caller that wants
+        live-encode constructs and injects the encoder (mirrors retriever/
+        mode_a/embedder). No lazy construction, so ``query()`` never loads
+        GLiNER unless a real encoder was explicitly wired in.
+        """
+        if self.store is None:
+            return None
+        return self._encoder
+
+    def _persist_exchange(self, user_prompt: str, result: dict, signal: str) -> None:
+        """Encode the (prompt, response) exchange as a new episode.
+
+        Best-effort: any failure is logged to stderr and swallowed -- a
+        persistence failure must never lose the response the user already has.
+        Skips when there is no encoder, or when the result carries no
+        non-empty string response (the ``direct``/``format``/``extract`` end
+        states that produce no string, and the ``supported=False`` early
+        return with ``response: None``).
+        """
+        try:
+            encoder = self._get_encoder()
+            if encoder is None:
+                return
+            response = result.get("response")
+            if not isinstance(response, str) or not response.strip():
+                return
+            if encoder.session_id is None:
+                encoder.start_session()  # one conversation session per instance
+            prof = _SIGNAL_PROFILES.get(signal, _SIGNAL_PROFILES["routine"])
+            # Role-tagged segments (OpenAI vocabulary). Today: user + assistant.
+            # system (boilerplate prompt) and tool/tool_call are reserved --
+            # appended here when those pathways are wired, not as flat strings.
+            messages = [
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": response},
+            ]
+            # ``working_memory.embed`` returns [1,384] TENSORS (not JSON-serializable
+            # for the store's summary_embedding); pass the raw embedder's ``.encode``
+            # instead, which yields one 1-D float vector per text. The encoder
+            # coerces it to ``list[float]`` for JSON persistence.
+            raw_encode = self.embedder.encode if self.embedder is not None else None
+            episode = encoder.encode_messages(
+                messages,
+                origin="live",
+                salience=prof["salience"],
+                utility_decay_rate=prof["decay_rate"],
+                embedder=raw_encode,
+                degrade_on_extract_fail=True,
+            )
+            result["persisted_episode_id"] = episode.id
+        except Exception as e:  # noqa: BLE001 - never lose the response
+            print(f"[persist-fail] {e}", file=sys.stderr)
+
+    def end_conversation(self) -> None:
+        """Close the live-encode conversation session.
+
+        Caller-invoked at conversation boundaries (mirrors the open save-trigger
+        policy -- the caller decides when a conversation ends). An unclosed
+        session is graceful, not broken: episodes still carry ``at_time``; only
+        ``ended_at`` is absent. No-op when no encoder or no open session.
+        """
+        encoder = self._get_encoder()
+        if encoder is None or encoder.session_id is None:
+            return
+        encoder.end_session()
+
     # ── session persistence (reuses the shipped state serializer) ──
 
     def save_session(self, session_id: Optional[str] = None) -> Path:
         """Persist the current WM state to disk (and optionally the store).
 
         ``session_id`` defaults to ``user_id``. File-first so tests need no
-        WaveDB. The save TRIGGER policy is intentionally NOT wired here — the
-        caller decides when to save (memory hippo-phase-2c-status).
+        WaveDB. This persists the WM SSM state (the caller decides when); it is
+        distinct from the per-exchange episode persistence, which ``query``
+        does automatically (``auto_persist``).
         """
         sid = session_id or self.user_id
         if sid is None:

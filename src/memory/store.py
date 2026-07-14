@@ -136,6 +136,11 @@ class HippocampalStore:
             {"type": "put", "key": f"content/ep/{eid}/ts", "value": episode.timestamp},
             {"type": "put", "key": f"content/ep/{eid}/salience", "value": str(episode.salience)},
             {"type": "put", "key": f"content/ep/{eid}/state", "value": episode.state},
+            # Provenance (2026-07-14): episode source + role-tagged segments.
+            # origin is always written (default "corpus"); messages is optional
+            # (None on pre-provenance episodes) so old episodes read back
+            # role-unaware and consumers fall back to full_text.
+            {"type": "put", "key": f"content/ep/{eid}/origin", "value": episode.origin},
             # Downstream-system fields (defaults at encode time; Phase 2-4
             # update them on retrieval / consolidation). Persisted now so the
             # store schema is stable from the start.
@@ -154,6 +159,8 @@ class HippocampalStore:
             ops.append({"type": "put", "key": f"content/ep/{eid}/consolidation_window_start", "value": episode.consolidation_window_start})
         if episode.summary_embedding:
             ops.append({"type": "put", "key": f"content/ep/{eid}/embedding", "value": json.dumps(episode.summary_embedding)})
+        if episode.messages:
+            ops.append({"type": "put", "key": f"content/ep/{eid}/messages", "value": json.dumps(episode.messages, ensure_ascii=False)})
 
         # ── Graph: sparse pointers (hippocampal index) via expand_triple ──
         # expand_triple returns root-namespace ops (the "memory/" subtree prefix
@@ -230,6 +237,8 @@ class HippocampalStore:
         retrieval_timestamps_raw = _b2s(self.db.get_sync(f"content/ep/{episode_id}/retrieval_timestamps"))
         consolidation_window_start = _b2s(self.db.get_sync(f"content/ep/{episode_id}/consolidation_window_start")) or None
         embedding_raw = _b2s(self.db.get_sync(f"content/ep/{episode_id}/embedding"))
+        origin = _b2s(self.db.get_sync(f"content/ep/{episode_id}/origin")) or "corpus"
+        messages_raw = _b2s(self.db.get_sync(f"content/ep/{episode_id}/messages"))
 
         try:
             salience = float(salience_str)
@@ -255,6 +264,10 @@ class HippocampalStore:
             summary_embedding = json.loads(embedding_raw) if embedding_raw else None
         except (ValueError, TypeError):
             summary_embedding = None
+        try:
+            messages = json.loads(messages_raw) if messages_raw else None
+        except (ValueError, TypeError):
+            messages = None
 
         return Episode(
             id=episode_id,
@@ -270,6 +283,8 @@ class HippocampalStore:
             retrieval_timestamps=retrieval_timestamps,
             consolidation_window_start=consolidation_window_start,
             summary_embedding=summary_embedding,
+            origin=origin,
+            messages=messages,
         )
 
     def set_summary_embedding(self, episode_id: str, embedding: list[float]) -> None:
