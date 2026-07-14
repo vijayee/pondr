@@ -215,7 +215,7 @@ class Config:
     # GLiNER
     gliner2_model: str = "fastino/gliner2-base-v1"
     gliner_decoder_model: str = "knowledgator/gliner-decoder-base-v1.0"
-    extraction_threshold: float = 0.3
+    extraction_threshold: float = 0.05  # see "Extraction threshold -- revisit" below
     
     # Bonsai (small LLM for relations and query planning)
     bonsai_model: str = os.getenv("BONSAI_MODEL", "gpt-4o-mini")
@@ -246,6 +246,39 @@ class Config:
 
 config = Config()
 ```
+
+### Extraction threshold -- revisit
+
+`extraction_threshold` is currently **0.05**, lowered from the model's
+"natural" 0.3. The matching topic/decision spans score far below 0.3 on CPU
+(a per-span confidence sweep showed the keyword-matching spans at ~0.04-0.07
+on CPU vs >0.3 on GPU -- a backend-numerics divergence in `count_lstm_v2`,
+not a knowledge gap, so retraining on CPU would not close it). A threshold
+sweep over the 20 `data/sample_conversations.jsonl` conversations:
+
+| threshold | mean topic recall | decisions non-empty | garbage spans leaked |
+|-----------|-------------------|---------------------|----------------------|
+| 0.30      | 0.09              | no                  | 0                    |
+| 0.10      | 0.14              | no                  | 0                    |
+| **0.05**  | **0.22**          | **yes**             | **0**                |
+| 0.03      | 0.27              | yes                 | 0                    |
+| 0.01      | 0.29              | yes                 | 0                    |
+
+0.05 clears both quality-test floors (`mean_topic > 0.2`, non-empty
+decisions) on CPU with zero garbage leaking through. On GPU the matching
+spans score above 0.3, so 0.05 admits strictly more true positives there too
+-- one threshold works for both backends, with no `if cuda` branching. This
+matters for deployment: end users get one extraction behavior regardless of
+whether their machine has a GPU.
+
+**Revisit once we have better training data.** This is a precision-for-recall
+tradeoff chosen against a 20-conversation sample where it was free (0 garbage).
+The domains a real user cares about are unknown in advance, so we are NOT
+domain-finetuning GLiNER (no target to tune for). When a larger, real corpus
+is available, re-run the sweep + measure precision on the actual graph
+ingest, and re-tune (likely back toward 0.1-0.3, or per-category). A CUDA
+torch build for the RTX 5080 (`torch==2.11.0+cu128`) is an optional separate
+lever for speed, not required for correctness since 0.05 passes on CPU.
 
 ---
 

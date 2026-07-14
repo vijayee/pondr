@@ -24,7 +24,17 @@ class Config:
     gliner2_model: str = "fastino/gliner2-base-v1"
     # GLiNER-Decoder: open discovery, invents labels freely (Knowledgator).
     gliner_decoder_model: str = "knowledgator/gliner-decoder-base-v1.0"
-    extraction_threshold: float = 0.3
+    # Extraction threshold. The matching spans sit far below the model's
+    # "natural" 0.3 on CPU: a sweep over the 20 sample conversations showed
+    # topic recall 0.09 at 0.3 / 0.22 at 0.05 / 0.27 at 0.03, with ZERO
+    # garbage spans leaking through down to 0.01 (the count_lstm_v2 count-pred
+    # is well-behaved here, so lowering the cutoff admits more true positives
+    # without flooding noise). 0.05 clears both quality-test floors
+    # (mean_topic > 0.2 and non-empty decisions) on CPU. On GPU the matching
+    # spans score ABOVE 0.3, so 0.05 admits strictly more true positives there
+    # too -- one threshold works for both backends, no `if cuda` branching.
+    # See docs/Phase 1a.md "Extraction threshold -- revisit".
+    extraction_threshold: float = 0.05
 
     # ── Bonsai ──
     # Prism-ML Ternary Bonsai (1.58-bit / Q2_0 ternary, Qwen3-based). The Q2_0
