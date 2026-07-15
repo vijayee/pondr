@@ -29,12 +29,13 @@ and is a placeholder ranker; the Phase 3 GNN consolidator replaces it.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from ..config import config as _config
-from ..memory.store import HippocampalStore
+from ..memory.store import HippocampalStore, _b2s
 
 # Phase 3b retrieval-time boost (lazy import inside the hook to keep the
 # module-import graph acyclic and avoid loading forgetting machinery on the
@@ -170,9 +171,18 @@ class GraphTraversal:
         candidate set (spec §371). Documents are NOT forgotten (no state/
         validity filter applies), so ``default_document_ids`` enumerates them
         all; the union is the no-axis seed for the unified doc+episode RAG path.
+
+        Semantic-memory ``M:NNNN`` nodes (DiffPool cluster abstractions the
+        consolidator writes when a Bonsai decider is wired) are added via
+        ``default_memory_ids``. M-nodes are NOT forgotten, so every written
+        memory is a candidate -- the abstract SURROGATE for its source episodes
+        (spec §371). The union is EMPTY when no M-nodes exist (cold start: no
+        decider / dry-run / server down -> no abstracts written), so the
+        candidate set is byte-identical to today.
         """
         eps = set(self.store.default_episode_ids(include_abstracted=False))
         eps |= set(self.store.default_document_ids())
+        eps |= set(self.store.default_memory_ids())
         return sorted(eps)
 
     # ── candidate-set construction (Python-side set ops) ──
@@ -447,7 +457,16 @@ class GraphTraversal:
         hits from the semantic fallback) are dispatched to ``_hydrate_section``.
         Section ids start with ``doc_``, so the ``_sec_`` check MUST precede the
         ``doc_`` check.
+
+        Semantic memories (``M:NNNN`` ids -- the DiffPool cluster abstractions
+        the consolidator writes when a Bonsai decider is wired) are dispatched
+        to ``_hydrate_memory``. The M-node's gist is the content; its source
+        episodes are surfaced as ``sources``. The ``M:`` check precedes
+        ``doc_`` (M ids start with ``M:``, never ``doc_``, but ordering it
+        first keeps the three-way discriminator explicit).
         """
+        if eid.startswith("M:"):
+            return self._hydrate_memory(eid)
         if "_sec_" in eid:
             return self._hydrate_section(eid)
         if eid.startswith("doc_"):
@@ -605,6 +624,65 @@ class GraphTraversal:
                 }
                 for s in doc.sections
             ],
+        }
+
+    def _hydrate_memory(self, mid: str) -> dict:
+        """Hydrate a semantic-memory result (the ``M:`` branch of ``_hydrate``).
+
+        A semantic memory (``M:NNNN``) is the DiffPool cluster abstraction the
+        consolidator writes when a Bonsai decider is wired -- the abstract
+        SURROGATE for its source episodes (spec §371). It is NOT forgotten, so
+        every written memory is a retrieval candidate (``default_memory_ids``
+        enumerates them; the empty-union gate keeps the cold-start corpus
+        byte-identical to today when no decider ran).
+
+        Builds the SAME 12-key result dict as an episode PLUS memory extras:
+        ``kind="memory"`` and ``sources`` (the ``abstracted_from`` episode ids).
+        The gist is the content: ``summary`` and ``text`` both carry the Bonsai-
+        generated gist (``summary`` for the display line, ``text`` for the full
+        chunk body the formatter renders). ``entities``/``topics``/``tones`` are
+        empty THIS slice -- the gist IS the content; carrying the source
+        episodes' axes onto the M-node is a deferred refinement (the abstracts
+        edges are still in the graph for any caller that wants them).
+        The reads are direct ``get_sync`` on the four ``content/mem/{mid}/``
+        keys ``create_abstract`` writes (``summary``/``text``/``ts``/
+        ``abstracted_from``). This mirrors ``SemanticMemoryWriter.get_abstract``
+        but avoids importing ``gnn.semantic_memory`` here (that module imports
+        ``store`` -- a ``store -> gnn -> store`` cycle) and avoids constructing
+        a writer on the retrieval path just to read four keys. ``summary`` empty
+        -> the memory is gone (deleted mid-query) -> the empty 12-key shell.
+        """
+        db = self.store.db
+        summary = _b2s(db.get_sync(f"content/mem/{mid}/summary"))
+        if not summary:
+            return {
+                "episode_id": mid, "summary": "", "text": "", "timestamp": "",
+                "entities": [], "topics": [], "tones": [], "decisions": [],
+                "session_id": None, "user_id": None, "follows": None,
+                "score": 0.0, "kind": "memory", "sources": [],
+            }
+        text = _b2s(db.get_sync(f"content/mem/{mid}/text")) or ""
+        ts = _b2s(db.get_sync(f"content/mem/{mid}/ts")) or ""
+        sources_raw = _b2s(db.get_sync(f"content/mem/{mid}/abstracted_from"))
+        try:
+            sources = json.loads(sources_raw) if sources_raw else []
+        except (ValueError, TypeError):
+            sources = []
+        return {
+            "episode_id": mid,
+            "kind": "memory",
+            "summary": summary,
+            "text": text,
+            "timestamp": ts,
+            "entities": [],
+            "topics": [],
+            "tones": [],
+            "decisions": [],
+            "session_id": None,
+            "user_id": None,
+            "follows": None,
+            "score": 0.0,
+            "sources": sources,
         }
 
     def _hydrate_section(self, sid: str) -> dict:

@@ -87,6 +87,20 @@ def _build_verifier() -> "object | None":
     return verifier
 
 
+def _build_decider() -> "object | None":
+    """Build the Bonsai deploy-time decider against the local endpoint.
+
+    Lazy: only constructed when ``--decide`` is passed. The 8B Bonsai
+    (localhost:8080/v1) is the SUBCONSCIOUS decider for three consolidation
+    actions (abstract gist, ontology promotion, identity_drift anomaly) --
+    NOT the Oracle/DeepSeek, which stays the training-data teacher only.
+    Returns a ``BonsaiDecider``; the consolidator gates every action on
+    BOTH ``decider is not None`` AND ``cfg.bonsai_decider_enabled``.
+    """
+    from src.gnn.bonsai_decider import BonsaiDecider
+    return BonsaiDecider()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run Phase 3a dream-state consolidation")
     parser.add_argument("--db", default=config.db_path, help="WaveDB store path")
@@ -172,6 +186,31 @@ def main() -> int:
     parser.add_argument("--deep-archive-days", type=int, default=None,
                         help="Physically remove edges soft-archived more than this many days ago "
                              "(default 365; the deep tier on top of soft-archive; 0 = disabled)")
+    # ── Bonsai-in-consolidation: the deploy-time decider. ``--decide`` wires
+    # the 8B Bonsai as the decider for abstract gist generation, ontology
+    # promotion (entity->class instanceOf + new-class creation), and the
+    # identity_drift anomaly decision (fix/ask_user/dismiss). Independent of
+    # ``--verify`` (the link-pred verifier); the two can run together. Without
+    # ``--decide`` the cold-start path is record-only + byte-identical to today
+    # (placeholder abstracts, no instanceOf edges, no anomaly actions).
+    # ``--no-bonsai`` disables the decider EVEN when wired (the per-action gate
+    # checks cfg.bonsai_decider_enabled), e.g. for an A/B comparison run.
+    parser.add_argument("--decide", action="store_true",
+                        help="Wire the 8B Bonsai as the deploy-time decider (abstract gist + "
+                             "ontology promotion + identity_drift anomaly). Requires the local "
+                             "Bonsai server (localhost:8080/v1).")
+    parser.add_argument("--no-bonsai", dest="bonsai_decider_enabled",
+                        action="store_false",
+                        help="Disable the Bonsai decider even when --decide is passed "
+                             "(record-only, byte-identical to a no-decider run)")
+    parser.set_defaults(bonsai_decider_enabled=True)
+    parser.add_argument("--abstract-gist-max-episodes", type=int, default=None,
+                        help="Cap on source episodes fed to the gist prompt (default 8; the "
+                             "8B's 4096 ctx -- a gist is a summary-of-summaries)")
+    parser.add_argument("--ontology-bonsai-threshold", type=float, default=None,
+                        help="Min ontology-proposal confidence gated through Bonsai (default 0.0 "
+                             "= every proposal above accept-threshold goes to Bonsai; raise to "
+                             "skip Bonsai on very-high-confidence auto-accepts)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -196,8 +235,17 @@ def main() -> int:
         "utility_prune_below": args.utility_prune_below,
         "ontology_decay_days": args.ontology_decay_days,
         "anomaly_resolve_threshold": args.anomaly_resolve_threshold,
+        # Bonsai-in-consolidation knobs.
+        "abstract_gist_max_episodes": args.abstract_gist_max_episodes,
+        "ontology_bonsai_threshold": args.ontology_bonsai_threshold,
     }
     cfg = replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+    # ``bonsai_decider_enabled`` is a bool with a real False meaning (the
+    # --no-bonsai A/B escape hatch), so it must NOT pass through the "is not
+    # None" filter (which drops False). Override explicitly when --no-bonsai
+    # was passed; the default (True) keeps the config default unchanged.
+    if not args.bonsai_decider_enabled:
+        cfg = replace(cfg, bonsai_decider_enabled=False)
     # Phase 3b master gate: the consolidator reads ``config.forgetting_enabled``
     # from the global singleton, so override it here (process-scoped) when the
     # flag is explicitly passed. Default (None) leaves the config default (True).
@@ -222,12 +270,14 @@ def main() -> int:
     try:
         model = _load_model(args.checkpoint, args.device) if args.checkpoint else None
         verifier = _build_verifier() if args.verify else None
+        decider = _build_decider() if args.decide else None
         centers = args.centers.split(",") if args.centers else None
 
         cons = Consolidator(
             store, model=model, verifier=verifier, config=cfg,
             dry_run=(not args.apply), device=args.device,
             allow_untrained_apply=args.force_untrained,
+            decider=decider,
         )
         report = cons.run(centers=centers, limit=args.limit)
         print(json.dumps(report, indent=2, ensure_ascii=False))

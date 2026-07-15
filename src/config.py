@@ -302,6 +302,27 @@ class ConsolidationConfig:
     # ``--deep-archive-days 0``) disables the sweep. Soft-archive (in-place,
     # excluded from default queries) always ships; this is the deep tier.
     deep_archive_days: Optional[int] = 365
+    # ── Bonsai-in-consolidation (the deploy-time decider). The 8B Bonsai
+    # (localhost:8080/v1) is the SUBCONSCIOUS decider for three consolidation
+    # actions: (1) abstract gist generation, (2) ontology promotion (entity
+    # -> class instanceOf typing + new-class creation), (3) the identity_drift
+    # anomaly decision (fix/ask_user/dismiss). The Oracle/DeepSeek stays the
+    # TRAINING-DATA teacher only; at deploy the decider is Bonsai. All three
+    # gate on BOTH a wired ``decider`` AND ``bonsai_decider_enabled`` so
+    # ``--no-bonsai`` disables even when wired, and a cold start (no decider
+    # / dry-run / server down) stays record-only + byte-identical to today.
+    bonsai_decider_enabled: bool = True
+    # Cap on the number of source episodes fed to the gist prompt (the 8B's
+    # 4096 ctx). A gist is a summary-of-summaries; 8 is plenty and bounds the
+    # HTTP round-trip size.
+    abstract_gist_max_episodes: int = 8
+    # Min ontology-proposal confidence gated through Bonsai. 0.0 = EVERY
+    # proposal above ``accept_threshold`` goes to Bonsai (Bonsai IS the
+    # deploy-time decider, per the user's "all three together" scope). Raise
+    # to skip Bonsai on very-high-confidence auto-accepts (one HTTP call per
+    # proposal at 0.0 -- acceptable for a nightly dream pass; see
+    # ``--ontology-bonsai-threshold`` for the escape hatch).
+    ontology_bonsai_threshold: float = 0.0
 
 
 @dataclass

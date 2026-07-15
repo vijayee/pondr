@@ -1,0 +1,256 @@
+"""Bonsai-in-consolidation: the deploy-time decider for three consolidation
+actions, all driven by the local 8B Bonsai model (the "subconscious").
+
+The consolidation loop (``consolidate.py``) clusters episodes (DiffPool GNN)
+and then, at APPLY time, performs three Bonsai-gated actions:
+
+1. **Abstract gist generation** -- synthesize one paragraph abstracting a
+   cluster into a semantic memory (``M:NNNN``), embed it, and index it so the
+   memory becomes a retrieval candidate.
+2. **Ontology promotion** -- gate the ontology head's entity->class typing
+   proposals through Bonsai: accept the typing, propose a NEW narrower class
+   under an existing parent, or reject.
+3. **Identity-drift anomaly decision** -- for an ``identity_drift`` rule-flag,
+   retrieve-then-decide ``fix``/``ask_user``/``dismiss``.
+
+The Oracle/DeepSeek is the *training-data teacher only* (it labels the pairs
+Bonsai is later fine-tuned on). At DEPLOY the decider is Bonsai -- local,
+zero-cost, the speed proposition. This module is the thin HTTP client to the
+Bonsai ``llama-server`` (OpenAI-compatible, ``config.bonsai_endpoint``); it
+mirrors ``BonsaiRelationExtractor``'s request + parse pattern but is a separate
+object (the decider returns str / dict, not triples, so it does not extend the
+link-prediction ``verifier`` callable).
+
+All three actions are independently gated: the caller passes ``decider=None``
+(or sets ``bonsai_decider_enabled=False``) and the cold-start path stays
+record-only and byte-identical to today -- no HTTP, no fabricated decision.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Optional
+
+import requests
+
+from ..config import config
+from ..training.prompts import (
+    bonsai_anomaly_decision_prompt,
+    bonsai_gist_prompt,
+    bonsai_typing_prompt,
+)
+
+__all__ = ["BonsaiDecider"]
+
+
+# Matches a ```json ... ``` (or bare ```) fenced block. Small models sometimes
+# wrap "ONLY JSON" output in fences anyway. Mirrors bonsai_relations._FENCE_RE.
+_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+
+# Control chars stripped defensively from a gist before it is stored as a
+# content value + vector-metadata string. Keeps tab/newline (legitimate prose)
+# but drops the C0 control range that would corrupt downstream JSON / display.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+class BonsaiDecider:
+    """Deploy-time Bonsai decider for abstract gist / ontology typing / anomaly.
+
+    Talks to an OpenAI-compatible ``llama-server`` (Bonsai) over HTTP. Plain
+    ``response_format: {"type": "json_object"}`` chat completions -- NO
+    tool-calling dependency. Constructible offline (the HTTP call is lazy, one
+    per ``gist``/``verify_typing``/``decide_anomaly`` call).
+
+    Each decision method returns ``None`` / a rejected verdict on HTTP or
+    parse failure rather than raising, so the consolidator can fall back to
+    the honest cold-start path (placeholder abstract / record-only) without a
+    try/except wrapper at every call site. ``RuntimeError`` is reserved for
+    ``_post_json`` itself (unexpected server state) and is caught by the
+    caller's best-effort contract.
+    """
+
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        temperature: Optional[float] = None,
+        timeout: float = 60.0,
+        max_tokens: int = 768,
+    ):
+        self.model = model or config.bonsai_model
+        self.endpoint = (endpoint or config.bonsai_endpoint).rstrip("/")
+        self.temperature = (
+            temperature if temperature is not None else config.bonsai_temperature
+        )
+        self.timeout = timeout
+        self.max_tokens = max_tokens
+
+    # ---- public decisions ------------------------------------------------
+
+    def health_check(self, timeout: float = 3.0) -> bool:
+        """True iff the Bonsai server responds to ``GET {endpoint}/models``.
+
+        The live-test skip guard: mirrors ``tests/test_bonsai_relations.py``.
+        Never raises -- a down server is a normal cold-start condition.
+        """
+        try:
+            r = requests.get(f"{self.endpoint}/models", timeout=timeout)
+            return r.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def gist(self, source_episodes: list[dict]) -> Optional[str]:
+        """Synthesize one paragraph abstracting ``source_episodes``.
+
+        ``source_episodes`` is a list of ``{id, summary, text?}`` dicts; the
+        caller pre-caps the list (``abstract_gist_max_episodes``). Returns the
+        gist string, or ``None`` on HTTP/parse failure (caller falls back to
+        the placeholder abstract). Control chars are stripped defensively
+        since the gist becomes a stored content value + vector-metadata.
+        """
+        if not source_episodes:
+            return None
+        prompt = bonsai_gist_prompt(source_episodes)
+        data = self._post_json(prompt)
+        if data is None:
+            return None
+        raw = data.get("gist") if isinstance(data, dict) else None
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        return _CTRL_RE.sub("", raw.strip())
+
+    def verify_typing(
+        self, entity: str, candidate_class: str, retrieved_context: dict
+    ) -> Optional[dict]:
+        """Decide an ontology typing proposal.
+
+        Returns ``{"accept": bool, "new_class": Optional[str], "parent":
+        Optional[str], "reasoning": str}``, or ``None`` on HTTP/parse failure
+        (caller records the proposal without writing). ``new_class``/``parent``
+        are normalized to ``None`` when empty/``"null"`` strings so the caller's
+        truthiness checks are unambiguous. The caller verifies ``parent``
+        exists in the seed ontology before creating any class.
+        """
+        prompt = bonsai_typing_prompt(entity, candidate_class, retrieved_context)
+        data = self._post_json(prompt)
+        if not isinstance(data, dict) or "accept" not in data:
+            return None
+        accept = bool(data.get("accept"))
+        new_class = _opt_str(data.get("new_class"))
+        parent = _opt_str(data.get("parent"))
+        # If a new class is proposed, a parent is required; without one the
+        # class would orphan -- the caller treats this as a rejection.
+        if new_class and not parent:
+            accept = False
+        return {
+            "accept": accept,
+            "new_class": new_class,
+            "parent": parent,
+            "reasoning": str(data.get("reasoning", ""))[:1000],
+        }
+
+    def decide_anomaly(self, flag: dict, retrieved_context: dict) -> Optional[dict]:
+        """Decide what to DO about an identity-drift flag.
+
+        ``flag`` is the ``{node, type, evidence}`` record from
+        ``anomaly_rules.flag_identity_drift``; ``retrieved_context`` is the
+        radius-1 neighborhood the consolidator gathered (the same context the
+        Oracle teacher saw, so the decision is reproducible). Reuses the
+        existing ``bonsai_anomaly_decision_prompt`` (prompts.py:142). Returns
+        ``{"decision": "fix"|"ask_user"|"dismiss", "action": str, "reasoning":
+        str}`` or ``None`` on failure (caller records the flag only).
+        """
+        flagged_entity = str(flag.get("node", ""))
+        anomaly_type = str(flag.get("type", "identity_drift"))
+        prompt = bonsai_anomaly_decision_prompt(
+            flagged_entity, retrieved_context, anomaly_type
+        )
+        data = self._post_json(prompt)
+        if not isinstance(data, dict) or "decision" not in data:
+            return None
+        decision = str(data.get("decision", "")).strip()
+        if decision not in ("fix", "ask_user", "dismiss"):
+            return None
+        return {
+            "decision": decision,
+            "action": str(data.get("action", ""))[:1000],
+            "reasoning": str(data.get("reasoning", ""))[:1000],
+        }
+
+    # ---- HTTP + parse helpers --------------------------------------------
+
+    def _post_json(self, prompt: str) -> Optional[dict]:
+        """POST a single-user chat completion, return the parsed JSON object.
+
+        Returns ``None`` on any HTTP failure, non-JSON body, or missing content
+        (the decision methods translate that into their own ``None`` /
+        rejected-verdict fallback). Never raises: a down server, a non-200
+        response, a non-JSON body, a missing ``choices[0].message.content``,
+        or an unparseable content string are ALL normal cold-start
+        conditions that route to ``None`` so the consolidator falls back to
+        the honest record-only / placeholder path without a try/except at
+        every call site. (``gist``/``verify_typing``/``decide_anomaly`` still
+        keep their own ``except Exception`` guards in ``_apply`` so a stub
+        decider that raises cannot break a dream pass.)
+        """
+        url = f"{self.endpoint}/chat/completions"
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=self.timeout)
+        except requests.RequestException:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            outer = resp.json()
+        except json.JSONDecodeError:
+            return None
+        try:
+            content = outer["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            return None
+        return self._parse_json_object(content)
+
+    @staticmethod
+    def _parse_json_object(content: str) -> Optional[dict]:
+        """Parse the model's JSON content into a dict.
+
+        Strips accidental ``` fences; failing that, falls back to the outermost
+        ``{...}`` span (handles trailing prose). Returns ``None`` if no JSON
+        object can be carved out -- the caller treats that as a missed
+        decision (record-only / placeholder), never a crash.
+        """
+        body = content.strip()
+        fence = _FENCE_RE.match(body)
+        if fence:
+            body = fence.group(1).strip()
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            start, end = body.find("{"), body.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    data = json.loads(body[start : end + 1])
+                except json.JSONDecodeError:
+                    return None
+            else:
+                return None
+        return data if isinstance(data, dict) else None
+
+
+def _opt_str(v) -> Optional[str]:
+    """Normalize a model string field to ``Optional[str]``: ``None`` for empty
+    / ``"null"`` / non-string; stripped otherwise."""
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s or s.lower() == "null":
+        return None
+    return s

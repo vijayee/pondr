@@ -761,6 +761,27 @@ class HippocampalStore:
             out.append(eid)
         return out
 
+    def default_memory_ids(self) -> "list[str]":
+        """All semantic-memory ids (``M:NNNN``), scanning ``content/mem/``.
+
+        Parallel to ``default_document_ids`` but for semantic memories (the
+        DiffPool cluster abstractions the consolidator writes). M-nodes are
+        NOT forgotten (no state/validity filter), so every written memory is a
+        retrieval candidate -- the abstract SURROGATE for its source episodes
+        (spec 371). The scan range ``content/mem/`` .. ``content/mem/\\x7f``
+        enumerates every ``content/mem/{mid}/...`` key prefix; parts[2] is the
+        ``M:NNNN`` id. Sorted so retrieval candidate enumeration is stable.
+        """
+        ids: set[str] = set()
+        for k, _ in self.db.create_read_stream(
+            start="content/mem/", end="content/mem/\x7f"
+        ):
+            parts = k.split("/", 3)
+            if len(parts) < 3 or not parts[2]:
+                continue
+            ids.add(parts[2])
+        return sorted(ids)
+
     # ---- episode-level forgetting state (Phase 3b) ----
 
     def _unindex_embedding(self, eid: str) -> None:
@@ -913,6 +934,39 @@ class HippocampalStore:
 
     def class_state(self, class_name: str) -> str:
         return _b2s(self.db.get_sync(self._class_key(class_name, "state"))) or "current"
+
+    def create_class(self, name: str, parent: "Optional[str]", when: str) -> None:
+        """Create a runtime-discovered class in ONE atomic ``batch_sync``.
+
+        Writes ``(name, subClassOf, parent)`` (when ``parent`` is given) + the
+        discovered marker + last_seen stamp, so the new class is immediately
+        decay-eligible and reassignment-ready (the mechanism A3 / Bonsai-gated
+        promotion lands into). Composite helper (not a primitive): the three
+        writes share one transaction/WAL record with the graph triple, mirroring
+        ``encode_episode``'s content+graph batch.
+
+        ``name`` / ``parent`` must be slash- and NUL-free: ``scan_classes``
+        reads ``content/class/{name}/field`` and returns ``parts[2]`` verbatim,
+        so a literal slash would split the key and the class would surface under
+        its hash, not its name (silent + confusing). ``safe_edge_component``
+        would hash it for the graph key, but the content/class sidecar would
+        still split -- so reject up front rather than half-hash.
+        """
+        for part, label in ((name, "name"), (parent, "parent")):
+            if part is None:
+                continue
+            if "/" in part or "\x00" in part or not part:
+                raise ValueError(
+                    f"create_class: {label} must be non-empty and free of "
+                    f"'/' and NUL (got {part!r})"
+                )
+        ops: list[dict] = []
+        if parent:
+            ops += self.graph.expand_triple(name, "subClassOf", parent)
+        ops.append({"type": "put", "key": self._class_key(name, "discovered"), "value": "1"})
+        ops.append({"type": "put", "key": self._class_key(name, "last_seen"), "value": when})
+        if ops:
+            self.db.batch_sync(ops)
 
     def scan_classes(self) -> "list[str]":
         """All class names with a ``content/class/`` entry (discovered or touched).

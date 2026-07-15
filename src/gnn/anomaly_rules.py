@@ -489,15 +489,23 @@ def flag_identity_drift(subgraph: dict) -> list[dict]:
 
     Returns findings ``{"node", "type": "identity_drift", "evidence"}``.
     """
-    # entity -> list of episode nodes (via has_entity / in_episode).
+    # entity -> set of episode nodes (via has_entity / in_episode). A
+    # has_entity edge (ep, has_entity, E:x) and its reverse in_episode edge
+    # (E:x, in_episode, ep) describe the SAME entity-episode link, so the
+    # episodes must be DEDUPED -- otherwise each episode is counted twice,
+    # the topic set list contains the same set twice, and a pair's Jaccard
+    # with itself is 1.0 (not 0), so "pairwise disjoint" is never true and
+    # the flag could never fire on real (bidirectional) data. The training
+    # path only saw this masked because the injector plants drift with a
+    # controlled edge set; deploy runs over the real bidirectional graph.
     node_ids = {n["id"] for n in subgraph["nodes"]}
-    ent_eps: dict[str, list[str]] = {}
+    ent_eps: dict[str, set[str]] = {}
     for e in subgraph["edges"]:
         if e["predicate"] == "has_entity" and e["subject"] in node_ids:
-            ent_eps.setdefault(e["object"], []).append(e["subject"])
+            ent_eps.setdefault(e["object"], set()).add(e["subject"])
         elif e["predicate"] == "in_episode" and e["object"] in node_ids:
             # in_episode: (entity, in_episode, episode) — the reverse orientation
-            ent_eps.setdefault(e["subject"], []).append(e["object"])
+            ent_eps.setdefault(e["subject"], set()).add(e["object"])
 
     # episode -> set of topics (via has_topic).
     ep_topics: dict[str, set[str]] = {}

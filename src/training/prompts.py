@@ -200,6 +200,77 @@ Return ONLY valid JSON:
 {{"decision": "fix|ask_user|dismiss", "action": "...", "reasoning": "..."}}"""
 
 
+def bonsai_gist_prompt(source_episodes: list[dict]) -> str:
+    """Prompt for the deploy-time Bonsai gist decider (spec §2.5 deploy step).
+
+    A gist is a summary-of-summaries: one paragraph that abstracts a DiffPool
+    cluster of episodes into a single semantic memory (``M:NNNN``). The caller
+    pre-caps the source list (``abstract_gist_max_episodes``) so the 8B's 4096
+    ctx is never blown. Each source carries ``id`` + ``summary`` + (optional)
+    ``text`` (a truncated full-text excerpt). Returns ONLY the gist string
+    envelope so ``BonsaiDecider._parse_json_object`` can carve it out.
+    """
+    lines = []
+    for ep in source_episodes:
+        eid = ep.get("id", "?")
+        sm = ep.get("summary", "")
+        tx = ep.get("text", "")
+        if tx:
+            lines.append(f"- [{eid}] {sm}\n  excerpt: {tx}")
+        else:
+            lines.append(f"- [{eid}] {sm}")
+    block = "\n".join(lines)
+    return f"""You are the subconscious of a memory system. A clustering pass grouped the
+episodes below because they are about the same underlying thing. Write ONE tight
+paragraph (3-6 sentences) that captures what the group is ABOUT -- the shared
+subject, the through-line, what was decided or learned -- NOT a list. This
+paragraph becomes a semantic memory that other episodes will be abstracted into,
+so it must stand alone: a reader who never saw the sources should understand the
+gist. Do not invent facts not supported by the sources; synthesize only.
+
+SOURCE EPISODES:
+{block}
+
+Return ONLY valid JSON:
+{{"gist": "..."}}"""
+
+
+def bonsai_typing_prompt(entity: str, candidate_class: str,
+                         retrieved_context: dict) -> str:
+    """Prompt for the deploy-time Bonsai ontology-typing decider.
+
+    Given an entity the ontology head proposes to type as ``candidate_class``
+    (above ``accept_threshold``) plus the entity's retrieved neighborhood, the
+    8B decides: is the typing right (``accept``), or is a NEW narrower class
+    under a named parent warranted? The caller verifies the proposed ``parent``
+    EXISTS in the seed ontology before creating the class (never orphans).
+    """
+    ctx_json = json.dumps(retrieved_context, ensure_ascii=False)
+    return f"""You are the ontology judge of a memory system. An entity-typing head proposed
+typing the entity below as a class. Decide whether that typing is correct, or
+whether the entity is better described by a NEW narrower class under an EXISTING
+parent class. The parent must already exist in the seed ontology (Person,
+Project, Technology, Concept, and their subclasses); if you propose a parent
+that does not exist, the system will reject the new class and record nothing.
+
+ENTITY: {entity}
+PROPOSED CLASS: {candidate_class}
+
+RETRIEVED CONTEXT (entity's neighborhood):
+{ctx_json}
+
+Decisions:
+- accept=true, new_class=null: the entity genuinely is an instance of the
+  proposed class. The system will write an instanceOf edge.
+- accept=true, new_class="<name>", parent="<existing class>": the entity is an
+  instance of a NEW narrower class under an existing parent. The system creates
+  the class then writes the instanceOf edge.
+- accept=false: the typing is wrong. The system records nothing.
+
+Return ONLY valid JSON:
+{{"accept": true|false, "new_class": "... or null", "parent": "... or null", "reasoning": "..."}}"""
+
+
 def bonsai_query_planning_prompt(conversation_text: str, question: str) -> str:
     """Prompt for generating Bonsai query planning training pairs."""
     return f"""You are generating training data for a query planner that converts

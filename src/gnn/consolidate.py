@@ -35,6 +35,7 @@ from .heads import ANOMALY_TYPES
 from .model import GNNModel
 from .semantic_memory import SemanticMemoryWriter
 from .taxonomy_graph import build_taxonomy_data
+from .anomaly_rules import enrich_subgraph, flag_identity_drift
 from ..memory.forgetting import (
     apply_dream_state,
     compose_utility,
@@ -51,6 +52,7 @@ from ..memory.edge_meta import (
 if TYPE_CHECKING:
     from ..config import ConsolidationConfig
     from ..memory.store import HippocampalStore
+    from .bonsai_decider import BonsaiDecider
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +106,7 @@ class Consolidator:
         dry_run: Optional[bool] = None,
         device: str = "cpu",
         allow_untrained_apply: bool = False,
+        decider: Optional["BonsaiDecider"] = None,
     ) -> None:
         from ..config import Phase3aConfig
         self.store = store
@@ -111,6 +114,7 @@ class Consolidator:
         self.cfg = config or pa.consolidation
         self.dry_run = self.cfg.dry_run_default if dry_run is None else dry_run
         self.verifier = verifier
+        self.decider = decider
         self.device = device
         # Untrained model is the dev-slice default; the real run passes a loaded
         # checkpoint. ``trained`` records which so the report is honest.
@@ -134,6 +138,11 @@ class Consolidator:
         # bare class names for the recorded proposals.
         self._class_emb: Optional[torch.Tensor] = None
         self._class_names: Optional[list[str]] = None
+        # Bonsai-in-consolidation: lazy embedder for the abstract-gist path
+        # (encode the gist so the M-node enters the vector index). Cached on
+        # ``self._embedder_obj``; tests inject a stub by setting it directly.
+        # ``None`` here is the lazy sentinel (the property loads on first use).
+        self._embedder_obj = None
         # Per-run accumulators consumed by ``_apply``. Defaults live here so a
         # direct ``_apply`` call (tests) works without ``run()``; ``run()`` resets
         # them at the top of each pass so a reused Consolidator starts clean.
@@ -175,6 +184,18 @@ class Consolidator:
             "edges_accepted": [], "edges_unverified": [], "anomalies": [],
             "ontology_proposed": [], "pruned": [], "verifier_calls": 0,
             "verifier_accepted": 0,
+            # Bonsai-in-consolidation (deploy-time decider). Each is empty on a
+            # cold start (no decider / disabled / dry-run) so the report stays
+            # byte-identical to today. ``abstracts_applied`` records M-nodes
+            # that got a real Bonsai gist + embedding + vector index entry;
+            # ``ontology_applied``/``ontology_rejected`` record instanceOf
+            # writes vs decider rejections; ``identity_drift_decisions``
+            # records the {flagged_entity, decision, action, reasoning}
+            # adjudications.
+            "abstracts_applied": [],
+            "ontology_applied": [],
+            "ontology_rejected": [],
+            "identity_drift_decisions": [],
             # Binned score histograms (100 width-0.01 buckets, [0,1]) so a reader
             # can sweep accept/bonsai/prune thresholds from ONE run without
             # re-running (exact at 0.01-boundaries like 0.05/0.15/0.85).
@@ -231,6 +252,13 @@ class Consolidator:
         # ``_apply`` physically removes. Populated by ``_step_deep_archive``
         # (read-only scan, runs in dry-run too so the report shows candidates).
         self._deep_archive_candidates: list[tuple[str, str, str, str]] = []
+        # identity_drift dedup: the flag is keyed by ENTITY (the flagged node),
+        # but the loop iterates EPISODE centers, so one entity appears in many
+        # centers' subgraphs. Without dedup the same drift finding would be
+        # appended (and adjudicated by Bonsai) once per episode the entity
+        # touches -- N duplicate HTTP calls + N duplicate report rows. This set
+        # is reset per ``run()`` so a fresh dream pass re-evaluates every entity.
+        self._drift_checked: set[str] = set()
 
         for center in centers:
             data = self.loader.load(center)
@@ -361,15 +389,19 @@ class Consolidator:
         if radius >= 3 and cap is None:
             # Bounded subgraph == the radius-3 giant already loaded -> reuse it.
             self._step_anomaly(data, out, report)
+            self._flag_identity_drift(center, list(data.node_id), report)
             return
         anom_data = self.loader.load(center, radius=radius, fanout_cap=cap)
         if anom_data.x.shape[0] < 2:
             # Too small to score (e.g. an isolated center under a tight cap) ->
-            # no anomalies this center; honest, not faked.
+            # no anomalies this center; honest, not faked. The identity-drift
+            # flag is also subgraph-shaped, so it too has nothing to run on.
+            self._flag_identity_drift(center, list(anom_data.node_id), report)
             return
         with torch.no_grad():
             anom_out = self.model(anom_data)
         self._step_anomaly(anom_data, anom_out, report)
+        self._flag_identity_drift(center, list(anom_data.node_id), report)
 
     def _step_anomaly(self, data, out, report: dict) -> None:
         """Flag nodes whose anomaly logits exceed 0.5 on any type."""
@@ -380,6 +412,74 @@ class Consolidator:
                 "node": data.node_id[n], "type": ANOMALY_TYPES[t],
                 "score": float(anomaly[n, t]),
             })
+
+    def _flag_identity_drift(
+        self, center: str, node_ids: list[str], report: dict
+    ) -> None:
+        """Run the ``identity_drift`` review-flag (Bonsai-decider-gated).
+
+        ``flag_identity_drift`` (anomaly_rules) is a deliberately OVER-FIRING
+        heuristic: an entity whose episodes' topic neighborhoods are pairwise
+        disjoint is flagged, but that is often legitimate (a person who is a
+        coder AND a parent). It is a FLAG-FOR-REVIEW routed to the Bonsai
+        decider, NOT a trained head label -- so it is only worth running when a
+        decider is wired to adjudicate it. With no decider the flag would just
+        pollute ``report["anomalies"]`` with un-actionable noise, so this method
+        is a no-op then (the cold-start path stays record-only + byte-identical).
+
+        CENTERING: the flag is keyed by ENTITY, so the subgraph it consumes is
+        extracted ENTITY-centered, not episode-centered. From an EPISODE center
+        at ``anomaly_subgraph_radius=2`` the BFS reaches the episode's entity
+        (hop 1) and that entity's sibling episodes (hop 2), but a sibling
+        episode's own ``has_topic`` edge is at hop 3 -- OUTSIDE the radius-2
+        ball -- so ``ep_topics[sibling_ep]`` is empty and the disjoint-topic
+        test can never fire. An ENTITY center at the same radius 2 reaches the
+        entity's episodes (hop 1) AND their topics (hop 2), which is exactly
+        the bipartite neighborhood the flag computes. So we iterate the ENTITY
+        node ids present in the loaded anomaly subgraph (``node_ids``, passed
+        by ``_step_anomaly_bounded`` from the bounded subgraph it already
+        loaded -- no extra extract to discover entities) and extract a fresh
+        ENTITY-centered subgraph per unchecked entity. ``self._drift_checked``
+        (reset per ``run()``) dedups across episode centers so each entity is
+        adjudicated at most once per dream pass.
+
+        Train/serve note: the training generator (``generate_gnn_training_data``)
+        ran ``flag_identity_drift`` on EPISODE-centered radius-2 anomaly
+        subgraphs, where (per above) it could not fire on realistic drift, so
+        the Oracle produced no identity_drift decision pairs -- Bonsai is
+        zero-shot on this flag this slice (plan-sanctioned; the LoRA fine-tune
+        is deferred). The decider's CONTEXT (``_gather_entity_context``) is
+        gathered separately from the entity's live neighborhood, so the
+        adjudication is consistent regardless of the flag's extraction center.
+        The deferred fine-tune must regenerate decision pairs with this same
+        entity-centered extraction so Bonsai trains on flags that actually fire.
+
+        Findings are appended to ``report["anomalies"]`` with
+        ``type="identity_drift"``, ``score=1.0`` (a rule-flag, not a head
+        logit), and ``evidence`` carried for the decider. The existing
+        ``contradictory_state`` filter in ``_apply`` ignores them, so these
+        are purely additive.
+        """
+        if self.decider is None or not self.cfg.bonsai_decider_enabled:
+            return
+        radius = self.cfg.anomaly_subgraph_radius
+        cap = self.cfg.anomaly_fanout_cap
+        for nid in node_ids:
+            if not nid.startswith("E:") or nid in self._drift_checked:
+                continue
+            self._drift_checked.add(nid)
+            try:
+                sub = self.loader._pipe.extract_subgraph(
+                    nid, radius=radius, fanout_cap=cap)
+            except Exception:  # noqa: BLE001 -- extract must never break pass
+                log.warning("identity_drift extract_subgraph failed for %s", nid)
+                continue
+            enrich_subgraph(self.store, sub)
+            for f in flag_identity_drift(sub):
+                report["anomalies"].append({
+                    "node": f["node"], "type": "identity_drift",
+                    "score": 1.0, "evidence": f.get("evidence"),
+                })
 
     def _step_ontology(self, data, out, report: dict) -> None:
         """Score entity vs candidate classes; record high-confidence typing proposals.
@@ -610,11 +710,60 @@ class Consolidator:
     # ── apply (mutates; only when not dry-run) ──
 
     def _apply(self, report: dict) -> None:
-        # Abstracts: one semantic memory per proposed cluster.
+        from ..config import config as _master_config
+        decider_active = (
+            self.decider is not None and self.cfg.bonsai_decider_enabled
+        )
+        # Abstracts: one semantic memory per proposed cluster. With a wired
+        # Bonsai decider the gist is a real synthesis-of-sources (8B) that is
+        # embedded + vector-indexed so the M-node becomes a retrieval
+        # candidate; WITHOUT a decider (cold start: none wired / disabled /
+        # dry-run) the honest placeholder is kept -- byte-identical to today,
+        # and the M-node stays graph-reachable only (not a semantic candidate).
         for ab in report["abstracts"]:
-            self.writer.create_abstract(
-                ab["episodes"], summary=f"Abstract of {ab['episodes']}",
+            gist_text: Optional[str] = None
+            if decider_active:
+                source_eps = self._gist_for(ab)
+                try:
+                    gist_text = self.decider.gist(source_eps)
+                except Exception:  # noqa: BLE001 -- gist failure -> placeholder
+                    log.warning("Bonsai gist failed; placeholder fallback")
+                    gist_text = None
+            if not gist_text:
+                # Honest cold-start fallback (a placeholder, NOT a stub to
+                # remove): the M-node is still written + abstracts edges still
+                # link it to its sources, just without a real gist/embedding.
+                self.writer.create_abstract(
+                    ab["episodes"], summary=f"Abstract of {ab['episodes']}",
+                )
+                continue
+            vec: Optional[list[float]] = None
+            try:
+                raw = self._embedder.encode([gist_text])[0]
+                # sentence-transformers returns a numpy float32 array; normalize
+                # to plain Python floats (create_abstract json.dumps the
+                # embedding, which rejects numpy, and _index_embedding passes
+                # the list to the C VectorLayer). Stubs already return floats.
+                if hasattr(raw, "tolist"):
+                    vec = [float(x) for x in raw.tolist()]
+                else:
+                    vec = [float(x) for x in raw]
+            except Exception:  # noqa: BLE001 -- embedder failure -> no index
+                log.warning("gist embed failed; M-node written unindexed")
+                vec = None
+            mid = self.writer.create_abstract(
+                ab["episodes"], summary=gist_text, text=gist_text, embedding=vec,
             )
+            # Index the M-node into the in-DB vector layer so it becomes a
+            # semantic-fallback retrieval candidate. ``_index_embedding`` is
+            # id-agnostic (accepts ``M:NNNN`` -- the id has ``:`` not ``/``; see
+            # store.py:339), so this is safe for a non-``ep_`` id. Skipped when
+            # the embedder failed (the M-node is still graph-reachable).
+            if vec is not None:
+                self.store._index_embedding(mid, vec, gist_text)
+            report["abstracts_applied"].append({
+                "mid": mid, "episodes": ab["episodes"], "gist": gist_text,
+            })
         # Accepted edges: write as graph triples (predicate 'related_to').
         for e in report["edges_accepted"]:
             ops = self.store.graph.expand_triple(
@@ -656,7 +805,6 @@ class Consolidator:
         # giant subgraph; low-confidence stays record-only). The resolver is
         # best-effort (see ``_resolve_contradictory_state``); when it returns a
         # pair, the old episode is superseded by the new one (E->E chain).
-        from ..config import config as _master_config
         if _master_config.forgetting_enabled:
             for anom in report["anomalies"]:
                 if anom.get("type") != "contradictory_state":
@@ -714,6 +862,120 @@ class Consolidator:
                     cleanup_ops.append(archived_edge_delete_op(s, p, o))
                 if cleanup_ops:
                     self.store.db.batch_sync(cleanup_ops)
+        # Bonsai-in-consolidation: ontology promotion. The ontology head RECORDS
+        # entity->class typing proposals; with a wired Bonsai decider each
+        # proposal above ``ontology_bonsai_threshold`` is gated through Bonsai,
+        # which either accepts the typing (write an ``instanceOf`` edge -- GNN-
+        # invisible, checkpoint-safe per ontology.py:85-88), proposes a NEW
+        # narrower class under an EXISTING seed parent (create the class then
+        # write the typing), or rejects (record-only). ``instanceOf`` is NOT in
+        # KNOWN_PREDICATES/_NODE_PREDICATES, so writing it never breaks a
+        # checkpoint load. No decider -> NO instanceOf edges (current behavior).
+        if decider_active:
+            now_ts = _dream_now()
+            for prop in report["ontology_proposed"]:
+                if prop.get("confidence", 0.0) < self.cfg.ontology_bonsai_threshold:
+                    continue
+                entity = prop["entity"]
+                cls = prop["class"]
+                ctx = self._gather_entity_context(f"E:{entity}" if not entity.startswith("E:") else entity)
+                try:
+                    verdict = self.decider.verify_typing(entity, cls, ctx)
+                except Exception:  # noqa: BLE001 -- record-only on failure
+                    log.warning("Bonsai verify_typing failed for %s", entity)
+                    verdict = None
+                if verdict is None or not verdict.get("accept"):
+                    report["ontology_rejected"].append({
+                        "entity": entity, "class": cls,
+                        "reasoning": (verdict or {}).get("reasoning", ""),
+                    })
+                    continue
+                new_class = verdict.get("new_class")
+                parent = verdict.get("parent")
+                if new_class:
+                    # A new narrower class: the parent MUST exist in the seed
+                    # ontology (subClassOf closure) -- never orphan. On a miss,
+                    # demote to record-only (rejection) rather than write a
+                    # dangling class.
+                    if not parent or not self._class_exists(parent):
+                        report["ontology_rejected"].append({
+                            "entity": entity, "class": cls,
+                            "new_class": new_class, "parent": parent,
+                            "reasoning": verdict.get("reasoning", ""),
+                        })
+                        continue
+                    self.store.create_class(new_class, parent, now_ts)
+                    target_class = new_class
+                else:
+                    target_class = cls
+                ops = self.store.graph.expand_triple(
+                    f"E:{entity}" if not entity.startswith("E:") else entity,
+                    "instanceOf", target_class,
+                )
+                if ops:
+                    self.store.db.batch_sync(ops)
+                report["ontology_applied"].append({
+                    "entity": entity, "class": target_class,
+                    "new_class": new_class, "parent": parent,
+                    "reasoning": verdict.get("reasoning", ""),
+                })
+            # Bonsai-in-consolidation: identity_drift anomaly decision. The
+            # ``identity_drift`` rule-flag (``_flag_identity_drift``) only ran
+            # because a decider is wired; here Bonsai adjudicates each flag
+            # ``fix``/``ask_user``/``dismiss``. Per D7 the dispatch is
+            # CONSERVATIVE: splitting an entity is genuinely semantic, so
+            # ``fix`` is treated as ``ask_user`` (recorded for human review)
+            # UNLESS the action is the one known-safe fix
+            # (``supersede_episode`` -- an E->E supersession chain, gated on
+            # ``forgetting_enabled`` like the contradictory_state path). No
+            # silent graph mutation from an over-firing flag.
+            for anom in report["anomalies"]:
+                if anom.get("type") != "identity_drift":
+                    continue
+                ctx = self._gather_entity_context(anom["node"])
+                try:
+                    decision = self.decider.decide_anomaly(anom, ctx)
+                except Exception:  # noqa: BLE001 -- record-only on failure
+                    log.warning("Bonsai decide_anomaly failed for %s",
+                                anom.get("node"))
+                    decision = None
+                if decision is None:
+                    report["identity_drift_decisions"].append({
+                        "flagged_entity": anom.get("node"),
+                        "anomaly_type": anom.get("type"),
+                        "decision": None, "action": "",
+                        "reasoning": "decider returned no decision",
+                    })
+                    continue
+                action = (decision.get("action") or "").lower()
+                verdict = decision.get("decision")
+                applied = False
+                if verdict == "fix" and "supersede_episode" in action and \
+                        _master_config.forgetting_enabled:
+                    # The one known-safe fix: resolve to a (old, new) pair and
+                    # supersede. Reuse the contradictory_state resolver to derive
+                    # the pair (identity_drift flags entities; the resolver
+                    # finds their source episodes by timestamp).
+                    resolved = self._resolve_contradictory_state(anom["node"])
+                    if resolved is not None:
+                        old_ep, new_ep = resolved
+                        self.writer.supersede_episode(new_ep, old_ep)
+                        report["forgetting"]["reconsolidated"].append({
+                            "entity": anom["node"], "old": old_ep,
+                            "new": new_ep,
+                        })
+                        applied = True
+                if not applied and verdict == "fix":
+                    # Conservative: a fix we can't safely auto-apply -> ask_user.
+                    verdict = "ask_user"
+                report["identity_drift_decisions"].append({
+                    "flagged_entity": anom.get("node"),
+                    "anomaly_type": anom.get("type"),
+                    "decision": verdict,
+                    "action": decision.get("action", ""),
+                    "reasoning": decision.get("reasoning", ""),
+                    "applied": applied,
+                })
 
     def _find_predicate(self, subject: str, object_: str) -> Optional[str]:
         """Recover the predicate of a stored ``(subject, ?, object)`` triple."""
@@ -726,6 +988,130 @@ class Consolidator:
             finally:
                 r.close()
         return None
+
+    # ── Bonsai-in-consolidation helpers ──
+
+    @property
+    def _embedder(self):
+        """Lazy embedder for the abstract-gist path.
+
+        Reuses the shared ``_sentence_transformers_embedder`` (BAAI/bge-small-en-v1.5,
+        384-dim) that ``WavedbVectorStore`` / ``VectorSearch`` load, so the
+        M-node embedding lives in the SAME 384-dim FLAT/COSINE vector layer as
+        episodes + document sections. Cached on ``self._embedder_obj``; tests
+        inject a stub by setting that attribute directly (no model download).
+        """
+        if self._embedder_obj is None:
+            from ..retrieval.vector_search import _sentence_transformers_embedder
+            self._embedder_obj = _sentence_transformers_embedder()
+        return self._embedder_obj
+
+    def _gist_for(self, ab: dict) -> list[dict]:
+        """Build the source-episode list for the gist prompt from a cluster.
+
+        Caps at ``cfg.abstract_gist_max_episodes`` (the 8B's 4096 ctx). Each
+        entry is ``{id, summary, text}`` where ``text`` is the episode's
+        ``full_text`` truncated to 512 chars (a gist is a summary-of-summaries;
+        the summary is the salient line, the truncated full text is context).
+        Missing episodes are skipped (defensive -- a cluster's episodes are
+        normally live, but a race / forget could drop one mid-pass).
+        """
+        cap = max(1, int(self.cfg.abstract_gist_max_episodes))
+        out: list[dict] = []
+        for eid in ab["episodes"][:cap]:
+            ep = self.store.get_episode(eid)
+            if ep is None:
+                continue
+            full = (ep.full_text or "")
+            out.append({
+                "id": eid,
+                "summary": ep.summary or "",
+                "text": full[:512],
+            })
+        return out
+
+    def _gather_entity_context(self, entity_id: str) -> dict:
+        """Radius-1 context the Bonsai decider adjudicates an entity with.
+
+        Reuses the SAME graph queries as ``_resolve_contradictory_state``
+        (distinct live ``state`` values, source episodes with summary +
+        timestamp, the entity's ``instanceOf`` typings) plus the entity's
+        topic neighborhoods (what the identity_drift flag keys on). This is
+        the retrieve-then-decide grounding: the deploy decider sees the SAME
+        context the Oracle teacher labeled against, so the decision is
+        reproducible (spec §2.5). Returns an empty-context shell for a
+        non-entity id so the decider can still return ``dismiss`` safely.
+        """
+        ctx: dict = {
+            "entity": entity_id, "states": [], "episodes": [],
+            "topics": [], "instance_of": [],
+        }
+        if not entity_id.startswith("E:"):
+            return ctx
+        graph = self.store.graph
+        # distinct live state values on the entity.
+        r = graph.query().vertex(entity_id).out("state").execute_sync()
+        try:
+            for v in r.vertices:
+                ctx["states"].append(v)
+        finally:
+            r.close()
+        # source episodes that mention the entity (has_entity reverse).
+        r = graph.query().vertex(entity_id).in_("has_entity").execute_sync()
+        try:
+            ep_ids = [v for v in r.vertices
+                      if isinstance(v, str) and v.startswith("ep_")]
+        finally:
+            r.close()
+        for eid in ep_ids:
+            ep = self.store.get_episode(eid)
+            if ep is None:
+                continue
+            ctx["episodes"].append({
+                "id": eid, "summary": ep.summary or "",
+                "timestamp": ep.timestamp or "",
+            })
+        # the entity's existing instanceOf typings.
+        r = graph.query().vertex(entity_id).out("instanceOf").execute_sync()
+        try:
+            for v in r.vertices:
+                ctx["instance_of"].append(v)
+        finally:
+            r.close()
+        # topic neighborhoods: each source episode's topics (has_topic).
+        for eid in ep_ids:
+            r = graph.query().vertex(eid).out("has_topic").execute_sync()
+            try:
+                for v in r.vertices:
+                    if v not in ctx["topics"]:
+                        ctx["topics"].append(v)
+            finally:
+                r.close()
+        return ctx
+
+    def _class_exists(self, class_name: str) -> bool:
+        """True iff ``class_name`` is in the seed ontology OR already created.
+
+        The seed ontology writes only ``subClassOf`` graph triples (no
+        ``content/class/`` entry), so ``scan_classes`` misses seed classes; this
+        checks BOTH the discovered-class marker (``is_class_discovered``) AND a
+        ``subClassOf`` edge in either direction (seed classes carry one). The
+        gate that prevents a new Bonsai-proposed class from orphaning: the
+        parent must return True here before ``store.create_class`` runs.
+        """
+        if self.store.is_class_discovered(class_name):
+            return True
+        graph = self.store.graph
+        for direction in ("out", "in_"):
+            q = graph.query().vertex(class_name)
+            q = q.out("subClassOf") if direction == "out" else q.in_("subClassOf")
+            r = q.execute_sync()
+            try:
+                if list(r.vertices):
+                    return True
+            finally:
+                r.close()
+        return False
 
     # ── Phase 3b step 8: anomaly -> reconsolidation resolver ──
 

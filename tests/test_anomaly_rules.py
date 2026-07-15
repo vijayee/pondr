@@ -388,6 +388,30 @@ def test_identity_drift_shared_topic_not_flagged():
     assert flag_identity_drift(sub) == []
 
 
+def test_identity_drift_bidirectional_edges_dedup():
+    # The deploy subgraph extractor emits BOTH orientations of an entity-episode
+    # link: ``has_entity`` (ep -> E:x) AND ``in_episode`` (E:x -> ep). Without
+    # dedup each episode is counted twice per entity, the topic-set list holds
+    # the same set twice, and a pair's Jaccard with itself is 1.0 -- so
+    # "pairwise disjoint" is never true and the flag could NEVER fire on real
+    # (bidirectional) data. This guards the dedup fix.
+    sub = _sub(
+        [_node("ep_000001", summary="x"), _node("ep_000002", summary="y"),
+         _node("E:Alice"), _node("T:database"), _node("T:parenting")],
+        [("ep_000001", "has_entity", "E:Alice"),
+         ("ep_000002", "has_entity", "E:Alice"),
+         # The reverse orientation the real BFS extractor emits:
+         ("E:Alice", "in_episode", "ep_000001"),
+         ("E:Alice", "in_episode", "ep_000002"),
+         ("ep_000001", "has_topic", "T:database"),
+         ("ep_000002", "has_topic", "T:parenting")],
+        center="ep_000001",
+    )
+    flags = flag_identity_drift(sub)
+    assert len(flags) == 1
+    assert flags[0]["node"] == "E:Alice"
+
+
 def test_identity_drift_not_in_anomaly_types():
     # The flag is routed to Bonsai, never to the head's label vector.
     sub = _sub(
