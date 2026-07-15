@@ -1,9 +1,9 @@
-# EnterpriseRAG-Bench -- "Conflicting Info" offline eval fixtures (Phase 4 D8)
+# EnterpriseRAG-Bench -- "Conflicting Info" offline eval fixtures (Phase 3c D8)
 
 This directory vendors a SMALL, fixed, COMMITTED subset of the
 [EnterpriseRAG-Bench](https://github.com/onyx-dot-app/EnterpriseRAG-Bench)
 "Conflicting Info" question category, distilled into the fields the
-deterministic Phase 4 path consumes. It is loaded by
+deterministic Phase 3c path consumes. It is loaded by
 `tests/test_enterpriserag_eval.py` at test time -- **no network, no model, no
 server**.
 
@@ -11,7 +11,7 @@ server**.
 
 EnterpriseRAG-Bench's "Conflicting Info" category is built from
 near-duplicate document pairs where **a newer document supersedes facts from
-an older one**. That structure is direct ground truth for the Phase 4
+an older one**. That structure is direct ground truth for the Phase 3c
 contradiction -> fact-level-tombstone path, and the per-question
 `expected_doc_ids` is citation ground truth.
 

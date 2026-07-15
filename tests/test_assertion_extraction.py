@@ -1,4 +1,4 @@
-"""Deterministic state-assertion extractor -- Phase 4 (D1/D6).
+"""Deterministic state-assertion extractor -- Phase 3c (D1/D6).
 
 Pure/unit: no IO, no model, no store. Covers the deterministic normalizer's
 high-precision paths (field ``key: value`` / ``key = value`` / ``key is [now]

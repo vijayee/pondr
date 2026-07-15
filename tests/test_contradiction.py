@@ -1,4 +1,4 @@
-"""Phase 4: fact-level contradiction detection + Bonsai adjudication + tombstone.
+"""Phase 3c: fact-level contradiction detection + Bonsai adjudication + tombstone.
 
 Exercises the D2/D3/D4 path end-to-end through ``Consolidator._apply`` (crafted
 reports, like ``test_consolidate_bonsai.py``): plant two ``(E:team, state, V)``
@@ -55,7 +55,7 @@ def _store(tmp_path):
 
 def _plant_assertion(store, entity_name, value, asserted_by, asserted_at):
     """Plant an entity ``(E:name, state, value)`` edge WITH sidecar provenance
-    (mirrors what the Phase 4 encoder writes via ``_assertion_edge_ops``)."""
+    (mirrors what the Phase 3c encoder writes via ``_assertion_edge_ops``)."""
     subj = f"E:{entity_name}"
     ops = store.graph.expand_triple(subj, "state", value)
     store.db.batch_sync(ops)

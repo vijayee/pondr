@@ -180,7 +180,7 @@ class BonsaiDecider:
         }
 
     def decide_contradiction(self, flag: dict, retrieved_context: dict) -> Optional[dict]:
-        """Decide what to DO about a ``contradictory_state`` flag (Phase 4 D3).
+        """Decide what to DO about a ``contradictory_state`` flag (Phase 3c D3).
 
         Mirror of ``decide_anomaly`` for the fact-level contradiction path:
         ``flag`` is the ``{node, type:"contradictory_state", evidence}`` record

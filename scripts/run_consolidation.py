@@ -102,7 +102,7 @@ def _build_decider() -> "object | None":
 
 
 def main() -> int:
-    # The report now carries Bonsai decider reasoning (identity_drift + Phase 4
+    # The report now carries Bonsai decider reasoning (identity_drift + Phase 3c
     # contradictions_resolved) which may be non-ASCII; reconfigure stdout to
     # utf-8 so ``json.dumps(..., ensure_ascii=False)`` does not crash on a
     # cp1252 console (Windows). Idempotent + harmless on UTF-8 platforms.
@@ -184,7 +184,7 @@ def main() -> int:
     parser.add_argument("--anomaly-resolve-threshold", type=float, default=None,
                         help="contradictory_state score at/above which the resolver auto-"
                              "supersedes (default 0.8; below = record-only)")
-    # ── Phase 4: citation + contradiction knobs. ``--no-assertions`` and
+    # ── Phase 3c: citation + contradiction knobs. ``--no-assertions`` and
     # ``--no-citation-resolution`` toggle the master Config singleton flags
     # (read by the encoder/store via ``config``), so they are overridden here
     # process-scoped like ``--no-forget``. ``--contradiction-resolve-threshold``
@@ -192,10 +192,10 @@ def main() -> int:
     # confidence gate; below = record-only, no mutation).
     parser.add_argument("--assertions", action=argparse.BooleanOptionalAction,
                         default=None,
-                        help="Toggle the Phase 4 entity-state-assertion writer (default on; "
+                        help="Toggle the Phase 3c entity-state-assertion writer (default on; "
                              "--no-assertions makes the encoder/store skip (E:entity,state,v) "
                              "edges -> the contradiction detector never fires -> byte-identical "
-                             "to a pre-Phase-4 run)")
+                             "to a pre-Phase-3c run)")
     parser.add_argument("--citation-resolution", action=argparse.BooleanOptionalAction,
                         default=None,
                         help="Toggle resolving Document.citations + email in_reply_to/references "
@@ -267,7 +267,7 @@ def main() -> int:
         # Bonsai-in-consolidation knobs.
         "abstract_gist_max_episodes": args.abstract_gist_max_episodes,
         "ontology_bonsai_threshold": args.ontology_bonsai_threshold,
-        # Phase 4 contradiction-adjudication confidence gate.
+        # Phase 3c contradiction-adjudication confidence gate.
         "contradiction_resolve_threshold": args.contradiction_resolve_threshold,
     }
     cfg = replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
@@ -282,7 +282,7 @@ def main() -> int:
     # flag is explicitly passed. Default (None) leaves the config default (True).
     if args.forget is not None:
         config.forgetting_enabled = args.forget
-    # Phase 4 master gates: the encoder/store read
+    # Phase 3c master gates: the encoder/store read
     # ``config.assertion_extraction_enabled`` and
     # ``config.citation_resolution_enabled`` from the global singleton, so
     # override them here (process-scoped) when the flag is explicitly passed.

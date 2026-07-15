@@ -1,4 +1,4 @@
-"""Deterministic state-assertion extractor (Phase 4, D1/D6).
+"""Deterministic state-assertion extractor (Phase 3c, D1/D6).
 
 A *state assertion* is an explicit ``entity -> value`` claim extracted from
 text -- the production writer of ``(E:entity, state, literal)`` edges that

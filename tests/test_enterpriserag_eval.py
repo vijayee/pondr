@@ -1,4 +1,4 @@
-"""Phase 4 (D8): EnterpriseRAG-Bench 'Conflicting Info' eval -- deterministic only.
+"""Phase 3c (D8): EnterpriseRAG-Bench 'Conflicting Info' eval -- deterministic only.
 
 Vendored offline fixture subset (``tests/fixtures/enterpriserag/pairs.json``):
 near-duplicate document pairs where a NEWER doc supersedes facts from an

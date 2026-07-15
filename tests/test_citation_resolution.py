@@ -1,7 +1,7 @@
-"""Phase 4: citation resolution + email provenance + cited_from (D5).
+"""Phase 3c: citation resolution + email provenance + cited_from (D5).
 
 Offline (no GLiNER/Bonsai/server): constructs Documents + Episodes directly and
-encodes them, then asserts the Phase 4 graph edges. Three citation pieces:
+encodes them, then asserts the Phase 3c graph edges. Three citation pieces:
 
 1. **doc->doc ``cites`` resolution**: ``Document.citations`` literals are
    resolved to Document node ids via ``find_document_by_title_or_url`` (title /
@@ -111,7 +111,7 @@ def test_cites_resolved_to_document_node(tmp_path):
 
 def test_cites_unresolved_keeps_literal(tmp_path):
     """A citation literal that matches no doc -> the literal itself is the
-    cite object (byte-identical to pre-Phase-4)."""
+    cite object (byte-identical to pre-Phase-3c)."""
     store = _store(tmp_path)
     store.encode_document(_doc("doc_000001", "Meeting Notes",
                                 citations=["some-unresolved-literal"]))
@@ -275,7 +275,7 @@ def test_document_state_assertions_write_entity_edges(tmp_path):
 
 def test_assertion_extraction_disabled_no_entity_edges(tmp_path):
     """``--no-assertions`` -> zero entity ``state`` edges from a doc (byte-
-    identical to pre-Phase-4)."""
+    identical to pre-Phase-3c)."""
     store = _store(tmp_path)
     saved = master_config.assertion_extraction_enabled
     master_config.assertion_extraction_enabled = False

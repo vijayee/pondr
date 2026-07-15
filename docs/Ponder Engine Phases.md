@@ -13,7 +13,8 @@ Phase 2: Subconscious ──── JEPA-Gated SSM Backbone, Retrieval Gate,
     │                       Working Memory, SSM Chunking, Presentation Gate
     │
 Phase 3: Consolidation ─── GNN Consolidator, Forgetting System, 
-    │                       Reconsolidation Counting, Ontology Decay
+    │                       Reconsolidation Counting, Ontology Decay,
+    │                       Citation + Contradiction Detection (3c)
     │
 Phase 4: Metacognition ──── Uncertainty Detector, Aspirational Model,
     │                       Self-Model, Common Sense Resolver, EXPAND Mechanism
@@ -448,6 +449,70 @@ A database you can talk to. The system retrieves relevant episodes, builds conte
 - Foundation for entity archiving
 
 **Developmental stage:** Forgetting system at INFANT.
+
+---
+
+### Phase 3c: Citation + Contradiction Detection
+
+> **Note:** "Phase 3c" is the citation + contradiction slice that closes 3b's
+> deferred A2 (anomaly-resolver provenance) gap and adds citation as the
+> provenance backbone. It was built under the working label "Phase 4" during
+> implementation; that label collided with this doc's Phase 4 (Metacognition),
+> so it was renumbered back to 3c — it is a 3b follow-on, not metacognition.
+> The detailed, code-aligned design record lives in `docs/Phase 3c.md`. Phase 3c
+> adds **no training cost** (deterministic normalizer + zero-shot Bonsai
+> adjudication, reusing 3a heads + the 3b edge sidecar; the trained metacognition
+> gates remain Phase 4).
+
+**Goal:** Give the forgetting system a production writer of entity-state
+assertions + value→source provenance, resolve contradictions at the fact level,
+and wire citation as the cross-source provenance backbone.
+
+**Duration:** 3-4 days
+
+**Key deliverables:**
+
+**Entity-state assertion extraction (closes 3b A2):**
+- Deterministic normalizer for explicit `X = Y` / `key: value` / `chose X` /
+  change-verb patterns (the shape Jira/Linear/Confluence status fields take)
+- Bonsai `has_state(Entity, Value)` relation for paraphrased assertions
+- Entity-owned `(E:entity, state, value)` edges, PUT-ONLY, with edge-sidecar
+  `asserted_by` + `asserted_at` provenance (the `supported_by` analog)
+
+**Fact-level tombstone (refines 3b's episode-level supersede):**
+- Contradiction resolution writes the old edge sidecar `state="superseded"` +
+  `superseded_by` + `superseded_at` — NOT episode-supersede (too coarse)
+- Tombstoned value drops from the live-values set → detector goes quiet
+  (the contradiction is *resolved*, not just recorded); MVCC keeps it retrievable
+- No persistent `contradicts` graph edge (ephemeral detect→adjudicate→tombstone),
+  avoiding the ontology dict-merge silent-overwrite
+
+**Bonsai contradiction adjudication:**
+- `BonsaiDecider.decide_contradiction` mirrors `decide_anomaly`; conservative
+  dispatch auto-applies ONLY `fix` + `supersede_assertion` + `forgetting_enabled`
+- The 3b timestamp heuristic becomes the no-sidecar fallback (injector edges)
+
+**Citation provenance (hash-tail predicates, GNN-invisible until retrain):**
+- doc→doc `cites` resolution (title/URL match) + persisted `resolved_citations`
+- email `in_reply_to` / `references` thread provenance; `.mbox` single-file threads
+- best-effort episode→doc `cited_from`
+
+**Evaluation (deterministic-only):**
+- EnterpriseRAG-Bench "Conflicting Info" as offline pytest fixtures
+  (contradiction recall + citation resolve-rate; paraphrased conflicts honestly
+  counted as a deterministic miss — Bonsai's job)
+
+**Developmental stage:** Deterministic normalizer + Bonsai zero-shot adjudication
+at INFANT (the deferred Bonsai LoRA fine-tune on contradiction decision pairs +
+the full bench LLM-judge harness are out of scope this slice).
+
+> **Alignment note:** 3b's "Reconsolidation on contradiction" deliverable
+> (`supersedes` edge, both preserved, current-only) is realized here at fact
+> granularity (edge sidecar, not a `supersedes` graph edge). 4a's Uncertainty
+> Detector flag condition #3 ("unresolved contradictions") consumes the
+> *detection* signal this slice produces; the trained Uncertainty Detector gate
+> itself remains Phase 4a. See `docs/Phase 3c.md` for the full design record,
+> risk register, and DoD.
 
 ---
 

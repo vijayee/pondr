@@ -131,7 +131,7 @@ class HippocampalEncoder:
     def _build_state_assertions(
         self, full_text: str, decisions: list[str], relations: list[dict]
     ) -> list[dict]:
-        """Build the episode's ``state_assertions`` (Phase 4, D1).
+        """Build the episode's ``state_assertions`` (Phase 3c, D1).
 
         The deterministic normalizer (``extract_state_assertions``) scans the
         full text + decision spans for explicit ``entity -> value`` field

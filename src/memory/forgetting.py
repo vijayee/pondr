@@ -85,7 +85,7 @@ def default_meta() -> dict:
         # (>deep_archive_days). None for current/never-archived edges and for
         # edges soft-archived before this field shipped (legacy -> not aged).
         "archived_at": None,
-        # ── Phase 4: assertion provenance + fact-level tombstone (D1/D2) ──
+        # ── Phase 3c: assertion provenance + fact-level tombstone (D1/D2) ──
         # ``asserted_by``/``asserted_at`` -- provenance for an assertion edge
         # ``(E:entity, state, value)``: the episode/document/section id that
         # asserted the value + when. The A2 anomaly-resolver reads these to

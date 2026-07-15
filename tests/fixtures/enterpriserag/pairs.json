@@ -4,7 +4,7 @@
   "license": "MIT (the upstream bench is MIT-licensed)",
   "subset_size": 5,
   "deterministic_only": true,
-  "caveat": "This is a DETERMINISTIC-PATH-ONLY slice (Phase 4 D8). The fixtures distill the bench's near-duplicate 'newer-supersedes-older' STRUCTURE and its expected_doc_ids citation ground truth into the fields the deterministic normalizer consumes (titles, bodies, the conflicting entity/state). We do NOT run the bench's full LLM-judge harness (correctness x completeness, three-judge consensus) -- we take its labels, not its scorer. A paraphrased-only conflict the deterministic normalizer cannot see (pair 5, catchable=false) is honestly counted as a miss; the recall threshold in the test is set to the deterministic-normalizer ceiling and documented. The Bonsai semantic adjudicator is exercised separately in tests/test_contradiction.py via FakeDecider + the live dogfood step.",
+  "caveat": "This is a DETERMINISTIC-PATH-ONLY slice (Phase 3c D8). The fixtures distill the bench's near-duplicate 'newer-supersedes-older' STRUCTURE and its expected_doc_ids citation ground truth into the fields the deterministic normalizer consumes (titles, bodies, the conflicting entity/state). We do NOT run the bench's full LLM-judge harness (correctness x completeness, three-judge consensus) -- we take its labels, not its scorer. A paraphrased-only conflict the deterministic normalizer cannot see (pair 5, catchable=false) is honestly counted as a miss; the recall threshold in the test is set to the deterministic-normalizer ceiling and documented. The Bonsai semantic adjudicator is exercised separately in tests/test_contradiction.py via FakeDecider + the live dogfood step.",
   "pairs": [
     {
       "id": "pair1_deployment_target",

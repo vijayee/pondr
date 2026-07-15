@@ -107,10 +107,10 @@ class Document:
     topics: list[str] = field(default_factory=list)
     relations: list[dict] = field(default_factory=list)
     citations: list[str] = field(default_factory=list)
-    # ── Phase 4: citation + assertion provenance (D1/D5) ──
+    # ── Phase 3c: citation + assertion provenance (D1/D5) ──
     # ``resolved_citations`` is the STORE-computed graph cite targets actually
     # written: a doc_id when ``find_document_by_title_or_url`` resolved the
-    # literal, else the literal itself (byte-identical to pre-Phase-4). It is
+    # literal, else the literal itself (byte-identical to pre-Phase-3c). It is
     # PERSISTED so the delete path (update/delete) emits symmetric deletes for
     # exactly the edges that were written (resolution is store-state-
     # dependent + not reproducible at delete time). Empty for docs encoded

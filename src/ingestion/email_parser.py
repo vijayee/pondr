@@ -137,7 +137,7 @@ class EmailParser:
         A directory -> every ``*.eml`` in it is one message in the thread; a
         single ``.eml`` file -> a one-message thread; a single ``.mbox`` file
         -> ``mailbox.mbox`` yields one ``Message`` per record, fed through the
-        same thread-reconstruction core (Phase 4 D9 -- ``mailbox.mboxMessage``
+        same thread-reconstruction core (Phase 3c D9 -- ``mailbox.mboxMessage``
         is a stdlib ``email.message.Message`` subclass, so ``parse_messages``
         and the reply-tree builder need NO changes). Non-``.eml`` files in a
         directory are skipped (honest: only ``.eml`` is wired there).

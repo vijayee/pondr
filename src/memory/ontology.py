@@ -427,7 +427,7 @@ DEVELOPMENT_CLASSES: dict[str, list[str]] = {
     "Communication": [
         "Message", "Notification", "Channel", "Signal", "Event",
     ],
-    # Email thread provenance (Phase 4 citation hook, D5): one node per email
+    # Email thread provenance (Phase 3c citation hook, D5): one node per email
     # message (keyed by its Message-ID). The email parser emits one
     # DocumentSection per message; ``realized_as`` links a section to its
     # EmailMessage node, and ``in_reply_to``/``references`` carry the reply
@@ -461,7 +461,7 @@ DEVELOPMENT_PROPERTIES: dict[str, dict[str, str]] = {
     # its leaf chunks; ``child_of`` preserves the section hierarchy the parser
     # saw; ``appears_in_doc`` is the entity->document back-pointer (so a doc
     # is findable from either end); ``cites`` is a doc-level citation edge
-    # (target resolved to a Document node in Phase 4; a literal target today).
+    # (target resolved to a Document node in Phase 3c; a literal target today).
     # All four are SNAKE_CASE -> ``_to_graph_predicate`` handles them with no
     # special-casing. They are hash-tail predicates -- intentionally NOT in
     # ``KNOWN_PREDICATES`` (graph_loader) or ``_NODE_PREDICATES``
@@ -472,7 +472,7 @@ DEVELOPMENT_PROPERTIES: dict[str, dict[str, str]] = {
     # a retrain-time distribution shift, NOT a checkpoint-load break.
     # NOTE: ``contradicts`` already exists as Statement->Statement (above); the
     # flat property dict-merge would silently overwrite it, so document
-    # contradiction detection (Phase 4) uses a DISTINCT predicate, not this one.
+    # contradiction detection (Phase 3c) uses a DISTINCT predicate, not this one.
     "has_section":    {"domain": "Document",         "range": "DocumentSection"},
     "child_of":       {"domain": "DocumentSection", "range": "DocumentSection"},
     "appears_in_doc": {"domain": "Entity",          "range": "Document"},
@@ -481,7 +481,7 @@ DEVELOPMENT_PROPERTIES: dict[str, dict[str, str]] = {
     # doc. Same hash-tail policy as the other four (GNN-invisible until retrain).
     "appears_in_section": {"domain": "Entity", "range": "DocumentSection"},
     "cites":          {"domain": "Document",        "range": "Document"},
-    # ── Email thread provenance (Phase 4 citation/contradiction hook) ──
+    # ── Email thread provenance (Phase 3c citation/contradiction hook) ──
     # ``in_reply_to`` (message -> parent Message-ID) + ``references`` (message
     # -> chain) reconstruct the reply tree an email parser flattened into
     # sections; ``realized_as`` links an email-message section to its
@@ -492,7 +492,7 @@ DEVELOPMENT_PROPERTIES: dict[str, dict[str, str]] = {
     "in_reply_to":  {"domain": "EmailMessage", "range": "EmailMessage"},
     "references":    {"domain": "EmailMessage", "range": "EmailMessage"},
     "realized_as":  {"domain": "DocumentSection", "range": "EmailMessage"},
-    # ── Phase 4 citation (episode/M-node -> doc provenance, D5) ──
+    # ── Phase 3c citation (episode/M-node -> doc provenance, D5) ──
     # Best-effort edge written when an episode's (or M-node's) text references a
     # known document title/URL (resolved via ``find_document_by_title_or_url``).
     # The assertion sidecar ``asserted_by`` IS the primary supported_by link

@@ -51,7 +51,7 @@ def _b2s(v) -> str:
 
 
 def _norm_title(s: "Optional[str]") -> str:
-    """Normalize a document title for citation matching (Phase 4, D5).
+    """Normalize a document title for citation matching (Phase 3c, D5).
 
     Lowercase, collapse whitespace, strip wrapping punctuation. "Policy A:
     Remote Work" -> "policy a remote work". Used by
@@ -242,14 +242,14 @@ class HippocampalStore:
         for rel in episode.relations:
             ops += self.graph.expand_triple(rel["subject"], rel["predicate"], rel["object"])
 
-        # ── Phase 4: entity-state assertion edges (D1) ──
+        # ── Phase 3c: entity-state assertion edges (D1) ──
         # The production writer of ``(E:entity, state, value)`` edges -- the A2
         # anomaly-resolver input. Each assertion carries provenance
         # (``asserted_by=eid``, ``asserted_at=timestamp``) on the edge sidecar
         # via ``_assertion_edge_ops`` (RMW-merged, idempotent, never revives a
         # tombstone). Gated on ``assertion_extraction_enabled``; an empty
         # ``state_assertions`` list (no explicit state claims in the turn) is
-        # a no-op, so a plain conversation is byte-identical to pre-Phase-4.
+        # a no-op, so a plain conversation is byte-identical to pre-Phase-3c.
         if episode.state_assertions:
             from ..config import config as _master_config
             if _master_config.assertion_extraction_enabled:
@@ -262,7 +262,7 @@ class HippocampalStore:
                         ent, val, eid, episode.timestamp
                     )
 
-        # ── Phase 4: best-effort cited_from provenance (D5) ──
+        # ── Phase 3c: best-effort cited_from provenance (D5) ──
         # When the episode text references a known document's title or
         # source_path, link ``(eid, cited_from, doc_id)`` -- the graph-
         # visible complement to the assertion sidecar's ``asserted_by``
@@ -957,7 +957,7 @@ class HippocampalStore:
         from .edge_meta import is_edge_current as _cur
         return _cur(self, subject, predicate, object)
 
-    # ---- Phase 4: entity-state assertions + citation + tombstone ----
+    # ---- Phase 3c: entity-state assertions + citation + tombstone ----
 
     def _assertion_edge_ops(
         self, entity: str, value, asserted_by: str, asserted_at: str
@@ -1280,7 +1280,7 @@ class HippocampalStore:
         "title", "source_type", "source_path", "authors", "ingested_at",
         "created_at", "language", "metadata", "entities", "topics",
         "citations", "relations", "section_ids",
-        # Phase 4 (D1/D5): persisted so update/delete are symmetric.
+        # Phase 3c (D1/D5): persisted so update/delete are symmetric.
         "resolved_citations", "state_assertions",
     )
     _SEC_FIELDS = (
@@ -1361,7 +1361,7 @@ class HippocampalStore:
                 emit(f"E:{e}", "appears_in_section", sec.id)  # entity->section reverse
             for t in sec.topics:
                 emit(sec.id, "has_topic", f"T:{t}")           # per-section topic axis
-        # Phase 4 (D5): cite targets are the STORE-resolved set -- a doc_id
+        # Phase 3c (D5): cite targets are the STORE-resolved set -- a doc_id
         # when ``find_document_by_title_or_url`` matched the literal, else the
         # literal itself. ``resolved_citations`` is PERSISTED so the delete
         # path emits symmetric deletes for exactly the edges that were written
@@ -1374,7 +1374,7 @@ class HippocampalStore:
         for rel in doc.relations:
             emit(rel["subject"], rel["predicate"], rel["object"])
 
-        # Phase 4 (D1): entity-state assertion edges. These are ENTITY-owned
+        # Phase 3c (D1): entity-state assertion edges. These are ENTITY-owned
         # (subject = E:entity, NOT doc-owned), so they are PUT-ONLY -- a doc
         # update/delete does NOT retract a fact the doc asserted (it may be
         # asserted elsewhere, and a doc updating X->Y is exactly the
@@ -1394,7 +1394,7 @@ class HippocampalStore:
                         ent, val, asserted_by, doc.ingested_at
                     )
 
-        # Phase 4 (D5): email thread provenance edges. The email parser
+        # Phase 3c (D5): email thread provenance edges. The email parser
         # collects per-message Message-IDs + in_reply_to/references maps in
         # ``doc.metadata``; map each Message-ID to its section id (one section
         # per message, in emission order) and emit (section, in_reply_to,
@@ -1455,12 +1455,12 @@ class HippocampalStore:
         put(f"{d}/citations", json.dumps(doc.citations))
         put(f"{d}/relations", json.dumps(doc.relations))
         put(f"{d}/section_ids", json.dumps([s.id for s in doc.sections]))
-        # Phase 4 (D1/D5): the resolved cite targets + state assertions
+        # Phase 3c (D1/D5): the resolved cite targets + state assertions
         # actually written to the graph, persisted so update/delete emit
         # symmetric ops (resolution is store-state-dependent, not reproducible
         # at delete time). Empty when citation resolution / assertion
         # extraction is disabled -> the graph-ops builder falls back to the
-        # literal ``citations`` (byte-identical to pre-Phase-4).
+        # literal ``citations`` (byte-identical to pre-Phase-3c).
         put(f"{d}/resolved_citations", json.dumps(doc.resolved_citations))
         put(f"{d}/state_assertions", json.dumps(doc.state_assertions))
         for sec in doc.sections:
@@ -1551,11 +1551,11 @@ class HippocampalStore:
                     bs.decr_ref(h)
         # 3. ONE atomic memory batch: delete old content + graph edges, write
         #    new content + graph edges + the upsert index.
-        # Phase 4 (D5): resolve citation literals to Document nodes ONCE here
+        # Phase 3c (D5): resolve citation literals to Document nodes ONCE here
         # so the put + the persisted ``resolved_citations`` (read back on
         # update/delete for symmetric deletes) agree. When citation
         # resolution is disabled, ``resolved_citations`` = the literals ->
-        # byte-identical to pre-Phase-4. ``doc.state_assertions`` is populated
+        # byte-identical to pre-Phase-3c. ``doc.state_assertions`` is populated
         # by the ingestion pipeline (deterministic normalizer + Bonsai
         # has_state); the graph-ops builder writes the assertion edges.
         from ..config import config as _master_config

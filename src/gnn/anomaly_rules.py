@@ -217,7 +217,7 @@ def enrich_subgraph(store: "HippocampalStore", subgraph: dict) -> dict:
                         edge = (nid, pred, nb)
                     else:
                         edge = (nb, pred, nid)
-                    # Phase 4 (D2): edge-currentness on the ``state`` branch.
+                    # Phase 3c (D2): edge-currentness on the ``state`` branch.
                     # A fact-level tombstone marks an assertion edge's sidecar
                     # ``state="superseded"`` (``supersede_assertion``); the graph
                     # edge itself is NOT deleted (MVCC). Without this filter the

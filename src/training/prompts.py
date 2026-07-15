@@ -203,7 +203,7 @@ Return ONLY valid JSON:
 def bonsai_contradiction_decision_prompt(
     flagged_entity: str, retrieved_context: dict
 ) -> str:
-    """Prompt for the deploy-time Bonsai contradiction adjudicator (Phase 4 D3).
+    """Prompt for the deploy-time Bonsai contradiction adjudicator (Phase 3c D3).
 
     Mirror of ``bonsai_anomaly_decision_prompt`` specialized for the
     fact-level contradiction: one entity carries two (or more) distinct live

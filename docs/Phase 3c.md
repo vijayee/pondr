@@ -1,4 +1,4 @@
-# Phase 4: Citation + Contradiction Detection
+# Phase 3c: Citation + Contradiction Detection
 
 Date: 2026-07-15
 Status: Implemented (deterministic path + Bonsai adjudication wired; full
@@ -24,7 +24,7 @@ production (A2, deferred)** for two reasons:
    the training injector + episode-level `(eid, "state", ...)`).
 2. No value -> episode provenance (the resolver used a timestamp heuristic).
 
-Phase 4 is the entity-state-assertion extraction path that closes A2, plus
+Phase 3c is the entity-state-assertion extraction path that closes A2, plus
 citation as the provenance backbone. The outcome: Ponder detects when a new
 statement contradicts an existing memory ("Policy A said X, Policy B updated
 it to Y"), tombstones the old fact at the FACT level (not the whole episode),

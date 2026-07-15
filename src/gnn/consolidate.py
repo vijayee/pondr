@@ -196,7 +196,7 @@ class Consolidator:
             "ontology_applied": [],
             "ontology_rejected": [],
             "identity_drift_decisions": [],
-            # Phase 4: contradiction adjudication (D3). Each entry is the
+            # Phase 3c: contradiction adjudication (D3). Each entry is the
             # disturbance record -- ``{entity, old_value, new_value,
             # asserted_by_old, asserted_at_old, asserted_by_new,
             # asserted_at_new, decision, action, reasoning, applied}``. Empty
@@ -820,7 +820,7 @@ class Consolidator:
                 if anom.get("type") != "contradictory_state":
                     continue
                 if decider_active:
-                    # Phase 4 (D3): when a decider is wired, the adjudication
+                    # Phase 3c (D3): when a decider is wired, the adjudication
                     # loop below owns ``contradictory_state`` -- it calls
                     # ``decide_contradiction`` and applies a fact-level
                     # tombstone (D2) on a conservative ``fix``. Keep the
@@ -995,7 +995,7 @@ class Consolidator:
                     "reasoning": decision.get("reasoning", ""),
                     "applied": applied,
                 })
-            # Phase 4 (D3): Bonsai adjudication of ``contradictory_state``
+            # Phase 3c (D3): Bonsai adjudication of ``contradictory_state``
             # flags -- the fact-level contradiction path. Mirrors the
             # ``identity_drift`` loop above: gather the entity context (which
             # now carries the conflicting ``state`` values WITH provenance),
@@ -1059,7 +1059,7 @@ class Consolidator:
                     vals = list(ctx.get("state_values", []))
                     # Deterministic old/new: order the conflicting values by
                     # ``asserted_at`` (earliest = old = the fact to tombstone,
-                    # latest = new = the current truth). Phase 4 assertion
+                    # latest = new = the current truth). Phase 3c assertion
                     # edges always carry ``asserted_at``; fall back to the
                     # value string so the sort is total (stable, deterministic)
                     # even if a sidecar is missing.
@@ -1170,7 +1170,7 @@ class Consolidator:
         if not entity_id.startswith("E:"):
             return ctx
         graph = self.store.graph
-        # distinct live state values on the entity. Phase 4 (D3): also gather
+        # distinct live state values on the entity. Phase 3c (D3): also gather
         # each value's edge-sidecar provenance (``asserted_by``/``asserted_at``)
         # so the Bonsai contradiction adjudicator sees the asserting units, and
         # skip superseded (tombstoned) edges so a resolved contradiction does
@@ -1308,11 +1308,11 @@ class Consolidator:
             r.close()
         if len(values) < 2:
             return None  # head over-fired; no real contradiction
-        # 2. Phase 4 (D4): prefer real provenance. When two values carry an
+        # 2. Phase 3c (D4): prefer real provenance. When two values carry an
         # ``asserted_by`` that is an EPISODE id (``ep_...``), order them by
         # ``asserted_at`` and return that pair directly -- no timestamp
         # heuristic, the asserting episodes ARE the provenance. This is the
-        # path the Phase 4 assertion writer takes (``asserted_by=episode_id``).
+        # path the Phase 3c assertion writer takes (``asserted_by=episode_id``).
         ep_provenance = [
             v for v in values
             if isinstance(v.get("asserted_by"), str)

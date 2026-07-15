@@ -133,7 +133,7 @@ class Config:
     # deprecated, so a fresh corpus is unaffected.
     forgetting_enabled: bool = True
 
-    # ── Phase 4: entity-state assertions + citation ──
+    # ── Phase 3c: entity-state assertions + citation ──
     # ``assertion_extraction_enabled`` gates the production writer of
     # ``(E:entity, state, value)`` edges -- the deterministic normalizer
     # (src/encoding/assertion_extractor.py) + Bonsai ``has_state`` relations,
@@ -335,7 +335,7 @@ class ConsolidationConfig:
     # no value->episode provenance, so the resolver assumes the latest-asserting
     # episode is the current truth).
     anomaly_resolve_threshold: float = 0.8
-    # ── Phase 4: contradiction adjudication ──
+    # ── Phase 3c: contradiction adjudication ──
     # A ``contradictory_state`` anomaly whose head score is >= this is handed to
     # the Bonsai ``decide_contradiction`` adjudicator (when a decider is wired
     # AND ``bonsai_decider_enabled`` AND ``forgetting_enabled``). Below this --

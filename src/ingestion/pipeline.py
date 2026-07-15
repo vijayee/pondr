@@ -123,7 +123,7 @@ class UnifiedIngestionPipeline:
 
         doc = Document.from_parse(doc_id, parsed, extracted, relations)
 
-        # Phase 4 (D1): per-section state assertions -- the deterministic
+        # Phase 3c (D1): per-section state assertions -- the deterministic
         # normalizer over each section's content (catches explicit ``key:
         # value`` / ``key is value`` / change-verb patterns -- Jira/Linear/
         # Confluence status fields, config snippets, spec tables), plus a

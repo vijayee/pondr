@@ -1,4 +1,4 @@
-"""Phase 4 (D9): ``.mbox`` single-file thread parsing.
+"""Phase 3c (D9): ``.mbox`` single-file thread parsing.
 
 ``mailbox.mbox`` yields stdlib ``email.message.Message`` objects, so the email
 thread-reconstruction core (``EmailParser.parse_messages``) needs NO changes --
