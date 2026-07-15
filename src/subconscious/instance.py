@@ -80,9 +80,31 @@ class JGSInstance(nn.Module):
 
         ``input_embedding`` is ``[batch, input_dim]``. If ``context`` is None a
         zero context vector is used.
+
+        Device alignment: the shared backbone (``W_A`` and the rest of the SSM)
+        is moved to its device at load time (``load_backbone``), but this
+        instance's own modules (``input_proj``/``gate``/``state_lora``/
+        ``output_proj``) are constructed on CPU, and the embedder feeds a CPU
+        tensor. On a CUDA build that mismatches inside ``self._backbone.step``
+        (``W_A`` on cuda vs ``x`` on cpu -> addmm RuntimeError). Align the input
+        and the instance-owned modules to the backbone's device; the recurrent
+        state then initializes on that device too (``_ensure_state`` reads
+        ``input_embedding.device``). On CPU every branch is a no-op (devices
+        already match), so the CPU path is byte-identical.
         """
         if input_embedding.dim() == 1:
             input_embedding = input_embedding.unsqueeze(0)
+        b = self._backbone  # type: ignore[attr-defined]
+        target = next(b.parameters()).device
+        # Constructors leave the instance-owned modules on CPU; follow the
+        # backbone (the shared weights) to its device once. ``.to`` does NOT
+        # touch the backbone -- it is held via ``object.__setattr__`` so PyTorch
+        # does not register it as a submodule -- and the backbone is already on
+        # ``target`` (``load_backbone`` moved it).
+        if next(self.parameters()).device != target:
+            self.to(target)
+        if input_embedding.device != target:
+            input_embedding = input_embedding.to(target)
         batch = input_embedding.shape[0]
         device = input_embedding.device
         dtype = input_embedding.dtype
