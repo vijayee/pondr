@@ -57,6 +57,16 @@ def _b2s(v) -> str:
 # knob) to match the Phase 1c mention formula, which is also hardcoded here.
 _SALIENCE_RECENCY_HALF_LIFE_DAYS = 30.0
 
+# Phase 2c+: per-unit feedback boost clamp bounds. The boost is a salience
+# WEIGHT (default 1.0 = neutral) that multiplies a unit's retrieval score. It
+# is clamped at WRITE (``write_unit_boost_batch``) so runaway feedback can't
+# push a unit to 100x or 0x -- the read path is a raw multiply (no clamp there,
+# so a clamped value is honored exactly). 0.25 .. 4.0 means a judged unit can
+# at most halve (rating 1 repeatedly) or quadruple (rating 5 repeatedly) its
+# raw score vs an unjudged one.
+_BOOST_MIN = 0.25
+_BOOST_MAX = 4.0
+
 
 def safe_edge_component(part: str) -> str:
     """A graph-key path component, hashing any part containing ``/`` or NUL.
@@ -539,6 +549,106 @@ class HippocampalStore:
             repr(float(score)),
         )
 
+    # ---- per-unit feedback boost (Phase 2c+) ----
+
+    def get_unit_boost(self, unit_id: str) -> float:
+        """Per-unit feedback salience weight; ``1.0`` on a fresh/unknown unit.
+
+        A "unit" is any retrieval result id verbatim -- an episode (``ep_*``),
+        a document (``doc_*``), or a section (``{doc_id}_sec_NNN``). The boost is
+        a MULTIPLIER on the unit's raw retrieval score (the chat's ``boost``
+        field, default 1 = neutral), written by ``record_feedback`` (a 1-5
+        model-usefulness rating) and clamped to ``[_BOOST_MIN, _BOOST_MAX]`` at
+        write time.
+
+        Cold-start: ``1.0`` on a missing key -- NO cold-start penalty (unlike
+        ``get_entity_salience``, which returns 0.0 for an unknown entity). So
+        a fresh corpus scores byte-identically to pre-2c+ retrieval until a unit
+        is actually judged. Ids with ``/`` or NUL are skipped (defensive, mirror
+        ``write_entity_salience_batch``) and read as 1.0. One ``get_sync`` point
+        lookup.
+        """
+        if not unit_id or "/" in unit_id or "\x00" in unit_id:
+            return 1.0
+        raw = _b2s(self.db.get_sync(f"content/unit_boost/{unit_id}"))
+        if not raw:
+            return 1.0
+        try:
+            return float(raw)
+        except ValueError:
+            return 1.0
+
+    def write_unit_boost_batch(self, boosts: dict[str, float]) -> None:
+        """Persist a batch of per-unit boosts in ONE sorted ``batch_sync``.
+
+        Keys are SORTED before submission (the load-bearing ``get_sync``-safe
+        constraint -- mirror ``write_entity_salience_batch``: sorted insertion
+        avoids the insertion-order-dependent split path). Each value is clamped
+        to ``[_BOOST_MIN, _BOOST_MAX]`` at WRITE (the clamp is the policy, not
+        the read path). Ids with ``/`` or NUL are skipped. Empty input is a
+        no-op. Called by ``record_feedback`` (the single boost-mutation site).
+        """
+        ops: list[dict] = []
+        for unit_id in sorted(boosts):
+            if not unit_id or "/" in unit_id or "\x00" in unit_id:
+                continue
+            val = min(_BOOST_MAX, max(_BOOST_MIN, float(boosts[unit_id])))
+            ops.append({
+                "type": "put",
+                "key": f"content/unit_boost/{unit_id}",
+                "value": repr(val),
+            })
+        if ops:
+            self.db.batch_sync(ops)
+
+    def persist_unit_boost(self, unit_id: str, boost: float) -> None:
+        """Single-point convenience wrapper over ``write_unit_boost_batch``."""
+        self.write_unit_boost_batch({unit_id: boost})
+
+    def record_feedback(self, judgments: list[dict]) -> int:
+        """Apply per-unit 1-5 usefulness ratings -> boost mutations.
+
+        Each judgment is ``{"unit_id": str, "rating": int 1..5}``. The rating
+        maps to a multiplicative nudge: ``useful = (rating-1)/4`` (1 -> 0, 3 ->
+        0.5, 5 -> 1), then ``new = clamp(old * (0.5 + useful), _BOOST_MIN,
+        _BOOST_MAX)`` -- rating 1 halves the boost, 3 is neutral, 5 grows it
+        1.5x. Repeated judgments compound (over many turns a useful unit rises,
+        a useless one falls), bounded by the clamp. ONE sorted
+        ``write_unit_boost_batch`` (idempotent re-rating of the same unit in one
+        call applies them in sorted-id order).
+
+        Best-effort, NEVER raises: a bad rating / unknown unit / store error is
+        logged to stderr and swallowed (mirror ``_persist_exchange`` -- a
+        feedback failure must never break the consumer's loop or lose the
+        response). Returns the count of judgments actually applied (0 on a
+        whole-method failure).
+        """
+        if not judgments:
+            return 0
+        try:
+            updates: dict[str, float] = {}
+            for j in judgments:
+                try:
+                    unit_id = j["unit_id"]
+                    rating = int(j["rating"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not unit_id or "/" in unit_id or "\x00" in unit_id:
+                    continue
+                if rating < 1 or rating > 5:
+                    continue
+                useful = (rating - 1) / 4.0
+                old = self.get_unit_boost(unit_id)
+                new = old * (0.5 + useful)
+                updates[unit_id] = new
+            if updates:
+                self.write_unit_boost_batch(updates)
+            return len(updates)
+        except Exception as e:  # noqa: BLE001 - never break the consumer's loop
+            import sys
+            print(f"[record_feedback-fail] {e}", file=sys.stderr)
+            return 0
+
     # ---- user / session / global ids ----
 
     def _counter_next(self, key: str) -> int:
@@ -1000,13 +1110,20 @@ class HippocampalStore:
         Triples (per the ingestion plan): ``(doc, instanceOf, Document)``,
         ``(doc, has_entity, E:x)`` + ``(E:x, appears_in_doc, doc)``,
         ``(doc, has_topic, T:t)``, ``(doc, has_section, sid)``,
-        ``(sid, child_of, parent)``, ``(sid, has_entity, E:x)``,
-        ``(doc, cites, target)``, plus each Bonsai ``relations`` triple. The
-        four document-specific predicates (``has_section``/``child_of``/
-        ``appears_in_doc``/``cites``) are snake_case hash-tail predicates,
+        ``(sid, child_of, parent)``, ``(sid, has_entity, E:x)`` +
+        ``(E:x, appears_in_section, sid)`` (the entity->SECTION reverse, so the
+        graph entity axis lands on the relevant chunk, not just the doc),
+        ``(sid, has_topic, T:t)`` (per-section topic axis), ``(doc, cites,
+        target)``, plus each Bonsai ``relations`` triple. The document-specific
+        predicates (``has_section``/``child_of``/``appears_in_doc``/``cites``/
+        ``appears_in_section``) are snake_case hash-tail predicates,
         checkpoint-safe + GNN-invisible until retrain (the A3 ``instanceOf``
-        template). Reversing a put uses the SAME ``(s, p, o)`` with
-        ``delete=True`` so the SPO/POS/OSP index entries all come out.
+        template). ``has_topic``/``has_entity`` ARE known -> doc/section nodes
+        enter GNN BFS on retrain (distribution shift, NOT a checkpoint break).
+        Reversing a put uses the SAME ``(s, p, o)`` with ``delete=True`` so the
+        SPO/POS/OSP index entries all come out -- the per-section ``has_topic``
+        + ``appears_in_section`` reverse edges are deleted symmetrically, no
+        orphan.
         """
         ops: list[dict] = []
 
@@ -1025,6 +1142,9 @@ class HippocampalStore:
                 emit(sec.id, "child_of", sec.parent_section)
             for e in sec.entities:
                 emit(sec.id, "has_entity", f"E:{e}")
+                emit(f"E:{e}", "appears_in_section", sec.id)  # entity->section reverse
+            for t in sec.topics:
+                emit(sec.id, "has_topic", f"T:{t}")           # per-section topic axis
         for target in doc.citations:
             emit(doc.id, "cites", target)
         for rel in doc.relations:

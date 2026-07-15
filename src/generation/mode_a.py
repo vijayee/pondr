@@ -28,6 +28,31 @@ _SYSTEM_PROMPT = (
 )
 
 
+def _normalize_tool_calls(tool_calls: list) -> list[dict]:
+    """Coerce a server's ``tool_calls`` list to plain dicts for ``dispatch_tool``.
+
+    Bonsai/llama-server returns the OpenAI shape (each call has ``id`` +
+    ``function: {name, arguments}`` with ``arguments`` as a JSON STRING); this
+    keeps that shape and just ensures plain dict types (no pydantic-ish
+    objects some servers return). ``arguments`` is left as the raw string --
+    ``dispatch_tool`` parses it best-effort.
+    """
+    out: list[dict] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") or {}
+        out.append({
+            "id": call.get("id"),
+            "type": call.get("type", "function"),
+            "function": {
+                "name": fn.get("name", "") if isinstance(fn, dict) else "",
+                "arguments": fn.get("arguments", {}) if isinstance(fn, dict) else {},
+            },
+        })
+    return out
+
+
 class ModeAGenerator:
     """Context-window adapter: retrieve → build context → LLM completion."""
 
@@ -71,7 +96,7 @@ class ModeAGenerator:
             "content": f"Context from past conversations:\n{context}\n\nUser: {prompt}",
         })
 
-        response = self._complete(messages)
+        response, _ = self._complete(messages)
         return {
             "response": response,
             "retrieved_episodes": episodes,
@@ -128,7 +153,7 @@ class ModeAGenerator:
             "role": "user",
             "content": f"Context from past conversations:\n{context}\n\nUser: {prompt}",
         })
-        response = self._complete(messages)
+        response, _ = self._complete(messages)
         return {
             "response": response,
             "route": route,
@@ -181,19 +206,37 @@ class ModeAGenerator:
             model_size=model_size,
         )
 
-    def _complete(self, messages: list[dict]) -> str:
-        """LLM completion over the local Bonsai endpoint; returns the content.
+    def _complete(
+        self,
+        messages: list[dict],
+        tools: Optional[list[dict]] = None,
+        tool_choice: Optional[str] = None,
+    ) -> tuple[str, Optional[list[dict]]]:
+        """LLM completion over the local Bonsai endpoint.
 
-        Raises ``RuntimeError`` with the verbatim server response on any failure
-        (connection, non-200, parse) so the caller sees the raw output. Tests
-        override this method to stub the server out.
+        Returns ``(content, tool_calls)`` -- ``content`` is the message text
+        (``""`` when the model emitted only tool calls), ``tool_calls`` is the
+        parsed ``choices[0].message.tool_calls`` list or ``None`` when absent
+        (no tools passed, or the model chose not to call any). ``tools`` /
+        ``tool_choice`` (OpenAI tool-calling protocol) are forwarded to the
+        Bonsai payload when given; both default ``None`` so existing callers
+        that pass no tools are unaffected (they unpack ``(content, None)``).
+
+        Raises ``RuntimeError`` with the verbatim server response on any
+        failure (connection, non-200, parse) so the caller sees the raw output.
+        Tests override this method to stub the server out. ``tool_calls``
+        (when present) are normalized to plain dicts (``{"id", "function":
+        {"name", "arguments"}}``) so ``dispatch_tool`` can consume them.
         """
         url = f"{self.endpoint}/chat/completions"
-        payload = {
+        payload: dict = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice or "auto"
         try:
             resp = requests.post(url, json=payload, timeout=self.timeout)
         except requests.RequestException as e:
@@ -204,6 +247,11 @@ class ModeAGenerator:
             )
         try:
             outer = resp.json()
-            return outer["choices"][0]["message"]["content"]
+            msg = outer["choices"][0]["message"]
         except (ValueError, KeyError, IndexError, TypeError) as e:
-            raise RuntimeError(f"Bonsai response missing choices[0].message.content: {outer}") from e
+            raise RuntimeError(f"Bonsai response missing choices[0].message: {outer}") from e
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            tool_calls = _normalize_tool_calls(tool_calls)
+        return content, tool_calls

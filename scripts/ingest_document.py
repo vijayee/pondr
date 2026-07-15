@@ -155,8 +155,8 @@ def main() -> int:
     sub.add_argument("--gc-blobs", action="store_true",
                      help="sweep zero-refcount orphan blobs from the cold store")
     ap.add_argument("--type", default="auto",
-                    choices=["auto", "markdown", "text", "pdf", "code", "docx", "web"],
-                    help="source type: auto|markdown|text|pdf|code|docx|web (default: auto by extension)")
+                    choices=["auto", "markdown", "text", "pdf", "code", "docx", "web", "email"],
+                    help="source type: auto|markdown|text|pdf|code|docx|web|email (default: auto by extension; email = a directory of .eml as a thread)")
     ap.add_argument("--no-extract", action="store_true",
                     help="skip GLiNER/Bonsai extraction (structure-only ingest)")
     args = ap.parse_args()

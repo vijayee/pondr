@@ -119,6 +119,19 @@ class Config:
     # deprecated, so a fresh corpus is unaffected.
     forgetting_enabled: bool = True
 
+    # ── Phase 2c+: feedback-driven salience ──
+    # When True, after a synthesizing turn the consumer (the external LLM, or
+    # Ponder's own Bonsai self-chat) reports per-unit usefulness via the
+    # ``record_feedback`` tool, and a per-unit boost (default 1.0, a no-op)
+    # reweights retrieval scoring on the next query (the "learning over time"
+    # differentiator vs stateless RAG). Default True: a fresh corpus reads
+    # boost=1.0 everywhere (no-op), so the loop is inert until a unit is judged.
+    feedback_salience_enabled: bool = True
+    # Max consecutive results of one kind (section/document/episode) in the
+    # top-K after kind-aware diversity rerank. 0 disables the cap (pure score
+    # sort -- the pre-2c+ behavior). Independent of feedback_salience_enabled.
+    kind_diversity_cap: int = 3
+
     # ── Paths ──
     data_dir: Path = Path("./data")
     sample_conversations: Path = Path("./data/sample_conversations.jsonl")

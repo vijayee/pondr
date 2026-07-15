@@ -122,21 +122,28 @@ class GraphTraversal:
 
         Episodes follow ``E:{entity} --out:in_episode--> ep`` (the store writes
         the reverse ``(E:{entity}, in_episode, eid)`` edge); documents follow
-        ``E:{entity} --out:appears_in_doc--> doc`` (the store writes the reverse
-        ``(E:{entity}, appears_in_doc, doc)`` edge at ``store.py:_document_graph_ops``).
-        The two vertex sets are UNIONED before the Phase 3b edge-level filter,
+        ``E:{entity} --out:appears_in_doc--> doc``; sections follow
+        ``E:{entity} --out:appears_in_section--> sid`` (the store writes the
+        reverse ``(E:{entity}, appears_in_section, sid)`` edge at
+        ``store.py:_document_graph_ops`` -- the entity->SECTION reverse so the
+        graph entity axis lands on the relevant chunk, not just the doc). The
+        three vertex sets are UNIONED before the Phase 3b edge-level filter,
         which drops episodes whose ``(ep, has_entity, E:{entity})`` association
-        is deprecated/superseded -- document ``has_entity`` edges are always
-        current (documents are exempt from forgetting, no sidecar is ever
-        written), so docs survive the filter. Returns a mix of ``ep_*`` and
-        ``doc_*`` ids; callers pass them to ``_hydrate``, which branches on the
-        ``doc_`` prefix. The method name is kept (read-only consumers use the
-        ``episodes_by_entity`` alias) -- it now returns episodes + docs.
+        is deprecated/superseded -- document/section ``has_entity`` edges are
+        always current (documents are exempt from forgetting, no sidecar is
+        ever written), so docs + sections survive the filter. Returns a mix of
+        ``ep_*``, ``doc_*``, and ``{doc_id}_sec_NNN`` ids; callers pass them to
+        ``_hydrate``, which discriminates ``"_sec_" in eid`` FIRST (section),
+        then ``doc_`` (document), else episode. The method name is kept
+        (read-only consumers use the ``episodes_by_entity`` alias) -- it now
+        returns episodes + docs + sections.
         """
         q = self.graph.query().vertex(f"E:{entity}").out("in_episode")
         eps = set(self._exec_vertices(q))
         qd = self.graph.query().vertex(f"E:{entity}").out("appears_in_doc")
         eps |= set(self._exec_vertices(qd))
+        qs = self.graph.query().vertex(f"E:{entity}").out("appears_in_section")
+        eps |= set(self._exec_vertices(qs))
         return self._filter_current_edges(list(eps), "has_entity", f"E:{entity}")
 
     def _get_episodes_by_topic(self, topic: str) -> list[str]:
@@ -718,7 +725,31 @@ class GraphTraversal:
             score += _W_TONE * len({a.lower() for a in r["tones"]} & ton_set)
             score += _W_RECENCY * recency_rank[r["episode_id"]]
             r["score"] = score
+        # Phase 2c+: per-unit feedback boost. Multiplies each score by the
+        # unit's persisted boost (default 1.0 -> no-op on a fresh corpus). A
+        # unit with score 0 (no axis match) stays 0 -- boost cannot invent
+        # relevance, only reweight. Gated on ``feedback_salience_enabled``.
+        self._apply_unit_boost(hydrated)
         return hydrated
+
+    def _apply_unit_boost(self, results: list[dict]) -> None:
+        """Multiply each result's score by its per-unit feedback boost.
+
+        The boost (default 1.0, clamped to ``[_BOOST_MIN, _BOOST_MAX]`` at write)
+        is the model-usefulness signal from ``record_feedback``; it is a
+        SEPARATE signal from ``_apply_retrieval_boost`` (the edge-sidecar
+        forgetting strengthening). Two stores, two mechanisms, complementary.
+        Gated on ``config.feedback_salience_enabled``; a no-op until a unit has
+        a non-default boost. Shared with ``retriever._semantic_fallback`` so
+        semantic-fallback hits are boost-aware too.
+        """
+        if not _config.feedback_salience_enabled:
+            return
+        for r in results:
+            eid = r.get("episode_id")
+            if not eid:
+                continue
+            r["score"] = r.get("score", 0.0) * self.store.get_unit_boost(eid)
 
     # ── public entry point ──
 

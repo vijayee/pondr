@@ -32,12 +32,14 @@ WaveDB-backed persistence is optional (pass a ``store``).
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from .config import Phase2cConfig
+from .config import Phase2cConfig, config as _runtime_config
 from .generation.mode_a import ModeAGenerator
 from .retrieval.chunked_context import ChunkedContextFormatter
 from .retrieval.end_state import dispatch_end_state
@@ -52,6 +54,9 @@ from .subconscious.state_serializer import (
     deserialize, serialize, snapshot_from_instance,
 )
 from .subconscious.working_memory import WorkingMemory, WorkingMemoryState
+from .tools import (
+    SELF_CHAT_TOOLS, dispatch_tool, feedback_instruction,
+)
 
 if TYPE_CHECKING:
     from .encoding.encoder import HippocampalEncoder
@@ -70,6 +75,43 @@ _SIGNAL_PROFILES = {
     "correction":  {"salience": 0.6, "decay_rate": 0.008},
     "frustration": {"salience": 0.3, "decay_rate": 0.03},    # fades fastest
 }
+
+
+def _parse_json_array(text: str) -> list[dict]:
+    """Best-effort extraction of a JSON array of objects from a model reply.
+
+    The fallback rating call asks for a bare JSON array, but a small model may
+    wrap it in prose or fences. This finds the first ``[`` ... ``]`` span and
+    parses it, then keeps only dicts with a ``unit_id``. Returns ``[]`` on any
+    failure (the caller treats empty as no-op, not an error).
+    """
+    if not text:
+        return []
+    s = text.strip()
+    # Strip a code fence if present.
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    # Find the first balanced [...] span (the array the model was asked for).
+    start = s.find("[")
+    if start == -1:
+        return []
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == "[":
+            depth += 1
+        elif s[i] == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed = json.loads(s[start:i + 1])
+                except (ValueError, TypeError):
+                    return []
+                if not isinstance(parsed, list):
+                    return []
+                return [o for o in parsed
+                        if isinstance(o, dict) and o.get("unit_id")]
+    return []
 
 
 class PonderOrchestrator:
@@ -239,16 +281,35 @@ class PonderOrchestrator:
         self.expand_handler.expand_count = 0
 
         # The synthesize callable: build messages and call mode_a._complete.
+        # Phase 2c+: pass the record_feedback tool so the model can rate the
+        # context units it used; after the call, dispatch any record_feedback
+        # tool calls. If the model emits none (Bonsai tool-calling may be
+        # unsupported on a Q2_0 8B), fall back to one small structured rating
+        # call. Best-effort: a feedback failure never loses the response.
+        feedback_enabled = _runtime_config.feedback_salience_enabled
+        feedback_state = {"count": 0}
+
         def _synthesize(context: str, history: Optional[list[dict]]) -> str:
             messages: list[dict] = [{"role": "system", "content":
                 "You are a helpful assistant with access to past conversations."}]
             if history:
                 messages.extend(history[-10:])
-            messages.append({
-                "role": "user",
-                "content": f"Context from past conversations:\n{context}\n\nUser: {user_prompt}",
-            })
-            return self.mode_a._complete(messages)
+            user_content = f"Context from past conversations:\n{context}\n\nUser: {user_prompt}"
+            if feedback_enabled:
+                user_content += "\n\n" + feedback_instruction(episodes)
+            messages.append({"role": "user", "content": user_content})
+            tools = SELF_CHAT_TOOLS if feedback_enabled else None
+            try:
+                content, tool_calls = self.mode_a._complete(messages, tools=tools)
+            except Exception as e:  # noqa: BLE001 - generation failure -> empty answer
+                print(f"[synthesize-fail] {e}", file=sys.stderr)
+                return ""
+            content = content or ""
+            if feedback_enabled:
+                feedback_state["count"] = self._dispatch_feedback(
+                    tool_calls, episodes, content, feedback_state["count"]
+                )
+            return content
 
         wm_state_final = self.working_memory.snapshot()
         result = dispatch_end_state(
@@ -285,6 +346,10 @@ class PonderOrchestrator:
             ),
         )
         result["measured_expand_count"] = measured_expand
+        # Phase 2c+: how many record_feedback judgments were applied this turn
+        # (0 when feedback is disabled, the model emitted none, or the fallback
+        # also yielded nothing). Observability only -- never blocks the response.
+        result["feedback_collected"] = feedback_state["count"]
 
         # 2026-07-14: close the runtime gap -- persist the (prompt, response)
         # exchange as a new episode so the system learns from use. Always-encode
@@ -363,6 +428,162 @@ class PonderOrchestrator:
             result["persisted_episode_id"] = episode.id
         except Exception as e:  # noqa: BLE001 - never lose the response
             print(f"[persist-fail] {e}", file=sys.stderr)
+
+    # ── Phase 2c+: feedback salience + consumer tool surface ──
+
+    def _dispatch_feedback(
+        self,
+        tool_calls: Optional[list[dict]],
+        episodes: list[dict],
+        content: str,
+        already: int,
+    ) -> int:
+        """Dispatch any ``record_feedback`` tool calls; fall back if none.
+
+        Self-chat feedback path: if the synthesis returned ``record_feedback``
+        tool calls, dispatch each via ``dispatch_tool`` (-> ``store.record_feedback``).
+        If the model emitted NONE (Bonsai tool-calling may be unsupported on a
+        Q2_0 8B), make ONE small structured rating call asking only for a JSON
+        array of {unit_id, rating}, parse it best-effort, and apply it. Best-
+        effort: any failure is logged and swallowed -- a feedback failure never
+        loses the response. Returns the cumulative count applied this turn.
+        """
+        if not _runtime_config.feedback_salience_enabled or self.store is None:
+            return already
+        count = already
+        if tool_calls:
+            for call in tool_calls:
+                fn = call.get("function", {}) if isinstance(call, dict) else {}
+                if fn.get("name") == "record_feedback":
+                    result = dispatch_tool(self, "record_feedback", fn.get("arguments", {}))
+                    try:
+                        parsed = json.loads(result) if isinstance(result, str) else {}
+                        count += int(parsed.get("applied", 0))
+                    except (ValueError, TypeError):
+                        pass
+            if count > already:
+                return count  # tool path worked -- skip the fallback
+        # Fallback: no usable record_feedback tool call -> one structured call.
+        if not episodes:
+            return count
+        try:
+            count += self._feedback_fallback_call(episodes, content)
+        except Exception as e:  # noqa: BLE001 - fallback is best-effort
+            print(f"[feedback-fallback-fail] {e}", file=sys.stderr)
+        return count
+
+    def _feedback_fallback_call(self, episodes: list[dict], content: str) -> int:
+        """One structured rating call when Bonsai emits no tool call.
+
+        Asks the model ONLY for a JSON array of ``{"unit_id","rating"}`` over the
+        cited units (capped), parses best-effort, and applies it via
+        ``store.record_feedback``. Returns the count applied. The model's prior
+        ``content`` (the answer) is included so the rating is grounded in what it
+        actually said. No tools passed (the fallback exists precisely because
+        tool-calling may be unsupported).
+        """
+        cap = 12
+        units = [
+            {"unit_id": e.get("episode_id", ""), "kind": e.get("kind", "episode")}
+            for e in episodes[:cap] if e.get("episode_id")
+        ]
+        if not units:
+            return 0
+        lines = [
+            "Rate how useful each cited memory unit was for the answer you just "
+            "gave, on a 1-5 scale (1=useless, 3=neutral, 5=essential). Be critical. "
+            "Reply with ONLY a JSON array, no prose, of objects like "
+            '{"unit_id":"<id>","rating":5}. Units:',
+        ]
+        for u in units:
+            lines.append(f'- {u["unit_id"]}')
+        prompt = "\n".join(lines)
+        messages = [
+            {"role": "system", "content": "You rate memory units for usefulness."},
+            {"role": "user", "content": f"Your answer was:\n{content[:1500]}\n\n{prompt}"},
+        ]
+        text, _ = self.mode_a._complete(messages)
+        if not text:
+            return 0
+        judgments = _parse_json_array(text)
+        if not judgments:
+            return 0
+        return self.store.record_feedback(judgments)
+
+    def expand_unit(self, unit_id: str) -> Optional[str]:
+        """Consumer tool: return the FULL text of a retrieved unit.
+
+        Resolves the unit by its id shape: an episode (``ep_*``) -> the episode
+        text; a section (``{doc_id}_sec_NNN``) -> the section body (cold pull);
+        a document (``doc_*``) -> the doc with all section bodies loaded. The
+        external LLM calls this via ``dispatch_tool("expand", ...)`` to pull a
+        compressed gist's full text. Returns ``None`` for a missing unit
+        (``dispatch_tool`` turns that into an error string).
+        """
+        if not unit_id or self.store is None:
+            return None
+        try:
+            if "_sec_" in unit_id:
+                # A section id: ``{doc_id}_sec_{i:03d}``. Split on the FIRST
+                # ``_sec_`` so a doc_id containing ``_sec_`` (unlikely) still
+                # resolves -- the section id is the full compound string.
+                head, _, _rest = unit_id.partition("_sec_")
+                doc_id = head
+                return self.store.get_section_body(doc_id, unit_id)
+            if unit_id.startswith("doc_"):
+                doc = self.store.get_document(unit_id, load_bodies=True)
+                if doc is None:
+                    return None
+                parts = [f"Title: {doc.title}", f"Source: {doc.source_path}"]
+                for sec in doc.sections:
+                    head = sec.heading or "(section)"
+                    parts.append(f"\n## {head}\n{sec.content}")
+                return "\n".join(parts)
+            # Episode: return summary + full text.
+            ep = self.store.get_episode(unit_id)
+            if ep is None:
+                return None
+            parts = []
+            if ep.summary:
+                parts.append(f"Summary: {ep.summary}")
+            if ep.full_text:
+                parts.append(ep.full_text)
+            return "\n".join(parts)
+        except Exception as e:  # noqa: BLE001 - expand is best-effort
+            print(f"[expand-fail] {e}", file=sys.stderr)
+            return None
+
+    def search_memory(
+        self,
+        query: str,
+        entities: Optional[list[str]] = None,
+        topics: Optional[list[str]] = None,
+    ) -> str:
+        """Consumer tool: re-retrieve mid-generation with a refined query/axes.
+
+        Runs the retriever with a literal query plan (the entities/topics axes
+        the consumer named) and builds the context string. The external LLM
+        calls this via ``dispatch_tool("search_memory", ...)`` when the initial
+        context was insufficient. Returns the formatted context (empty string
+        when nothing is found).
+        """
+        if self.retriever is None or not query:
+            return ""
+        try:
+            plan = {
+                "entities": entities or [],
+                "topics": topics or [],
+                "tones": [],
+                "entity_mode": "union",
+                "limit": _runtime_config.default_retrieval_limit,
+            }
+            results = self.retriever.retrieve_with_plan(plan)
+            if not results:
+                return ""
+            return self.retriever.build_context_string(results)
+        except Exception as e:  # noqa: BLE001 - search is best-effort
+            print(f"[search_memory-fail] {e}", file=sys.stderr)
+            return ""
 
     def end_conversation(self) -> None:
         """Close the live-encode conversation session.

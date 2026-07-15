@@ -41,6 +41,7 @@ from .pdf_parser import PDFParser
 from .code_parser import CodeParser
 from .docx_parser import DocxParser
 from .web_parser import WebParser
+from .email_parser import EmailParser
 
 __all__ = [
     "HierarchicalChunker",
@@ -54,4 +55,5 @@ __all__ = [
     "CodeParser",
     "DocxParser",
     "WebParser",
+    "EmailParser",
 ]

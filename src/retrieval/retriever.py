@@ -140,7 +140,13 @@ class HippocampalRetriever:
                 if sr["episode_id"] not in existing_ids:
                     results.append(sr)
                     existing_ids.add(sr["episode_id"])
-            results.sort(key=lambda r: r["score"], reverse=True)
+        # Kind-aware diversity rerank (Phase 2c+): sort by score (the per-unit
+        # feedback boost is already applied in both score sites), then cap the
+        # run of one kind so a wall of sections (or episodes) can't drown the
+        # other kind in the top-K. Gated on ``kind_diversity_cap > 0``; when 0
+        # this is a pure score sort (the pre-2c+ behavior). Independent of
+        # feedback_salience_enabled. Replaces the old bare ``results.sort``.
+        results = self._kind_aware_rerank(results)
 
         return results
 
@@ -264,6 +270,63 @@ class HippocampalRetriever:
             ep = self.traversal._hydrate(eid)
             ep["score"] = sim * 0.5  # discount so graph matches rank higher
             out.append(ep)
+        # Phase 2c+: semantic-fallback hits are boost-aware too (one shared
+        # helper with the graph score site so no scored result bypasses the
+        # per-unit feedback boost).
+        self.traversal._apply_unit_boost(out)
+        return out
+
+    def _kind_aware_rerank(self, results: list[dict]) -> list[dict]:
+        """Sort by score, then cap the run of any one ``kind`` in the top-K.
+
+        Greedy walk over the score-sorted list: allow at most
+        ``config.kind_diversity_cap`` CONSECUTIVE results of the same kind
+        (``section``/``document``/``episode`` -- ``episode`` when ``kind`` is
+        absent, the episode-dict default) before the next slot is taken from a
+        DIFFERENT kind if one remains. This prevents a wall of section chunks
+        (or a wall of episodes) drowning the other kind in the top-K. Score
+        order is preserved WITHIN each kind. ``kind_diversity_cap=0`` disables
+        the cap -> pure score sort (the pre-2c+ behavior). Independent of
+        ``feedback_salience_enabled``.
+        """
+        cap = config.kind_diversity_cap
+        results = sorted(results, key=lambda r: r.get("score", 0.0), reverse=True)
+        if cap <= 0 or not results:
+            return results
+
+        def _kind(r: dict) -> str:
+            return r.get("kind") or "episode"
+
+        remaining = list(results)
+        out: list[dict] = []
+        while remaining:
+            # Count how many of the current leading kind are already at the tail.
+            run = 0
+            if out:
+                last_kind = _kind(out[-1])
+                for r in reversed(out):
+                    if _kind(r) == last_kind:
+                        run += 1
+                    else:
+                        break
+            if run >= cap:
+                # The tail is saturated with one kind -- pick the next result of
+                # a DIFFERENT kind if any remains (keep score order: the first
+                # non-matching remaining item is the highest-scoring other kind).
+                pick = None
+                for r in remaining:
+                    if _kind(r) != _kind(out[-1]):
+                        pick = r
+                        break
+                if pick is None:
+                    # No other kind left -- append the rest in score order.
+                    out.extend(remaining)
+                    remaining = []
+                    break
+                out.append(pick)
+                remaining.remove(pick)
+            else:
+                out.append(remaining.pop(0))
         return out
 
     def build_with_chunking(

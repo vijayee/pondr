@@ -52,7 +52,7 @@ def test_generate_wires_context_and_episodes(tmp_path):
 
     def fake_complete(messages):
         captured.append(messages)
-        return "You were frustrated about the WAL config."
+        return ("You were frustrated about the WAL config.", None)
 
     gen._complete = fake_complete  # type: ignore[method-assign]
 
@@ -81,7 +81,7 @@ def test_generate_includes_conversation_history(tmp_path):
     gen = ModeAGenerator(retr)
 
     captured: list[list[dict]] = []
-    gen._complete = lambda messages: captured.append(messages) or "ok"  # type: ignore[method-assign]
+    gen._complete = lambda messages: captured.append(messages) or ("ok", None)  # type: ignore[method-assign]
 
     history = [{"role": "user", "content": f"turn {i}"} for i in range(15)]
     gen.generate("follow up", conversation_history=history)
@@ -101,7 +101,7 @@ def test_generate_with_no_matches_still_calls_llm(tmp_path):
     gen = ModeAGenerator(retr)
 
     called = []
-    gen._complete = lambda messages: called.append(messages) or "no relevant context"  # type: ignore[method-assign]
+    gen._complete = lambda messages: called.append(messages) or ("no relevant context", None)  # type: ignore[method-assign]
 
     result = gen.generate("What was I frustrated about?")
     assert result["retrieved_episodes"] == []

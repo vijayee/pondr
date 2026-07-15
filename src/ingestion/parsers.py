@@ -74,6 +74,10 @@ _TYPE_BY_EXT = {
     ".pdf": "pdf",
     ".docx": "docx",
     ".html": "web", ".htm": "web",
+    # Email -- one .eml is one message; ingest a DIRECTORY of .eml as a thread
+    # (the EmailParser reconstructs the reply tree). ``.mbox`` single-file
+    # parsing is deferred (not registered until wired).
+    ".eml": "email",
     # Source code -- one row per supported extension (CodeParser infers the
     # language from the extension).
     ".py": "code", ".js": "code", ".mjs": "code", ".ts": "code",
@@ -192,6 +196,10 @@ _PARSERS = {
     "code": "src.ingestion.code_parser.CodeParser",
     "docx": "src.ingestion.docx_parser.DocxParser",
     "web": "src.ingestion.web_parser.WebParser",
+    # Email: stdlib ``email`` (zero deps) -- lazy string keeps the import order
+    # identical to the other format parsers (no circular import: it imports
+    # ``from .parsers import ParsedDocument, RawSection``).
+    "email": "src.ingestion.email_parser.EmailParser",
 }
 
 

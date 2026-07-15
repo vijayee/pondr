@@ -68,9 +68,9 @@ class _StubModeA:
         self.reply = reply
         self.calls: list[list[dict]] = []
 
-    def _complete(self, messages: list[dict]) -> str:
+    def _complete(self, messages: list[dict], tools=None, tool_choice=None) -> tuple:
         self.calls.append(messages)
-        return self.reply
+        return self.reply, None
 
 
 class _StubGliner:

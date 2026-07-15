@@ -467,7 +467,22 @@ DEVELOPMENT_PROPERTIES: dict[str, dict[str, str]] = {
     "has_section":    {"domain": "Document",         "range": "DocumentSection"},
     "child_of":       {"domain": "DocumentSection", "range": "DocumentSection"},
     "appears_in_doc": {"domain": "Entity",          "range": "Document"},
+    # entity->SECTION back-pointer (the per-section reverse of has_entity): the
+    # graph entity axis now lands on the relevant chunk, not just the whole
+    # doc. Same hash-tail policy as the other four (GNN-invisible until retrain).
+    "appears_in_section": {"domain": "Entity", "range": "DocumentSection"},
     "cites":          {"domain": "Document",        "range": "Document"},
+    # ── Email thread provenance (Phase 4 citation/contradiction hook) ──
+    # ``in_reply_to`` (message -> parent Message-ID) + ``references`` (message
+    # -> chain) reconstruct the reply tree an email parser flattened into
+    # sections; ``realized_as`` links an email-message section to its
+    # Message-ID node. All three are hash-tail predicates (GNN-invisible) -- the
+    # email parser emits sections; these provenance edges are written in Phase
+    # 4 when citation/contradiction detection lands. Documented here so the
+    # namespace is reserved now.
+    "in_reply_to":  {"domain": "EmailMessage", "range": "EmailMessage"},
+    "references":    {"domain": "EmailMessage", "range": "EmailMessage"},
+    "realized_as":  {"domain": "DocumentSection", "range": "EmailMessage"},
 
     # ── Communication ──
     "delivers":           {"domain": "Channel",      "range": "Message"},

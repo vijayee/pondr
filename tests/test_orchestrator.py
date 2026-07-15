@@ -17,7 +17,7 @@ import hashlib
 import pytest
 import torch
 
-from src.config import Phase2cConfig
+from src.config import Phase2cConfig, config as _config
 from src.memory.episode import Episode
 from src.memory.store import HippocampalStore
 from src.orchestrator import PonderOrchestrator
@@ -64,16 +64,18 @@ class _StubPlanner:
 class _StubModeA:
     """Stub for ModeAGenerator — records _complete calls, returns canned text.
 
-    The orchestrator's synthesize callable uses ``mode_a._complete(messages)``;
-    a real Bonsai round-trip is out of scope for the offline suite.
+    The orchestrator's synthesize callable uses ``mode_a._complete(messages,
+    tools=...)``; a real Bonsai round-trip is out of scope for the offline
+    suite. Returns ``(reply, None)`` -- no tool calls -- matching the new
+    ``(content, tool_calls)`` tuple contract (``tool_calls=None``).
     """
     def __init__(self, reply: str = "SYNTH RESPONSE") -> None:
         self.reply = reply
         self.calls: list[list[dict]] = []
 
-    def _complete(self, messages: list[dict]) -> str:
+    def _complete(self, messages: list[dict], tools=None, tool_choice=None) -> tuple:
         self.calls.append(messages)
-        return self.reply
+        return self.reply, None
 
 
 class _StubGate:
@@ -172,11 +174,21 @@ def test_extract_end_state_no_llm(tmp_path):
 
 
 def test_synthesize_end_state_calls_llm_once(tmp_path):
-    """Reasoning query → synthesize → exactly one LLM call."""
+    """Reasoning query → synthesize → exactly one LLM call.
+
+    Feedback collection is disabled here (the 2c+ feedback loop would add a
+    second call); this test isolates the end-state dispatch -> one synthesis
+    call, not the feedback side effect.
+    """
     plan = {"entities": ["Postgres"], "entity_mode": "union"}
     eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
     orch, store = _orchestrator(tmp_path, plan, eps, reply="LLM SAID THIS")
-    res = orch.query("Why did we choose Postgres?")
+    saved = _config.feedback_salience_enabled
+    _config.feedback_salience_enabled = False
+    try:
+        res = orch.query("Why did we choose Postgres?")
+    finally:
+        _config.feedback_salience_enabled = saved
     assert res["end_state_plan"].end_state == "synthesize"
     assert res["response"] == "LLM SAID THIS"
     assert len(orch.mode_a.calls) == 1
@@ -222,11 +234,20 @@ def _orchestrator_with_gate(tmp_path, plan, episodes, pathway, reply="SYNTH"):
 
 
 def test_gate_path_graph_retrieve_runs_full_pipeline(tmp_path):
-    """graph_retrieve pathway → retrieve + chunk + synthesize (one LLM call)."""
+    """graph_retrieve pathway → retrieve + chunk + synthesize (one LLM call).
+
+    Feedback disabled (would add a second call) to isolate the gate-path
+    synthesis, mirroring ``test_synthesize_end_state_calls_llm_once``.
+    """
     plan = {"entities": ["Postgres"], "entity_mode": "union"}
     eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
     orch, store = _orchestrator_with_gate(tmp_path, plan, eps, pathway="graph_retrieve")
-    res = orch.query("Why did we choose Postgres?")
+    saved = _config.feedback_salience_enabled
+    _config.feedback_salience_enabled = False
+    try:
+        res = orch.query("Why did we choose Postgres?")
+    finally:
+        _config.feedback_salience_enabled = saved
     assert res["supported"] is True
     assert res["route"].pathway == "graph_retrieve"
     assert res["end_state_plan"].end_state == "synthesize"
