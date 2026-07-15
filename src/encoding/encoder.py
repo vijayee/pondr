@@ -40,14 +40,21 @@ class HippocampalEncoder:
         gliner_decoder_model: Optional[str] = None,
         bonsai_model: Optional[str] = None,
         bonsai_endpoint: Optional[str] = None,
+        gliner_device: str = "cpu",
+        gliner_timing: bool = False,
     ):
         self.store = store
         self.user_id = user_id
         # Model selection defaults come from config via the extractors; pass
-        # overrides through only when provided.
+        # overrides through only when provided. gliner_device/gliner_timing
+        # thread through to GLiNERExtractor so the live-encode path can run
+        # GLiNER on CUDA (the ~20s/conv CPU bottleneck) with an OOM-safe CPU
+        # fallback, and optionally log per-stage extraction timing.
         self.gliner = GLiNERExtractor(
             gliner2_model=gliner2_model,
             gliner_decoder_model=gliner_decoder_model,
+            device=gliner_device,
+            timing=gliner_timing,
         )
         self.bonsai = BonsaiRelationExtractor(
             model=bonsai_model,

@@ -20,10 +20,24 @@ class Config:
     wal_sync_mode: str = "debounced"
 
     # ── GLiNER ──
-    # GLiNER2: stable extraction against the evolved schema (Fastino, CPU).
+    # GLiNER2: stable extraction against the evolved schema (Fastino). Both
+    # GLiNER models are transformer-based and GPU-intended (the extractor
+    # module docstring: "both models are heavy (GPU)"). They previously loaded
+    # with no device -> CPU, the ~20s/conv ingestion bottleneck (CPU pegged
+    # 95%, GPU ~0 on the 2026-07-06 pod). gliner_device="auto" now moves them
+    # to CUDA when available, with an OOM-safe per-model CPU fallback (the 8B
+    # Bonsai server can fill the 5080's 16GB VRAM, leaving no room).
     gliner2_model: str = "fastino/gliner2-base-v1"
     # GLiNER-Decoder: open discovery, invents labels freely (Knowledgator).
     gliner_decoder_model: str = "knowledgator/gliner-decoder-base-v1.0"
+    # Device for the GLiNER models: "cpu" (default -- keeps every existing
+    # caller byte-identical), "auto" (CUDA if available, else CPU; the SERVING
+    # entrypoint's path), or an explicit "cuda"/"cuda:0". The CUDA move is
+    # OOM-safe -> per-model CPU fallback.
+    gliner_device: str = "cpu"
+    # Log per-stage GLiNER extraction timing ([gliner-timing] stable/open/total)
+    # to stderr. Off by default; enable to measure the CPU-vs-CUDA bottleneck.
+    gliner_timing: bool = False
     # Extraction threshold. The matching spans sit far below the model's
     # "natural" 0.3 on CPU: a sweep over the 20 sample conversations showed
     # topic recall 0.09 at 0.3 / 0.22 at 0.05 / 0.27 at 0.03, with ZERO

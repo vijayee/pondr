@@ -18,8 +18,12 @@ reference ``GLiNERExtractor`` on a CPU box.
 
 from __future__ import annotations
 
+import sys
+import time
 from collections import defaultdict
 from typing import Any
+
+import torch
 
 from ..config import config
 
@@ -117,6 +121,8 @@ class GLiNERExtractor:
         gliner_decoder_model: str | None = None,
         threshold: float | None = None,
         promotion_threshold: int | None = None,
+        device: str = "cpu",
+        timing: bool = False,
     ):
         # Defaults come from the central Config so local + RunPod runs use the
         # same model selection. Constructor args override for experiments/tests.
@@ -127,6 +133,7 @@ class GLiNERExtractor:
             promotion_threshold if promotion_threshold is not None
             else config.discovery_buffer_threshold
         )
+        self._timing = timing
 
         # Heavy imports are deferred so the module is importable on a CPU box
         # (the encoder orchestrator imports this class; only the RunPod pod
@@ -142,12 +149,58 @@ class GLiNERExtractor:
                 "Install them on the RunPod GPU pod (pip install gliner gliner2)."
             ) from e
 
+        # Resolve the device. "auto" -> CUDA when available, else CPU; "cpu"
+        # (the default) keeps every existing caller on CPU byte-identically.
+        # These are transformer models (the module docstring notes "both models
+        # are heavy (GPU)"); running them on CPU is the documented ~20s/conv
+        # ingestion bottleneck (memory gliner-gpu-config-task / wavedb-mvcc-
+        # read-amplification-bottleneck). GPU is the intended path for the
+        # SERVING entrypoint (which passes "auto"); CPU stays as the
+        # always-available fallback (see the OOM guard below).
+        if device == "auto":
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            dev = device
+
         # Model download happens here. Per the plan's process instruction, a
         # failed download must be reported verbatim — do not swallow HuggingFace
         # errors, let them propagate.
         self.discoverer = GLiNER.from_pretrained(gliner_decoder_model)
         self.extractor = GLiNER2.from_pretrained(gliner2_model)
+
+        # Move each model to the resolved device. The .to("cuda") is OOM-safe:
+        # on this dev box the 8B Bonsai server already owns ~14.6GB of the
+        # 5080's 16GB VRAM, so two GLiNER models may not fit the remainder and
+        # the move can raise. A CUDA OOM must NOT crash the live-encode path --
+        # fall back to CPU for that model and log it (the exchange still
+        # persists, just slower). The fallback is per-model so a tight-VRAM box
+        # can land one model on GPU and the other on CPU.
+        self.discoverer, dev_d = self._move_model(self.discoverer, dev, "discoverer")
+        self.extractor, dev_e = self._move_model(self.extractor, dev, "extractor")
+        # Actual per-model devices (may differ from `dev` after an OOM fallback).
+        self._device_d = dev_d
+        self._device_e = dev_e
+        print(f"[gliner-device] discoverer={dev_d} extractor={dev_e}", file=sys.stderr)
         self.discovery_buffer: dict[str, list[str]] = defaultdict(list)
+
+    @staticmethod
+    def _move_model(model, dev: str, name: str):
+        """Move a GLiNER model to ``dev`` with an OOM-safe CPU fallback.
+
+        Returns ``(model, resolved_device_str)``. A CUDA move that raises
+        (typically out-of-memory when the 8B Bonsai server already fills the
+        GPU) falls back to CPU and logs -- it never crashes the encoder, so a
+        live exchange still persists even when VRAM is exhausted.
+        """
+        if dev == "cpu":
+            return model, "cpu"
+        try:
+            model = model.to(dev)
+            return model, dev
+        except Exception as e:  # noqa: BLE001 - OOM / any device failure -> CPU
+            print(f"[gliner-device] {name}: CUDA move failed ({e!r}); "
+                  f"falling back to CPU", file=sys.stderr)
+            return model, "cpu"
 
     def extract(self, text: str) -> dict:
         """Extract structured information from conversation text.
@@ -170,8 +223,18 @@ class GLiNERExtractor:
         ``tones`` are fixed-label classifications from the bounded
         AffectiveTone taxonomy.
         """
-        stable = self._extract_stable(text)
-        discovered = self._extract_open(text)
+        if self._timing:
+            t0 = time.perf_counter()
+            stable = self._extract_stable(text)
+            t1 = time.perf_counter()
+            discovered = self._extract_open(text)
+            t2 = time.perf_counter()
+            print(f"[gliner-timing] stable={t1 - t0:.3f}s open={t2 - t1:.3f}s "
+                  f"total={t2 - t0:.3f}s device_d={self._device_d} "
+                  f"device_e={self._device_e}", file=sys.stderr)
+        else:
+            stable = self._extract_stable(text)
+            discovered = self._extract_open(text)
         self._buffer_discoveries(discovered)
 
         return {**stable, "discovered": discovered}

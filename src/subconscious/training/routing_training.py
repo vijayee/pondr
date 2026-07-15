@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ..backbone import JGSBackbone
-from ..configs import BackboneConfig
+from ..configs import BackboneConfig, INSTANCE_CONFIGS, InstanceConfig
 from ..gate import GateContext
 from ..retrieval_gate import RetrievalGate
 from ..routing import (
@@ -101,6 +101,49 @@ def load_backbone(
         p.requires_grad = False
     backbone.eval()
     return backbone
+
+
+def load_retrieval_gate(
+    path: str,
+    backbone: JGSBackbone,
+    config: Optional[InstanceConfig] = None,
+    device: str = "auto",
+    map_location: str = "cpu",
+) -> RetrievalGate:
+    """Load a trained Phase 2b RetrievalGate checkpoint onto ``backbone``.
+
+    The checkpoint is ``{"gate": state_dict, "val_accuracy": float,
+    "epoch": int}`` (see ``train_retrieval_gate_supervised``'s save). The
+    gate's ``state_dict()`` EXCLUDES the shared backbone (it is stored via
+    ``object.__setattr__`` on ``JGSInstance``, not registered as a submodule),
+    so loading ``ckpt["gate"]`` restores only the instance-owned params
+    (input/output projections + LoRA, decomposed gate) and the five routing
+    heads -- the already-frozen ``backbone`` passed in is reused, NOT
+    reloaded. Loads strict (raises on any missing/unexpected key, mirroring
+    ``load_backbone``), moves to the resolved device, eval mode.
+
+    This is the runtime loader -- it pairs with ``load_backbone`` so a serving
+    entrypoint can stand up the TRAINED gate (val 0.826) on the TRAINED
+    backbone, instead of the fresh untrained instances every test construction
+    uses.
+    """
+    cfg = config or INSTANCE_CONFIGS["retrieval_gate"]
+    gate = RetrievalGate(backbone, cfg)
+    # weights_only=False: the checkpoint is the user's own Phase 2b output (a
+    # plain {"gate": sd, ...} dict, no code). Safe here; do NOT load arbitrary
+    # .pt files this way -- same contract as load_backbone.
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    sd = ckpt["gate"] if isinstance(ckpt, dict) and "gate" in ckpt else ckpt
+    missing, unexpected = gate.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"gate checkpoint {path} mismatch: missing={list(missing)[:8]} "
+            f"unexpected={list(unexpected)[:8]}"
+        )
+    dev = _resolve_device(device)
+    gate = gate.to(dev)
+    gate.eval()
+    return gate
 
 
 # ── config ──
