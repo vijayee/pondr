@@ -55,7 +55,8 @@ from .subconscious.state_serializer import (
 )
 from .subconscious.working_memory import WorkingMemory, WorkingMemoryState
 from .tools import (
-    SELF_CHAT_TOOLS, dispatch_tool, feedback_instruction,
+    LOOP_TOOLS, SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
+    feedback_instruction, run_tool_loop,
 )
 
 if TYPE_CHECKING:
@@ -114,6 +115,33 @@ def _parse_json_array(text: str) -> list[dict]:
     return []
 
 
+def _sum_record_feedback_applied(collected: Optional[list[dict]]) -> int:
+    """Sum the ``applied`` counts from a tool loop's ``record_feedback`` calls.
+
+    ``run_tool_loop`` returns ``collected`` as ``[{"name", "result"}, ...]`` where
+    ``result`` is the ``dispatch_tool`` return string. ``record_feedback``'s
+    result is JSON ``{"ok": True, "applied": N}``; this parses each and sums
+    ``N``. Mirrors the per-call parse in ``_dispatch_feedback``. Non-
+    ``record_feedback`` entries (expand / search_memory) and any parse failure
+    contribute 0 -- a retrieval-only loop yields 0, which triggers the
+    structured fallback (mirroring the one-shot path's "skip fallback if a tool
+    worked" early-return).
+    """
+    total = 0
+    if not collected:
+        return total
+    for entry in collected:
+        if not isinstance(entry, dict) or entry.get("name") != "record_feedback":
+            continue
+        result = entry.get("result")
+        try:
+            parsed = json.loads(result) if isinstance(result, str) else {}
+            total += int(parsed.get("applied", 0))
+        except (ValueError, TypeError):
+            pass
+    return total
+
+
 class PonderOrchestrator:
     """Compose the Phase 2c pipeline. Owns the cross-query Working Memory.
 
@@ -148,6 +176,11 @@ class PonderOrchestrator:
         # construction) so ``query()`` never loads GLiNER unless a real encoder
         # was explicitly wired in.
         self._encoder = encoder
+        # Self-chat tool-loop transcript surfaced onto the query result (D6).
+        # Declared here so the attribute always exists; ``query`` resets it to
+        # None before the synthesize call and sets it to the loop dict only when
+        # the loop path ran (the non-loop path leaves it None).
+        self._last_loop = None
 
         # The cross-query Working Memory (persistent state). embedder injected so
         # WM can embed episodes/queries on demand.
@@ -281,23 +314,79 @@ class PonderOrchestrator:
         self.expand_handler.expand_count = 0
 
         # The synthesize callable: build messages and call mode_a._complete.
-        # Phase 2c+: pass the record_feedback tool so the model can rate the
-        # context units it used; after the call, dispatch any record_feedback
-        # tool calls. If the model emits none (Bonsai tool-calling may be
-        # unsupported on a Q2_0 8B), fall back to one small structured rating
-        # call. Best-effort: a feedback failure never loses the response.
+        # Phase 2c+: the self-chat TOOL LOOP (self_chat_tool_loop_enabled, the
+        # default) lets Bonsai call expand / search_memory mid-generation to
+        # ground its answer beyond the pre-retrieved context, plus
+        # record_feedback for salience (gated by feedback_salience_enabled). A
+        # live probe confirmed the 8B Bonsai emits native, parseable
+        # tool_calls (finish_reason "tool_calls"), so the loop is the primary
+        # path; the structured-JSON fallback stays as a safety net for when the
+        # model emits no record_feedback (loop on OR off). When the loop is OFF
+        # the body is byte-identical to the one-shot path (the A/B regression
+        # guard). Best-effort: a feedback or loop failure never loses the
+        # response.
         feedback_enabled = _runtime_config.feedback_salience_enabled
+        loop_enabled = _runtime_config.self_chat_tool_loop_enabled
         feedback_state = {"count": 0}
+        # Loop transcript surfaced onto the result dict by query() (D6). Reset
+        # per query; set to the loop dict only when the loop path ran.
+        self._last_loop = None
 
         def _synthesize(context: str, history: Optional[list[dict]]) -> str:
-            messages: list[dict] = [{"role": "system", "content":
-                "You are a helpful assistant with access to past conversations."}]
+            sys_content = "You are a helpful assistant with access to past conversations."
+            if loop_enabled:
+                # Bounds redundant tool calls from the 8B: only call a tool
+                # when the provided context is genuinely insufficient. Loop-
+                # path-only so the one-shot path stays byte-identical.
+                sys_content += (" Only call a tool when the provided context is"
+                                " genuinely insufficient; if you can answer"
+                                " from it, do so without calling tools.")
+            messages: list[dict] = [{"role": "system", "content": sys_content}]
             if history:
                 messages.extend(history[-10:])
             user_content = f"Context from past conversations:\n{context}\n\nUser: {user_prompt}"
             if feedback_enabled:
                 user_content += "\n\n" + feedback_instruction(episodes)
             messages.append({"role": "user", "content": user_content})
+
+            if loop_enabled:
+                # Loop path: run_tool_loop drives the multi-turn tool
+                # conversation (call -> dispatch -> append tool result ->
+                # repeat). The tool SET is the gate for the record_feedback
+                # boost side-effect inside the loop: TOOL_SCHEMAS (all 3)
+                # when feedback is on, LOOP_TOOLS (expand + search_memory)
+                # when off -- dispatch_tool does not re-check
+                # feedback_salience_enabled, so the set must.
+                loop_tools = TOOL_SCHEMAS if feedback_enabled else LOOP_TOOLS
+                dispatch_fn = lambda name, args: dispatch_tool(self, name, args)
+                try:
+                    loop = run_tool_loop(
+                        self.mode_a._complete, "", messages, dispatch_fn,
+                        max_iters=_runtime_config.self_chat_tool_loop_max_iters,
+                        tools=loop_tools,
+                    )
+                except Exception as e:  # noqa: BLE001 - loop failure -> empty answer
+                    print(f"[synthesize-loop-fail] {e}", file=sys.stderr)
+                    return ""
+                if loop.get("exhausted"):
+                    print("[synthesize-loop-exhausted] hit max_iters mid-conversation",
+                          file=sys.stderr)
+                content = loop.get("content") or ""
+                if feedback_enabled and self.store is not None:
+                    # The store-is-not-None guard is required: the fallback
+                    # below (_feedback_fallback_call) dereferences self.store.
+                    fb_sum = _sum_record_feedback_applied(loop.get("collected"))
+                    if fb_sum == 0:
+                        try:
+                            fb_sum = self._feedback_fallback_call(episodes, content)
+                        except Exception as e:  # noqa: BLE001 - fallback is best-effort
+                            print(f"[feedback-fallback-fail] {e}", file=sys.stderr)
+                    feedback_state["count"] += fb_sum
+                self._last_loop = loop  # surfaced on result by query() (D6)
+                return content
+
+            # One-shot path (loop disabled) -- byte-identical to the pre-loop
+            # body: one _complete + _dispatch_feedback.
             tools = SELF_CHAT_TOOLS if feedback_enabled else None
             try:
                 content, tool_calls = self.mode_a._complete(messages, tools=tools)
@@ -350,6 +439,18 @@ class PonderOrchestrator:
         # (0 when feedback is disabled, the model emitted none, or the fallback
         # also yielded nothing). Observability only -- never blocks the response.
         result["feedback_collected"] = feedback_state["count"]
+
+        # Phase 2c+: when the self-chat tool loop ran, surface its transcript
+        # for live-dogfood observability (the synthesize end-state only; the
+        # non-loop path leaves self._last_loop None and adds nothing -- so the
+        # result keys stay byte-identical to the one-shot path when the loop is
+        # off). loop_exhausted is True iff the loop hit max_iters mid-
+        # conversation (a truncated tool trajectory, not a clean stop).
+        if self._last_loop is not None:
+            result["loop_tool_messages"] = self._last_loop.get("tool_messages")
+            result["loop_collected"] = self._last_loop.get("collected")
+            result["loop_exhausted"] = self._last_loop.get("exhausted", False)
+            self._last_loop = None
 
         # 2026-07-14: close the runtime gap -- persist the (prompt, response)
         # exchange as a new episode so the system learns from use. Always-encode

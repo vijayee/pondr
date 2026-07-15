@@ -132,6 +132,22 @@ class Config:
     # sort -- the pre-2c+ behavior). Independent of feedback_salience_enabled.
     kind_diversity_cap: int = 3
 
+    # ── Phase 2c+: self-chat full agent loop ──
+    # When True, the Bonsai self-chat synthesize path runs a multi-turn tool
+    # loop (``run_tool_loop``): the model may call ``expand`` / ``search_memory``
+    # mid-generation to ground its answer beyond the pre-retrieved context, and
+    # ``record_feedback`` for salience (gated by ``feedback_salience_enabled``).
+    # When False, ``_synthesize`` is byte-identical to the one-shot path (one
+    # ``mode_a._complete`` + ``_dispatch_feedback``) -- the A/B regression
+    # guard. Default True: a live probe confirmed the 8B Bonsai emits native,
+    # parseable ``tool_calls`` (``finish_reason:"tool_calls"``), so the loop is
+    # the primary path; the structured-JSON fallback stays as a safety net.
+    self_chat_tool_loop_enabled: bool = True
+    # Loop bound: each turn is one Bonsai call + N tool dispatches (~2.6s/call
+    # warm on the 5080). 4 leaves headroom for an expand + a search + a clean
+    # answer turn inside the 4K context.
+    self_chat_tool_loop_max_iters: int = 4
+
     # ── Paths ──
     data_dir: Path = Path("./data")
     sample_conversations: Path = Path("./data/sample_conversations.jsonl")

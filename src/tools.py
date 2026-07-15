@@ -181,26 +181,44 @@ def run_tool_loop(
     messages: list[dict],
     dispatch: Callable[[str, Any], str],
     max_iters: int = 4,
+    tools: Optional[list[dict]] = None,
 ) -> dict:
-    """Optional convenience agent loop for a host (and later self-chat).
+    """Optional convenience agent loop for a host (and Ponder self-chat).
 
     ``llm_call(messages, tools) -> (content, tool_calls)`` is the consumer's
     model call. Each emitted ``tool_calls`` entry is dispatched via ``dispatch``
     and fed back as a ``tool``-role message; the loop repeats until the model
     emits no tool_calls or ``max_iters`` is hit. Returns ``{"content",
-    "tool_messages", "iterations"}``. The host may run its OWN loop and call
+    "tool_messages", "iterations", "collected", "loop_turns", "exhausted"}``.
+
+    ``tools`` defaults to the full ``TOOL_SCHEMAS`` (the external-consumer
+    surface); self-chat passes a gated subset (``TOOL_SCHEMAS`` when feedback
+    is on, ``LOOP_TOOLS`` when it is off) so ``record_feedback``'s boost
+    side-effect stays behind the ``feedback_salience_enabled`` gate -- see
+    ``orchestrator._synthesize``. The host may run its OWN loop and call
     ``dispatch_tool`` directly instead -- this is a convenience, not required.
+
+    ``iterations`` is the count of tool calls DISPATCHED; ``loop_turns`` is the
+    count of model calls made; ``exhausted`` is True iff the final turn still
+    emitted tool_calls (the loop hit ``max_iters`` mid-conversation, not a
+    clean stop) so a caller can log/observe truncation.
     """
-    tools = TOOL_SCHEMAS
+    if tools is None:
+        tools = TOOL_SCHEMAS
     tool_messages: list[dict] = list(messages)
     collected: list[dict] = []
     content = ""
-    for i in range(max_iters):
+    turns = 0
+    exhausted = False
+    for _ in range(max_iters):
+        turns += 1
         text, tool_calls = llm_call(tool_messages, tools)
         if text:
             content = text
         if not tool_calls:
+            exhausted = False
             break
+        exhausted = True  # this turn still wanted tools; cleared on a clean stop
         # Echo the assistant's tool_calls back into the transcript so the next
         # call sees the request, then append each dispatched result.
         tool_messages.append({"role": "assistant", "content": text or "",
@@ -215,13 +233,22 @@ def run_tool_loop(
             tool_messages.append({"role": "tool", "tool_call_id": cid or "",
                                   "content": result})
     return {"content": content, "tool_messages": tool_messages,
-            "iterations": len(collected), "collected": collected}
+            "iterations": len(collected), "collected": collected,
+            "loop_turns": turns, "exhausted": exhausted}
 
 
-# A compact subset offered to Bonsai self-chat synthesis (the full set is for
-# the external consumer; ``search_memory`` mid-stream needs the full loop and
-# is deferred). The orchestrator passes this to ``mode_a._complete``.
+# A compact subset offered to the NON-loop Bonsai self-chat synthesis path (the
+# full set is for the external consumer). The full self-chat TOOL LOOP
+# (``orchestrator._synthesize`` with ``self_chat_tool_loop_enabled=True``) uses
+# ``TOOL_SCHEMAS`` when feedback is on, or ``LOOP_TOOLS`` when it is off -- that
+# is the path through which ``search_memory`` enters self-chat mid-generation.
 SELF_CHAT_TOOLS: list[dict] = [TOOL_SCHEMAS[0], TOOL_SCHEMAS[1]]
+
+# Retrieval-only tool set for the self-chat loop when feedback is DISABLED:
+# ``expand`` + ``search_memory`` (``record_feedback`` is excluded so the boost
+# side-effect stays behind the ``feedback_salience_enabled`` gate even inside
+# the loop -- ``dispatch_tool`` does not re-check that gate itself).
+LOOP_TOOLS: list[dict] = [TOOL_SCHEMAS[1], TOOL_SCHEMAS[2]]
 
 
 def feedback_instruction(units: list[dict]) -> str:

@@ -35,7 +35,7 @@ from src.retrieval.graph_traversal import GraphTraversal
 from src.retrieval.retriever import HippocampalRetriever
 from src.subconscious.backbone import JGSBackbone
 from src.subconscious.configs import BackboneConfig
-from src.tools import TOOL_SCHEMAS, dispatch_tool
+from src.tools import LOOP_TOOLS, SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool
 
 
 # ── stubs (mirror tests/test_orchestrator.py) ──
@@ -347,8 +347,9 @@ def test_dispatch_never_raises_on_bad_input(tmp_path):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_self_chat_tool_call_path_applies_feedback(tmp_path):
-    """Bonsai emits a record_feedback tool call -> dispatch applies it; one
-    LLM call; tool_calls never leak into the response."""
+    """Bonsai emits a record_feedback tool call inside the tool loop -> dispatch
+    applies it; the loop runs a second clean turn (no tool_calls) to finish;
+    two LLM calls; tool_calls never leak into the response."""
     plan = {"entities": ["Postgres"], "entity_mode": "union"}
     eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
     tool_call = [{
@@ -356,16 +357,18 @@ def test_self_chat_tool_call_path_applies_feedback(tmp_path):
         "function": {"name": "record_feedback",
                      "arguments": {"judgments": [{"unit_id": "ep_001", "rating": 5}]}},
     }]
-    mode_a = _ScriptedModeA([("THE ANSWER", tool_call)])
+    # Turn 1: the answer + record_feedback tool call. Turn 2: clean (no tools)
+    # so the loop stops after applying the feedback (no fallback needed).
+    mode_a = _ScriptedModeA([("THE ANSWER", tool_call), ("THE ANSWER", None)])
     orch, store = _orch(tmp_path, plan, eps, mode_a)
     res = orch.query("Why did we choose Postgres?")
     assert res["end_state_plan"].end_state == "synthesize"
     assert res["response"] == "THE ANSWER"          # the text answer, unchanged
     assert "record_feedback" not in res["response"]  # tool_calls not concatenated
     assert res["feedback_collected"] == 1
-    assert len(mode_a.calls) == 1                     # no fallback (tool path worked)
-    # Tools were offered on the synthesis call.
-    assert mode_a.calls[0]["tools"] is not None
+    assert len(mode_a.calls) == 2          # tool-call turn + clean turn (no fallback)
+    # The full tool surface (incl record_feedback) was offered on turn 1.
+    assert mode_a.calls[0]["tools"] is TOOL_SCHEMAS
     # The boost was written.
     assert store.get_unit_boost("ep_001") == pytest.approx(1.5)
     store.close()
@@ -410,20 +413,209 @@ def test_self_chat_fallback_no_rating_is_noop(tmp_path):
 
 def test_feedback_disabled_skips_self_chat_feedback(tmp_path):
     """feedback_salience_enabled=False -> no feedback instruction, no tools
-    offered, no fallback call; pure synthesize (one call)."""
+    offered, no fallback call; pure synthesize (one call). This test runs the
+    NON-loop (one-shot) path (self_chat_tool_loop_enabled=False) as the A/B
+    regression guard for the old ``tools is None`` assertion; the loop+disabled
+    shape (LOOP_TOOLS offered) is covered by
+    ``test_self_chat_loop_feedback_disabled_offers_no_record_feedback``."""
     plan = {"entities": ["Postgres"], "entity_mode": "union"}
     eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
     mode_a = _ScriptedModeA([("THE ANSWER", None), ("should never be used", None)])
     cfg = Phase2cConfig()
-    saved = _config.feedback_salience_enabled
+    saved_fb = _config.feedback_salience_enabled
+    saved_loop = _config.self_chat_tool_loop_enabled
     _config.feedback_salience_enabled = False
+    _config.self_chat_tool_loop_enabled = False
     try:
         orch, store = _orch(tmp_path, plan, eps, mode_a, cfg=cfg)
         res = orch.query("Why did we choose Postgres?")
     finally:
-        _config.feedback_salience_enabled = saved
+        _config.feedback_salience_enabled = saved_fb
+        _config.self_chat_tool_loop_enabled = saved_loop
     assert res["response"] == "THE ANSWER"
     assert res["feedback_collected"] == 0
     assert len(mode_a.calls) == 1                     # no fallback
     assert mode_a.calls[0]["tools"] is None          # tools not offered
+    store.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. self-chat full agent loop (run_tool_loop wired into _synthesize)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _tool_call(name, args, cid="call_1"):
+    return [{"id": cid, "type": "function",
+             "function": {"name": name, "arguments": args}}]
+
+
+def test_self_chat_loop_dispatches_expand_and_refeeds(tmp_path):
+    """The loop lets Bonsai call ``expand`` mid-generation: turn 1 emits the
+    tool call, the dispatched result is fed back, turn 2 gives the final answer
+    with no tools. Two calls; expand was dispatched; the tool result appears in
+    turn 2's messages. Feedback is disabled here so the structured fallback
+    does NOT fire (the loop/refeed shape is the point; the fallback is
+    exercised by its own test) -- the loop offers LOOP_TOOLS."""
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres",
+               text="User: why\nAssistant: because the in-DB vector layer")]
+    expand_call = _tool_call("expand", {"unit_id": "ep_001"})
+    mode_a = _ScriptedModeA([("draft", expand_call), ("FINAL ANSWER", None)])
+    saved = _config.feedback_salience_enabled
+    _config.feedback_salience_enabled = False
+    try:
+        orch, store = _orch(tmp_path, plan, eps, mode_a)
+        res = orch.query("Why did we choose Postgres?")
+    finally:
+        _config.feedback_salience_enabled = saved
+    assert res["response"] == "FINAL ANSWER"
+    assert len(mode_a.calls) == 2                       # expand turn + clean turn
+    assert mode_a.calls[0]["tools"] is LOOP_TOOLS       # retrieval surface offered
+    # The loop surfaced its transcript + the expand dispatch is recorded.
+    assert res["loop_exhausted"] is False
+    names = [c["name"] for c in res["loop_collected"]]
+    assert names == ["expand"]
+    # The loop transcript carries the fed-back tool-role result message.
+    roles = [m.get("role") for m in res["loop_tool_messages"]]
+    assert "tool" in roles
+    store.close()
+
+
+def test_self_chat_loop_dispatches_search_memory_and_refeeds(tmp_path):
+    """Same shape with ``search_memory``: the model re-searches mid-generation,
+    the fresh context is fed back, then it answers. Two calls. Feedback
+    disabled so the fallback does not fire (see the expand test for the
+    rationale)."""
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+    search_call = _tool_call("search_memory",
+                             {"query": "Postgres decision", "entities": ["Postgres"]})
+    mode_a = _ScriptedModeA([("draft", search_call), ("FINAL ANSWER", None)])
+    saved = _config.feedback_salience_enabled
+    _config.feedback_salience_enabled = False
+    try:
+        orch, store = _orch(tmp_path, plan, eps, mode_a)
+        res = orch.query("Why did we choose Postgres?")
+    finally:
+        _config.feedback_salience_enabled = saved
+    assert res["response"] == "FINAL ANSWER"
+    assert len(mode_a.calls) == 2
+    assert mode_a.calls[0]["tools"] is LOOP_TOOLS
+    names = [c["name"] for c in res["loop_collected"]]
+    assert names == ["search_memory"]
+    store.close()
+
+
+def test_self_chat_loop_max_iters_bound(tmp_path):
+    """If the model keeps emitting tool calls, the loop stops at max_iters and
+    reports ``exhausted=True`` (a truncated trajectory, not a clean stop).
+    Feedback disabled so the structured fallback does not add an extra call
+    after the exhausted loop -- this isolates the max_iters cap."""
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+    search_call = _tool_call("search_memory", {"query": "x"})
+    # Every turn emits a tool call -> the loop never stops cleanly.
+    mode_a = _ScriptedModeA([(f"t{i}", search_call) for i in range(5)])
+    saved_iters = _config.self_chat_tool_loop_max_iters
+    saved_fb = _config.feedback_salience_enabled
+    _config.self_chat_tool_loop_max_iters = 2
+    _config.feedback_salience_enabled = False
+    try:
+        orch, store = _orch(tmp_path, plan, eps, mode_a)
+        res = orch.query("Why did we choose Postgres?")
+    finally:
+        _config.self_chat_tool_loop_max_iters = saved_iters
+        _config.feedback_salience_enabled = saved_fb
+    assert len(mode_a.calls) == 2                       # capped at max_iters=2
+    assert res["loop_exhausted"] is True
+    store.close()
+
+
+def test_self_chat_loop_disabled_is_byte_identical_one_shot(tmp_path):
+    """self_chat_tool_loop_enabled=False -> the one-shot path: one _complete +
+    _dispatch_feedback. A record_feedback tool call on the single call is still
+    dispatched (the one-shot path's _dispatch_feedback handles it). One call."""
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+    tool_call = _tool_call("record_feedback",
+                           {"judgments": [{"unit_id": "ep_001", "rating": 5}]})
+    mode_a = _ScriptedModeA([("THE ANSWER", tool_call)])
+    saved = _config.self_chat_tool_loop_enabled
+    _config.self_chat_tool_loop_enabled = False
+    try:
+        orch, store = _orch(tmp_path, plan, eps, mode_a)
+        res = orch.query("Why did we choose Postgres?")
+    finally:
+        _config.self_chat_tool_loop_enabled = saved
+    assert res["response"] == "THE ANSWER"
+    assert res["feedback_collected"] == 1
+    assert len(mode_a.calls) == 1                       # one-shot, no clean turn
+    # The non-loop path offers SELF_CHAT_TOOLS (record_feedback + expand).
+    assert mode_a.calls[0]["tools"] is SELF_CHAT_TOOLS
+    # No loop transcript keys are surfaced (byte-identical to the pre-loop result).
+    assert "loop_collected" not in res
+    store.close()
+
+
+def test_self_chat_loop_record_feedback_counted_in_feedback_collected(tmp_path):
+    """A record_feedback tool call inside the loop is counted into
+    feedback_collected (filter-then-sum of the loop's collected results); no
+    fallback fires because the tool path worked."""
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+    tool_call = _tool_call("record_feedback",
+                           {"judgments": [{"unit_id": "ep_001", "rating": 5}]})
+    mode_a = _ScriptedModeA([("THE ANSWER", tool_call), ("THE ANSWER", None)])
+    orch, store = _orch(tmp_path, plan, eps, mode_a)
+    res = orch.query("Why did we choose Postgres?")
+    assert res["feedback_collected"] == 1
+    assert store.get_unit_boost("ep_001") == pytest.approx(1.5)
+    assert len(mode_a.calls) == 2                       # tool turn + clean turn
+    # No third (fallback) call -- the record_feedback tool call applied 1.
+    store.close()
+
+
+def test_self_chat_loop_fallback_fires_when_no_record_feedback(tmp_path):
+    """When the loop runs retrieval tools but no record_feedback, the
+    filter-then-sum yields 0 and the structured fallback fires (one extra
+    call). Three calls: expand turn + clean turn + fallback."""
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres",
+               text="User: why\nAssistant: because")]
+    expand_call = _tool_call("expand", {"unit_id": "ep_001"})
+    fallback_json = '[{"unit_id":"ep_001","rating":4}]'
+    mode_a = _ScriptedModeA([("draft", expand_call),
+                             ("FINAL ANSWER", None),
+                             (fallback_json, None)])
+    orch, store = _orch(tmp_path, plan, eps, mode_a)
+    res = orch.query("Why did we choose Postgres?")
+    assert res["response"] == "FINAL ANSWER"
+    assert res["feedback_collected"] == 1
+    assert len(mode_a.calls) == 3                       # expand + clean + fallback
+    # rating 4 -> useful 0.75 -> 1.0 * (0.5+0.75) = 1.25
+    assert store.get_unit_boost("ep_001") == pytest.approx(1.25)
+    store.close()
+
+
+def test_self_chat_loop_feedback_disabled_offers_no_record_feedback(tmp_path):
+    """Loop enabled + feedback disabled: the loop runs with LOOP_TOOLS (expand
+    + search_memory) so record_feedback is NOT offered -> the boost side-effect
+    stays behind the feedback gate even inside the loop. One call; no feedback."""
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+    mode_a = _ScriptedModeA([("THE ANSWER", None), ("should never be used", None)])
+    saved_fb = _config.feedback_salience_enabled
+    saved_loop = _config.self_chat_tool_loop_enabled
+    _config.feedback_salience_enabled = False
+    # loop stays at its default (True) -- this is the loop+disabled shape.
+    _config.self_chat_tool_loop_enabled = True
+    try:
+        orch, store = _orch(tmp_path, plan, eps, mode_a)
+        res = orch.query("Why did we choose Postgres?")
+    finally:
+        _config.feedback_salience_enabled = saved_fb
+        _config.self_chat_tool_loop_enabled = saved_loop
+    assert res["response"] == "THE ANSWER"
+    assert res["feedback_collected"] == 0
+    assert len(mode_a.calls) == 1                       # clean answer, no fallback
+    assert mode_a.calls[0]["tools"] is LOOP_TOOLS       # record_feedback excluded
     store.close()
