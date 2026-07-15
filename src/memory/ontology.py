@@ -427,6 +427,15 @@ DEVELOPMENT_CLASSES: dict[str, list[str]] = {
     "Communication": [
         "Message", "Notification", "Channel", "Signal", "Event",
     ],
+    # Email thread provenance (Phase 4 citation hook, D5): one node per email
+    # message (keyed by its Message-ID). The email parser emits one
+    # DocumentSection per message; ``realized_as`` links a section to its
+    # EmailMessage node, and ``in_reply_to``/``references`` carry the reply
+    # tree. A leaf class (like DocumentSection/Statement) -- declared so the
+    # email provenance predicates have a real node to point at. Hash-tail:
+    # GNN-invisible until retrain (the email predicates are NOT in
+    # ``KNOWN_PREDICATES`` / ``_NODE_PREDICATES``).
+    "EmailMessage": [],
     # Security & access control.
     "Security": [
         "Permission", "Privilege", "AccessToken", "Scope",
@@ -483,6 +492,15 @@ DEVELOPMENT_PROPERTIES: dict[str, dict[str, str]] = {
     "in_reply_to":  {"domain": "EmailMessage", "range": "EmailMessage"},
     "references":    {"domain": "EmailMessage", "range": "EmailMessage"},
     "realized_as":  {"domain": "DocumentSection", "range": "EmailMessage"},
+    # ── Phase 4 citation (episode/M-node -> doc provenance, D5) ──
+    # Best-effort edge written when an episode's (or M-node's) text references a
+    # known document title/URL (resolved via ``find_document_by_title_or_url``).
+    # The assertion sidecar ``asserted_by`` IS the primary supported_by link
+    # (it carries the doc/section id directly); ``cited_from`` is the graph-
+    # visible complement for cross-unit traversal. No edge when no match.
+    # Hash-tail predicate -- NOT in ``KNOWN_PREDICATES`` / ``_NODE_PREDICATES``
+    # (GNN-invisible until retrain, checkpoint-safe).
+    "cited_from":    {"domain": "Episode",    "range": "Document"},
 
     # ── Communication ──
     "delivers":           {"domain": "Channel",      "range": "Message"},

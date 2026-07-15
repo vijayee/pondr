@@ -85,6 +85,24 @@ def default_meta() -> dict:
         # (>deep_archive_days). None for current/never-archived edges and for
         # edges soft-archived before this field shipped (legacy -> not aged).
         "archived_at": None,
+        # ── Phase 4: assertion provenance + fact-level tombstone (D1/D2) ──
+        # ``asserted_by``/``asserted_at`` -- provenance for an assertion edge
+        # ``(E:entity, state, value)``: the episode/document/section id that
+        # asserted the value + when. The A2 anomaly-resolver reads these to
+        # pick old/new from real provenance instead of the timestamp heuristic
+        # (D4). None on edges that are not assertions (legacy + non-state edges)
+        # and on assertion edges written before this field shipped.
+        "asserted_by": None,
+        "asserted_at": None,
+        # ``superseded_by``/``superseded_at`` -- the fact-level tombstone (D2):
+        # when a contradiction is adjudicated, the OLD ``(E:entity, state,
+        # oldValue)`` edge sidecar gets ``state="superseded"`` + these two
+        # fields (the asserting unit that superseded it + when). The existing
+        # ``is_edge_current`` filter then drops the tombstoned old value out
+        # of the live-values set, so the detector goes quiet (the contradiction
+        # is *resolved*, not just recorded). None on edges never tombstoned.
+        "superseded_by": None,
+        "superseded_at": None,
     }
 
 

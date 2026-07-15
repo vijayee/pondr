@@ -196,6 +196,16 @@ class Consolidator:
             "ontology_applied": [],
             "ontology_rejected": [],
             "identity_drift_decisions": [],
+            # Phase 4: contradiction adjudication (D3). Each entry is the
+            # disturbance record -- ``{entity, old_value, new_value,
+            # asserted_by_old, asserted_at_old, asserted_by_new,
+            # asserted_at_new, decision, action, reasoning, applied}``. Empty
+            # on a cold start (no decider / disabled / dry-run / forgetting off)
+            # so the report stays byte-identical to today. The 3b no-decider
+            # episode-supersede path (``forgetting.reconsolidated``) is separate
+            # and stays intact; this list is the ADDITIVE fact-tombstone path
+            # under ``decider_active``.
+            "contradictions_resolved": [],
             # Binned score histograms (100 width-0.01 buckets, [0,1]) so a reader
             # can sweep accept/bonsai/prune thresholds from ONE run without
             # re-running (exact at 0.01-boundaries like 0.05/0.15/0.85).
@@ -809,6 +819,15 @@ class Consolidator:
             for anom in report["anomalies"]:
                 if anom.get("type") != "contradictory_state":
                     continue
+                if decider_active:
+                    # Phase 4 (D3): when a decider is wired, the adjudication
+                    # loop below owns ``contradictory_state`` -- it calls
+                    # ``decide_contradiction`` and applies a fact-level
+                    # tombstone (D2) on a conservative ``fix``. Keep the
+                    # episode-supersede path here for the no-decider cold
+                    # start (3b behavior, byte-identical) and for the
+                    # ``identity_drift`` ``fix`` path which still uses it.
+                    continue
                 if anom.get("score", 0.0) < self.cfg.anomaly_resolve_threshold:
                     continue  # low-confidence -> record-only
                 resolved = self._resolve_contradictory_state(anom["node"])
@@ -976,6 +995,108 @@ class Consolidator:
                     "reasoning": decision.get("reasoning", ""),
                     "applied": applied,
                 })
+            # Phase 4 (D3): Bonsai adjudication of ``contradictory_state``
+            # flags -- the fact-level contradiction path. Mirrors the
+            # ``identity_drift`` loop above: gather the entity context (which
+            # now carries the conflicting ``state`` values WITH provenance),
+            # ask Bonsai ``decide_contradiction``, and apply ONLY a
+            # conservative ``fix`` whose ``action`` contains
+            # ``supersede_assertion`` AND ``forgetting_enabled`` -- that calls
+            # ``store.supersede_assertion`` to tombstone the old fact at the
+            # FACT level (D2), not the episode level. Any other ``fix`` ->
+            # ``ask_user`` (record-only). Every decision is recorded in
+            # ``report["contradictions_resolved"]`` (the chat's disturbance
+            # record: old value, new value, asserting units, adjudication).
+            # Gated on ``decider is not None`` (cold start -> the
+            # episode-supersede block above owns it) AND
+            # ``contradiction_resolve_threshold`` (low-confidence ->
+            # record-only, no mutation). No HTTP when ``decider`` is None.
+            if self.decider is not None and \
+                    _master_config.forgetting_enabled:
+                for anom in report["anomalies"]:
+                    if anom.get("type") != "contradictory_state":
+                        continue
+                    if not decider_active:
+                        # ``--no-bonsai`` A/B escape hatch: the decider is
+                        # wired but ``bonsai_decider_enabled`` is False. Skip
+                        # adjudication (record-only), mirroring identity_drift.
+                        continue
+                    if anom.get("score", 0.0) < \
+                            self.cfg.contradiction_resolve_threshold:
+                        continue  # low-confidence -> record-only
+                    entity = anom["node"]
+                    ctx = self._gather_entity_context(entity)
+                    try:
+                        decision = self.decider.decide_contradiction(
+                            anom, ctx)
+                    except Exception:  # noqa: BLE001 -- record-only on fail
+                        log.warning(
+                            "Bonsai decide_contradiction failed for %s",
+                            entity)
+                        decision = None
+                    if decision is None:
+                        vals = list(ctx.get("state_values", []))
+                        vals.sort(key=lambda v: (v.get("asserted_at") or "",
+                                                 v.get("value") or ""))
+                        report["contradictions_resolved"].append({
+                            "entity": entity,
+                            "old_value": vals[0].get("value")
+                                         if vals else None,
+                            "new_value": vals[1].get("value")
+                                         if len(vals) > 1 else None,
+                            "decision": None, "action": "",
+                            "reasoning": "decider returned no decision",
+                            "applied": False,
+                        })
+                        continue
+                    action = (decision.get("action") or "").lower()
+                    verdict = decision.get("decision")
+                    applied = False
+                    old_value = None
+                    new_value = None
+                    new_unit = None
+                    when = _dream_now()
+                    vals = list(ctx.get("state_values", []))
+                    # Deterministic old/new: order the conflicting values by
+                    # ``asserted_at`` (earliest = old = the fact to tombstone,
+                    # latest = new = the current truth). Phase 4 assertion
+                    # edges always carry ``asserted_at``; fall back to the
+                    # value string so the sort is total (stable, deterministic)
+                    # even if a sidecar is missing.
+                    vals.sort(key=lambda v: (v.get("asserted_at") or "",
+                                             v.get("value") or ""))
+                    old_rec = vals[0] if vals else {}
+                    new_rec = vals[1] if len(vals) > 1 else {}
+                    old_value = old_rec.get("value")
+                    new_value = new_rec.get("value")
+                    new_unit = new_rec.get("asserted_by") or new_rec.get("unit")
+                    if verdict == "fix" and "supersede_assertion" in action and \
+                            _master_config.forgetting_enabled and \
+                            old_value is not None and new_value is not None and \
+                            old_value != new_value:
+                        # The one known-safe fix: tombstone the old fact at the
+                        # fact level (D2). ``new_unit`` is the asserting unit
+                        # (episode/section/doc id); ``when`` is now.
+                        self.store.supersede_assertion(
+                            entity, old_value, new_unit or "", when)
+                        applied = True
+                    if not applied and verdict == "fix":
+                        # Conservative: a fix we can't safely auto-apply ->
+                        # ask_user (record-only, no mutation).
+                        verdict = "ask_user"
+                    report["contradictions_resolved"].append({
+                        "entity": entity,
+                        "old_value": old_value,
+                        "new_value": new_value,
+                        "asserted_by_old": old_rec.get("asserted_by"),
+                        "asserted_at_old": old_rec.get("asserted_at"),
+                        "asserted_by_new": new_rec.get("asserted_by"),
+                        "asserted_at_new": new_rec.get("asserted_at"),
+                        "decision": verdict,
+                        "action": decision.get("action", ""),
+                        "reasoning": decision.get("reasoning", ""),
+                        "applied": applied,
+                    })
 
     def _find_predicate(self, subject: str, object_: str) -> Optional[str]:
         """Recover the predicate of a stored ``(subject, ?, object)`` triple."""
@@ -1043,17 +1164,33 @@ class Consolidator:
         non-entity id so the decider can still return ``dismiss`` safely.
         """
         ctx: dict = {
-            "entity": entity_id, "states": [], "episodes": [],
-            "topics": [], "instance_of": [],
+            "entity": entity_id, "states": [], "state_values": [],
+            "episodes": [], "topics": [], "instance_of": [],
         }
         if not entity_id.startswith("E:"):
             return ctx
         graph = self.store.graph
-        # distinct live state values on the entity.
+        # distinct live state values on the entity. Phase 4 (D3): also gather
+        # each value's edge-sidecar provenance (``asserted_by``/``asserted_at``)
+        # so the Bonsai contradiction adjudicator sees the asserting units, and
+        # skip superseded (tombstoned) edges so a resolved contradiction does
+        # not re-fire (D2). ``is_edge_current`` is True for no-sidecar edges
+        # (episode-level + injector-planted), so the 3b path is unchanged.
         r = graph.query().vertex(entity_id).out("state").execute_sync()
         try:
             for v in r.vertices:
+                if not self.store.is_edge_current(entity_id, "state", v):
+                    continue  # tombstoned fact -- already resolved (D2)
+                if v in ctx["states"]:
+                    continue
                 ctx["states"].append(v)
+                meta = self.store.get_edge_meta(entity_id, "state", v)
+                ctx["state_values"].append({
+                    "value": v,
+                    "asserted_by": meta.get("asserted_by"),
+                    "asserted_at": meta.get("asserted_at"),
+                    "unit": meta.get("asserted_by"),
+                })
         finally:
             r.close()
         # source episodes that mention the entity (has_entity reverse).
@@ -1147,18 +1284,51 @@ class Consolidator:
         if not entity_id.startswith("E:"):
             return None
         graph = self.store.graph
-        # 1. distinct live state values on the entity.
-        state_values: set[str] = set()
+        # 1. distinct live state values on the entity, WITH edge-sidecar
+        # provenance (D4). Skip superseded (tombstoned) edges so a resolved
+        # contradiction does not re-fire (D2); ``is_edge_current`` is True for
+        # no-sidecar edges, so injector-planted edges still surface (3b).
+        values: list[dict] = []  # [{value, asserted_by, asserted_at}]
+        seen: set[str] = set()
         r = graph.query().vertex(entity_id).out("state").execute_sync()
         try:
             for v in r.vertices:
-                # state objects are literals (not node ids); dedup them.
-                state_values.add(v)
+                if not self.store.is_edge_current(entity_id, "state", v):
+                    continue  # tombstoned fact -- already resolved (D2)
+                if v in seen:
+                    continue
+                seen.add(v)
+                meta = self.store.get_edge_meta(entity_id, "state", v)
+                values.append({
+                    "value": v,
+                    "asserted_by": meta.get("asserted_by"),
+                    "asserted_at": meta.get("asserted_at"),
+                })
         finally:
             r.close()
-        if len(state_values) < 2:
+        if len(values) < 2:
             return None  # head over-fired; no real contradiction
-        # 2. source episodes that mention the entity.
+        # 2. Phase 4 (D4): prefer real provenance. When two values carry an
+        # ``asserted_by`` that is an EPISODE id (``ep_...``), order them by
+        # ``asserted_at`` and return that pair directly -- no timestamp
+        # heuristic, the asserting episodes ARE the provenance. This is the
+        # path the Phase 4 assertion writer takes (``asserted_by=episode_id``).
+        ep_provenance = [
+            v for v in values
+            if isinstance(v.get("asserted_by"), str)
+            and v["asserted_by"].startswith("ep_")
+            and v.get("asserted_at")
+        ]
+        if len(ep_provenance) >= 2:
+            ep_provenance.sort(key=lambda v: v["asserted_at"])
+            old_ep = ep_provenance[0]["asserted_by"]
+            new_ep = ep_provenance[-1]["asserted_by"]
+            if old_ep != new_ep:
+                return (old_ep, new_ep)
+        # 3. Fallback (D4): sidecar provenance absent or non-episode
+        # (injector-planted edges have no sidecar; doc/section provenance is
+        # not an episode id). Re-derive from the entity's source episodes by
+        # timestamp -- the original 3b heuristic, unchanged.
         ep_ids: list[str] = []
         r = graph.query().vertex(entity_id).in_("has_entity").execute_sync()
         try:
@@ -1167,7 +1337,7 @@ class Consolidator:
             r.close()
         if len(ep_ids) < 2:
             return None  # can't attribute the contradiction to >=2 assertions
-        # 3. order by timestamp; latest = new, earliest = old.
+        # 4. order by timestamp; latest = new, earliest = old.
         stamped: list[tuple[str, str]] = []
         for eid in ep_ids:
             ep = self.store.get_episode(eid)

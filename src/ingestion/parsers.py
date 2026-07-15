@@ -75,9 +75,11 @@ _TYPE_BY_EXT = {
     ".docx": "docx",
     ".html": "web", ".htm": "web",
     # Email -- one .eml is one message; ingest a DIRECTORY of .eml as a thread
-    # (the EmailParser reconstructs the reply tree). ``.mbox`` single-file
-    # parsing is deferred (not registered until wired).
+    # (the EmailParser reconstructs the reply tree). A single ``.mbox`` file
+    # holds many messages (``mailbox.mbox``); EmailParser.parse feeds them
+    # through the same thread-reconstruction core (Phase 4 D9).
     ".eml": "email",
+    ".mbox": "email",
     # Source code -- one row per supported extension (CodeParser infers the
     # language from the extension).
     ".py": "code", ".js": "code", ".mjs": "code", ".ts": "code",

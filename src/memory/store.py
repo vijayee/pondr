@@ -50,6 +50,20 @@ def _b2s(v) -> str:
     return str(v)
 
 
+def _norm_title(s: "Optional[str]") -> str:
+    """Normalize a document title for citation matching (Phase 4, D5).
+
+    Lowercase, collapse whitespace, strip wrapping punctuation. "Policy A:
+    Remote Work" -> "policy a remote work". Used by
+    ``find_document_by_title_or_url`` so a citation literal "Policy A" matches
+    a doc titled "Policy A: Remote Work" (substring containment).
+    """
+    if not s:
+        return ""
+    import re as _re
+    return _re.sub(r"\s+", " ", s.strip().strip(" .,:;!?\"'()[]").lower()).strip()
+
+
 # Phase 3b step 10: entity-salience recency half-life (days). A mention at the
 # half-life is worth half a same-instant mention; 4x half-life -> 1/16. The
 # mention factor (Phase 1c) and structural factor (Phase 3a head) are both
@@ -227,6 +241,48 @@ class HippocampalStore:
             ops += self.graph.expand_triple(eid, "has_decision", f"D:{decision}")
         for rel in episode.relations:
             ops += self.graph.expand_triple(rel["subject"], rel["predicate"], rel["object"])
+
+        # ── Phase 4: entity-state assertion edges (D1) ──
+        # The production writer of ``(E:entity, state, value)`` edges -- the A2
+        # anomaly-resolver input. Each assertion carries provenance
+        # (``asserted_by=eid``, ``asserted_at=timestamp``) on the edge sidecar
+        # via ``_assertion_edge_ops`` (RMW-merged, idempotent, never revives a
+        # tombstone). Gated on ``assertion_extraction_enabled``; an empty
+        # ``state_assertions`` list (no explicit state claims in the turn) is
+        # a no-op, so a plain conversation is byte-identical to pre-Phase-4.
+        if episode.state_assertions:
+            from ..config import config as _master_config
+            if _master_config.assertion_extraction_enabled:
+                for a in episode.state_assertions:
+                    ent = a.get("entity")
+                    val = a.get("value")
+                    if not ent or val is None:
+                        continue
+                    ops += self._assertion_edge_ops(
+                        ent, val, eid, episode.timestamp
+                    )
+
+        # ── Phase 4: best-effort cited_from provenance (D5) ──
+        # When the episode text references a known document's title or
+        # source_path, link ``(eid, cited_from, doc_id)`` -- the graph-
+        # visible complement to the assertion sidecar's ``asserted_by``
+        # (which IS the primary supported_by link). Gated on
+        # ``citation_resolution_enabled``; no edge when no match. O(N_docs)
+        # reads + a ``default_document_ids`` scan per encode -- best-effort
+        # for the first slice; a future title-index can replace the scan
+        # (matters only for corpora with many docs AND many episodes).
+        from ..config import config as _master_config
+        if _master_config.citation_resolution_enabled:
+            text_lower = episode.full_text.lower()
+            for _doc_id in self.default_document_ids():
+                _title = _b2s(self.db.get_sync(f"content/doc/{_doc_id}/title"))
+                if len(_title) >= 4 and _title.lower() in text_lower:
+                    ops += self.graph.expand_triple(eid, "cited_from", _doc_id)
+                    continue
+                _sp = _b2s(self.db.get_sync(f"content/doc/{_doc_id}/source_path"))
+                if len(_sp) >= 4 and _sp in episode.full_text:
+                    ops += self.graph.expand_triple(eid, "cited_from", _doc_id)
+
         if episode.follows:
             ops += self.graph.expand_triple(eid, "follows", episode.follows)
 
@@ -901,6 +957,110 @@ class HippocampalStore:
         from .edge_meta import is_edge_current as _cur
         return _cur(self, subject, predicate, object)
 
+    # ---- Phase 4: entity-state assertions + citation + tombstone ----
+
+    def _assertion_edge_ops(
+        self, entity: str, value, asserted_by: str, asserted_at: str
+    ) -> list[dict]:
+        """Build the atomic ops for one assertion edge + its provenance sidecar.
+
+        ``(E:entity, state, value)`` graph triple (idempotent via
+        ``expand_triple``) + an edge-sidecar put recording ``asserted_by`` /
+        ``asserted_at`` (the episode/document/section id that asserted the
+        value + when). The sidecar is RMW-merged over the existing sidecar
+        (``get_edge_meta`` returns ``default_meta`` for a fresh edge, or the
+        live sidecar for a re-asserted value), so re-asserting the SAME value
+        preserves forgetting state (utility/decay/access_count) and NEVER
+        revives a tombstoned value (a ``state="superseded"`` edge stays
+        superseded -- the adjudicator owns tombstones). The provenance is
+        updated to the latest asserting unit (latest-asserting wins, the A2
+        resolver's signal).
+
+        Returns ops ready to splice into a caller's ``batch_sync`` (the
+        graph ops + one sidecar put). The RMW read happens before the batch
+        is submitted (single-threaded -> consistent).
+        """
+        from .edge_meta import edge_meta_put_op, get_edge_meta
+        subj = f"E:{entity}"
+        obj = str(value)
+        ops = self.graph.expand_triple(subj, "state", obj)
+        meta = get_edge_meta(self, subj, "state", obj)
+        meta["asserted_by"] = asserted_by
+        meta["asserted_at"] = asserted_at
+        ops.append(edge_meta_put_op(subj, "state", obj, meta))
+        return ops
+
+    def find_document_by_title_or_url(self, literal: "Optional[str]") -> "Optional[str]":
+        """Resolve a citation literal to a Document node id, best-effort.
+
+        Scans every document's ``title`` + ``source_path`` (via
+        ``default_document_ids``). A non-URL literal matches on normalized
+        title equality, then title substring containment either way (so
+        "Policy A" resolves a doc titled "Policy A: Remote Work"). A URL
+        literal (``http(s)://``) matches when it is a substring of a doc's
+        ``source_path`` or ``title``. Returns the first matching doc id, or
+        ``None``. O(N_docs) point reads -- cheap for a small corpus, best-
+        effort for large (the citation path is not hot). Used by
+        ``encode_document`` to resolve ``Document.citations`` (D5).
+        """
+        if not literal:
+            return None
+        lit = literal.strip()
+        if not lit:
+            return None
+        lit_lower = lit.lower()
+        is_url = lit_lower.startswith(("http://", "https://"))
+        lit_norm = _norm_title(lit)
+        for doc_id in self.default_document_ids():
+            title = _b2s(self.db.get_sync(f"content/doc/{doc_id}/title"))
+            source_path = _b2s(self.db.get_sync(f"content/doc/{doc_id}/source_path"))
+            if is_url:
+                if source_path and lit in source_path:
+                    return doc_id
+                if title and lit in title:
+                    return doc_id
+            else:
+                tnorm = _norm_title(title)
+                if tnorm and lit_norm:
+                    if tnorm == lit_norm:
+                        return doc_id
+                    if lit_norm in tnorm or tnorm in lit_norm:
+                        return doc_id
+                if source_path and lit and lit in source_path:
+                    return doc_id
+        return None
+
+    def supersede_assertion(
+        self, entity: str, old_value, new_unit: str, when: str
+    ) -> None:
+        """Fact-level tombstone (D2): mark ``(E:entity, state, old_value)`` superseded.
+
+        The chat's fact-level MVCC: the OLD assertion edge's sidecar gets
+        ``state="superseded"`` + ``superseded_by=new_unit`` (the asserting
+        unit that contradicted it) + ``superseded_at=when`` + ``validity_end=
+        when``. The edge itself is NOT deleted (MVCC -- it stays retrievable
+        via include_inactive); ``is_edge_current`` then returns False for it,
+        so once the anomaly subgraph load threads edge-currentness (D2),
+        the tombstoned old value drops out of the live-values set and the
+        ``_detect_contradictory_state`` detector goes quiet -- the
+        contradiction is *resolved*, not just recorded. RMW-merged over the
+        existing sidecar (preserves utility/decay/access_count + the
+        original ``asserted_by``/``asserted_at`` provenance).
+        """
+        from .edge_meta import get_edge_meta, update_edge_meta
+        # Accept either a raw entity name (``team``) or a pre-prefixed id
+        # (``E:team`` -- what ``anom["node"]`` carries from the detector);
+        # the assertion edges are stored under ``E:{name}``.
+        name = entity[2:] if entity.startswith("E:") else entity
+        subj = f"E:{name}"
+        obj = str(old_value)
+        meta = get_edge_meta(self, subj, "state", obj)
+        meta["state"] = "superseded"
+        meta["superseded_by"] = new_unit
+        meta["superseded_at"] = when
+        meta["validity_end"] = when
+        update_edge_meta(self, subj, "state", obj, meta)
+
     # ---- ontology-class decay (Phase 3b step 9) ----
     # Per-class metadata lives under ``content/class/{safe(class)}/...``. The
     # seed ontology writes ONLY ``subClassOf`` graph triples (no content/class
@@ -1120,6 +1280,8 @@ class HippocampalStore:
         "title", "source_type", "source_path", "authors", "ingested_at",
         "created_at", "language", "metadata", "entities", "topics",
         "citations", "relations", "section_ids",
+        # Phase 4 (D1/D5): persisted so update/delete are symmetric.
+        "resolved_citations", "state_assertions",
     )
     _SEC_FIELDS = (
         "heading", "level", "parent", "blob_hash", "entities", "topics",
@@ -1199,10 +1361,75 @@ class HippocampalStore:
                 emit(f"E:{e}", "appears_in_section", sec.id)  # entity->section reverse
             for t in sec.topics:
                 emit(sec.id, "has_topic", f"T:{t}")           # per-section topic axis
-        for target in doc.citations:
+        # Phase 4 (D5): cite targets are the STORE-resolved set -- a doc_id
+        # when ``find_document_by_title_or_url`` matched the literal, else the
+        # literal itself. ``resolved_citations`` is PERSISTED so the delete
+        # path emits symmetric deletes for exactly the edges that were written
+        # (resolution is store-state-dependent + not reproducible at delete
+        # time); fall back to the literal ``citations`` for docs encoded before
+        # this field / when citation resolution is disabled (byte-identical).
+        cite_targets = doc.resolved_citations or doc.citations
+        for target in cite_targets:
             emit(doc.id, "cites", target)
         for rel in doc.relations:
             emit(rel["subject"], rel["predicate"], rel["object"])
+
+        # Phase 4 (D1): entity-state assertion edges. These are ENTITY-owned
+        # (subject = E:entity, NOT doc-owned), so they are PUT-ONLY -- a doc
+        # update/delete does NOT retract a fact the doc asserted (it may be
+        # asserted elsewhere, and a doc updating X->Y is exactly the
+        # contradiction the resolver should catch, not silently delete). The
+        # sidecar is RMW-merged (``_assertion_edge_ops``) so re-assertion
+        # preserves forgetting state and never revives a tombstoned value.
+        if not delete:
+            from ..config import config as _master_config
+            if _master_config.assertion_extraction_enabled and doc.state_assertions:
+                for a in doc.state_assertions:
+                    ent = a.get("entity")
+                    val = a.get("value")
+                    if not ent or val is None:
+                        continue
+                    asserted_by = a.get("section") or doc.id
+                    ops += self._assertion_edge_ops(
+                        ent, val, asserted_by, doc.ingested_at
+                    )
+
+        # Phase 4 (D5): email thread provenance edges. The email parser
+        # collects per-message Message-IDs + in_reply_to/references maps in
+        # ``doc.metadata``; map each Message-ID to its section id (one section
+        # per message, in emission order) and emit (section, in_reply_to,
+        # parent_section) + (section, references, ref_section) for in-set refs.
+        # PUT is gated on ``citation_resolution_enabled`` (the de-wonk cold-
+        # start: citation off -> zero in_reply_to edges); DELETE always emits
+        # so a flag flip after encoding still cleans up (delete_sync no-ops
+        # an absent edge). Section ids are doc-specific -> safe to delete
+        # symmetrically (no shared-edge concern, unlike assertions).
+        meta = doc.metadata or {}
+        message_ids = meta.get("message_ids") or []
+        if message_ids:
+            from ..config import config as _master_config
+            cit_on = _master_config.citation_resolution_enabled
+            if delete or cit_on:
+                mid_to_sid = {
+                    mid: f"{doc.id}_sec_{i:03d}"
+                    for i, mid in enumerate(message_ids)
+                }
+                in_reply_to = meta.get("in_reply_to") or {}
+                for mid, parent in in_reply_to.items():
+                    sid = mid_to_sid.get(mid)
+                    psid = mid_to_sid.get(parent)
+                    if sid and psid and sid != psid:
+                        emit(sid, "in_reply_to", psid)
+                references = meta.get("references") or {}
+                for mid, refs_raw in references.items():
+                    sid = mid_to_sid.get(mid)
+                    if not sid:
+                        continue
+                    for tok in str(refs_raw).split():
+                        ref_mid = tok.strip().strip("<>")
+                        rsid = mid_to_sid.get(ref_mid)
+                        if rsid and rsid != sid:
+                            emit(sid, "references", rsid)
         return ops
 
     def _document_metadata_ops(self, doc: Document) -> list[dict]:
@@ -1228,6 +1455,14 @@ class HippocampalStore:
         put(f"{d}/citations", json.dumps(doc.citations))
         put(f"{d}/relations", json.dumps(doc.relations))
         put(f"{d}/section_ids", json.dumps([s.id for s in doc.sections]))
+        # Phase 4 (D1/D5): the resolved cite targets + state assertions
+        # actually written to the graph, persisted so update/delete emit
+        # symmetric ops (resolution is store-state-dependent, not reproducible
+        # at delete time). Empty when citation resolution / assertion
+        # extraction is disabled -> the graph-ops builder falls back to the
+        # literal ``citations`` (byte-identical to pre-Phase-4).
+        put(f"{d}/resolved_citations", json.dumps(doc.resolved_citations))
+        put(f"{d}/state_assertions", json.dumps(doc.state_assertions))
         for sec in doc.sections:
             s = f"{d}/sec/{sec.id}"
             put(f"{s}/heading", sec.heading)
@@ -1316,6 +1551,21 @@ class HippocampalStore:
                     bs.decr_ref(h)
         # 3. ONE atomic memory batch: delete old content + graph edges, write
         #    new content + graph edges + the upsert index.
+        # Phase 4 (D5): resolve citation literals to Document nodes ONCE here
+        # so the put + the persisted ``resolved_citations`` (read back on
+        # update/delete for symmetric deletes) agree. When citation
+        # resolution is disabled, ``resolved_citations`` = the literals ->
+        # byte-identical to pre-Phase-4. ``doc.state_assertions`` is populated
+        # by the ingestion pipeline (deterministic normalizer + Bonsai
+        # has_state); the graph-ops builder writes the assertion edges.
+        from ..config import config as _master_config
+        if _master_config.citation_resolution_enabled and doc.citations:
+            doc.resolved_citations = [
+                self.find_document_by_title_or_url(c) or c
+                for c in doc.citations
+            ]
+        else:
+            doc.resolved_citations = list(doc.citations)
         ops: list[dict] = []
         if old_doc is not None:
             ops += self._document_delete_content_ops(
@@ -1381,6 +1631,10 @@ class HippocampalStore:
         citations_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/citations"))
         relations_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/relations"))
         section_ids_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/section_ids"))
+        resolved_citations_raw = _b2s(self.db.get_sync(
+            f"content/doc/{doc_id}/resolved_citations"))
+        state_assertions_raw = _b2s(self.db.get_sync(
+            f"content/doc/{doc_id}/state_assertions"))
 
         def _loads(raw, default):
             try:
@@ -1428,6 +1682,8 @@ class HippocampalStore:
             topics=_loads(topics_raw, []),
             relations=_loads(relations_raw, []),
             citations=_loads(citations_raw, []),
+            resolved_citations=_loads(resolved_citations_raw, []),
+            state_assertions=_loads(state_assertions_raw, []),
         )
 
     def get_section_body(self, doc_id: str, section_id: str) -> Optional[str]:

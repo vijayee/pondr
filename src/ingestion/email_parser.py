@@ -32,6 +32,7 @@ import email
 import email.header
 import email.utils
 import html as _html
+import mailbox
 import os
 import re
 from email.message import Message
@@ -131,12 +132,15 @@ class EmailParser:
     source_type: str = "email"
 
     def parse(self, source_path: str) -> ParsedDocument:
-        """Parse a directory of ``.eml`` files (a thread) or a single ``.eml``.
+        """Parse a directory of ``.eml`` files (a thread), a single ``.eml``, or a ``.mbox``.
 
         A directory -> every ``*.eml`` in it is one message in the thread; a
-        single ``.eml`` file -> a one-message thread. Non-``.eml`` files in a
-        directory are skipped (honest: only ``.eml`` is wired; ``.mbox`` is
-        deferred).
+        single ``.eml`` file -> a one-message thread; a single ``.mbox`` file
+        -> ``mailbox.mbox`` yields one ``Message`` per record, fed through the
+        same thread-reconstruction core (Phase 4 D9 -- ``mailbox.mboxMessage``
+        is a stdlib ``email.message.Message`` subclass, so ``parse_messages``
+        and the reply-tree builder need NO changes). Non-``.eml`` files in a
+        directory are skipped (honest: only ``.eml`` is wired there).
         """
         messages: list[Message] = []
         if os.path.isdir(source_path):
@@ -146,6 +150,11 @@ class EmailParser:
                 path = os.path.join(source_path, name)
                 with open(path, "rb") as fh:
                     messages.append(email.message_from_binary_file(fh))
+        elif source_path.lower().endswith(".mbox"):
+            # ``mailbox.mbox(path)`` is a lazy iterable of ``mboxMessage``
+            # (a ``Message`` subclass); materialize it so the file handle can
+            # close before the thread core runs (the core does no IO).
+            messages = list(mailbox.mbox(source_path))
         else:
             with open(source_path, "rb") as fh:
                 messages.append(email.message_from_binary_file(fh))

@@ -1,0 +1,101 @@
+{
+  "source": "onyx-dot-app/EnterpriseRAG-Bench -- 'Conflicting Info' category",
+  "source_url": "https://github.com/onyx-dot-app/EnterpriseRAG-Bench",
+  "license": "MIT (the upstream bench is MIT-licensed)",
+  "subset_size": 5,
+  "deterministic_only": true,
+  "caveat": "This is a DETERMINISTIC-PATH-ONLY slice (Phase 4 D8). The fixtures distill the bench's near-duplicate 'newer-supersedes-older' STRUCTURE and its expected_doc_ids citation ground truth into the fields the deterministic normalizer consumes (titles, bodies, the conflicting entity/state). We do NOT run the bench's full LLM-judge harness (correctness x completeness, three-judge consensus) -- we take its labels, not its scorer. A paraphrased-only conflict the deterministic normalizer cannot see (pair 5, catchable=false) is honestly counted as a miss; the recall threshold in the test is set to the deterministic-normalizer ceiling and documented. The Bonsai semantic adjudicator is exercised separately in tests/test_contradiction.py via FakeDecider + the live dogfood step.",
+  "pairs": [
+    {
+      "id": "pair1_deployment_target",
+      "catchable": true,
+      "old_doc": {
+        "title": "Deployment Plan v1",
+        "source_path": "docs/deployment-plan-v1.md",
+        "body": "# Deployment Plan v1\n\nThe deployment target is staging.\n"
+      },
+      "new_doc": {
+        "title": "Deployment Plan v2",
+        "source_path": "docs/deployment-plan-v2.md",
+        "body": "# Deployment Plan v2\n\nThe deployment target is now production.\n"
+      },
+      "expected_doc_id": "doc_000002",
+      "conflicting_entity": "deployment target",
+      "old_value": "staging",
+      "new_value": "production"
+    },
+    {
+      "id": "pair2_database",
+      "catchable": true,
+      "old_doc": {
+        "title": "Database Decision - Initial",
+        "source_path": "docs/db-decision-v1.md",
+        "body": "# Database Decision - Initial\n\nDatabase: MySQL\n"
+      },
+      "new_doc": {
+        "title": "Database Decision - Revised",
+        "source_path": "docs/db-decision-v2.md",
+        "body": "# Database Decision - Revised\n\nDatabase: Postgres\n"
+      },
+      "expected_doc_id": "doc_000002",
+      "conflicting_entity": "database",
+      "old_value": "MySQL",
+      "new_value": "Postgres"
+    },
+    {
+      "id": "pair3_ticket_status",
+      "catchable": true,
+      "old_doc": {
+        "title": "Ticket PROJ-123 v1",
+        "source_path": "tickets/PROJ-123-v1.md",
+        "body": "# Ticket PROJ-123 v1\n\nStatus: open\n"
+      },
+      "new_doc": {
+        "title": "Ticket PROJ-123 v2",
+        "source_path": "tickets/PROJ-123-v2.md",
+        "body": "# Ticket PROJ-123 v2\n\nStatus: closed\n"
+      },
+      "expected_doc_id": "doc_000002",
+      "conflicting_entity": "status",
+      "old_value": "open",
+      "new_value": "closed"
+    },
+    {
+      "id": "pair4_priority",
+      "catchable": true,
+      "old_doc": {
+        "title": "Sprint Priorities v1",
+        "source_path": "docs/sprint-priorities-v1.md",
+        "body": "# Sprint Priorities v1\n\nPriority is high\n"
+      },
+      "new_doc": {
+        "title": "Sprint Priorities v2",
+        "source_path": "docs/sprint-priorities-v2.md",
+        "body": "# Sprint Priorities v2\n\nPriority is low\n"
+      },
+      "expected_doc_id": "doc_000002",
+      "conflicting_entity": "priority",
+      "old_value": "high",
+      "new_value": "low"
+    },
+    {
+      "id": "pair5_paraphrased_miss",
+      "catchable": false,
+      "old_doc": {
+        "title": "Team Standardization Notes",
+        "source_path": "docs/team-standardization.md",
+        "body": "# Team Standardization Notes\n\nWe discussed the data layer and settled on MySQL going forward.\n"
+      },
+      "new_doc": {
+        "title": "Data Layer Update",
+        "source_path": "docs/data-layer-update.md",
+        "body": "# Data Layer Update\n\nGoing forward the team's data layer is Postgres.\n"
+      },
+      "expected_doc_id": "doc_000002",
+      "conflicting_entity": "data layer",
+      "old_value": "MySQL",
+      "new_value": "Postgres",
+      "miss_reason": "Paraphrased-only conflict with no field-style 'key: value' / 'key is value' shape the deterministic normalizer recognizes; Bonsai's has_state relation (out of scope for the deterministic-only slice) would catch it. Honestly counted as a deterministic miss."
+    }
+  ]
+}

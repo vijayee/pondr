@@ -102,6 +102,14 @@ def _build_decider() -> "object | None":
 
 
 def main() -> int:
+    # The report now carries Bonsai decider reasoning (identity_drift + Phase 4
+    # contradictions_resolved) which may be non-ASCII; reconfigure stdout to
+    # utf-8 so ``json.dumps(..., ensure_ascii=False)`` does not crash on a
+    # cp1252 console (Windows). Idempotent + harmless on UTF-8 platforms.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
     parser = argparse.ArgumentParser(description="Run Phase 3a dream-state consolidation")
     parser.add_argument("--db", default=config.db_path, help="WaveDB store path")
     parser.add_argument("--checkpoint", default=None,
@@ -176,6 +184,27 @@ def main() -> int:
     parser.add_argument("--anomaly-resolve-threshold", type=float, default=None,
                         help="contradictory_state score at/above which the resolver auto-"
                              "supersedes (default 0.8; below = record-only)")
+    # ── Phase 4: citation + contradiction knobs. ``--no-assertions`` and
+    # ``--no-citation-resolution`` toggle the master Config singleton flags
+    # (read by the encoder/store via ``config``), so they are overridden here
+    # process-scoped like ``--no-forget``. ``--contradiction-resolve-threshold``
+    # is a ConsolidationConfig override (the Bonsai adjudication loop's
+    # confidence gate; below = record-only, no mutation).
+    parser.add_argument("--assertions", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Toggle the Phase 4 entity-state-assertion writer (default on; "
+                             "--no-assertions makes the encoder/store skip (E:entity,state,v) "
+                             "edges -> the contradiction detector never fires -> byte-identical "
+                             "to a pre-Phase-4 run)")
+    parser.add_argument("--citation-resolution", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Toggle resolving Document.citations + email in_reply_to/references "
+                             "to graph edges (default on; --no-citation-resolution keeps literals "
+                             "as-is and writes zero citation/provenance edges -> byte-identical)")
+    parser.add_argument("--contradiction-resolve-threshold", type=float, default=None,
+                        help="contradictory_state score at/above which the Bonsai decider "
+                             "adjudicates and may tombstone a fact (default 0.8; below = "
+                             "record-only; only acts when --decide is wired)")
     # A1 deep-archive tier. Soft-archive (state='archived', in-place) always
     # ships; this is the deep tier -- physically remove edges soft-archived
     # more than this many days ago (write a recoverable archive/edge/... JSON,
@@ -238,6 +267,8 @@ def main() -> int:
         # Bonsai-in-consolidation knobs.
         "abstract_gist_max_episodes": args.abstract_gist_max_episodes,
         "ontology_bonsai_threshold": args.ontology_bonsai_threshold,
+        # Phase 4 contradiction-adjudication confidence gate.
+        "contradiction_resolve_threshold": args.contradiction_resolve_threshold,
     }
     cfg = replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
     # ``bonsai_decider_enabled`` is a bool with a real False meaning (the
@@ -251,6 +282,15 @@ def main() -> int:
     # flag is explicitly passed. Default (None) leaves the config default (True).
     if args.forget is not None:
         config.forgetting_enabled = args.forget
+    # Phase 4 master gates: the encoder/store read
+    # ``config.assertion_extraction_enabled`` and
+    # ``config.citation_resolution_enabled`` from the global singleton, so
+    # override them here (process-scoped) when the flag is explicitly passed.
+    # Default (None) leaves the config default (True) -- byte-identical.
+    if args.assertions is not None:
+        config.assertion_extraction_enabled = args.assertions
+    if args.citation_resolution is not None:
+        config.citation_resolution_enabled = args.citation_resolution
     # Anomaly fanout-cap is handled separately: 0 = uncapped (None) is a LEGITIMATE
     # override (the prior giant behavior, for comparison), so it must NOT be
     # dropped by the "is not None" filter above. Only override when the flag was

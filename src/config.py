@@ -133,6 +133,25 @@ class Config:
     # deprecated, so a fresh corpus is unaffected.
     forgetting_enabled: bool = True
 
+    # ── Phase 4: entity-state assertions + citation ──
+    # ``assertion_extraction_enabled`` gates the production writer of
+    # ``(E:entity, state, value)`` edges -- the deterministic normalizer
+    # (src/encoding/assertion_extractor.py) + Bonsai ``has_state`` relations,
+    # which unblock the dormant A2 ``contradictory_state`` anomaly resolver.
+    # Default True: the deterministic normalizer is inert on a corpus with no
+    # explicit state claims (zero ``state`` edges -> detector never fires -> no
+    # tombstones -> byte-identical to today), and the Bonsai half degrades to
+    # empty when no server is wired, so a cold start is unchanged.
+    assertion_extraction_enabled: bool = True
+    # ``citation_resolution_enabled`` gates resolving ``Document.citations``
+    # (literal strings) to Document nodes via title/URL match
+    # (``find_document_by_title_or_url``) + emitting email
+    # ``in_reply_to``/``references`` provenance edges. Default True: unresolved
+    # literals are kept as-is (byte-identical) and email provenance is only
+    # written when the parser supplied reply maps, so a corpus with no
+    # citations / no email is unchanged.
+    citation_resolution_enabled: bool = True
+
     # ── Phase 2c+: feedback-driven salience ──
     # When True, after a synthesizing turn the consumer (the external LLM, or
     # Ponder's own Bonsai self-chat) reports per-unit usefulness via the
@@ -316,6 +335,15 @@ class ConsolidationConfig:
     # no value->episode provenance, so the resolver assumes the latest-asserting
     # episode is the current truth).
     anomaly_resolve_threshold: float = 0.8
+    # ── Phase 4: contradiction adjudication ──
+    # A ``contradictory_state`` anomaly whose head score is >= this is handed to
+    # the Bonsai ``decide_contradiction`` adjudicator (when a decider is wired
+    # AND ``bonsai_decider_enabled`` AND ``forgetting_enabled``). Below this --
+    # or with no decider -- the flag is record-only (still in
+    # ``report["anomalies"]`` for observability, no mutation). Mirrors
+    # ``anomaly_resolve_threshold``; the 3b no-decider episode-supersede path
+    # stays intact (the decider loop is ADDITIVE under ``decider_active``).
+    contradiction_resolve_threshold: float = 0.8
     # Ontology decay (Phase 3b step 9). A DISCOVERED class (runtime-invented
     # label promoted via Bonsai -- a deferred path) whose ``last_seen`` is older
     # than this many days is deprecated (``content/class/{c}/state =

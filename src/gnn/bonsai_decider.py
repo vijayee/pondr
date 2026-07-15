@@ -37,6 +37,7 @@ import requests
 from ..config import config
 from ..training.prompts import (
     bonsai_anomaly_decision_prompt,
+    bonsai_contradiction_decision_prompt,
     bonsai_gist_prompt,
     bonsai_typing_prompt,
 )
@@ -165,6 +166,38 @@ class BonsaiDecider:
         anomaly_type = str(flag.get("type", "identity_drift"))
         prompt = bonsai_anomaly_decision_prompt(
             flagged_entity, retrieved_context, anomaly_type
+        )
+        data = self._post_json(prompt)
+        if not isinstance(data, dict) or "decision" not in data:
+            return None
+        decision = str(data.get("decision", "")).strip()
+        if decision not in ("fix", "ask_user", "dismiss"):
+            return None
+        return {
+            "decision": decision,
+            "action": str(data.get("action", ""))[:1000],
+            "reasoning": str(data.get("reasoning", ""))[:1000],
+        }
+
+    def decide_contradiction(self, flag: dict, retrieved_context: dict) -> Optional[dict]:
+        """Decide what to DO about a ``contradictory_state`` flag (Phase 4 D3).
+
+        Mirror of ``decide_anomaly`` for the fact-level contradiction path:
+        ``flag`` is the ``{node, type:"contradictory_state", evidence}`` record
+        from ``_detect_contradictory_state``; ``retrieved_context`` carries
+        the conflicting ``state_values`` WITH provenance (``asserted_by`` /
+        ``asserted_at``), gathered by ``_gather_entity_context``. Uses
+        ``bonsai_contradiction_decision_prompt``. Returns
+        ``{"decision": "fix"|"ask_user"|"dismiss", "action": str, "reasoning":
+        str}`` or ``None`` on failure (caller records the flag only -- honest
+        cold-start, no fabricated decision). The conservative dispatcher in
+        ``_apply`` auto-applies ONLY a ``fix`` whose ``action`` contains
+        ``supersede_assertion`` AND ``forgetting_enabled``; any other ``fix``
+        -> ``ask_user`` (record-only).
+        """
+        flagged_entity = str(flag.get("node", ""))
+        prompt = bonsai_contradiction_decision_prompt(
+            flagged_entity, retrieved_context
         )
         data = self._post_json(prompt)
         if not isinstance(data, dict) or "decision" not in data:

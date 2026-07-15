@@ -24,6 +24,7 @@ the CLI can print ``created doc_NNNNNN`` vs ``updated doc_NNNNNN``.
 
 from typing import Optional
 
+from ..encoding.assertion_extractor import extract_state_assertions
 from ..memory.document import Document
 from .chunker import HierarchicalChunker
 from .parsers import detect_type, get_parser
@@ -121,6 +122,29 @@ class UnifiedIngestionPipeline:
             created = False
 
         doc = Document.from_parse(doc_id, parsed, extracted, relations)
+
+        # Phase 4 (D1): per-section state assertions -- the deterministic
+        # normalizer over each section's content (catches explicit ``key:
+        # value`` / ``key is value`` / change-verb patterns -- Jira/Linear/
+        # Confluence status fields, config snippets, spec tables), plus a
+        # doc-level pass that also lifts Bonsai ``has_state`` relations. Each
+        # assertion is tagged with its asserting section id (``asserted_by``);
+        # the store writes ``(E:entity, state, value)`` edges with that
+        # provenance. Empty for structure-only ingests (no extractor) and
+        # docs with no explicit state claims -- the cold-start no-op (D6).
+        # Section ids mirror ``Document.from_parse``'s ``{doc_id}_sec_{i:03d}``.
+        state_assertions: list[dict] = []
+        for i, sec in enumerate(parsed.sections):
+            sid = f"{doc_id}_sec_{i:03d}"
+            for a in extract_state_assertions(sec.content, None, None):
+                state_assertions.append({"entity": a["entity"],
+                                         "value": a["value"], "section": sid})
+        for a in extract_state_assertions(self._doc_text(parsed), None, relations):
+            # Doc-level assertions default ``asserted_by`` to the doc id
+            # (set by the store when ``section`` is absent).
+            state_assertions.append({"entity": a["entity"], "value": a["value"]})
+        doc.state_assertions = state_assertions
+
         self.store.encode_document(doc, update=not created)
         return doc_id, created
 

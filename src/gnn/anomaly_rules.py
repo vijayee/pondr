@@ -214,9 +214,25 @@ def enrich_subgraph(store: "HippocampalStore", subgraph: dict) -> dict:
                     result.close()
                 for nb in neighbors:
                     if direction == "out":
-                        extra_edges[(nid, pred, nb)] = None
+                        edge = (nid, pred, nb)
                     else:
-                        extra_edges[(nb, pred, nid)] = None
+                        edge = (nb, pred, nid)
+                    # Phase 4 (D2): edge-currentness on the ``state`` branch.
+                    # A fact-level tombstone marks an assertion edge's sidecar
+                    # ``state="superseded"`` (``supersede_assertion``); the graph
+                    # edge itself is NOT deleted (MVCC). Without this filter the
+                    # tombstoned OLD value would still be surfaced here and
+                    # ``_detect_contradictory_state`` would keep flagging a
+                    # contradiction that was already adjudicated -- the
+                    # tombstone would not *resolve* it. ``is_edge_current``
+                    # returns True for an edge with no sidecar (episode-level
+                    # ``(eid, state, "current")`` + injector-planted edges),
+                    # so the 3b no-sidecar path is unchanged. Only the
+                    # ``state`` predicate carries assertion tombstones; the
+                    # other three predicates have no per-edge sidecar.
+                    if pred == "state" and not store.is_edge_current(*edge):
+                        continue
+                    extra_edges[edge] = None
 
     subgraph["edges"] = [
         {"subject": s, "predicate": p, "object": o}

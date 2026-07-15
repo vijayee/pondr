@@ -32,6 +32,16 @@ class Episode:
     tones: list[str] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
     relations: list[dict] = field(default_factory=list)
+    # ── Phase 4: entity-state assertions ──
+    # Explicit ``entity -> value`` claims (``{"entity", "value"}``) lifted from
+    # the deterministic normalizer (src/encoding/assertion_extractor.py) UNION
+    # Bonsai ``has_state`` relations. These are the production writer of
+    # ``(E:entity, state, literal)`` edges (the A2 anomaly-resolver input);
+    # provenance defaults to the carrying episode (the store writes
+    # ``asserted_by=episode_id`` / ``asserted_at=timestamp`` on each edge's
+    # sidecar). Empty on pre-Phase-4 episodes + text with no explicit state
+    # claims -- the cold-start no-op (D6).
+    state_assertions: list[dict] = field(default_factory=list)
     follows: Optional[str] = None
     # User/session scope for global chat history. None = unscoped (backward-
     # compatible with the single-session Phase 1a model). When set, the store

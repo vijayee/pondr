@@ -200,6 +200,69 @@ Return ONLY valid JSON:
 {{"decision": "fix|ask_user|dismiss", "action": "...", "reasoning": "..."}}"""
 
 
+def bonsai_contradiction_decision_prompt(
+    flagged_entity: str, retrieved_context: dict
+) -> str:
+    """Prompt for the deploy-time Bonsai contradiction adjudicator (Phase 4 D3).
+
+    Mirror of ``bonsai_anomaly_decision_prompt`` specialized for the
+    fact-level contradiction: one entity carries two (or more) distinct live
+    ``state`` values, each asserted by a different source (episode/document/
+    section) at a different time. The disturbance record -- the conflicting
+    values WITH their provenance (``asserted_by`` / ``asserted_at``) -- is
+    carried in ``retrieved_context["state_values"]`` (gathered by
+    ``_gather_entity_context``), so Bonsai adjudicates from the same evidence
+    the chat's disturbance record specifies, not just the generic graph
+    neighborhood.
+
+    The conservative dispatcher (consolidate ``_apply``) auto-applies ONLY a
+    ``fix`` whose ``action`` contains ``supersede_assertion`` (the fact-level
+    tombstone); any other ``fix`` routes to ``ask_user`` (record-only). So the
+    prompt steers a safe fix toward the literal action ``supersede_assertion``.
+    Returns ONLY the three fields Bonsai must predict.
+    """
+    values = retrieved_context.get("state_values") if isinstance(
+        retrieved_context, dict) else None
+    values_json = json.dumps(values, ensure_ascii=False) if values else "[]"
+    # The rest of the context (states, episodes, topics, instance_of) -- the
+    # same neighborhood shape the anomaly prompt receives.
+    ctx = {k: v for k, v in (retrieved_context or {}).items()
+           if k != "state_values"} if isinstance(retrieved_context, dict) else {}
+    ctx_json = json.dumps(ctx, ensure_ascii=False)
+    return f"""You are the deploy-time decider for a small local model (Bonsai) that decides
+what a memory system should DO about a CONTRADICTION: one entity carries two
+(or more) distinct live state values, each asserted by a different source
+(episode / document / section) at a different time. This is the conflict-aware
+cognitive mode -- detect, adjudicate, tombstone the superseded fact at the FACT
+level (not the whole episode), and keep it retrievable.
+
+The newest-asserting value is usually the current truth (a policy was updated,
+a ticket's status changed, a team switched tools) -- supersede the older value
+(tombstone it, keep it retrievable) unless the two values are genuinely
+complementary (e.g. status at different dates) or the provenance is too weak.
+
+Decisions (pick exactly one):
+- fix: safely resolve without the user -> action "supersede_assertion"
+  (tombstone the older value, keep the newer)
+- ask_user: a human must clarify (both values may be valid, or the provenance
+  is ambiguous)
+- dismiss: not a real contradiction (complementary states / stale noise)
+
+FLAGGED ENTITY: {flagged_entity}
+
+CONTRADICTING VALUES + PROVENANCE (value, who asserted it, when):
+{values_json}
+
+SURROUNDING CONTEXT:
+{ctx_json}
+
+Decide what the system should do, then explain it. Default to "ask_user" when
+you are not sure which value is the current truth.
+
+Return ONLY valid JSON:
+{{"decision": "fix|ask_user|dismiss", "action": "...", "reasoning": "..."}}"""
+
+
 def bonsai_gist_prompt(source_episodes: list[dict]) -> str:
     """Prompt for the deploy-time Bonsai gist decider (spec §2.5 deploy step).
 

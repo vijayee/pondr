@@ -25,6 +25,7 @@ from typing import Optional
 
 from ..memory.episode import Episode
 from ..memory.store import HippocampalStore
+from .assertion_extractor import extract_state_assertions
 from .bonsai_relations import BonsaiRelationExtractor
 from .gliner_extractor import GLiNERExtractor
 
@@ -127,6 +128,26 @@ class HippocampalEncoder:
             print(f"[bonsai-fail] {episode_id}: {e}", file=sys.stderr)
             return []
 
+    def _build_state_assertions(
+        self, full_text: str, decisions: list[str], relations: list[dict]
+    ) -> list[dict]:
+        """Build the episode's ``state_assertions`` (Phase 4, D1).
+
+        The deterministic normalizer (``extract_state_assertions``) scans the
+        full text + decision spans for explicit ``entity -> value`` field
+        patterns, AND lifts any Bonsai ``has_state``/``state`` relations, in
+        one deduped union (Bonsai wins on overlap, deterministic fills when
+        Bonsai returns none). The store gates the WRITE of ``(E:entity, state,
+        value)`` edges on ``config.assertion_extraction_enabled``; this method
+        only populates the episode field, so the extraction is always free +
+        inert (no patterns -> empty list -> no edges downstream).
+        """
+        try:
+            return extract_state_assertions(full_text, decisions, relations)
+        except Exception as e:  # noqa: BLE001 - never let a regex hiccup drop a turn
+            print(f"[assertion-fail] {e}", file=sys.stderr)
+            return []
+
     def _apply_overrides_and_store(
         self, episode: Episode, *, salience, utility_decay_rate,
         summary_embedding, embedder,
@@ -197,6 +218,9 @@ class HippocampalEncoder:
             session_id=self.session_id,
             origin=origin,
         )
+        episode.state_assertions = self._build_state_assertions(
+            full_text, episode.decisions, episode.relations
+        )
 
         self._apply_overrides_and_store(
             episode, salience=salience, utility_decay_rate=utility_decay_rate,
@@ -246,6 +270,9 @@ class HippocampalEncoder:
             user_id=self.user_id,
             session_id=self.session_id,
             origin=origin,
+        )
+        episode.state_assertions = self._build_state_assertions(
+            full_text, episode.decisions, episode.relations
         )
 
         self._apply_overrides_and_store(

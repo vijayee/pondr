@@ -38,6 +38,11 @@ Relation types:
 - concerns(Episode, Topic): the conversation is about a topic
 - involves(Episode, Entity): an entity participates in the conversation
 - contradicts(Statement, Statement): one statement contradicts another
+- has_state(Entity, Value): an ENTITY's current state/value/choice -- the
+  subject is a tool/team/ticket/policy/project, NOT a person (a person making
+  a choice is ``decides``). Use for explicit "the team chose X", "status: Y",
+  "X is now Z", "switched to W"; Value is the literal value (a tool name, a
+  status, a number).
 - follows_up_on(Episode, Episode): this conversation continues from another
 
 Conversation:

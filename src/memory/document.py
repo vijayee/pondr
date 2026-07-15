@@ -107,6 +107,23 @@ class Document:
     topics: list[str] = field(default_factory=list)
     relations: list[dict] = field(default_factory=list)
     citations: list[str] = field(default_factory=list)
+    # ── Phase 4: citation + assertion provenance (D1/D5) ──
+    # ``resolved_citations`` is the STORE-computed graph cite targets actually
+    # written: a doc_id when ``find_document_by_title_or_url`` resolved the
+    # literal, else the literal itself (byte-identical to pre-Phase-4). It is
+    # PERSISTED so the delete path (update/delete) emits symmetric deletes for
+    # exactly the edges that were written (resolution is store-state-
+    # dependent + not reproducible at delete time). Empty for docs encoded
+    # before this field / when citation resolution is disabled -> the store
+    # falls back to ``citations`` (the literals).
+    resolved_citations: list[str] = field(default_factory=list)
+    # ``state_assertions`` -- the doc's explicit ``entity -> value`` claims
+    # (deterministic normalizer over each section + Bonsai ``has_state`` doc-
+    # level relations), each tagged with its asserting section id
+    # (``{"entity", "value", "section"}``). The store writes
+    # ``(E:entity, state, value)`` edges with sidecar ``asserted_by=section``.
+    # Empty for structure-only ingests + docs with no explicit state claims.
+    state_assertions: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_parse(
