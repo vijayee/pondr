@@ -327,14 +327,20 @@ class HippocampalStore:
         )
 
     def _index_embedding(self, eid: str, vec, summary: str = "") -> None:
-        """Best-effort upsert of an episode embedding into the in-DB vector index.
+        """Best-effort upsert of an embedding into the in-DB vector index.
 
         The single chokepoint for embedding writes: called from
-        ``encode_episode`` (the live path) and ``set_summary_embedding`` (the
-        backfill path used by ``build_vector_index.py``). Best-effort + logged
-        + never raises -- a vector-index hiccup must never fail an episode
-        encode (mirrors ``_persist_exchange``'s philosophy). An episode with a
-        missing vector entry is still fully retrievable via the graph path.
+        ``encode_episode`` (the live path), ``set_summary_embedding`` (the
+        backfill path used by ``build_vector_index.py``), and
+        ``encode_document`` (per-section document-chunk embeddings). Id-agnostic:
+        the layer now holds ``ep_*`` episode ids, ``{doc_id}_sec_{i:03d}``
+        section ids (per-chunk document vectors -- the doc-RAG semantic path),
+        and (hypothetically) ``doc_*`` ids -- though documents are NOT
+        vector-indexed (no doc-level embedding is ever written); only their
+        sections are. Best-effort + logged + never raises -- a vector-index
+        hiccup must never fail an encode (mirrors ``_persist_exchange``'s
+        philosophy). An episode/section with a missing vector entry is still
+        retrievable via the graph path.
         """
         import sys
         if self.vector_layer is None:
@@ -648,14 +654,16 @@ class HippocampalStore:
     # ---- episode-level forgetting state (Phase 3b) ----
 
     def _unindex_embedding(self, eid: str) -> None:
-        """Best-effort removal of an episode embedding from the in-DB vector index.
+        """Best-effort removal of an embedding from the in-DB vector index.
 
         The single delete chokepoint, called from ``set_episode_state`` when an
-        episode is deprecated/superseded. ``delete_sync`` on an absent id is a
-        no-op, so the lack of a ``doc_`` guard here is harmless (``doc_*`` ids
-        are never ``ep_*`` and the vector layer only holds ``ep_*``). Best-effort
-        + logged + never raises -- a vector-index hiccup must never fail a state
-        change. NOTE: ``SemanticMemoryWriter.supersede_episode`` writes
+        episode is deprecated/superseded, and from ``encode_document`` /
+        ``delete_document`` for per-section document-chunk embeddings. Id-
+        agnostic: ``delete_sync`` on an absent id is a no-op, so this is safe to
+        call on any id (``ep_*``, ``{doc_id}_sec_{i:03d}``, or a stale ``doc_*``).
+        Best-effort + logged + never raises -- a vector-index hiccup must never
+        fail a state change or a document encode/delete. NOTE:
+        ``SemanticMemoryWriter.supersede_episode`` writes
         ``state="superseded"`` directly (NOT via this method), so it calls this
         helper itself; hooking only ``set_episode_state`` would miss
         reconsolidation/anomaly-driven supersession.
@@ -1139,9 +1147,27 @@ class HippocampalStore:
             ops += self._document_delete_content_ops(
                 doc.id, [s.id for s in old_doc.sections])
             ops += self._document_graph_ops(old_doc, delete=True)
+            # Unindex the OLD section vectors (per-chunk vector indexing): the
+            # old sections are being removed from the hot store + graph, so
+            # their vector-layer entries must go too. Best-effort + idempotent
+            # (``delete_sync`` no-ops on an absent id, e.g. a structure-only old
+            # section that was never indexed). Unchanged sections are re-indexed
+            # below with the same vector (idempotent overwrite) -- wasteful but
+            # correct for the first slice; a per-section embedding delta is
+            # deferred (mirrors the blob-refcount delta already done for bodies).
+            for s in old_doc.sections:
+                self._unindex_embedding(s.id)
         ops += self._document_metadata_ops(doc)
         ops += self._document_graph_ops(doc, delete=False)
         self.db.batch_sync(ops)
+        # 4. Index each NEW section that has an embedding -- one vector per
+        #    chunk (the per-chunk doc-RAG semantic path). Sections with no
+        #    embedding (structure-only ingest, no embedder) are simply not
+        #    indexed; they stay findable via the graph entity/topic axes but not
+        #    via the semantic fallback. Best-effort + never raises.
+        for s in doc.sections:
+            if s.embedding is not None:
+                self._index_embedding(s.id, s.embedding, s.heading)
 
     def get_document(
         self, doc_id: str, load_bodies: bool = True
@@ -1156,12 +1182,20 @@ class HippocampalStore:
         the section structure + blob hashes without the cold pull. Graph
         structure (entities/topics/relations/citations) is read back from the
         hot-store metadata fields (written at encode), not re-queried from the
-        graph layer. Returns ``None`` for a missing doc (no title key).
+        graph layer. Returns ``None`` for a missing doc (no ``source_type`` key
+        -- the existence sentinel; ``title`` can legitimately be empty for a
+        heading-less source, so it is NOT the sentinel).
         """
-        title = _b2s(self.db.get_sync(f"content/doc/{doc_id}/title"))
-        if not title:
+        # Existence sentinel: source_type is ALWAYS written at encode (defaults
+        # to "text") and never empty for a real doc. title can be empty (a
+        # markdown doc with only ``##`` headings, or a plain-text file), so
+        # gating on title would make such docs unreadable -- and break the
+        # encode_document UPDATE path (old_doc would load as None -> old section
+        # vectors orphaned). source_type is the safe marker.
+        source_type = _b2s(self.db.get_sync(f"content/doc/{doc_id}/source_type"))
+        if not source_type:
             return None
-        source_type = _b2s(self.db.get_sync(f"content/doc/{doc_id}/source_type")) or "text"
+        title = _b2s(self.db.get_sync(f"content/doc/{doc_id}/title"))
         source_path = _b2s(self.db.get_sync(f"content/doc/{doc_id}/source_path"))
         authors_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/authors"))
         ingested_at = _b2s(self.db.get_sync(f"content/doc/{doc_id}/ingested_at"))
@@ -1221,6 +1255,25 @@ class HippocampalStore:
             relations=_loads(relations_raw, []),
             citations=_loads(citations_raw, []),
         )
+
+    def get_section_body(self, doc_id: str, section_id: str) -> Optional[str]:
+        """Materialize ONE section's body from the cold store (single-section pull).
+
+        Reads the hot ``content/doc/{doc_id}/sec/{section_id}/blob_hash`` ref
+        (no cold pull) and, when present, pulls that one blob from the cold
+        BlobStore. This is the retrieval-path cold read: ``_hydrate_document``
+        calls it at most once per doc result to fill ``text`` with the matched
+        section's body. Cold-read only -- it never writes the hot store, so a
+        retrieved body does NOT enter the memory LRU as a permanent resident
+        (the blob store has its own LRU; this just reads through it). Returns
+        ``None`` when the section or its blob is absent (the caller falls back
+        to an empty ``text``).
+        """
+        blob_hash = _b2s(self.db.get_sync(
+            f"content/doc/{doc_id}/sec/{section_id}/blob_hash"))
+        if not blob_hash:
+            return None
+        return self._blob_store().get_blob(blob_hash)
 
     def default_document_ids(self) -> list[str]:
         """All document ids (scan ``content/doc/``).
@@ -1296,6 +1349,12 @@ class HippocampalStore:
         for sec in doc.sections:
             if sec.blob_hash:
                 bs.decr_ref(sec.blob_hash)
+        # Unindex each section's per-chunk vector (best-effort; ``delete_sync``
+        # no-ops on an absent id, e.g. a structure-only section never indexed).
+        # Done AFTER the memory batch so the doc is already unfindable if the
+        # vector delete races a concurrent search.
+        for sec in doc.sections:
+            self._unindex_embedding(sec.id)
         return True
 
     def gc_blobs(self) -> int:

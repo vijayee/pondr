@@ -188,7 +188,14 @@ def _build_graph(episodes: list[dict]) -> dict:
     for e in episodes:
         eid = e.get("episode_id")
         if eid:
-            nodes.append({"id": eid, "kind": "episode", "timestamp": e.get("timestamp", "")})
+            # ``kind`` comes from the hydrated result dict (``"section"`` for a
+            # per-chunk vector hit, ``"document"`` for a graph-path doc hit);
+            # episode dicts carry no ``kind`` key, so they fall through to
+            # ``"episode"``. ``rel`` stays ``appears_in`` for UI symmetry across
+            # the three result kinds. (Section ids start with ``doc_``, so the
+            # ``kind`` field -- not the prefix -- is the discriminator.)
+            kind = e.get("kind") or "episode"
+            nodes.append({"id": eid, "kind": kind, "timestamp": e.get("timestamp", "")})
         for ent in e.get("entities", []):
             if ent and ent not in seen_entities:
                 seen_entities.add(ent)

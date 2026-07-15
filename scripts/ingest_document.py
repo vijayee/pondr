@@ -66,6 +66,30 @@ def _maybe_extractors(extract: bool):
     return gliner, bonsai
 
 
+def _maybe_embedder(store, extract: bool):
+    """Construct the per-chunk section embedder if available; return it or None.
+
+    Reuses the same vector backend episodes use (the in-DB WaveDB VectorLayer
+    via ``WavedbVectorStore`` when the store opened one, else the FAISS
+    ``VectorSearch`` sidecar) -- both expose ``.encode`` (lazy-loading the same
+    bge-small model). The embedder produces one vector per section (the per-
+    chunk doc-RAG semantic path). When ``extract`` is False (``--no-extract``) or
+    the model/deps are missing, returns ``None`` so the pipeline runs structure-
+    only (sections are findable via the graph axes, not the semantic fallback).
+    """
+    if not extract:
+        return None
+    try:
+        if getattr(store, "vector_layer", None) is not None:
+            from src.retrieval.wavedb_vector_store import WavedbVectorStore
+            return WavedbVectorStore(store)
+        from src.retrieval.vector_search import VectorSearch
+        return VectorSearch(store)
+    except Exception as exc:  # ImportError / model-load error on a CPU box
+        print(f"warning: section embedder unavailable, skipping per-chunk vector indexing: {exc}")
+        return None
+
+
 def _ingest(args) -> int:
     store = _build_store(args.db, args.doc_db)
     try:
@@ -80,12 +104,14 @@ def _ingest(args) -> int:
             semantic_split_threshold=ic.semantic_split_threshold,
         )
         gliner, bonsai = _maybe_extractors(not args.no_extract)
+        embedder = _maybe_embedder(store, not args.no_extract)
         pipe = UnifiedIngestionPipeline(store, chunker=chunker)
         doc_id, created = pipe.ingest(
             args.source,
             source_type=args.type,
             extractor=gliner,
             relation_extractor=bonsai,
+            embedder=embedder,
         )
         print(f"{'created' if created else 'updated'} {doc_id}")
         return 0
@@ -129,7 +155,8 @@ def main() -> int:
     sub.add_argument("--gc-blobs", action="store_true",
                      help="sweep zero-refcount orphan blobs from the cold store")
     ap.add_argument("--type", default="auto",
-                    help="source type: auto|markdown|text (default: auto by extension)")
+                    choices=["auto", "markdown", "text", "pdf", "code", "docx", "web"],
+                    help="source type: auto|markdown|text|pdf|code|docx|web (default: auto by extension)")
     ap.add_argument("--no-extract", action="store_true",
                     help="skip GLiNER/Bonsai extraction (structure-only ingest)")
     args = ap.parse_args()

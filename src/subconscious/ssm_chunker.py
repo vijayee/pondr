@@ -215,6 +215,61 @@ class SSMChunker:
                 "SSMChunker.expand: episode not found in the in-memory secondary "
                 "set and no store supplied to load it from"
             )
+        # Document / section result (the unified doc+episode RAG path): expand
+        # pulls the body on demand (``expand`` is NOT the hot retrieve path, so a
+        # cold pull is fine here). Build the same dict shape as an episode so
+        # downstream chunking/formatting (which read ``.get``) is unaffected.
+        # Section ids (``{doc_id}_sec_{i:03d}``) start with ``doc_`` AND contain
+        # ``_sec_``, so the ``_sec_`` check MUST precede the ``doc_`` check (else
+        # a section id would hit ``get_document(section_id)`` -> None ->
+        # EpisodeNotFound). For a doc id, the matched body is the first
+        # non-empty section (on-demand EXPAND has no query axes, so there is no
+        # "matched" section to pick).
+        if "_sec_" in episode_id:
+            doc_id = episode_id.rsplit("_sec_", 1)[0]
+            doc = store.get_document(doc_id, load_bodies=True)
+            if doc is None:
+                raise EpisodeNotFound(episode_id)
+            sec = next((s for s in doc.sections if s.id == episode_id), None)
+            if sec is None:
+                raise EpisodeNotFound(episode_id)
+            return {
+                "episode_id": episode_id,
+                "summary": doc.title,
+                "text": sec.content or "",
+                "timestamp": doc.ingested_at,
+                "entities": list(getattr(sec, "entities", []) or []),
+                "topics": list(getattr(sec, "topics", []) or []),
+                "tones": [],
+                "decisions": [],
+                "score": 0.0,
+                "kind": "section",
+                "source_path": doc.source_path,
+                "section_heading": sec.heading,
+                "doc_id": doc_id,
+            }
+        if episode_id.startswith("doc_"):
+            doc = store.get_document(episode_id, load_bodies=True)
+            if doc is None:
+                raise EpisodeNotFound(episode_id)
+            text = ""
+            for sec in doc.sections:
+                if sec.content:
+                    text = sec.content
+                    break
+            return {
+                "episode_id": episode_id,
+                "summary": doc.title,
+                "text": text,
+                "timestamp": doc.ingested_at,
+                "entities": list(getattr(doc, "entities", []) or []),
+                "topics": list(getattr(doc, "topics", []) or []),
+                "tones": [],
+                "decisions": [],
+                "score": 0.0,
+                "kind": "document",
+                "source_path": doc.source_path,
+            }
         ep = store.get_episode(episode_id)
         if ep is None:
             raise EpisodeNotFound(episode_id)

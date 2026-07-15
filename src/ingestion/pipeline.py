@@ -50,6 +50,7 @@ class UnifiedIngestionPipeline:
         source_type: str = "auto",
         extractor=None,
         relation_extractor=None,
+        embedder=None,
     ) -> tuple[str, bool]:
         """Ingest (or re-ingest) a source. Returns ``(doc_id, created)``.
 
@@ -59,6 +60,19 @@ class UnifiedIngestionPipeline:
         ``BonsaiRelationExtractor``) are optional -- when ``None`` the
         pipeline runs structure-only (no entities/topics/relations). Re-ingest
         resolves identity by ``source_path`` and updates in place.
+
+        ``embedder`` (any object with ``encode(texts: list[str]) ->
+        list[list[float]]`` -- the same protocol ``VectorSearch`` /
+        ``WavedbVectorStore`` satisfy) is optional -- when set, each section's
+        text (``heading + "\\n" + content``, the chunk content per the chat
+        design) is embedded in ONE batched ``encode`` call and assigned to
+        ``sec.embedding`` before ``Document.from_parse``, so the per-chunk
+        vector rides through ``encode_document`` into BOTH the hot
+        ``sec/embedding`` key AND the in-DB vector layer (the per-chunk doc-RAG
+        semantic path). When ``None`` (structure-only ingest, no embedder), no
+        embeddings are written -- sections stay findable via the graph
+        entity/topic axes but not via the semantic fallback (mirrors episodes'
+        ``set_summary_embedding`` backfill model).
         """
         if source_type == "auto":
             source_type = detect_type(source_path)
@@ -81,6 +95,19 @@ class UnifiedIngestionPipeline:
         relations: list[dict] = []
         if relation_extractor is not None:
             relations = list(relation_extractor.extract(self._doc_text(parsed)))
+
+        # Per-section embeddings (the per-chunk vector-index path): ONE batched
+        # encode over every section's chunk text. Assigned to the RawSection so
+        # ``Document.from_parse`` carries it through to ``encode_document``,
+        # which persists the hot key AND indexes the vector layer.
+        if embedder is not None and parsed.sections:
+            sec_texts = [
+                (s.heading + "\n" + s.content) if s.heading else s.content
+                for s in parsed.sections
+            ]
+            vecs = embedder.encode(sec_texts)
+            for s, vec in zip(parsed.sections, vecs):
+                s.embedding = list(vec)
 
         extracted = {"sections": sec_extractions}
 

@@ -109,6 +109,48 @@ class ChunkedContextFormatter:
         tones = ep.get("tones", [])
         summary = ep.get("summary", "")
         text = ep.get("text", "")
+        kind = ep.get("kind")
+        if kind == "section":
+            # Section (per-chunk) result: the chunk body is in ``text``
+            # (materialized at hydrate); the renderer needs no store/cold pull.
+            lines = [f"--- Section {eid} ({ts}) ---"]
+            src = ep.get("source_path", "")
+            if src:
+                lines.append(f"Source: {src}")
+            if summary:
+                lines.append(f"Title: {summary}")
+            if entities:
+                lines.append(f"Entities: {', '.join(entities)}")
+            if topics:
+                lines.append(f"Topics: {', '.join(topics)}")
+            heading = ep.get("section_heading", "")
+            if text:
+                if heading:
+                    lines.append(f"Section '{heading}': {text}")
+                else:
+                    lines.append(f"Section: {text}")
+            return "\n".join(lines)
+        if kind == "document":
+            # Document result (graph-path hit): the matched section body is in
+            # ``text`` (already materialized at hydrate), so the renderer needs
+            # no store/cold pull.
+            lines = [f"--- Document {eid} ({ts}) ---"]
+            src = ep.get("source_path", "")
+            if src:
+                lines.append(f"Source: {src}")
+            if summary:
+                lines.append(f"Title: {summary}")
+            if entities:
+                lines.append(f"Entities: {', '.join(entities)}")
+            if topics:
+                lines.append(f"Topics: {', '.join(topics)}")
+            matched = ep.get("matched_section", "")
+            if text:
+                if matched:
+                    lines.append(f"Section '{matched}': {text}")
+                else:
+                    lines.append(f"Section: {text}")
+            return "\n".join(lines)
         lines = [f"--- Episode {eid} ({ts}) ---"]
         if entities:
             lines.append(f"Entities: {', '.join(entities)}")

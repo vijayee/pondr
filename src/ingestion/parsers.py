@@ -38,6 +38,10 @@ class RawSection:
     level: int
     content: str
     parent_index: Optional[int] = None
+    # Optional per-chunk dense vector, filled by the pipeline's embedder AFTER
+    # chunking (so the chunker -- which builds new RawSection objects -- cannot
+    # drop it). ``Document.from_parse`` copies it to ``DocumentSection.embedding``.
+    embedding: Optional[list[float]] = None
 
 
 @dataclass
@@ -67,6 +71,14 @@ _TYPE_BY_EXT = {
     ".markdown": "markdown",
     ".txt": "text",
     ".text": "text",
+    ".pdf": "pdf",
+    ".docx": "docx",
+    ".html": "web", ".htm": "web",
+    # Source code -- one row per supported extension (CodeParser infers the
+    # language from the extension).
+    ".py": "code", ".js": "code", ".mjs": "code", ".ts": "code",
+    ".c": "code", ".h": "code", ".cpp": "code", ".cc": "code", ".cxx": "code",
+    ".hpp": "code", ".go": "code", ".rs": "code", ".java": "code",
 }
 
 
@@ -172,10 +184,23 @@ class PlainTextParser:
 _PARSERS = {
     "markdown": MarkdownParser,
     "text": PlainTextParser,
+    # The four format parsers live in their own modules (each lazy-imports its
+    # heavy dep inside ``parse``). They are imported lazily here to keep this
+    # module importable without their deps AND to avoid a circular import
+    # (those modules ``from .parsers import ParsedDocument, RawSection``).
+    "pdf": "src.ingestion.pdf_parser.PDFParser",
+    "code": "src.ingestion.code_parser.CodeParser",
+    "docx": "src.ingestion.docx_parser.DocxParser",
+    "web": "src.ingestion.web_parser.WebParser",
 }
 
 
 def get_parser(source_type: str) -> DocumentParser:
     """Instantiate the parser for a source_type (``"auto"`` -> text fallback)."""
     cls = _PARSERS.get(source_type, PlainTextParser)
+    if isinstance(cls, str):
+        # Lazy import of a format parser module path.
+        import importlib
+        mod_name, _, attr = cls.rpartition(".")
+        cls = getattr(importlib.import_module(mod_name), attr)
     return cls()

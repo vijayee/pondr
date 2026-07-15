@@ -118,17 +118,26 @@ class GraphTraversal:
         ]
 
     def _get_episodes_by_entity(self, entity: str) -> list[str]:
-        """Episodes that mention ``entity`` — ``E:{entity} --out:in_episode--> ep``.
+        """Episodes AND documents that mention ``entity``.
 
-        The store writes the reverse edge ``(E:{entity}, in_episode, eid)`` for
-        entities (topic/tone/decision only write the forward ``(eid, has_*,
-        leaf)`` edge), so the lookup follows ``in_episode`` OUT of ``E:{entity}``,
-        not into it. The Phase 3b edge-level filter then drops episodes whose
-        ``(ep, has_entity, E:{entity})`` association is deprecated/superseded.
+        Episodes follow ``E:{entity} --out:in_episode--> ep`` (the store writes
+        the reverse ``(E:{entity}, in_episode, eid)`` edge); documents follow
+        ``E:{entity} --out:appears_in_doc--> doc`` (the store writes the reverse
+        ``(E:{entity}, appears_in_doc, doc)`` edge at ``store.py:_document_graph_ops``).
+        The two vertex sets are UNIONED before the Phase 3b edge-level filter,
+        which drops episodes whose ``(ep, has_entity, E:{entity})`` association
+        is deprecated/superseded -- document ``has_entity`` edges are always
+        current (documents are exempt from forgetting, no sidecar is ever
+        written), so docs survive the filter. Returns a mix of ``ep_*`` and
+        ``doc_*`` ids; callers pass them to ``_hydrate``, which branches on the
+        ``doc_`` prefix. The method name is kept (read-only consumers use the
+        ``episodes_by_entity`` alias) -- it now returns episodes + docs.
         """
         q = self.graph.query().vertex(f"E:{entity}").out("in_episode")
-        eps = self._exec_vertices(q)
-        return self._filter_current_edges(eps, "has_entity", f"E:{entity}")
+        eps = set(self._exec_vertices(q))
+        qd = self.graph.query().vertex(f"E:{entity}").out("appears_in_doc")
+        eps |= set(self._exec_vertices(qd))
+        return self._filter_current_edges(list(eps), "has_entity", f"E:{entity}")
 
     def _get_episodes_by_topic(self, topic: str) -> list[str]:
         q = self.graph.query().vertex(f"T:{topic}").in_("has_topic")
@@ -141,7 +150,7 @@ class GraphTraversal:
         return self._filter_current_edges(eps, "has_tone", f"A:{tone}")
 
     def _get_all_episode_ids(self) -> list[str]:
-        """All episode ids — scan the content namespace (complete).
+        """All episode ids AND document ids — the no-axis candidate seed.
 
         The doc's POS-scan over ``has_entity`` only yields entity-bearing
         episodes, which would drop entity-less episodes from the candidate seed
@@ -151,9 +160,13 @@ class GraphTraversal:
 
         Delegates to ``store.default_episode_ids`` so abstracted episodes
         (Phase 3a semantic memories) are excluded from the default retrieval
-        candidate set (spec §371).
+        candidate set (spec §371). Documents are NOT forgotten (no state/
+        validity filter applies), so ``default_document_ids`` enumerates them
+        all; the union is the no-axis seed for the unified doc+episode RAG path.
         """
-        return self.store.default_episode_ids(include_abstracted=False)
+        eps = set(self.store.default_episode_ids(include_abstracted=False))
+        eps |= set(self.store.default_document_ids())
+        return sorted(eps)
 
     # ── candidate-set construction (Python-side set ops) ──
 
@@ -219,10 +232,17 @@ class GraphTraversal:
         Drops episodes whose lifecycle state is ``deprecated``/``superseded`` or
         whose ``validity_end`` is set. Gated on ``config.forgetting_enabled``;
         a no-op until something is actually deprecated.
+
+        Documents (``doc_`` ids) are exempt from forgetting -- they have no
+        ``state``/``validity_end`` keys, so ``is_episode_active`` would read them
+        as current anyway, but the prefix gate short-circuits past the two
+        ``get_sync`` calls and makes the exemption explicit. The episode branch
+        is byte-identical (the ``or`` only fires for ``doc_`` ids).
         """
         if not _config.forgetting_enabled:
             return episode_ids
-        return {eid for eid in episode_ids if self.store.is_episode_active(eid)}
+        return {eid for eid in episode_ids
+                if eid.startswith("doc_") or self.store.is_episode_active(eid)}
 
     # ── follows chain (temporal order) ──
 
@@ -281,6 +301,11 @@ class GraphTraversal:
 
         Buckets are anchored to ``datetime.now()``. ``last_week`` is the half-open
         interval [now-14d, now-7d). Unknown buckets apply no filter.
+
+        Documents (``doc_`` ids) are timestamped by ``ingested_at`` (read via
+        ``get_document(load_bodies=False)`` -- no cold pull), mirroring the
+        salience-compute type-dispatch already shipped in Phase 1; episodes keep
+        the ``get_episode`` path. Both decode to an ISO ``datetime`` the same way.
         """
         if bucket not in _TEMPORAL_BUCKETS_DAYS:
             return candidates
@@ -291,12 +316,8 @@ class GraphTraversal:
 
         out: set[str] = set()
         for eid in candidates:
-            ep = self.store.get_episode(eid)
-            if not ep or not ep.timestamp:
-                continue
-            try:
-                ts = datetime.fromisoformat(ep.timestamp)
-            except ValueError:
+            ts = self._candidate_timestamp(eid)
+            if ts is None:
                 continue
             if ts >= start and (end is None or ts < end):
                 out.add(eid)
@@ -312,19 +333,20 @@ class GraphTraversal:
 
         ``date_from`` / ``date_to`` are ISO date or datetime strings; either may
         be ``None`` (one-sided range). A bare date (``"2025-06-01"``) parses at
-        midnight. Inclusive on both ends. O(candidates) with one ``get_episode``
+        midnight. Inclusive on both ends. O(candidates) with one timestamp read
         per candidate — same cost shape as ``_filter_temporal``. This is the
         Phase 1c long-range path: O(candidates) instead of walking a ``follows``
         chain capped at ``_MAX_FOLLOWS_HOPS``.
+
+        Documents (``doc_`` ids) are timestamped by ``ingested_at`` (no cold
+        pull); episodes by ``get_episode``. Both resolve via the shared
+        ``_candidate_timestamp`` helper.
         """
         lo = self._parse_dt(date_from) if date_from else None
         hi = self._parse_dt(date_to) if date_to else None
         out: set[str] = set()
         for eid in candidates:
-            ep = self.store.get_episode(eid)
-            if not ep or not ep.timestamp:
-                continue
-            ts = self._parse_dt(ep.timestamp)
+            ts = self._candidate_timestamp(eid)
             if ts is None:
                 continue
             if lo is not None and ts < lo:
@@ -333,6 +355,24 @@ class GraphTraversal:
                 continue
             out.add(eid)
         return out
+
+    def _candidate_timestamp(self, eid: str) -> Optional[datetime]:
+        """One candidate's timestamp as a ``datetime`` (``None`` if unreadable).
+
+        Type-dispatch by id prefix (mirrors the salience-compute dispatch in
+        Phase 1): episodes read ``get_episode().timestamp``; documents read
+        ``get_document(eid, load_bodies=False).ingested_at`` (NO cold pull).
+        Absent/empty/unparseable -> ``None`` (the caller drops the candidate).
+        """
+        if eid.startswith("doc_"):
+            doc = self.store.get_document(eid, load_bodies=False)
+            if doc is None or not doc.ingested_at:
+                return None
+            return self._parse_dt(doc.ingested_at)
+        ep = self.store.get_episode(eid)
+        if not ep or not ep.timestamp:
+            return None
+        return self._parse_dt(ep.timestamp)
 
     @staticmethod
     def _parse_dt(s: str) -> Optional[datetime]:
@@ -374,14 +414,38 @@ class GraphTraversal:
         """Public alias for ``_get_episodes_by_topic`` (read-only consumers)."""
         return self._get_episodes_by_topic(topic)
 
-    def _hydrate(self, eid: str) -> dict:
-        """Load content + graph-side fields for one episode into a result dict.
+    def _hydrate(
+        self,
+        eid: str,
+        query_entities: Optional[list[str]] = None,
+        query_topics: Optional[list[str]] = None,
+    ) -> dict:
+        """Load content + graph-side fields for one episode (or document) into a
+        result dict.
 
         Graph fields come from a SINGLE scan over ``memory/spo/{eid}/`` (all
         outgoing edges), bucketed by predicate — one scan per episode instead of
         one per axis. The user is one extra POS scan (reverse of ``has_session``)
         only when the episode is session-scoped.
+
+        Documents (``doc_`` ids) are dispatched to ``_hydrate_document``: the doc
+        is loaded metadata-only (no cold pull), and at most ONE matched section
+        body is materialized into ``text`` (the graph path hits at doc-level from
+        entity/topic edges, so a single section is shown). ``query_entities`` /
+        ``query_topics`` (threaded from ``retrieve``) drive the matched-section
+        selection; they default to ``None`` so ``hydrate_episode`` and other
+        read-only callers stay unchanged.
+
+        Sections (``{doc_id}_sec_{i:03d}`` ids -- the per-chunk vector-index
+        hits from the semantic fallback) are dispatched to ``_hydrate_section``.
+        Section ids start with ``doc_``, so the ``_sec_`` check MUST precede the
+        ``doc_`` check.
         """
+        if "_sec_" in eid:
+            return self._hydrate_section(eid)
+        if eid.startswith("doc_"):
+            return self._hydrate_document(eid, query_entities, query_topics)
+
         ep = self.store.get_episode(eid)
         result: dict = {
             "episode_id": eid,
@@ -425,6 +489,177 @@ class GraphTraversal:
         if result["session_id"]:
             result["user_id"] = self._user_for_session(result["session_id"])
         return result
+
+    # ── matched-section selection for the document graph path ──
+
+    @staticmethod
+    def _section_match_score(
+        sec, query_entities: set[str], query_topics: set[str], index: int
+    ) -> tuple[int, int, int]:
+        """Order key for picking the section to materialize for a doc result.
+
+        ``(overlap, richness, neg_index)``: ``overlap`` = the section's
+        entities+topics that also appear in the query axes; ``richness`` = the
+        section's total entities+topics (tie-break: the denser section is
+        likelier the substantive one); ``neg_index`` = ``-index`` so that, on a
+        final tie, ``max()`` picks the EARLIEST section. ``max()`` over this key
+        across all sections selects the matched section.
+        """
+        sec_ents = {e.lower() for e in getattr(sec, "entities", []) or []}
+        sec_tops = {t.lower() for t in getattr(sec, "topics", []) or []}
+        overlap = len(sec_ents & query_entities) + len(sec_tops & query_topics)
+        richness = len(sec_ents) + len(sec_tops)
+        return (overlap, richness, -index)
+
+    def _hydrate_document(
+        self,
+        eid: str,
+        query_entities: Optional[list[str]] = None,
+        query_topics: Optional[list[str]] = None,
+    ) -> dict:
+        """Hydrate a document result (the ``doc_`` branch of ``_hydrate``).
+
+        Builds the SAME 12-key result dict as an episode (so every downstream
+        consumer that does ``r.get(...)`` works unchanged) PLUS doc extras:
+        ``kind="document"``, ``source_path``, ``matched_section`` (heading), and
+        ``sections`` -- a METADATA-ONLY list (``id, heading, level, blob_hash,
+        entities, topics``) carrying blob_hash refs, NEVER section bodies. The
+        doc-level graph structure (entities/topics) is read from the hot-store
+        metadata (``get_document``), not re-scanned.
+
+        **Hot/cold invariant:** ``get_document(load_bodies=False)`` does NO cold
+        pull; at most ONE ``get_section_body`` materializes the matched
+        section's body into ``text``. The matched section is the one whose
+        entities+topics overlap the query axes most (ties -> richest section ->
+        earliest); with no query axes or no overlap, the richest section wins.
+        ``text=""`` if the doc has no sections or the cold pull misses.
+
+        Episode dicts stay key-identical (no ``kind`` key); the ``kind`` extra
+        is safe because all consumers use ``.get``. Formatters / end_state branch
+        on the ``kind`` field (so a section id -- which starts with ``doc_`` --
+        is never mis-rendered as a document; see ``_hydrate_section``).
+        """
+        doc = self.store.get_document(eid, load_bodies=False)
+        if doc is None:
+            # Defensive: a doc id that no longer resolves (deleted mid-query) ->
+            # the empty 12-key shell + doc extras, same as a missing episode.
+            return {
+                "episode_id": eid, "summary": "", "text": "", "timestamp": "",
+                "entities": [], "topics": [], "tones": [], "decisions": [],
+                "session_id": None, "user_id": None, "follows": None,
+                "score": 0.0, "kind": "document", "source_path": "",
+                "matched_section": "", "sections": [],
+            }
+
+        q_ent = {e.lower() for e in (query_entities or [])}
+        q_top = {t.lower() for t in (query_topics or [])}
+
+        # Pick the matched section (best overlap with the query axes; ties ->
+        # richest, then earliest). At most one section's body is pulled below.
+        matched_sid: Optional[str] = None
+        matched_heading = ""
+        if doc.sections:
+            best = max(
+                range(len(doc.sections)),
+                key=lambda i: self._section_match_score(
+                    doc.sections[i], q_ent, q_top, i),
+            )
+            matched = doc.sections[best]
+            matched_sid = matched.id
+            matched_heading = matched.heading
+
+        text = ""
+        if matched_sid is not None:
+            body = self.store.get_section_body(eid, matched_sid)
+            if body is not None:
+                text = body
+
+        return {
+            "episode_id": eid,
+            "kind": "document",
+            "summary": doc.title,
+            "text": text,
+            "timestamp": doc.ingested_at,
+            "entities": list(doc.entities),
+            "topics": list(doc.topics),
+            "tones": [],
+            "decisions": [],
+            "session_id": None,
+            "user_id": None,
+            "follows": None,
+            "score": 0.0,
+            "source_path": doc.source_path,
+            "matched_section": matched_heading,
+            "sections": [
+                {
+                    "id": s.id, "heading": s.heading, "level": s.level,
+                    "blob_hash": s.blob_hash, "entities": list(s.entities),
+                    "topics": list(s.topics),
+                }
+                for s in doc.sections
+            ],
+        }
+
+    def _hydrate_section(self, sid: str) -> dict:
+        """Hydrate a section result (the per-chunk vector-index hit path).
+
+        Section ids are compound ``{doc_id}_sec_{i:03d}``; they START WITH
+        ``doc_`` and contain ``_sec_``, so ``_hydrate`` checks ``"_sec_" in eid``
+        BEFORE the ``doc_`` prefix and routes here. The semantic fallback
+        (``_semantic_fallback``) lands section ids in its hit list, and this is
+        the chunk-level result the user asked for -- the relevant chunk, not the
+        whole doc.
+
+        Builds the SAME 12-key result dict as an episode PLUS section extras:
+        ``kind="section"``, ``source_path``, ``section_heading``, ``doc_id``,
+        ``summary`` = the parent doc title (context for the chunk). The chunk
+        body is materialized into ``text`` via ONE ``get_section_body`` cold
+        pull (the on-demand chunk read). Entities/topics come from the SECTION
+        (not the parent doc) so the chunk is described by its own axes.
+
+        ``get_document`` is called with ``load_bodies=False`` (NO cold pull);
+        ``text`` is empty if the parent doc or section is missing.
+        """
+        doc_id = sid.rsplit("_sec_", 1)[0]
+        doc = self.store.get_document(doc_id, load_bodies=False)
+        if doc is None:
+            return {
+                "episode_id": sid, "summary": "", "text": "", "timestamp": "",
+                "entities": [], "topics": [], "tones": [], "decisions": [],
+                "session_id": None, "user_id": None, "follows": None,
+                "score": 0.0, "kind": "section", "source_path": "",
+                "section_heading": "", "doc_id": doc_id,
+            }
+        sec = next((s for s in doc.sections if s.id == sid), None)
+        text = ""
+        heading = ""
+        entities: list[str] = []
+        topics: list[str] = []
+        if sec is not None:
+            heading = sec.heading
+            entities = list(sec.entities)
+            topics = list(sec.topics)
+            body = self.store.get_section_body(doc_id, sid)
+            if body is not None:
+                text = body
+        return {
+            "episode_id": sid,
+            "kind": "section",
+            "summary": doc.title,
+            "text": text,
+            "timestamp": doc.ingested_at,
+            "entities": entities,
+            "topics": topics,
+            "tones": [],
+            "decisions": [],
+            "session_id": None,
+            "user_id": None,
+            "follows": None,
+            "score": 0.0,
+            "source_path": doc.source_path,
+            "section_heading": heading,
+            "doc_id": doc_id,
+        }
 
     # ── scoring ──
 
@@ -549,7 +784,10 @@ class GraphTraversal:
             if not candidates:
                 return []
 
-        hydrated = [self._hydrate(eid) for eid in candidates]
+        hydrated = [
+            self._hydrate(eid, query_entities=entities, query_topics=topics)
+            for eid in candidates
+        ]
         scored = self._score_candidates(hydrated, entities, topics, tones)
         scored.sort(key=lambda r: r["score"], reverse=True)
         results = scored[:limit]

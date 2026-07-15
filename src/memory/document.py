@@ -138,9 +138,11 @@ class Document:
         document and no separate section counter; ``parent_index`` is mapped
         to the parent's compound id here.
 
-        ``blob_hash`` and ``embedding`` are left ``None`` here: the store
-        fills ``blob_hash`` at encode time (hashing the body into the cold
-        store), and the embedding backfill fills ``embedding`` later.
+        ``blob_hash`` is left ``None`` here: the store fills it at encode time
+        (hashing the body into the cold store). ``embedding`` is copied from
+        ``raw.embedding`` when the pipeline pre-embedded the section (the
+        per-chunk vector-index path); otherwise it is ``None`` and a later
+        backfill fills it.
         """
         if ingested_at is None:
             ingested_at = datetime.now().isoformat()
@@ -166,6 +168,7 @@ class Document:
                 parent_section=parent,
                 entities=list(sec_ents),
                 topics=list(sec_tops),
+                embedding=getattr(raw, "embedding", None),
             ))
 
         # Doc-level entities/topics default to the section union; an explicit

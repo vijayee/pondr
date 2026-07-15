@@ -317,14 +317,47 @@ class HippocampalRetriever:
         token_count = len("\n".join(parts)) // 4
 
         for ep in episodes:
-            chunk = (
-                f"[{ep.get('episode_id', '')} | {ep.get('timestamp', '')}]\n"
-                f"Entities: {', '.join(ep.get('entities', []))}\n"
-                f"Topics: {', '.join(ep.get('topics', []))}\n"
-                f"Tone: {', '.join(ep.get('tones', []))}\n"
-                f"Summary: {ep.get('summary', '')}\n"
-                "\n"
-            )
+            eid = ep.get("episode_id", "")
+            kind = ep.get("kind")
+            if kind == "section":
+                # Section (per-chunk) result: the matched chunk body is in
+                # ``text`` (materialized at hydrate), so no store/cold pull here.
+                body = ep.get("text", "")
+                heading = ep.get("section_heading", "")
+                chunk = (
+                    f"[{eid} | {ep.get('timestamp', '')}]\n"
+                    f"Source: {ep.get('source_path', '')}\n"
+                    f"Title: {ep.get('summary', '')}\n"
+                    f"Entities: {', '.join(ep.get('entities', []))}\n"
+                    f"Topics: {', '.join(ep.get('topics', []))}\n"
+                    + (f"Section '{heading}': {body}\n" if heading else
+                       (f"Section: {body}\n" if body else ""))
+                    + "\n"
+                )
+            elif kind == "document":
+                # Document result (graph-path hit): cite source + title + the
+                # matched section body (in ``text`` at hydrate, no cold pull).
+                matched = ep.get("matched_section", "")
+                body = ep.get("text", "")
+                chunk = (
+                    f"[{eid} | {ep.get('timestamp', '')}]\n"
+                    f"Source: {ep.get('source_path', '')}\n"
+                    f"Title: {ep.get('summary', '')}\n"
+                    f"Entities: {', '.join(ep.get('entities', []))}\n"
+                    f"Topics: {', '.join(ep.get('topics', []))}\n"
+                    + (f"Section '{matched}': {body}\n" if matched else
+                       (f"Section: {body}\n" if body else ""))
+                    + "\n"
+                )
+            else:
+                chunk = (
+                    f"[{ep.get('episode_id', '')} | {ep.get('timestamp', '')}]\n"
+                    f"Entities: {', '.join(ep.get('entities', []))}\n"
+                    f"Topics: {', '.join(ep.get('topics', []))}\n"
+                    f"Tone: {', '.join(ep.get('tones', []))}\n"
+                    f"Summary: {ep.get('summary', '')}\n"
+                    "\n"
+                )
             chunk_tokens = len(chunk) // 4
             if token_count + chunk_tokens > max_tokens:
                 break

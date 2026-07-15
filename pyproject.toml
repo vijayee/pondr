@@ -51,6 +51,19 @@ dev = [
 gnn = [
     "ogb",
 ]
+# Document-ingestion parser deps (the RAG-replacement pillar). Each parser
+# lazy-imports its dep inside ``parse`` and raises a clear RuntimeError on a
+# missing dep, so the offline test suite stays green without this extra
+# (``importorskip`` skips the dep-specific tests). ``pip install -e
+# .[ingestion]`` opts into all of them.
+ingestion = [
+    "pypdf>=4.0",
+    "tree-sitter",
+    "tree-sitter-languages",
+    "python-docx",
+    "beautifulsoup4",
+    "lxml",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -58,8 +71,15 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 # The doc's layout uses a top-level `src` package with `memory`/`encoding`
-# subpackages and `from src.memory.store import ...` style imports.
-packages = ["src", "src.memory", "src.encoding"]
+# subpackages and `from src.memory.store import ...` style imports. Declare ALL
+# src.* subpackages that ship on disk so editable installs + wheels include
+# them (pre-existing bug: only src/src.memory/src.encoding were declared, so
+# src.ingestion/src.retrieval/src.subconscious/src.gnn/src.training were
+# silently dropped from built distributions).
+packages = [
+    "src", "src.memory", "src.encoding", "src.ingestion", "src.retrieval",
+    "src.subconscious", "src.gnn", "src.training",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

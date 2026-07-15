@@ -37,6 +37,10 @@ from .parsers import (
     detect_type,
 )
 from .pipeline import UnifiedIngestionPipeline
+from .pdf_parser import PDFParser
+from .code_parser import CodeParser
+from .docx_parser import DocxParser
+from .web_parser import WebParser
 
 __all__ = [
     "HierarchicalChunker",
@@ -46,4 +50,8 @@ __all__ = [
     "RawSection",
     "detect_type",
     "UnifiedIngestionPipeline",
+    "PDFParser",
+    "CodeParser",
+    "DocxParser",
+    "WebParser",
 ]
