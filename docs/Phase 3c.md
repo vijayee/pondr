@@ -376,3 +376,107 @@ fine-tune lifts strict has_state catch off 0 and drives the negative
 false-fix rate to 0 while holding adjudication recall >= 12/13. The full
 EnterpriseRAG-Bench LLM-judge harness (D7 deferred item 2) remains out of
 scope; this 16-pair harness is the cheaper, sufficient gate.
+
+### 7.6 27B zero-shot probe (the de-risk before the fine-tune, 2026-07-15)
+
+Before committing to the LoRA fine-tune and to using the **27B as the
+training-data generator**, the 8B's bigger sibling `Ternary-Bonsai-27B-Q2_0`
+(6.83 GB Q2_0, served the same way on the 5080 via PTX JIT) was run through the
+identical 16-pair harness to separate **capacity-bound** failure (8B too small;
+27B does it) from **task-bound** (hard even at 27B). Server config matched the
+8B run: `--reasoning-budget 0 --reasoning-format none
+--chat-template-kwargs {"enable_thinking": false}`, `-c 16384`, `--top-p 0.85`
+(client sends `temperature=0.1`, the one sampling param it controls). The
+harness's `_parse_relations` (fence-strip + carve-outermost + salvage) parsed
+both models identically, so the comparison is apples-to-apples.
+
+Side-by-side (8B -> 27B):
+
+| Metric | 8B | 27B |
+|---|---|---|
+| Deterministic catch (recall) | 4/13 | 4/13 (unchanged) |
+| Bonsai strict `has_state` catch | **0/13** | **4/13** (F2, F3, F4, P7) |
+| Bonsai relaxed any-predicate catch | 5/13 | 5/13 |
+| schema-adherence gap (relaxed - strict) | +38.5% | +7.7% |
+| strict FP on negatives | 0/3 | 1/3 (N14) |
+| adjudication correct (conflicts, fix+supersede) | 12/13 (92%) | 9/13 (69%) |
+| negatives false-fix (false tombstone) | **3/3** | **1/3** (N15, N16 dismissed) |
+
+**Verdict: capacity-bound, not task-bound.** Three takeaways:
+
+1. **The 27B emits `has_state` natively** (strict catch 0 -> 4, including the
+   paraphrased P7 shape the 8B never reached). The 8B's schema defiance is a
+   capacity shortfall, not a family/task limit. Fine-tuning the 8B toward
+   27B behavior is therefore plausible, and the 27B is a viable
+   `has_state`-emitting generator for Stage B's training pairs.
+
+2. **The 27B discriminates non-conflicts** (negative false-fix 3/3 -> 1/3):
+   it correctly `dismiss`es N15 (same value) and N16 (different entity), where
+   the 8B rubber-stamped all three. So 27B-as-adjudication-label-source is
+   viable.
+
+3. **Two caveats survive at 27B**, and both shape the fine-tune:
+   - **Adjudication recall dropped** (12/13 -> 9/13): the 27B is more
+     conservative -- it `ask_user`s on 4 real conflicts (F1, P6, P9, P13)
+     instead of auto-fixing. The fine-tune must keep the 8B's conflict-recall
+     (12/13), not inherit the 27B's over-caution.
+   - **N14 (complementary-temporal) still false-fixes at 27B** (the prod MySQL /
+     staging Postgres shape). The 27B over-extracts complementary scopes as a
+     `has_state` collision. So N14-shape negatives stay **load-bearing** in the
+     fine-tune data, and 27B-as-judge cannot be trusted for that shape --
+     planted/structural labels (the "no Oracle-as-judge" decision) carry it.
+
+Net: the de-risk clears the fine-tune. Stage B uses the 27B as the generator
+(emits `has_state`, discriminates N15/N16), targets the 8B to learn the
+`has_state` schema + canonical naming while *keeping* its 12/13 conflict
+recall, and leans on planted N14/N15/N16 negatives to drive the false-tombstone
+rate to 0. Trainer + serving notes (the ternary merge-into-ternary is dead per
+`ternative`; runtime-LoRA on the ternary Q2_0 base is the serve path; the Prism
+fork's `llama-finetune.exe` is full-finetune-only so PEFT on the dense Qwen3-8B
+is the trainer) are in the plan at `.claude/plans/mellow-jumping-token.md`.
+
+### 7.7 Three-way comparison: 8B vs 27B vs DeepSeek v4 flash (2026-07-15)
+
+After the 27B probe, the same 16-pair harness was pointed at DeepSeek v4 flash
+through the local Ollama server (`BONSAI_EVAL_ENDPOINT=http://localhost:11434/v1`,
+`BONSAI_EVAL_MODEL=deepseek-v4-flash:cloud`; the probe was made
+endpoint/model-agnostic via env vars -- no production code change). Result
+file `scripts/_scratch/bonsai_zeroshot_eval_result_dsflash.json` (probe not
+committed).
+
+| Metric | 8B | 27B | DeepSeek v4 flash |
+|---|---|---|---|
+| Deterministic catch | 4/13 | 4/13 | 4/13 |
+| strict `has_state` catch | 0/13 | 4/13 | 0/13 |
+| relaxed any-predicate catch | 5/13 | 5/13 | 0/13 |
+| adjudication correct (fix+supersede) | 12/13 | 9/13 | **13/13** |
+| negatives false-fix | 3/3 | 1/3 | 1/3 |
+
+Two findings:
+
+1. **DeepSeek's 0/13 extraction is an interface artifact, not a capability
+   gap.** The production extractor sends `response_format: {"type":
+   "json_object"}`; under that constraint DeepSeek v4 flash (via the Ollama
+   cloud proxy) returns **empty content** (`finish_reason: stop`, zero tokens)
+   on the decision-framed bodies (F1-F4, P5-P13), while it DOES extract
+   status-framed text (N14 -> `has_state build green`). Without the
+   `json_object` constraint it produces valid JSON including `has_state`
+   (P5 -> `the team has_state MySQL`). So its latent extraction is fine and
+   schema-adherent; the 0/13 is the `json_object`-constraint + this
+   model/proxy misbehaving on decision-framed inputs. Through the production
+   interface as-is, though, it is a no-op extractor.
+
+2. **DeepSeek is the strongest adjudicator** (13/13, best of the three; 8B 12/13,
+   27B 9/13) and, like the 27B, discriminates the easy negatives (dismisses
+   N15/N16; only N14 false-fixes). The adjudication prompt also uses
+   `json_object` but the model satisfies it -- the single decision object is an
+   easier constrained target than a list of relations.
+
+Implications for Stage B: DeepSeek v4 flash (already the preferred Oracle per
+[[deepseek-flash-over-pro]]) is the strongest **adjudication-label** source
+(13/13 + non-conflict discrimination), reinforcing its use there. As an
+**extraction-shape** generator the 27B is preferable because it emits `has_state`
+**through the actual production interface** (4/13 strict), where DeepSeek is
+hobbled by `json_object`. N14 false-fixes across all three models (8B 3/3, 27B
+1/3, DeepSeek 1/3 -- always the complementary-temporal case) -> the planted
+N14-shape negatives stay load-bearing regardless of generator.
