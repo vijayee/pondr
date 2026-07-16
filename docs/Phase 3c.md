@@ -254,3 +254,125 @@ tombstone refines the prior episode-level path (which stays for
 EnterpriseRAG-Bench eval are in-slice. The Bonsai LoRA fine-tune on
 contradiction decision pairs + the full bench LLM-judge harness are deferred
 (Section D7).
+
+## 7. Zero-shot Bonsai eval + the LoRA fine-tune decision (the D7 gate, closed)
+
+D7 deferred the Bonsai LoRA fine-tune "by analogy" to `identity_drift`
+(Bonsai zero-shot this slice). That deferral was supposed to hinge on a
+judgement of how well Bonsai performs **without** fine-tuning -- a judgement
+that had never actually been made. This section records that judgement from a
+zero-shot eval run on 2026-07-15, and supersedes the by-analogy deferral with
+an evidence-based one: **the fine-tune is warranted** on both axes.
+
+### 7.1 Method
+
+Fixture: `tests/fixtures/enterpriserag/semantic_pairs.json` -- 16 pairs, up
+from the 5-pair deterministic-only `pairs.json`: **4 field-control** (F1-F4,
+`key: value` / `key is value` patterns the deterministic normalizer catches),
+**9 paraphrased** (P5-P13, mid-sentence claims the normalizer misses -- the
+discriminating set), **3 negatives** (N14 complementary-temporal, N15
+same-value-no-conflict, N16 different-entity-same-value). Harness:
+`scripts/_probe_bonsai_zeroshot_eval.py` (probe, not committed; result in
+`scripts/_scratch/bonsai_zeroshot_eval_result.json`). Three measurements:
+
+1. **Extraction catch** -- does a route flag a collision (shared normalized
+   entity + different values across old/new)? `det` (deterministic
+   normalizer), `bonsai_strict` (Bonsai relations filtered to `has_state`/
+   `state` -- exactly what the production `extract_state_assertions` lifts),
+   `bonsai_relaxed` (Bonsai relations with ANY predicate; subject=entity,
+   object=value -- the latent capability ignoring schema adherence).
+2. **Adjudication** -- `decide_contradiction` is independent of the extraction
+   schema (it takes a flag + `state_values` + provenance), so we adjudicate
+   ALL 13 conflicts from ground-truth values, not just the Bonsai-caught
+   subset. Correct = `decision=="fix"` AND `action` contains
+   `supersede_assertion`.
+3. **Negatives** -- feed each negative's values as a flag; a `fix`+
+   `supersede_assertion` is a false auto-tombstone.
+
+### 7.2 Results
+
+| Measurement                                  | Result          |
+|----------------------------------------------|-----------------|
+| Deterministic catch (recall)                 | 4/13 (30.77%)   |
+| Bonsai strict has_state catch (recall)        | **0/13 (0%)**   |
+| Bonsai relaxed any-predicate catch            | 5/13 (38.46%)   |
+| Schema-adherence gap (relaxed - strict)      | +38.46%         |
+| Bonsai strict false-positives on negatives    | 0/3             |
+| Bonsai relaxed false-positives on negatives   | 1/3 (N14)       |
+| Adjudication correct (fix + supersede_assertion) | 12/13 (92.31%) |
+| Adjudication returned-None (failure)         | 0/13            |
+| Negatives false auto-fix (raw rubber-stamp)   | 3/3             |
+
+### 7.3 Findings
+
+**Finding 1 -- Bonsai zero-shot does NOT follow the `has_state` schema.**
+The relation prompt lists `has_state(Entity, Value)`, but Bonsai 8B zero-shot
+ignores it and emits freeform predicates (`is`, `uses`, `decides`,
+`is going to be`, `runs on`). Strict has_state catch is 0/13. Because the
+production encoder (`extract_state_assertions`) only lifts `has_state`/
+`state` predicates from `episode.relations`, the shipped Bonsai assertion
+arm contributes **nothing** in production -- Bonsai-enabled encode is
+byte-identical to deterministic-only encode today. The semantic capability IS
+latent (relaxed catch 5/13, +2 paraphrased over deterministic: P5, P13), but
+it is unrealized because of schema non-adherence, not capability absence, and
+it is noisy (1/3 relaxed false-positive on N14).
+
+**Finding 2 -- Bonsai zero-shot adjudicates with high recall but is a
+rubber-stamp on non-conflicts.** On the 13 ground-truth conflicts it returns
+`fix + supersede_assertion` on 12/13 (P8 conservatively `ask_user`). But fed
+a `contradictory_state` flag + two values, it auto-tombstoned 3/3 negatives.
+This is a precision failure, not a recall one: it does not discriminate
+non-conflicts. The realistic production-reachable negative is **N14**
+(complementary-temporal: shared entity + different values, e.g. "database is
+MySQL for prod / Postgres for staging" -- NOT a real conflict, but the
+deterministic detector WOULD flag it, since it keys on shared entity +
+different value). N15 (same value) and N16 (different entity) are not
+detector-reachable, so they are a decider-robustness probe rather than a
+production risk. The honest production risk is therefore **1/1 realistic
+false-tombstone** (N14), with 3/3 as the raw rubber-stamp probe.
+
+**Finding 3 -- the deterministic route IS leaving opportunities on the
+table.** Deterministic catch is 4/13 (the 4 field-controls); it misses all 9
+paraphrased conflicts. Bonsai-relaxed catches 2 of those (P5, P13). The
+deterministic-only path is the honest ceiling it was documented to be, and
+the paraphrased conflicts are exactly the opportunity Bonsai is supposed to
+claim.
+
+### 7.4 Decision (the D7 gate, now evidence-based)
+
+**The Bonsai LoRA fine-tune is WARRANTED -- on both axes -- and the D7
+"defer by analogy" deferral is superseded by this evidence.**
+
+- **Extraction axis**: zero-shot Bonsai contributes 0 in production (schema
+  non-adherence). The fine-tune teaches the `has_state(Entity, Value)` schema
+  with consistent entity/value naming, unlocking the paraphrased-conflict
+  catch the deterministic route cannot reach.
+- **Adjudication axis (the stronger driver)**: zero-shot Bonsai rubber-stamps
+  non-conflicts, including the realistic N14 complementary-temporal case ->
+  a silent false fact-tombstone. This is the worst failure mode (a correct
+  fact quietly marked superseded), and it is NOT cheaply filterable -- it
+  requires the model to actually discriminate, which is the fine-tune's job.
+
+A cheaper partial alternative exists for the extraction axis alone: a
+**relaxed production filter** that accepts `is`/`uses`/`runs on`/
+`is going to be` as state-like predicates would close part of the
+schema-adherence gap without a fine-tune. It is NOT adopted as the path
+forward because (a) it inherits the 1/3 relaxed false-positive rate, and (b)
+it does nothing for the adjudication precision gap, which is the binding
+problem. It remains available as a stopgap if the fine-tune is delayed.
+
+### 7.5 Fine-tune scope (next slice, not this one)
+
+Train Bonsai (LoRA on the 8B gguf, or the in-process path per
+[[hippo-bonsai-local-server]] option A) on **entity-centered decision pairs**
+regenerated with the 3b `identity_drift` extraction: (a) extraction pairs
+that force the `has_state(Entity, Value)` predicate + canonical entity
+naming on paraphrased assertions (the P5-P13 shape); (b) adjudication pairs
+that include N14-style complementary-temporal / N15 same-value / N16
+different-entity negatives so the decider learns to `dismiss`/`ask_user`
+rather than rubber-stamp. The eval harness here
+(`_probe_bonsai_zeroshot_eval.py`) is the before/after gate: a successful
+fine-tune lifts strict has_state catch off 0 and drives the negative
+false-fix rate to 0 while holding adjudication recall >= 12/13. The full
+EnterpriseRAG-Bench LLM-judge harness (D7 deferred item 2) remains out of
+scope; this 16-pair harness is the cheaper, sufficient gate.

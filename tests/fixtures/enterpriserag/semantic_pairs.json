@@ -1,0 +1,182 @@
+{
+  "source": "EnterpriseRAG-Bench 'Conflicting Info' structure (near-duplicate, newer-supersedes-older) -- EXPANDED semantic eval set for the Bonsai zero-shot study (Phase 3c, fine-tune hinge).",
+  "source_url": "https://github.com/onyx-dot-app/EnterpriseRAG-Bench",
+  "license": "MIT (upstream bench is MIT-licensed); specific titles/bodies are distilled fixtures crafted to probe the deterministic normalizer's ceiling vs Bonsai has_state.",
+  "purpose": "Two questions: (1) OPPORTUNITY -- does Bonsai has_state catch paraphrased/semantic conflicts the deterministic normalizer (src/encoding/assertion_extractor.py) misses? (det catch-rate vs Bonsai catch-rate). (2) FINE-TUNE HINGE -- on the conflicts Bonsai catches, does decide_contradiction (zero-shot) adjudicate correctly (fix + supersede_assertion)? That quality gates whether the LoRA fine-tune on contradiction decision pairs is warranted.",
+  "det_normalizer_ceiling": "The deterministic normalizer is LINE-ANCHORED and matches only ^key: value / ^key is/are/was [now] value / ^subject {chose|selected|adopted|picked|switched to|moved to|is now using|now uses|replaced X with} value. The 'paraphrased' pairs embed the state claim mid-sentence after a comma/clause or use a non-listed verb ('will be', 'is going to be', 'settled on', 'landed on', 'runs on', 'agreed ... will be') so the normalizer genuinely does NOT catch them. The harness MEASURES actual det-catch (self-validating) rather than trusting this label.",
+  "scoring": "For each pair the harness extracts assertions from old+new bodies (deterministic normalizer vs Bonsai has_state), normalizes entities (src/encoding/assertion_extractor._norm_key), and checks for a COLLISION: a shared normalized entity with DIFFERENT values across the two docs. conflict=true pairs: a catch (collision) is a true positive (recall). conflict=false pairs: a catch is a false positive (precision). Adjudication runs only on caught conflict pairs: decide_contradiction should return fix + supersede_assertion (newer supersedes older).",
+  "pairs": [
+    {
+      "id": "F1_database_field",
+      "category": "field_control",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "database",
+      "old_doc": {"title": "DB Pick v1", "source_path": "docs/db-pick-v1.md", "body": "# DB Pick v1\n\ndatabase: MySQL\n"},
+      "new_doc": {"title": "DB Pick v2", "source_path": "docs/db-pick-v2.md", "body": "# DB Pick v2\n\ndatabase: Postgres\n"},
+      "old_value": "MySQL", "new_value": "Postgres"
+    },
+    {
+      "id": "F2_ticket_status_field",
+      "category": "field_control",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "status",
+      "old_doc": {"title": "Ticket T-1 v1", "source_path": "tickets/T-1-v1.md", "body": "# Ticket T-1 v1\n\nstatus: open\n"},
+      "new_doc": {"title": "Ticket T-1 v2", "source_path": "tickets/T-1-v2.md", "body": "# Ticket T-1 v2\n\nstatus: closed\n"},
+      "old_value": "open", "new_value": "closed"
+    },
+    {
+      "id": "F3_deploy_target_field_is",
+      "category": "field_control",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "deployment target",
+      "old_doc": {"title": "Deploy v1", "source_path": "docs/deploy-v1.md", "body": "# Deploy v1\n\ndeployment target is staging\n"},
+      "new_doc": {"title": "Deploy v2", "source_path": "docs/deploy-v2.md", "body": "# Deploy v2\n\ndeployment target is now production\n"},
+      "old_value": "staging", "new_value": "production"
+    },
+    {
+      "id": "F4_cache_field_eq",
+      "category": "field_control",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "cache",
+      "old_doc": {"title": "Cache v1", "source_path": "docs/cache-v1.md", "body": "# Cache v1\n\ncache = redis\n"},
+      "new_doc": {"title": "Cache v2", "source_path": "docs/cache-v2.md", "body": "# Cache v2\n\ncache = memcached\n"},
+      "old_value": "redis", "new_value": "memcached"
+    },
+    {
+      "id": "P5_data_layer_paraphrased",
+      "category": "paraphrased",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "data layer",
+      "old_doc": {"title": "Team Standardization Notes", "source_path": "docs/team-standardization.md", "body": "# Team Standardization Notes\n\nWe discussed the data layer and settled on MySQL going forward.\n"},
+      "new_doc": {"title": "Data Layer Update", "source_path": "docs/data-layer-update.md", "body": "# Data Layer Update\n\nGoing forward the team's data layer is Postgres.\n"},
+      "old_value": "MySQL", "new_value": "Postgres",
+      "miss_reason": "Paraphrased, no line-anchored field/change-verb shape; apostrophe in 'team's' breaks the _FIELD_IS_RE key char class."
+    },
+    {
+      "id": "P6_database_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "database",
+      "old_doc": {"title": "Q2 Infra Notes", "source_path": "docs/q2-infra.md", "body": "# Q2 Infra Notes\n\nAfter the team meeting, we agreed that the database will be MySQL for the foreseeable future.\n"},
+      "new_doc": {"title": "Q3 Infra Update", "source_path": "docs/q3-infra.md", "body": "# Q3 Infra Update\n\nLooking ahead, the database is going to be Postgres across all services.\n"},
+      "old_value": "MySQL", "new_value": "Postgres",
+      "miss_reason": "Leading clause + comma before the entity ('After the team meeting,'); 'will be' / 'is going to be' are not in the change-verb list."
+    },
+    {
+      "id": "P7_deploy_target_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "deployment target",
+      "old_doc": {"title": "Launch Plan A", "source_path": "docs/launch-a.md", "body": "# Launch Plan A\n\nBased on the architecture review, the deployment target is going to be staging for the first release.\n"},
+      "new_doc": {"title": "Launch Plan B", "source_path": "docs/launch-b.md", "body": "# Launch Plan B\n\nGiven the new timeline, the deployment target is going to be production, staging is no longer the plan.\n"},
+      "old_value": "staging", "new_value": "production",
+      "miss_reason": "Leading clause + comma; 'is going to be' not a listed change verb."
+    },
+    {
+      "id": "P8_framework_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "framework",
+      "old_doc": {"title": "Frontend Decision v1", "source_path": "docs/frontend-v1.md", "body": "# Frontend Decision v1\n\nFollowing the spike, we agreed the framework will be React for the new app.\n"},
+      "new_doc": {"title": "Frontend Decision v2", "source_path": "docs/frontend-v2.md", "body": "# Frontend Decision v2\n\nAfter re-evaluating, the framework is going to be Svelte going forward.\n"},
+      "old_value": "React", "new_value": "Svelte",
+      "miss_reason": "Leading clause + comma; 'will be' / 'is going to be' not listed change verbs."
+    },
+    {
+      "id": "P9_hosting_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "hosting provider",
+      "old_doc": {"title": "Cloud Choice v1", "source_path": "docs/cloud-v1.md", "body": "# Cloud Choice v1\n\nIn last week's review, we decided the hosting provider will be AWS.\n"},
+      "new_doc": {"title": "Cloud Choice v2", "source_path": "docs/cloud-v2.md", "body": "# Cloud Choice v2\n\nGoing forward, the hosting provider is going to be GCP for cost reasons.\n"},
+      "old_value": "AWS", "new_value": "GCP",
+      "miss_reason": "Leading clause + comma; 'decided' / 'will be' / 'is going to be' not in the change-verb list."
+    },
+    {
+      "id": "P10_ci_runner_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "ci runner",
+      "old_doc": {"title": "CI Notes v1", "source_path": "docs/ci-v1.md", "body": "# CI Notes v1\n\nPer the platform team, the CI runner will be GitHub Actions for all repos.\n"},
+      "new_doc": {"title": "CI Notes v2", "source_path": "docs/ci-v2.md", "body": "# CI Notes v2\n\nMoving ahead, the CI runner is going to be self-hosted Jenkins on our own metal.\n"},
+      "old_value": "GitHub Actions", "new_value": "self-hosted Jenkins",
+      "miss_reason": "Leading clause + comma; 'will be' / 'is going to be' not listed change verbs."
+    },
+    {
+      "id": "P11_secrets_landed_on",
+      "category": "paraphrased",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "secrets store",
+      "old_doc": {"title": "Secrets v1", "source_path": "docs/secrets-v1.md", "body": "# Secrets v1\n\nFor the secrets store, the team landed on Vault as the backend.\n"},
+      "new_doc": {"title": "Secrets v2", "source_path": "docs/secrets-v2.md", "body": "# Secrets v2\n\nThese days, the secrets store runs on AWS Secrets Manager across the board.\n"},
+      "old_value": "Vault", "new_value": "AWS Secrets Manager",
+      "miss_reason": "Leading clause + comma; 'landed on' / 'runs on' not in the change-verb list. Also tests Bonsai entity-naming consistency ('secrets store' both docs)."
+    },
+    {
+      "id": "P12_pkg_manager_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "package manager",
+      "old_doc": {"title": "Tooling v1", "source_path": "docs/tooling-v1.md", "body": "# Tooling v1\n\nAfter the discussion, we agreed the package manager will be npm.\n"},
+      "new_doc": {"title": "Tooling v2", "source_path": "docs/tooling-v2.md", "body": "# Tooling v2\n\nGoing forward, the package manager is going to be pnpm for the monorepo.\n"},
+      "old_value": "npm", "new_value": "pnpm",
+      "miss_reason": "Leading clause + comma; 'will be' / 'is going to be' not listed change verbs."
+    },
+    {
+      "id": "P13_region_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "correct_decision": "fix",
+      "entity_hint": "region",
+      "old_doc": {"title": "Region v1", "source_path": "docs/region-v1.md", "body": "# Region v1\n\nFor the primary deployment, the region is us-east-1 for latency reasons.\n"},
+      "new_doc": {"title": "Region v2", "source_path": "docs/region-v2.md", "body": "# Region v2\n\nNow that most users are in Europe, the region is going to be eu-west-1 for everyone.\n"},
+      "old_value": "us-east-1", "new_value": "eu-west-1",
+      "miss_reason": "Leading clause + comma; 'is' sits after 'the region' but the line starts with 'For the primary deployment,' so _FIELD_IS_RE (line-anchored) does not match."
+    },
+    {
+      "id": "N14_complementary_temporal",
+      "category": "negative_complementary",
+      "conflict": false,
+      "correct_decision": "dismiss",
+      "entity_hint": "build status",
+      "old_doc": {"title": "January Status", "source_path": "docs/jan-status.md", "body": "# January Status\n\nAs of January, the build status was green on the old runner.\n"},
+      "new_doc": {"title": "July Status", "source_path": "docs/jul-status.md", "body": "# July Status\n\nAs of July, the build status is red on the new runner.\n"},
+      "old_value": "green", "new_value": "red",
+      "negatives_reason": "Complementary temporal states (different dates) -- NOT a contradiction. A correct decider dismisses (or ask_user). Tests Bonsai precision: does it over-flag when provenance is temporally qualified?"
+    },
+    {
+      "id": "N15_same_value_no_conflict",
+      "category": "negative_same_value",
+      "conflict": false,
+      "correct_decision": "none",
+      "entity_hint": "database",
+      "old_doc": {"title": "Plan A", "source_path": "docs/plan-a.md", "body": "# Plan A\n\ndatabase: Postgres\n"},
+      "new_doc": {"title": "Plan B", "source_path": "docs/plan-b.md", "body": "# Plan B\n\ndatabase: Postgres\n"},
+      "old_value": "Postgres", "new_value": "Postgres",
+      "negatives_reason": "Same entity, same value -- no collision (equal values), no contradiction. Tests that catch is defined as shared entity AND different value (not just shared entity)."
+    },
+    {
+      "id": "N16_different_entity_same_value",
+      "category": "negative_different_entity",
+      "conflict": false,
+      "correct_decision": "none",
+      "entity_hint": "framework",
+      "old_doc": {"title": "Frontend v1", "source_path": "docs/frontend-fw-v1.md", "body": "# Frontend v1\n\nThe frontend framework will be React.\n"},
+      "new_doc": {"title": "Mobile v1", "source_path": "docs/mobile-fw-v1.md", "body": "# Mobile v1\n\nThe mobile framework will be React.\n"},
+      "old_value": "React", "new_value": "React",
+      "negatives_reason": "Different entities (frontend framework vs mobile framework), same value -- no shared entity, no contradiction. Tests Bonsai entity discrimination."
+    }
+  ]
+}
