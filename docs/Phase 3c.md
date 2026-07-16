@@ -480,3 +480,65 @@ Implications for Stage B: DeepSeek v4 flash (already the preferred Oracle per
 hobbled by `json_object`. N14 false-fixes across all three models (8B 3/3, 27B
 1/3, DeepSeek 1/3 -- always the complementary-temporal case) -> the planted
 N14-shape negatives stay load-bearing regardless of generator.
+
+### 7.8 Dense-base probe: local qwen3:8b (2026-07-15)
+
+Stage B's open decision was "verify Bonsai's dense base == Qwen3-8B-Instruct
+(Prism post-training-quant only, or quant+extra-train)?" -- i.e. is the 8B's
+zero-shot `has_state` non-adherence a Bonsai artifact or a Qwen3-8B base trait?
+A locally-installed Ollama `qwen3:8b` (Q4_K_M, 8.2B -- the dense Qwen3-8B that
+is the PEFT candidate) answers it directly. Ran via the same 16-pair harness
+(probe `scripts/_probe_qwen3_zeroshot_thinkoff.py`, not committed; result
+`scripts/_scratch/bonsai_zeroshot_eval_result_qwen3_8b_thinkoff.json`).
+
+**Interface caveat (material).** The production extractor POSTs to
+`/v1/chat/completions` with `response_format: {json_object}` and does NOT pass
+Ollama's `think` flag; `qwen3:8b` defaults to **thinking-on**, and with
+`max_tokens=768` the reasoning eats the whole budget -> `finish_reason=length`,
+**empty content** (reproduced deterministically on P7: think-on 3/3 empty,
+think-off 3/3 valid). `/v1` ignores a `think:false` passthrough (verified), so
+driving `/api/chat` with `think:false` is the only way to get the fair number.
+The 8B/27B Bonsai runs were thinking-off (`--reasoning-budget 0`), so
+think-off is the like-for-like interface. Through the production `/v1`
+interface as-is, qwen3:8b is flaky (first run 1/13 strict, 12/32 extraction
+calls empty) -- an interface artifact, not a capability ceiling (P5 and P11
+emit valid `has_state` JSON when they don't overrun). Think-off results:
+
+| Metric | Bonsai 8B (ternary) | qwen3:8b (dense) | Bonsai 27B | DeepSeek flash |
+|---|---|---|---|---|
+| Deterministic catch | 4/13 | 4/13 | 4/13 | 4/13 |
+| strict `has_state` catch | 0/13 | **0/13** | 4/13 | 0/13 (artifact) |
+| relaxed any-predicate catch | 5/13 | 3/13 | 5/13 | 0/13 (artifact) |
+| adjudication correct (fix+supersede) | 12/13 | **13/13** | 9/13 | 13/13 |
+| adjudication None-fail | 0/13 | 0/13 | 0/13 | 0/13 | (omitted from prior table) |
+| negatives false-fix | 3/3 | **3/3** | 1/3 | 1/3 |
+
+**Two findings:**
+
+1. **Dense qwen3:8b == Bonsai 8B ternary on the `has_state` schema (both
+   0/13 strict).** The schema non-adherence is a **Qwen3-8B base trait**, not a
+   Bonsai/ternary artifact -- Bonsai is quant-only (not quant+extra-train) on
+   this task. This **resolves the Stage B open decision**: the PEFT base can be
+   upstream Qwen3-8B-Instruct; there is no hidden Bonsai post-train to recover.
+   (Minor divergence: dense qwen3 relaxed 3/13 vs Bonsai 8B relaxed 5/13 --
+   Bonsai's post-train slightly *helps* latent extraction -- but both are 0
+   strict, so it does not change the fine-tune-justified verdict.)
+
+2. **Dense qwen3:8b is the most aggressive rubber-stamp adjudicator** (13/13
+   decided, 13/13 correct on conflicts, but 3/3 negatives false-fix -- it
+   fixes unconditionally, never `ask_user`/`dismiss`). Perfect conflict recall,
+   zero non-conflict discrimination -- the same rubber-stamp shape as the
+   ternary 8B (12/13 + 3/3) but more consistent. This confirms the binding
+   driver is **adjudication precision, not capacity**: you cannot get
+   non-conflict discrimination from the 8B at any quantization (dense or
+   ternary both rubber-stamp); only 27B/DeepSeek discriminate, and only
+   marginally (1/3). -> the fine-tune's planted-negative (N14/N15/N16) data is
+   the load-bearing ingredient for the decider, exactly as planned.
+
+Stage B implication: PEFT on upstream Qwen3-8B-Instruct is the correct base;
+the fine-tune teaches a schema the 8B genuinely lacks (dense == ternary == 0)
+AND a categorical non-conflict call it rubber-stamps at every quantization.
+Note for the runtime: the production extractor would need `think:false` (or a
+larger `max_tokens`) to serve qwen3:8b-class models reliably over Ollama --
+moot for Stage B since the serve target is the ternary Bonsai via llama-server
+(thinking already off), not Ollama qwen3.
