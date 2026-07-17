@@ -441,3 +441,132 @@ def test_gather_context_excludes_tombstoned_edges(tmp_path):
     values = {v["value"] for v in ctx["state_values"]}
     assert values == {"Postgres"}  # MySQL dropped (tombstoned)
     store.close()
+
+
+# ── Phase 3c Sec 7: deterministic non-conflict guards ──
+#
+# The 8B (and 27B) decider capacity-boundedly rubber-stamp complementary-
+# temporal pairs (jan-status green / jul-status red) into fix+supersede_assertion
+# -- a silent false tombstone. Two correct-by-construction guards short-circuit
+# decide_contradiction BEFORE the HTTP call: equal values -> dismiss (defense-in-
+# depth; the detector only flags DISTINCT values so this is a safety net) and
+# both-sources-month-named -> ask_user (non-mutating; stops the false tombstone).
+# _gather_entity_context resolves each assertion's asserted_by doc/section id
+# back to its source_path so the month-name signal is available in PRODUCTION
+# (not just the eval harness, which passes source_path directly as asserted_by).
+
+
+def _plant_doc(store, doc_id, source_path):
+    """Plant the minimal hot-store doc metadata so ``document_source_path``
+    resolves (the existence sentinel is ``source_type``; see ``get_document``)."""
+    store.db.put_sync(f"content/doc/{doc_id}/source_type", "text")
+    store.db.put_sync(f"content/doc/{doc_id}/source_path", source_path)
+
+
+def test_gather_context_resolves_source_path_for_doc_provenance(tmp_path):
+    """A state_value whose ``asserted_by`` is a doc/section id carries the
+    resolved ``source_path`` so the complementary-temporal guard can see the
+    month-named filename. Episode-id provenance -> ``source_path`` is None
+    (guard falls through to the LLM)."""
+    store = _store(tmp_path)
+    _plant_doc(store, "doc_000001", "docs/jan-status.md")
+    _plant_doc(store, "doc_000002", "docs/jul-status.md")
+    # Section-id provenance: ``{doc_id}_sec_{NNN}`` -> strip ``_sec_`` tail.
+    _plant_assertion(store, "dep", "green", "doc_000001_sec_002",
+                     "2026-07-01T10:00:00Z")
+    # Doc-id provenance (doc-level assertion): resolves directly.
+    _plant_assertion(store, "dep", "red", "doc_000002",
+                     "2026-07-05T10:00:00Z")
+
+    cons = _cons(store)
+    ctx = cons._gather_entity_context("E:dep")
+    by_val = {v["value"]: v for v in ctx["state_values"]}
+    assert by_val["green"]["source_path"] == "docs/jan-status.md"  # section id
+    assert by_val["red"]["source_path"] == "docs/jul-status.md"     # doc id
+    store.close()
+
+
+def test_gather_context_source_path_none_for_episode_provenance(tmp_path):
+    """Episode-id (``ep_...``) provenance carries no source_path -> guard falls
+    through to the LLM (the existing 3b/3c episode-provenance path unchanged)."""
+    store = _store(tmp_path)
+    _plant_assertion(store, "team", "MySQL", "ep_old",
+                     "2026-07-01T10:00:00Z")
+    _plant_assertion(store, "team", "Postgres", "ep_new",
+                     "2026-07-05T10:00:00Z")
+    cons = _cons(store)
+    ctx = cons._gather_entity_context("E:team")
+    for v in ctx["state_values"]:
+        assert v["source_path"] is None
+    store.close()
+
+
+def test_decide_contradiction_complementary_temporal_guard_no_http(tmp_path):
+    """Two DIFFERENT values asserted by month-named point-in-time records ->
+    ask_user, returned by the deterministic guard BEFORE any HTTP call (no
+    server needed). This is the N14 false-tombstone fix."""
+    from src.gnn.bonsai_decider import BonsaiDecider
+    dec = BonsaiDecider()  # lazy HTTP -- never reached (guard short-circuits)
+    state_values = [
+        {"value": "green", "source_path": "docs/jan-status.md",
+         "asserted_by": "doc_000001_sec_002", "asserted_at": "2026-07-01"},
+        {"value": "red", "source_path": "docs/jul-status.md",
+         "asserted_by": "doc_000002", "asserted_at": "2026-07-05"},
+    ]
+    flag = {"node": "E:dep", "type": "contradictory_state",
+            "evidence": state_values}
+    out = dec.decide_contradiction(flag, {"state_values": state_values})
+    assert out is not None
+    assert out["decision"] == "ask_user"
+    assert out["action"] == "no_action"
+    assert "complementary temporal" in out["reasoning"]
+
+
+def test_decide_contradiction_equal_values_guard_no_http(tmp_path):
+    """All-equal live values -> dismiss (defense-in-depth; the production
+    detector only flags DISTINCT values, but a direct caller / future path
+    must still not false-fix an agreeing pair)."""
+    from src.gnn.bonsai_decider import BonsaiDecider
+    dec = BonsaiDecider()
+    state_values = [
+        {"value": "Postgres", "asserted_by": "docs/plan-a.md",
+         "asserted_at": "2026-07-01"},
+        {"value": "Postgres", "asserted_by": "docs/plan-b.md",
+         "asserted_at": "2026-07-05"},
+    ]
+    flag = {"node": "E:db", "type": "contradictory_state",
+            "evidence": state_values}
+    out = dec.decide_contradiction(flag, {"state_values": state_values})
+    assert out is not None
+    assert out["decision"] == "dismiss"
+    assert out["action"] == "no_action"
+
+
+def test_decide_contradiction_real_conflict_bypasses_guard(tmp_path):
+    """A genuine same-entity value change (different values, NON-month-named
+    version-suffixed decision docs) bypasses both guards so the fine-tuned
+    adapter adjudicates over HTTP. Verifies the guard never false-dismisses a
+    real conflict: ``_post_json`` IS reached (the LLM path runs)."""
+    from src.gnn.bonsai_decider import BonsaiDecider
+    dec = BonsaiDecider()
+    # Monkeypatch the HTTP layer to PROVE the guard did not short-circuit: if
+    # the guard fired, _post_json would never be called and the recorded prompt
+    # would stay None. A real conflict must reach the LLM path.
+    seen_prompt = {"p": None}
+
+    def fake_post_json(prompt):
+        seen_prompt["p"] = prompt
+        return None  # simulate a miss -> decide_contradiction returns None
+
+    dec._post_json = fake_post_json
+    state_values = [
+        {"value": "MySQL", "source_path": "docs/db-pick-v1.md",
+         "asserted_by": "doc_000003", "asserted_at": "2026-07-01"},
+        {"value": "Postgres", "source_path": "docs/db-pick-v2.md",
+         "asserted_by": "doc_000004", "asserted_at": "2026-07-05"},
+    ]
+    flag = {"node": "E:db", "type": "contradictory_state",
+            "evidence": state_values}
+    out = dec.decide_contradiction(flag, {"state_values": state_values})
+    assert out is None           # HTTP miss -> None (no fabricated decision)
+    assert seen_prompt["p"] is not None  # the LLM path WAS reached (guard did not fire)

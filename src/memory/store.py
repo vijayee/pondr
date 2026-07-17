@@ -1363,6 +1363,22 @@ class HippocampalStore:
             f"content/doc_by_source/{safe_edge_component(source_path)}"))
         return raw or None
 
+    def document_source_path(self, doc_id: str) -> Optional[str]:
+        """Light reverse lookup: the ``source_path`` for ``doc_id``, or ``None``.
+
+        One hot-store ``get_sync`` (no section / cold-body pull, unlike
+        ``get_document``). Used by the Phase 3c contradiction decider context
+        (``_gather_entity_context``) to resolve an assertion's ``asserted_by``
+        doc/section id back to its source filename so the complementary-temporal
+        guard can recognize month-named point-in-time records
+        (``docs/jan-status.md``). ``None`` for a missing doc or an
+        episode/``None`` provenance id (caller falls through to the LLM).
+        """
+        if not isinstance(doc_id, str) or not doc_id:
+            return None
+        raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/source_path"))
+        return raw or None
+
     def _document_graph_ops(self, doc: Document, delete: bool) -> list[dict]:
         """Build expand_triple ops for a doc's graph pointers (put or delete).
 

@@ -1185,10 +1185,25 @@ class Consolidator:
                     continue
                 ctx["states"].append(v)
                 meta = self.store.get_edge_meta(entity_id, "state", v)
+                asserted_by = meta.get("asserted_by")
+                # Phase 3c (D3+): resolve the asserting doc/section id back to
+                # its source_path so the contradiction decider's complementary-
+                # temporal guard can recognize month-named point-in-time records
+                # (docs/jan-status.md / docs/jul-status.md). Episode-id
+                # (``ep_...``) and ``None`` provenance carry no source_path ->
+                # the guard falls through to the LLM (status quo). Section ids
+                # are ``{doc_id}_sec_{NNN}``; strip the ``_sec_`` tail to get the
+                # doc id, then one light ``document_source_path`` lookup.
+                source_path = None
+                if isinstance(asserted_by, str) and not asserted_by.startswith("ep_"):
+                    doc_id = (asserted_by.rsplit("_sec_", 1)[0]
+                              if "_sec_" in asserted_by else asserted_by)
+                    source_path = self.store.document_source_path(doc_id)
                 ctx["state_values"].append({
                     "value": v,
-                    "asserted_by": meta.get("asserted_by"),
+                    "asserted_by": asserted_by,
                     "asserted_at": meta.get("asserted_at"),
+                    "source_path": source_path,
                     "unit": meta.get("asserted_by"),
                 })
         finally:

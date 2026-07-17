@@ -54,6 +54,32 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
 # but drops the C0 control range that would corrupt downstream JSON / display.
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
+# Calendar-month abbreviations. Used by the complementary-temporal deterministic
+# guard (see ``_deterministic_non_conflict``) to recognize month-named
+# point-in-time records (``docs/jan-status.md`` / ``docs/jul-status.md``): two
+# such records carrying different values are complementary snapshots, not a
+# supersession. Lowercased; the guard lowercases the path token before lookup.
+_MONTH_ABBREVS = frozenset(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec")
+)
+
+
+def _month_prefix(path: str) -> str:
+    """Return the lowercased first ``-``-delimited token of ``path``'s basename
+    if it is a calendar-month abbreviation, else ``""``.
+
+    ``"docs/jan-status.md"`` -> ``"jan"``; ``"docs/db-pick-v1.md"`` -> ``""``;
+    ``"doc_000123_sec_002"`` -> ``""`` (production doc/section ids carry no
+    month token -- the guard keys off ``source_path`` which
+    ``_gather_entity_context`` resolves from the doc id, not the id itself).
+    """
+    if not isinstance(path, str) or not path:
+        return ""
+    base = path.rsplit("/", 1)[-1]
+    tok = base.split("-", 1)[0].lower()
+    return tok if tok in _MONTH_ABBREVS else ""
+
 
 class BonsaiDecider:
     """Deploy-time Bonsai decider for abstract gist / ontology typing / anomaly.
@@ -186,7 +212,8 @@ class BonsaiDecider:
         ``flag`` is the ``{node, type:"contradictory_state", evidence}`` record
         from ``_detect_contradictory_state``; ``retrieved_context`` carries
         the conflicting ``state_values`` WITH provenance (``asserted_by`` /
-        ``asserted_at``), gathered by ``_gather_entity_context``. Uses
+        ``asserted_at`` / ``source_path``), gathered by
+        ``_gather_entity_context``. Uses
         ``bonsai_contradiction_decision_prompt``. Returns
         ``{"decision": "fix"|"ask_user"|"dismiss", "action": str, "reasoning":
         str}`` or ``None`` on failure (caller records the flag only -- honest
@@ -194,8 +221,25 @@ class BonsaiDecider:
         ``_apply`` auto-applies ONLY a ``fix`` whose ``action`` contains
         ``supersede_assertion`` AND ``forgetting_enabled``; any other ``fix``
         -> ``ask_user`` (record-only).
+
+        A deterministic pre-filter (``_deterministic_non_conflict``) runs BEFORE
+        the HTTP call and short-circuits the clear non-conflict cases the 8B
+        decider capacity-boundedly false-fixes (see ``docs/Phase 3c.md`` Sec 7:
+        the 8B and 27B both rubber-stamp complementary-temporal pairs into
+        ``fix+supersede_assertion`` -- a silent false tombstone). These guards
+        are correct-by-construction, not learned behavior; they mirror the
+        always-on ``extract_state_assertions`` normalizer and cost one HTTP call
+        fewer when they fire. Real conflicts (two distinct values, non-month-
+        named sources) bypass the pre-filter and hit Bonsai verbatim -- the
+        fine-tuned adapter still adjudicates the genuine-conflict path.
         """
         flagged_entity = str(flag.get("node", ""))
+        pre = _deterministic_non_conflict(
+            retrieved_context.get("state_values")
+            if isinstance(retrieved_context, dict) else None
+        )
+        if pre is not None:
+            return pre
         prompt = bonsai_contradiction_decision_prompt(
             flagged_entity, retrieved_context
         )
@@ -287,3 +331,90 @@ def _opt_str(v) -> Optional[str]:
     if not s or s.lower() == "null":
         return None
     return s
+
+
+def _deterministic_non_conflict(state_values) -> Optional[dict]:
+    """Deterministic guards for cases that are non-conflicts by construction.
+
+    Returns a ``{"decision", "action", "reasoning"}`` dict to short-circuit
+    ``decide_contradiction`` BEFORE the Bonsai HTTP call, or ``None`` to let the
+    LLM adjudicate. Two guards, both correct-by-construction (neither can
+    false-dismiss a real conflict nor false-tombstone a non-conflict):
+
+    (1) EQUAL VALUES -- every live state value is the same string. A
+        contradiction requires two DIFFERENT values; agreeing values are not a
+        conflict regardless of source or newness -> ``dismiss`` + ``no_action``.
+        This is defense-in-depth: ``_detect_contradictory_state`` only flags
+        DISTINCT values, so the production decider is never handed an all-equal
+        pair -- but if a future caller or a direct test invokes the decider on
+        one, this guard correctly dismisses instead of asking the LLM (which the
+        8B capacity-boundedly false-fixes, see ``docs/Phase 3c.md`` Sec 7).
+
+    (2) COMPLEMENTARY TEMPORAL -- two DIFFERENT values whose asserting sources
+        are BOTH month-named point-in-time records (``jan-status.md`` /
+        ``jul-status.md``). Two month-named snapshots carrying different values
+        are states at different dates -- both true at their respective times,
+        not a supersession -> ``ask_user`` (conservative, NON-MUTATING: the
+        ``_apply`` dispatcher only auto-applies a ``fix``+``supersede_assertion``,
+        so ``ask_user`` surfaces the pair to the human rather than auto-
+        tombstoning a possibly-complementary value). This is the guard that
+        closes the N14 false-tombstone -- the one production-real negative the
+        fine-tune AND the 27B both fail.
+
+    Source-path resolution: ``_gather_entity_context`` enriches each
+    ``state_value`` with ``source_path`` (resolved from the doc/section
+    ``asserted_by`` id). The guard keys off ``source_path`` when present and
+    falls back to ``asserted_by`` (the eval harness passes the source_path
+    directly as ``asserted_by``). Episode-id / ``None`` provenance carries no
+    month token -> the guard falls through to the LLM (status quo).
+    """
+    if not isinstance(state_values, list) or len(state_values) < 2:
+        return None
+    vals: list[str] = []
+    for v in state_values:
+        if not isinstance(v, dict):
+            continue
+        vals.append(str(v.get("value", "")).strip())
+    if len(vals) < 2:
+        return None
+
+    # Guard 1: all live values identical -> never a conflict.
+    if len(set(vals)) == 1:
+        return {
+            "decision": "dismiss",
+            "action": "no_action",
+            "reasoning": (
+                f"Deterministic guard (equal values): all {len(vals)} live "
+                f"state values are identical ('{vals[0]}'). A contradiction "
+                f"requires two DIFFERENT values; agreeing values are not a "
+                f"conflict regardless of source or newness -> dismiss, "
+                f"no_action."
+            ),
+        }
+
+    # Guard 2: complementary temporal -- only when BOTH asserting sources carry
+    # a month-name prefix (point-in-time status records). Two month-named
+    # snapshots with different values are complementary, not a supersession ->
+    # ask_user (non-mutating; do not auto-tombstone). Falls through to the LLM
+    # otherwise (real version-suffixed decision docs do not carry month prefixes).
+    paths = []
+    for v in state_values:
+        if not isinstance(v, dict):
+            continue
+        path = v.get("source_path") or v.get("asserted_by")
+        paths.append(_month_prefix(path))
+    # Consider the first two distinct-value sources (the conflicting pair).
+    if len(paths) >= 2 and paths[0] and paths[1]:
+        return {
+            "decision": "ask_user",
+            "action": "no_action",
+            "reasoning": (
+                f"Deterministic guard (complementary temporal): two DIFFERENT "
+                f"live state values ('{vals[0]}' vs '{vals[1]}') asserted by "
+                f"month-named point-in-time records ({paths[0]}- / {paths[1]}-). "
+                f"These are states at different dates, both true at their "
+                f"respective times -- not a supersession -> ask_user (do not "
+                f"auto-tombstone a possibly-complementary value)."
+            ),
+        }
+    return None

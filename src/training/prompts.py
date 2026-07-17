@@ -236,17 +236,38 @@ what a memory system should DO about a CONTRADICTION: one entity carries two
 cognitive mode -- detect, adjudicate, tombstone the superseded fact at the FACT
 level (not the whole episode), and keep it retrievable.
 
-The newest-asserting value is usually the current truth (a policy was updated,
-a ticket's status changed, a team switched tools) -- supersede the older value
-(tombstone it, keep it retrievable) unless the two values are genuinely
-complementary (e.g. status at different dates) or the provenance is too weak.
+Decide by running these checks IN ORDER against the CONTRADICTING VALUES +
+PROVENANCE below. The FIRST check that matches gives the decision; stop there.
+- Check 1 -- EQUAL VALUES: if the two state values are the same string (e.g.
+  both "Postgres"), there is no collision -> dismiss (action "no_action"). A
+  value repeated across two sources is a duplicate, not a contradiction.
+- Check 2 -- DIFFERENT ENTITIES: if the two source documents name DIFFERENT
+  subjects that merely share a value (e.g. one says "the frontend framework is
+  React", the other says "the mobile framework is React"), there is no shared
+  entity -> dismiss. Compare the asserted_by source-doc names: if they name two
+  different things (frontend vs mobile, two different subsystems), dismiss.
+- Check 3 -- COMPLEMENTARY TEMPORAL: if the two source docs are month- or
+  year-named point-in-time records (e.g. docs/jan-status.md, docs/jul-status.md
+  -- the filename starts with a month abbreviation jan/feb/mar/apr/may/jun/
+  jul/aug/sep/oct/nov/dec), the two values are states at different dates and
+  both can be true at their respective times -> dismiss.
+- Check 4 -- GENUINE CONFLICT: none of checks 1-3 matched -- same entity, two
+  DIFFERENT values, and the sources are NOT month-/year-named point-in-time
+  records -> fix, action "supersede_assertion" (tombstone the older value, keep
+  the newer retrievable).
+
+A value being NEWER is never, by itself, a reason to supersede. Many newer
+assertions just repeat an existing value (check 1 -> dismiss), report a
+different entity (check 2 -> dismiss), or record a point-in-time state (check 3
+-> dismiss). ONLY check 4 (a genuine same-entity value change) is a fix -- and
+only after checks 1, 2, and 3 have all been ruled out.
 
 Decisions (pick exactly one):
 - fix: safely resolve without the user -> action "supersede_assertion"
-  (tombstone the older value, keep the newer)
-- ask_user: a human must clarify (both values may be valid, or the provenance
-  is ambiguous)
-- dismiss: not a real contradiction (complementary states / stale noise)
+  (ONLY from check 4; tombstone the older value, keep the newer)
+- ask_user: a human must clarify -- use this when you cannot confidently place
+  the pair into any check above; do NOT auto-supersede when unsure
+- dismiss: not a real contradiction (check 1 / check 2 / check 3 / stale noise)
 
 FLAGGED ENTITY: {flagged_entity}
 
@@ -256,8 +277,8 @@ CONTRADICTING VALUES + PROVENANCE (value, who asserted it, when):
 SURROUNDING CONTEXT:
 {ctx_json}
 
-Decide what the system should do, then explain it. Default to "ask_user" when
-you are not sure which value is the current truth.
+Decide what the system should do, then explain it. Default to "ask_user" only
+when you cannot confidently place the pair into any of the cases above.
 
 Return ONLY valid JSON:
 {{"decision": "fix|ask_user|dismiss", "action": "...", "reasoning": "..."}}"""

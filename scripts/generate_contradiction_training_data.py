@@ -317,21 +317,71 @@ def _adjudication_context(spec: dict) -> dict:
 
 
 def _adjudication_gold(spec: dict) -> dict:
+    """Gold decision + action + a checklist-walking reasoning.
+
+    The reasoning ALWAYS walks the three non-conflict checks (EQUAL VALUES,
+    DIFFERENT ENTITIES, COMPLEMENTARY TEMPORAL) in the same order the
+    ``bonsai_contradiction_decision_prompt`` checklist lists them, then states
+    the verdict. This teaches the LoRA the *procedure* (run every check, then
+    decide) rather than a per-type pattern -- which is what generalizes to the
+    held-out negatives. v1-v4 fine-tunes used a single-sentence reasoning and
+    the dismiss signal stayed unstable (v2 dismissed only N16, v3/v4 lost it;
+    N15/N14 never learned) -- the explicit walk forces the model to read the
+    value comparison + source-doc names on every pair.
+    """
     g = CONFLICT_TYPES[spec["conflict_type"]]
     ctype = spec["conflict_type"]
+    entity = spec["entity"]
+    old_v = spec.get("old_value", spec.get("value"))
+    new_v = spec.get("new_value", spec.get("value"))
+    op = spec["old_path"]
+    np_ = spec["new_path"]
+    # month prefix of a docs/<month>-<slug>.md path ("" if not month-named)
+    def _month(path: str) -> str:
+        return path.split("/")[-1].split("-")[0] if "/" in path else ""
     if ctype == "real":
-        reasoning = (f"Same {spec['entity']} carries two different live values; the "
-                    f"newer ({spec['new_value']}) supersedes the older ({spec['old_value']}).")
+        # Conclude fix via Check 4 (all non-conflict checks fail) -- NOT "the
+        # newer supersedes". v5 keyed on "newer wins" and overrode its own
+        # no-contradiction assessment on the negatives; this gold teaches fix =
+        # "checks 1-3 ruled out", which is the only generalizable fix rule.
+        reasoning = (
+            f"Check 1 EQUAL VALUES: '{old_v}' != '{new_v}' -> no match. "
+            f"Check 2 DIFFERENT ENTITIES: {op} and {np_} are both generic docs "
+            f"about the same {entity} -> same entity. "
+            f"Check 3 COMPLEMENTARY TEMPORAL: {op} and {np_} are not month-named "
+            f"point-in-time records -> no. "
+            f"Check 4 GENUINE CONFLICT: none of checks 1-3 matched -> same "
+            f"entity, two different values, not point-in-time -> fix, "
+            f"supersede_assertion (tombstone the older '{old_v}', keep "
+            f"'{new_v}' retrievable).")
     elif ctype == "complementary_temporal":
-        reasoning = (f"Both values come from month-named point-in-time records "
-                    f"({spec['old_path']} vs {spec['new_path']}); each was true at "
-                    f"a different time -- complementary, not a contradiction.")
+        m1, m2 = _month(op), _month(np_)
+        reasoning = (
+            f"Check 1 EQUAL VALUES: '{old_v}' != '{new_v}' -> no match. "
+            f"Check 2 DIFFERENT ENTITIES: {op} and {np_} are both about the same "
+            f"{entity} -> same entity. "
+            f"Check 3 COMPLEMENTARY TEMPORAL: {op} starts with '{m1}' and {np_} "
+            f"starts with '{m2}' -- both are month abbreviations, so these are "
+            f"month-named point-in-time records -> two values from "
+            f"differently-dated reports, each true at its own time -> dismiss, "
+            f"no_action. (Stop at check 3; do not reach check 4.)")
     elif ctype == "same_value":
-        reasoning = (f"Both assertions give the same value ({spec['old_value']}); no "
-                    f"collision, no contradiction.")
+        reasoning = (
+            f"Check 1 EQUAL VALUES: '{old_v}' == '{new_v}' -> MATCH -> the two "
+            f"sources assert the same value, so there is no collision and no "
+            f"contradiction -> dismiss, no_action. (Stop at check 1; do not "
+            f"reach check 4 -- a value being newer does NOT make equal values a "
+            f"conflict.)")
     else:  # different_entity
-        reasoning = (f"The two values belong to different entities ({spec['entity']} vs "
-                    f"{spec['entity2']}); no shared entity, no contradiction.")
+        entity2 = spec["entity2"]
+        reasoning = (
+            f"Check 1 EQUAL VALUES: '{old_v}' == '{new_v}' -> match, but equal "
+            f"values alone is not the whole test. "
+            f"Check 2 DIFFERENT ENTITIES: {op} names {entity2} and {np_} names "
+            f"{entity} -> two different subjects merely share the value "
+            f"'{old_v}' -> no shared entity, no contradiction -> dismiss, "
+            f"no_action. (Stop at check 2; do not reach check 4 -- a value being "
+            f"newer does NOT make different entities a conflict.)")
     return {"decision": g["decision"], "action": g["action"], "reasoning": reasoning}
 
 
