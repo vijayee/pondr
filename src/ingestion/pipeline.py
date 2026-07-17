@@ -76,16 +76,21 @@ class UnifiedIngestionPipeline:
         entity/topic axes but not via the semantic fallback (mirrors episodes'
         ``set_summary_embedding`` backfill model).
 
-        ``doc_kind_tagger`` (Phase 3c Sec 7.11; any object with
-        ``classify_doc_kind(text) -> Optional[str]`` -- a ``BonsaiDecider``
-        satisfies this) is optional -- when set, the doc's semantic KIND is
-        tagged at ingest (one zero-shot HTTP call over ``_doc_text``) and
-        written to ``doc.doc_kind``. When ``None`` (structure-only / cold-
-        start) OR the call fails / returns an out-of-vocab label, ``doc_kind``
-        stays the ``"other"`` default -> byte-identical to pre-7.11 (NO
-        fabricated label). The tag lets the complementary-temporal guard fire
-        on a semantic signal (both sources ``point_in_time_snapshot``) instead
-        of a filename month-prefix, which is inert on real enterprise docs.
+        ``doc_kind_tagger`` (Phase 3c Sec 7.11 + deferred head; any object with
+        ``classify_doc_kind(section_texts: list[str]) -> Optional[str]`` -- a
+        ``BonsaiDocKindTagger`` / ``BackboneDocKindTagger`` from
+        ``src.ingestion.doc_kind`` satisfies this) is optional -- when set, the
+        doc's semantic KIND is tagged at ingest and written to ``doc.doc_kind``.
+        The interface takes the per-section text SEQUENCE (the same ``sec_texts``
+        embedded above) so the trained head can step the SSM over the sections;
+        the Bonsai adapter joins them back to the ``_doc_text`` it always sent
+        (byte-identical to the Sec 7.11 HTTP path). When ``None`` (structure-only
+        / cold-start) OR the call fails / returns an out-of-vocab label,
+        ``doc_kind`` stays the ``"other"`` default -> byte-identical to pre-7.11
+        (NO fabricated label). The tag lets the complementary-temporal guard
+        fire on a semantic signal (both sources ``point_in_time_snapshot``)
+        instead of a filename month-prefix, which is inert on real enterprise
+        docs.
         """
         if source_type == "auto":
             source_type = detect_type(source_path)
@@ -112,12 +117,16 @@ class UnifiedIngestionPipeline:
         # Per-section embeddings (the per-chunk vector-index path): ONE batched
         # encode over every section's chunk text. Assigned to the RawSection so
         # ``Document.from_parse`` carries it through to ``encode_document``,
-        # which persists the hot key AND indexes the vector layer.
-        if embedder is not None and parsed.sections:
+        # which persists the hot key AND indexes the vector layer. The same
+        # ``sec_texts`` feed the doc-kind tagger (Sec 7.11 + the deferred head)
+        # so the head gets the section SEQUENCE it steps the SSM over.
+        sec_texts: list[str] = []
+        if parsed.sections:
             sec_texts = [
                 (s.heading + "\n" + s.content) if s.heading else s.content
                 for s in parsed.sections
             ]
+        if embedder is not None and sec_texts:
             vecs = embedder.encode(sec_texts)
             for s, vec in zip(parsed.sections, vecs):
                 s.embedding = list(vec)
@@ -157,18 +166,23 @@ class UnifiedIngestionPipeline:
             state_assertions.append({"entity": a["entity"], "value": a["value"]})
         doc.state_assertions = state_assertions
 
-        # Phase 3c Sec 7.11: semantic doc-kind tag (zero-shot Bonsai at ingest).
-        # Injected (a BonsaiDecider or any duck-typed classify_doc_kind); when
+        # Phase 3c Sec 7.11 + deferred head: semantic doc-kind tag at ingest.
+        # Injected (a ``DocKindTagger`` -- a ``BonsaiDocKindTagger`` for the
+        # zero-shot HTTP path, a ``BackboneDocKindTagger`` for the trained local
+        # head, or any duck-typed ``classify_doc_kind(section_texts)``). The
+        # interface takes the section-text SEQUENCE (not the joined ``_doc_text``)
+        # so the head can step the SSM over the sections; the Bonsai adapter
+        # joins them back to the identical ``_doc_text`` it always sent. When
         # None (structure-only / cold-start) doc_kind stays the "other" default
-        # -> byte-identical to pre-7.11. Best-effort: a failed call (down
-        # server, parse error) or an out-of-vocab label (classify_doc_kind
-        # returns None) also leaves "other" -- NO fabricated label. The tag
-        # lets the complementary-temporal guard fire on a semantic signal
-        # (both sources point_in_time_snapshot) instead of a filename month-
-        # prefix, which is inert on real enterprise docs (the bench finding).
+        # -> byte-identical to pre-7.11. Best-effort: a failed call (down server,
+        # parse error, head load failure) or an out-of-vocab label returns None
+        # -> also leaves "other" -- NO fabricated label. The tag lets the
+        # complementary-temporal guard fire on a semantic signal (both sources
+        # point_in_time_snapshot) instead of a filename month-prefix, which is
+        # inert on real enterprise docs (the bench finding).
         if doc_kind_tagger is not None:
             try:
-                kind = doc_kind_tagger.classify_doc_kind(self._doc_text(parsed))
+                kind = doc_kind_tagger.classify_doc_kind(sec_texts)
             except Exception:  # noqa: BLE001 -- best-effort; cold-start safe
                 kind = None
             if kind is not None:

@@ -87,6 +87,17 @@ INSTANCE_CONFIGS: dict[str, InstanceConfig] = {
         lora_rank=4,
         gate_config=GateConfig(num_context_features=2),  # placeholder for the deferred learned gate
     ),
+    # Phase 3c Sec 7.11 deferred step: the doc-kind classifier head. A trained
+    # JGS instance whose forward embeds a doc's sections, steps the shared SSM
+    # over them (serving path), pools the final recurrent state, and applies a
+    # 5-class head. The gate is unused (the head pools state, not the step
+    # output) but required by JGSInstance -- a 1-feature placeholder, mirroring
+    # presentation_gate's deferred-gate pattern. lora_rank=4 (fast, small head).
+    "doc_kind": InstanceConfig(
+        name="doc_kind",
+        lora_rank=4,
+        gate_config=GateConfig(num_context_features=1),  # placeholder (head ignores the gate)
+    ),
     "uncertainty_detector": InstanceConfig(
         name="uncertainty_detector",
         lora_rank=4,

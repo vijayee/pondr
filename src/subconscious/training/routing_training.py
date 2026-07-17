@@ -36,6 +36,7 @@ from torch import Tensor
 
 from ..backbone import JGSBackbone
 from ..configs import BackboneConfig, INSTANCE_CONFIGS, InstanceConfig
+from ..doc_kind_head import DocKindHead
 from ..gate import GateContext
 from ..retrieval_gate import RetrievalGate
 from ..routing import (
@@ -144,6 +145,54 @@ def load_retrieval_gate(
     gate = gate.to(dev)
     gate.eval()
     return gate
+
+
+def load_doc_kind_head(
+    path: str,
+    backbone: JGSBackbone,
+    config: Optional[InstanceConfig] = None,
+    device: str = "auto",
+    map_location: str = "cpu",
+) -> DocKindHead:
+    """Load a trained DocKindHead checkpoint onto ``backbone`` (frozen).
+
+    Pairs with ``load_backbone`` exactly as ``load_retrieval_gate`` does. The
+    checkpoint is ``{"head": state_dict, "labels": [...], "val_accuracy": float,
+    "epoch": int}`` (see ``train_doc_kind_head_supervised``'s save). The head's
+    ``state_dict()`` EXCLUDES the shared backbone (stored via
+    ``object.__setattr__`` on ``JGSInstance``), so loading ``ckpt["head"]``
+    restores only the instance-owned params (input/output projections + LoRA,
+    state_lora, decomposed gate) and the 5-class classifier head -- the
+    already-frozen ``backbone`` passed in is reused, NOT reloaded. Loads strict
+    (raises on any missing/unexpected key, mirroring ``load_backbone`` /
+    ``load_retrieval_gate``), validates the persisted label order against
+    ``DocKindHead.LABELS`` (a mismatch is a hard error -- the logits would map
+    to the wrong classes), moves to the resolved device, eval mode.
+    """
+    cfg = config or INSTANCE_CONFIGS["doc_kind"]
+    head = DocKindHead(backbone, cfg)
+    # weights_only=False: the checkpoint is the user's own training output (a
+    # plain {"head": sd, "labels": [...], ...} dict, no code). Safe here; do
+    # NOT load arbitrary .pt files this way -- same contract as load_backbone.
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    sd = ckpt["head"] if isinstance(ckpt, dict) and "head" in ckpt else ckpt
+    labels = ckpt.get("labels") if isinstance(ckpt, dict) else None
+    if labels is not None and list(labels) != list(DocKindHead.LABELS):
+        raise RuntimeError(
+            f"doc-kind head checkpoint {path} label-order mismatch: "
+            f"ckpt={list(labels)} != head={list(DocKindHead.LABELS)} -- "
+            f"the logits would map to the wrong classes"
+        )
+    missing, unexpected = head.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"doc-kind head checkpoint {path} mismatch: "
+            f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+        )
+    dev = _resolve_device(device)
+    head = head.to(dev)
+    head.eval()
+    return head
 
 
 # ── config ──

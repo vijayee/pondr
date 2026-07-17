@@ -49,9 +49,11 @@ def _maybe_extractors(extract: bool):
     prints a warning (so the operator knows extraction was skipped) but does
     NOT abort the ingest -- structure-only ingestion is still useful and re-
     ingest later fills the entities/topics in place. ``decider`` (a
-    ``BonsaiDecider``) is the Phase 3c Sec 7.11 doc-kind tagger -- constructed
-    from the same Bonsai server as the relation extractor; ``None`` when
-    Bonsai is unavailable (doc_kind stays the cold-start "other" default).
+    ``BonsaiDecider``) is the Phase 3c Sec 7.11 doc-kind Bonsai FALLBACK tagger
+    -- constructed from the same Bonsai server as the relation extractor and
+    used only when no trained backbone head checkpoint is present
+    (``build_doc_kind_tagger`` prefers the head); ``None`` when Bonsai is
+    unavailable (doc_kind stays the cold-start "other" default).
     """
     if not extract:
         return None, None, None
@@ -113,6 +115,17 @@ def _ingest(args) -> int:
         )
         gliner, bonsai, decider = _maybe_extractors(not args.no_extract)
         embedder = _maybe_embedder(store, not args.no_extract)
+        # Phase 3c Sec 7.11 + deferred head: prefer the trained backbone
+        # doc-kind head (local forward pass, no :8080 contention) when its
+        # checkpoint exists; fall back to the Bonsai zero-shot HTTP tagger
+        # (wrapping ``decider``); else None -> cold-start "other".
+        from src.ingestion.doc_kind import build_doc_kind_tagger
+        doc_kind_tagger = build_doc_kind_tagger(
+            head_path=args.doc_kind_head,
+            backbone_path=args.backbone,
+            device=args.device,
+            bonsai_decider=decider,
+        )
         pipe = UnifiedIngestionPipeline(store, chunker=chunker)
         doc_id, created = pipe.ingest(
             args.source,
@@ -120,7 +133,7 @@ def _ingest(args) -> int:
             extractor=gliner,
             relation_extractor=bonsai,
             embedder=embedder,
-            doc_kind_tagger=decider,
+            doc_kind_tagger=doc_kind_tagger,
         )
         print(f"{'created' if created else 'updated'} {doc_id}")
         return 0
@@ -168,6 +181,14 @@ def main() -> int:
                     help="source type: auto|markdown|text|pdf|code|docx|web|email (default: auto by extension; email = a directory of .eml as a thread)")
     ap.add_argument("--no-extract", action="store_true",
                     help="skip GLiNER/Bonsai extraction (structure-only ingest)")
+    ap.add_argument("--doc-kind-head", default="data/training/doc_kind_head/best.pt",
+                    help="trained doc-kind head checkpoint (default: data/training/doc_kind_head/best.pt; "
+                         "when present, a local forward pass tags doc_kind instead of the Bonsai HTTP call)")
+    ap.add_argument("--backbone",
+                    default="data/pod_runs/phase2a_full/checkpoints/backbone/backbone_final.pt",
+                    help="Phase 2a backbone checkpoint the doc-kind head runs on (frozen)")
+    ap.add_argument("--device", default="auto",
+                    help="device for the doc-kind head backbone (auto|cpu|cuda; default auto)")
     args = ap.parse_args()
 
     if args.gc_blobs:
