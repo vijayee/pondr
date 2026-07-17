@@ -112,11 +112,65 @@ CONFLICT_TYPES = {
 # Adjudication-type sampling weights (real conflicts dominate so recall stays
 # high; the three negative shapes are weighted toward the load-bearing N14).
 CONFLICT_WEIGHTS = {
-    "real": 50,
-    "complementary_temporal": 22,
-    "same_value": 14,
-    "different_entity": 14,
+    "real": 34,
+    "complementary_temporal": 20,
+    "same_value": 26,
+    "different_entity": 20,
 }
+# NOTE: same_value is weighted well above its natural rate (was 14) because the
+# v1 fine-tune failed to generalize the equal-values -> dismiss rule: with only
+# 28 same_value examples over 5 epochs the LoRA overfit the literal
+# "{entity}-v1/-v2 + equal values -> dismiss" pattern and false-fixed the
+# harness's plan-a/plan-b N15. More same_value weight + diversified paths + 3
+# epochs forces the rule to generalize.
+
+# ── asserted_by path design ─────────────────────────────────────────────
+# The harness feeds the decider state_values (value, asserted_by, asserted_at)
+# ONLY, and hardcodes asserted_at = 2026-07-14 / 2026-07-15 for every pair, so
+# asserted_at carries NO signal. The discriminative signal for each conflict
+# type lives in:
+#   real                  -> value DIFFERENCE (two different values, same entity)
+#   same_value (N15)      -> value EQUALITY (two equal values)
+#   different_entity (N16)-> source-doc NAME references two different entities
+#   complementary_temporal(N14) -> source-doc NAME is month-named (point-in-time)
+# `real` and `same_value` draw asserted_by from the SAME generic pool so the
+# model cannot key on a path pattern to separate them -- it must learn the
+# value-comparison rule. Month- and entity-named paths are reserved for the
+# temporal / different-entity shapes so their signals stay unique.
+_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
+           "jul", "aug", "sep", "oct", "nov", "dec"]
+
+_GENERIC_PATH_POOL = [
+    "{slug}-v1.md", "{slug}-v2.md",
+    "{slug}-a.md", "{slug}-b.md",
+    "plan-{slug}.md", "team-{slug}.md",
+    "{slug}-update.md", "decisions/{slug}.md",
+    "{slug}-plan.md", "notes-{slug}.md",
+]
+
+
+def _slug(entity: str) -> str:
+    return entity.replace(" ", "-")
+
+
+def _two_generic_paths(slug: str, rng: random.Random) -> tuple[str, str]:
+    a, b = rng.sample(_GENERIC_PATH_POOL, 2)
+    return f"docs/{a.format(slug=slug)}", f"docs/{b.format(slug=slug)}"
+
+
+def _two_month_paths(slug: str, rng: random.Random) -> tuple[str, str]:
+    # Month-named point-in-time records. The harness N14 uses docs/jan-status.md
+    # / docs/jul-status.md; sampling the full month pool (not just jan/jul)
+    # generalizes the "month-named source doc -> complementary" rule beyond the
+    # fixture instead of overfitting the literal jan/jul pair.
+    m1, m2 = rng.sample(_MONTHS, 2)
+    return f"docs/{m1}-{slug}.md", f"docs/{m2}-{slug}.md"
+
+
+def _two_entity_paths(entity: str, entity2: str) -> tuple[str, str]:
+    # The two source docs name two DIFFERENT entities -- the signal that the two
+    # values belong to different things (harness N16: frontend-fw vs mobile-fw).
+    return f"docs/{_slug(entity2)}-fw-v1.md", f"docs/{_slug(entity)}-fw-v1.md"
 
 
 def _gen_extraction_prompt(spec: dict) -> str:
@@ -206,78 +260,60 @@ def _build_adjudication_specs(n: int, rng: random.Random) -> list[dict]:
     for _ in range(n):
         ctype = rng.choices(types, weights=weights, k=1)[0]
         entity, values = rng.choice(ENTITIES)
+        slug = _slug(entity)
         if ctype == "different_entity":
-            # two different but confusable entities, same value
+            # two different but confusable entities, same value, entity-named docs
             entity2, values2 = rng.choice(ENTITIES)
             while entity2 == entity:
                 entity2, values2 = rng.choice(ENTITIES)
             value = rng.choice(list(set(values) & set(values2) or values))
+            op, np_ = _two_entity_paths(entity, entity2)
             specs.append({"conflict_type": ctype, "entity": entity,
-                          "entity2": entity2, "value": value})
+                          "entity2": entity2, "value": value,
+                          "old_path": op, "new_path": np_})
         elif ctype == "same_value":
             value = rng.choice(values)
+            op, np_ = _two_generic_paths(slug, rng)
             specs.append({"conflict_type": ctype, "entity": entity,
-                          "old_value": value, "new_value": value})
+                          "old_value": value, "new_value": value,
+                          "old_path": op, "new_path": np_})
         elif ctype == "complementary_temporal":
             old_v, new_v = rng.sample(values, 2) if len(values) >= 2 else (values[0], values[0])
+            op, np_ = _two_month_paths(slug, rng)
             specs.append({"conflict_type": ctype, "entity": entity,
                           "old_value": old_v, "new_value": new_v,
-                          "old_date": "2026-01-15", "new_date": "2026-07-15"})
-        else:  # real
+                          "old_path": op, "new_path": np_})
+        else:  # real -- generic paths, value difference is the only signal
             old_v, new_v = rng.sample(values, 2) if len(values) >= 2 else (values[0], values[0])
+            op, np_ = _two_generic_paths(slug, rng)
             specs.append({"conflict_type": ctype, "entity": entity,
                           "old_value": old_v, "new_value": new_v,
-                          "old_date": "2026-07-14", "new_date": "2026-07-15"})
+                          "old_path": op, "new_path": np_})
     return specs
 
 
 def _adjudication_context(spec: dict) -> dict:
-    """Build the structured flag + retrieved context the deploy decider sees.
+    """Build the state_values the deploy decider's COMMON subset (and the
+    held-out gate) present: (value, asserted_by, asserted_at) only.
 
-    Mirrors bonsai_contradiction_decision_prompt input: flagged_entity +
-    state_values (value, asserted_by, asserted_at) + surrounding ctx. The
-    episode summaries carry the distinguishing signal (point-in-time vs
-    going-forward) so the decider can learn to discriminate.
+    asserted_at is constant (2026-07-14 / 2026-07-15) for every type -- the
+    harness hardcodes the same pair for all 16 pairs, so asserted_at carries NO
+    signal. The discriminative signal lives in value-equality (same_value) or
+    the source-doc NAME (complementary_temporal = month-named, different_entity
+    = entity-named), or value-difference (real). asserted_by is drawn per type
+    in ``_build_adjudication_specs`` (see the path-design comment above).
     """
     ctype = spec["conflict_type"]
     entity = spec["entity"]
-    if ctype == "different_entity":
-        # Two different entities; the "flag" is still on one, but ctx shows the
-        # other entity owns the second value -> dismiss (no shared entity).
-        e2 = spec["entity2"]
-        state_values = [
-            {"value": spec["value"], "asserted_by": f"docs/{entity.replace(' ', '-')}-v1.md",
-             "asserted_at": "2026-07-14"},
-            {"value": spec["value"], "asserted_by": f"docs/{e2.replace(' ', '-')}-v1.md",
-             "asserted_at": "2026-07-15"},
-        ]
-        ctx = {"states": [
-            {"entity": entity, "value": spec["value"], "source": "v1"},
-            {"entity": e2, "value": spec["value"], "source": "v1"},
-        ]}
-        return {"flagged_entity": entity, "state_values": state_values, "ctx": ctx}
-
-    if ctype == "same_value":
-        old_v = new_v = spec["old_value"]
-        ep_old = f"{entity} is {old_v} per the v1 plan."
-        ep_new = f"{entity} is {new_v} per the v2 plan."
-    elif ctype == "complementary_temporal":
-        old_v, new_v = spec["old_value"], spec["new_value"]
-        ep_old = f"As of {spec['old_date']}, {entity} was {old_v}."
-        ep_new = f"As of {spec['new_date']}, {entity} is {new_v}."
-    else:  # real
-        old_v, new_v = spec["old_value"], spec["new_value"]
-        ep_old = f"Going forward, {entity} is {old_v}."
-        ep_new = f"Going forward, {entity} is {new_v} (supersedes the prior plan)."
-
+    # different_entity stores a single `value`; real/same_value/comp_temporal
+    # store old_value/new_value.
+    old_v = spec.get("old_value", spec.get("value"))
+    new_v = spec.get("new_value", spec.get("value"))
     state_values = [
-        {"value": old_v, "asserted_by": f"docs/{entity.replace(' ', '-')}-v1.md",
-         "asserted_at": spec.get("old_date", "2026-07-14")},
-        {"value": new_v, "asserted_by": f"docs/{entity.replace(' ', '-')}-v2.md",
-         "asserted_at": spec.get("new_date", "2026-07-15")},
+        {"value": old_v, "asserted_by": spec["old_path"], "asserted_at": "2026-07-14"},
+        {"value": new_v, "asserted_by": spec["new_path"], "asserted_at": "2026-07-15"},
     ]
-    ctx = {"episodes": [{"summary": ep_old}, {"summary": ep_new}]}
-    return {"flagged_entity": entity, "state_values": state_values, "ctx": ctx}
+    return {"flagged_entity": entity, "state_values": state_values}
 
 
 def _adjudication_gold(spec: dict) -> dict:
@@ -287,9 +323,9 @@ def _adjudication_gold(spec: dict) -> dict:
         reasoning = (f"Same {spec['entity']} carries two different live values; the "
                     f"newer ({spec['new_value']}) supersedes the older ({spec['old_value']}).")
     elif ctype == "complementary_temporal":
-        reasoning = (f"Values are time-qualified at different dates ({spec['old_date']} "
-                    f"vs {spec['new_date']}); both are true at their respective times "
-                    f"-- not a contradiction.")
+        reasoning = (f"Both values come from month-named point-in-time records "
+                    f"({spec['old_path']} vs {spec['new_path']}); each was true at "
+                    f"a different time -- complementary, not a contradiction.")
     elif ctype == "same_value":
         reasoning = (f"Both assertions give the same value ({spec['old_value']}); no "
                     f"collision, no contradiction.")
@@ -303,9 +339,18 @@ def _build_adjudication_records(specs: list[dict]) -> list[dict]:
     records = []
     for i, spec in enumerate(specs):
         env = _adjudication_context(spec)
-        user = bonsai_contradiction_decision_prompt(env["flagged_entity"], {
-            "state_values": env["state_values"], **env["ctx"],
-        })
+        # Adjudication trains on the SAME retrieved_context shape the production
+        # decider's COMMON subset (and the held-out gate) present: state_values
+        # ONLY (value, asserted_by, asserted_at). We deliberately do NOT pass the
+        # ``episodes``/``states`` ctx here: the gate (scripts/_probe_bonsai_zeroshot_eval)
+        # sends {"state_values": ...} and nothing else, so a LoRA that learns to
+        # dismiss keyed on withheld episode text ("As of {date}...") fails to
+        # transfer (verified: first fine-tune held adj recall 13/13 but false-fixed
+        # 3/3 negatives). Training on state_values-only forces the dismiss signal
+        # onto the value/entity comparison, which the disturbance record always
+        # carries. Production's extra surrounding context is then a no-op bonus.
+        user = bonsai_contradiction_decision_prompt(
+            env["flagged_entity"], {"state_values": env["state_values"]})
         gold = _adjudication_gold(spec)
         records.append({
             "id": f"adj_{i:04d}",
