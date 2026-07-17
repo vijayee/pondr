@@ -43,6 +43,7 @@ class DocKindHeadTrainingConfig:
     epochs: int = 20
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
+    accum_steps: int = 16   # gradient accumulation over N docs (effective batch)
 
     # Hardware / IO.
     dtype: str = "float32"   # gate training is fp32-only; same here
@@ -215,6 +216,10 @@ def train_doc_kind_head_supervised(
 
     # Inverse-frequency class weights so the head can't collapse to the majority
     # class (``other`` / ``decision_update`` typically dominate a real store).
+    # CAPPED at 3.0: an uncapped inverse-freq weight on a 3-example class
+    # (e.g. reference -> 11.2x) destabilizes per-doc SGD -- the head thrashes
+    # trying to fit the rare class and mode-collapses on the rest. A mild cap
+    # keeps the minority signal without letting one class dominate the gradient.
     train_labels = [_doc_label_index(r) for r in train_data]
     n_classes = len(DocKindHead.LABELS)
     counts = [0] * n_classes
@@ -222,9 +227,10 @@ def train_doc_kind_head_supervised(
         counts[c] += 1
     total = max(sum(counts), 1)
     smooth = 1.0
-    weights = [total / (n_classes * (counts[c] + smooth)) for c in range(n_classes)]
+    _CAP = 3.0
+    weights = [min(total / (n_classes * (counts[c] + smooth)), _CAP) for c in range(n_classes)]
     class_weight = torch.tensor(weights, dtype=torch.float32, device=dev)
-    print(f"  class weights: {[round(float(x), 2) for x in class_weight]}")
+    print(f"  class weights (capped {_CAP}): {[round(float(x), 2) for x in class_weight]}")
     print(f"  train label counts: {dict(zip(DocKindHead.LABELS, counts))}")
 
     rng = random.Random(cfg.seed)
@@ -234,22 +240,37 @@ def train_doc_kind_head_supervised(
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # Gradient accumulation: each doc is an independent SSM forward (per-doc
+    # recurrent state, reset per doc), so we can't batch the variable-length
+    # section sequence the way the gate trainer batches single-step queries.
+    # Instead we accumulate loss/accum across N docs and step once -- this is
+    # mini-batch SGD in effect (the head params see the MEAN gradient over N
+    # docs), which is far less noisy than per-doc SGD on 582k params (per-doc
+    # SGD mode-collapsed to a single class; the gate trainer uses batch=32).
+    accum = max(1, cfg.accum_steps)
+
     for epoch in range(cfg.epochs):
         head.train()
         order = list(range(n_train))
         rng.shuffle(order)
         total_loss = 0.0
         n_steps = 0
-        for i in order:
-            optimizer.zero_grad()
+        optimizer.zero_grad()
+        for k, i in enumerate(order):
             logits = head.forward(train_embs[i])           # [1, 5]
             target = torch.tensor([_doc_label_index(train_data[i])],
                                    dtype=torch.long, device=dev)
-            loss = F.cross_entropy(logits, target, weight=class_weight)
+            loss = F.cross_entropy(logits, target, weight=class_weight) / accum
             loss.backward()
-            optimizer.step()
-            total_loss += float(loss.item())
+            total_loss += float(loss.item()) * accum
             n_steps += 1
+            if (k + 1) % accum == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+        # tail step for any leftover docs < accum
+        if n_steps % accum != 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
         train_loss = total_loss / max(n_steps, 1)
         val_acc = evaluate_doc_kind(head, val_data, val_embs)

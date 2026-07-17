@@ -7,15 +7,17 @@ writes to ``content/doc/{doc_id}/doc_kind`` are this head's training data. This
 head replaces the HTTP call at ingest with a local forward pass through the
 frozen shared backbone (no :8080 contention).
 
-Architecture (the confirmed "section sequence via inject + pool state" path):
+Architecture (section sequence via the serving path + pooled step outputs):
 a doc is a sequence of sections. The head embeds each section (bge-small,
 384-d), steps the SSM over the section embeddings on the **serving path** (the
 same ``JGSInstance.step`` loop ``SSMChunker.compress_episodes`` runs via
-``WorkingMemory.inject``), pools the final layer's recurrent state via
-``state.mean(dim=1)`` (mirroring ``DecomposedGate._pool`` in ``gate.py``), and
-applies a 5-class linear head. This reuses a production serving path and keeps
-section structure -- it does NOT use the pretraining-only ``forward_seq`` and
-does NOT crush the doc to a single embedding.
+``WorkingMemory.inject``), mean-pools the per-section STEP OUTPUTS (the learned
+``output_proj`` readout, 256-d -- the same signal ``RetrievalGate`` classifies
+on), and applies a 5-class linear head. This reuses a production serving path
+and keeps section structure -- it does NOT use the pretraining-only
+``forward_seq`` and does NOT crush the doc to a single embedding. (An earlier
+design pooled the raw recurrent state via ``state.mean(dim=1)``; it mode-
+collapsed on real enterprise prose and was replaced -- see ``forward``.)
 
 The shared backbone is frozen and held via ``object.__setattr__`` (inherited
 from ``JGSInstance``), so ``head.state_dict()`` EXCLUDES the ~19.5M backbone
@@ -70,14 +72,14 @@ class DocKindHead(JGSInstance):
     def __init__(self, backbone, config: Optional[InstanceConfig] = None):
         cfg = config or INSTANCE_CONFIGS["doc_kind"]
         super().__init__(backbone, cfg)
-        d = cfg.d_model  # 384 -- the SSM recurrent-state dim we pool
+        d = cfg.output_dim  # 256 -- the step-output readout dim we pool
         self.head = nn.Sequential(
             nn.Linear(d, 128), nn.GELU(),
             nn.Linear(128, len(self.LABELS)),
         )
 
     def forward(self, section_embeddings: list[Tensor]) -> Tensor:
-        """Step the SSM over the section embeddings, pool the final state, classify.
+        """Step the SSM over the section embeddings, pool the step outputs, classify.
 
         Args:
             section_embeddings: one ``[1, 384]`` (or ``[384]``) bge-small embedding
@@ -88,21 +90,26 @@ class DocKindHead(JGSInstance):
 
         Resets the recurrent state first (each doc is independent -- no
         cross-doc memory), then steps each section embedding through the serving
-        path (``JGSInstance.step``), then pools the LAST layer's recurrent state
-        ``[1, d_state=16, d_model=384]`` via ``mean(dim=1)`` -> ``[1, 384]``
-        (mirrors ``DecomposedGate._pool`` in ``gate.py``). The last layer is the
-        most-abstracted summary -- the natural pooled representation of the doc.
+        path (``JGSInstance.step``). We pool the per-section STEP OUTPUTS (the
+        learned ``output_proj`` readout, ``[1, 256]`` each) via a mean over
+        sections -> ``[1, 256]`` -- NOT the raw recurrent state. The step output
+        is the same signal ``RetrievalGate`` (Phase 2b, val 0.826) classifies on;
+        pooling the raw recurrent state (an earlier design) mode-collapsed on
+        real bge-small embeddings of similar enterprise prose (the frozen state
+        was not linearly separable for the subtle doc-kind distinctions). The
+        step output is the backbone's learned readout, which is.
         """
         if not section_embeddings:
             raise ValueError("DocKindHead.forward called with no section embeddings")
         self.reset_state(1)
+        outputs = []
         for emb in section_embeddings:
-            self.step(emb)
-        # After the loop self.state holds the final per-layer recurrent states
-        # (detached per-step by JGSInstance -- no BPTT across sections). Pool the
-        # last layer's [1, d_state, d_model] -> [1, d_model].
-        state = self.state[-1]
-        pooled = state.mean(dim=1)
+            out, _pred, _decision = self.step(emb)   # [1, output_dim=256]
+            outputs.append(out)
+        # Mean over sections -> [1, output_dim]. outputs differ per section
+        # (the readout of the SSM state after absorbing that section); the mean
+        # is a doc-level summary that retains per-section signal.
+        pooled = torch.stack(outputs, dim=1).mean(dim=1)
         return self.head(pooled)
 
     @torch.no_grad()
