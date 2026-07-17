@@ -17,11 +17,12 @@ mode_a, tmp_path WaveDB store, ReferenceSSM backbone).
 from __future__ import annotations
 
 import hashlib
+import time
 
 import pytest
 import torch
 
-from src.config import Phase2cConfig
+from src.config import Phase2cConfig, config
 from src.encoding.encoder import HippocampalEncoder
 from src.memory.episode import Episode
 from src.memory.store import HippocampalStore
@@ -383,3 +384,49 @@ def test_from_messages_summary_fallback_when_no_assistant_content(tmp_path):
     assert "Just a user question" in rt.summary
     assert [m["role"] for m in rt.messages] == ["system", "user"]
     store.close()
+
+
+# ── 12. async-distill: stub written synchronously, edges filled by the worker ──
+
+def test_async_distill_stub_then_fill_end_to_end(tmp_path, monkeypatch):
+    """With ``async_distill_enabled`` on, ``query()`` writes the stub (content +
+    embedding) synchronously and returns immediately; the graph edges are filled
+    by the background worker. The stub is content-retrievable right away; the
+    entity edge appears only after the worker's fill (drain)."""
+    monkeypatch.setattr(config, "async_distill_enabled", True)
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+
+    class _SlowGliner(_StubGliner):
+        """Sleeps so the worker's fill is still in flight right after query()
+        returns -- makes the 'no edges yet' assertion deterministic."""
+        def extract(self, text):
+            time.sleep(0.3)
+            return super().extract(text)
+
+    orch, store, _ = _orch_with_encoder(
+        tmp_path, plan, eps, reply="ASYNC REPLY", gliner=_SlowGliner(),
+    )
+    try:
+        res = orch.query("Why did we choose Postgres?")
+        eid = res["persisted_episode_id"]
+        # Stub written synchronously: the episode is content-retrievable
+        # immediately (origin + embedding land on the main thread).
+        ep = store.get_episode(eid)
+        assert ep is not None
+        assert ep.origin == "live"
+        assert ep.summary_embedding is not None
+        # Edges NOT yet filled -- the slow GLiNER is still in flight on the
+        # worker thread, so the graph is thin right after the response returns.
+        assert not _has_graph_edge(store, eid, "has_entity", "E:Postgres"), (
+            "entity edge appeared synchronously -- the fill ran on the main thread"
+        )
+        # Drain: the worker finishes the fill + writes the graph edges.
+        joined = orch.drain(timeout=10.0)
+        assert joined, "distill worker did not join within timeout"
+        assert _has_graph_edge(store, eid, "has_entity", "E:Postgres"), (
+            "entity edge missing after drain -- the fill did not write edges"
+        )
+    finally:
+        orch.drain(timeout=10.0)
+        store.close()

@@ -542,3 +542,99 @@ Note for the runtime: the production extractor would need `think:false` (or a
 larger `max_tokens`) to serve qwen3:8b-class models reliably over Ollama --
 moot for Stage B since the serve target is the ternary Bonsai via llama-server
 (thinking already off), not Ollama qwen3.
+### 7.9 Isolated 10-pass extractor + async-distill (the serve-time enabler, 2026-07-16)
+
+The 8B `has_state` schema gap (7.2-7.8) has a zero-shot fix that predates the
+fine-tune: **one focused single-predicate pass per class**, merged. The V1
+merged prompt makes `has_state` race `decides`/`concerns`/`involves` for the
+"at most 6" salience slots and loses; isolation removes the race -- one pass
+per class, no competing predicates, no salience cap. Probed
+(`scripts/_scratch/_probe_isolate_classes.py`, uncommitted) on the ternary 8B:
+
+| metric | V1 merged | isolated 10-pass |
+|---|---|---|
+| strict `has_state` catch | 0/13 | **11/13** |
+| classes that emit | 7/10 | **10/10** |
+| negative false-fix (FP) | 3/3 | **0/3** |
+| cost / doc | ~2.3 s (1 call) | **~22.8 s** (10 calls) |
+
+So isolation closes the schema gap **zero-shot** -- the shipped Bonsai
+assertion arm goes from a no-op to live without any fine-tune. The catch: 10
+HTTP round-trips to the one 8B on `:8080` is ~22.8 s/doc, which is unacceptable
+on the synchronous `query()` path (the user would wait 22 s for every reply).
+
+**Async-distill (the architectural answer).** The 22 s extraction is moved off
+the synchronous path so the response returns immediately:
+
+```
+main thread (query):  id = store.next_episode_id()          # counter is main-thread-only
+                      ep  = encoder.encode_messages_stub(messages, id, ...)   # no extract, no store
+                      store.encode_episode_content(id, ep)  # stub: content + vector index
+                      encoder.last_episode_id = id          # follows chain
+                      enqueue(worker, id, ep)  ->  return response
+worker (DistillWorker): ep  = encoder.encode_messages_fill(ep, id)   # GLiNER + 10-pass Bonsai
+                        store.encode_episode_edges(id, ep)           # fill: graph edges
+```
+
+Design (`/.claude/plans/async-distill-stub.md`):
+
+- **Stub-then-fill.** `encode_episode` is split into `_content_ops` + `_edge_ops`
+  (byte-identical: the sync path merges them into one `batch_sync`). The stub
+  writes content + the vector index (immediately retrievable by embedding,
+  graph-invisible); the worker fills the graph edges. Content-before-edges
+  preserves the atomicity invariant -- never edges without content.
+- **Pre-allocated id.** `next_episode_id()` is called on the main thread; the
+  worker never touches the persisted counter, `last_episode_id`, or `session_id`
+  (sidesteps the RMW race the counter's docstring warns about).
+- **Single-worker FIFO** (`queue.Queue` + one daemon thread) so encodes never
+  run concurrently -- avoids encoder-state races and keeps WaveDB writes
+  serialized. A user who out-types 22 s/turn just queues; the queue drains; the
+  user never blocks.
+- **Foreground-priority yielding.** `query()` sets `foreground_busy` for the
+  response-build duration; the worker installs a `pause_gate` on the encoder
+  (`_extract`) + its Bonsai extractor (each isolated per-class call) and blocks
+  while busy -- extraction runs only in the GAPS between turns, so a fast user
+  never contends with the background for the one 8B. Residual TOCTOU: at most
+  one in-flight extraction call (~2.3 s) can contend with a query that lands
+  just after a gate check (the deliberate trade -- full mutual exclusion would
+  make the foreground block on the worker's in-flight call).
+- **Failure semantics.** A worker exception (Bonsai HTTP 500, GLiNER hiccup,
+  store write error) is logged; the episode keeps its stub (content + embedding,
+  no edges) -- vector-retrievable, just graph-thin. The queue survives; the next
+  turn still encodes. Best-effort memory, not transactional (mirrors
+  `_persist_exchange`'s "never lose the response").
+- **Teardown.** `orch.drain(timeout)` stops accepting work, finishes in-flight +
+  queued encodes, joins the thread; `serve_ponder.py` calls it in `finally`
+  before `store.close()` so queued stubs get their edges while WaveDB is still
+  writable. Idempotent + force-clears `foreground_busy` so a blocked worker can
+  exit.
+
+**Gating (both default OFF, byte-identical when off):**
+- `config.bonsai_isolation_extraction` -- the 10-pass isolated extractor (vs the
+  V1 single-pass). Only viable behind async (22.8 s/doc).
+- `config.async_distill_enabled` -- the background worker (vs the fused sync
+  `encode_messages` path). The orchestrator constructs the `DistillWorker` in
+  `__init__` only when this is on AND an encoder is wired.
+
+Both flags off = the synchronous V1 path, byte-identical to pre-async. The
+flags are independent but isolation-without-async would block the response
+(only enable isolation when async is also on).
+
+**Tests.** 15 new offline tests: store split lossless + graph-invisibility
+(`test_store_stub_fill.py`, 4); encoder stub/fill contract -- fill never touches
+the counter / `last_episode_id`, stub+fill matches fused
+(`test_encoder_stub_fill.py`, 5); worker failure-isolation / drain /
+foreground-priority yield / thread-isolation (`test_distill_worker.py`, 6);
+isolated extractor dispatch + per-class normalization + degrade
+(`test_bonsai_relations.py`, +3); end-to-end async stub-then-fill through the
+orchestrator (`test_orchestrator_persist.py::test_async_distill_stub_then_fill_end_to_end`).
+The V1 single-pass path is asserted byte-identical (one HTTP call, the merged
+prompt, no predicate normalization).
+
+**Relation to the fine-tune (Stage B).** Async-distill is the serve-time enabler
+for the isolated extractor, NOT the fine-tune. The fine-tune (7.5) targets
+adjudication precision (the binding driver, capacity-invariant at 8B per 7.8)
+and is served as a runtime LoRA adapter (`llama-server --lora`, never merged
+into ternary -- 7.5/ternative). The isolated extractor + async-distill ship
+independently and are orthogonal to the adapter: they fix `has_state` extraction
+zero-shot; the adapter fixes the decider's non-conflict discrimination.

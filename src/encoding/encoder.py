@@ -33,6 +33,15 @@ from .gliner_extractor import GLiNERExtractor
 class HippocampalEncoder:
     """Orchestrates extraction and storage of conversation episodes."""
 
+    # Foreground-priority yielding hook (Phase 3c async-distill). Class-level
+    # default so instances built via ``object.__new__`` (test fixtures that skip
+    # ``__init__``'s GLiNER load) still have the attribute -- ``_extract`` reads
+    # it unconditionally. The background distill worker sets an instance
+    # attribute (shadowing this) to a blocking callable, and clears it back to
+    # ``None`` after the fill. ``None`` = no yielding, byte-identical to the
+    # synchronous path.
+    pause_gate: Optional[object] = None
+
     def __init__(
         self,
         store: HippocampalStore,
@@ -102,6 +111,10 @@ class HippocampalEncoder:
         backfilled embedding).
         """
         try:
+            # Yield to the foreground before the GLiNER GPU call (mirrors the
+            # per-Bonsai-call gate in extract_isolated). None (sync path) no-op.
+            if self.pause_gate is not None:
+                self.pause_gate()
             return self.gliner.extract(full_text)
         except Exception as e:  # noqa: BLE001 - intentional broad guard
             if not degrade_on_extract_fail:
@@ -148,11 +161,11 @@ class HippocampalEncoder:
             print(f"[assertion-fail] {e}", file=sys.stderr)
             return []
 
-    def _apply_overrides_and_store(
+    def _apply_overrides(
         self, episode: Episode, *, salience, utility_decay_rate,
         summary_embedding, embedder,
     ) -> None:
-        """Apply caller-supplied overrides, then store atomically.
+        """Apply caller-supplied overrides to an in-memory episode (no store).
 
         ``salience`` / ``utility_decay_rate`` set the episode's persistence
         levers (the forgetting dream pass fades ``utility_score *= (1 -
@@ -172,6 +185,22 @@ class HippocampalEncoder:
         elif embedder is not None:
             vec = embedder([episode.summary])[0]
             episode.summary_embedding = [float(x) for x in vec]
+
+    def _apply_overrides_and_store(
+        self, episode: Episode, *, salience, utility_decay_rate,
+        summary_embedding, embedder,
+    ) -> None:
+        """Apply caller-supplied overrides, then store atomically.
+
+        Thin wrapper over ``_apply_overrides`` + ``store.encode_episode``; the
+        synchronous corpus/live path. The async-distill path calls
+        ``_apply_overrides`` alone (the stub), then stores content and edges
+        separately via ``store.encode_episode_content`` / ``encode_episode_edges``.
+        """
+        self._apply_overrides(
+            episode, salience=salience, utility_decay_rate=utility_decay_rate,
+            summary_embedding=summary_embedding, embedder=embedder,
+        )
         self.store.encode_episode(episode)
 
     def encode_turn(
@@ -280,6 +309,116 @@ class HippocampalEncoder:
             summary_embedding=summary_embedding, embedder=embedder,
         )
         self.last_episode_id = episode_id
+        return episode
+
+    # ── Async-distill entry points (stub-then-fill + pre-allocated id) ──
+    #
+    # The synchronous ``encode_messages`` fuses build + extract + store into one
+    # call on the main thread. The async path splits it so the 22 s extraction
+    # runs on a background worker while the response has already returned:
+    #
+    #   main thread:  id = store.next_episode_id()
+    #                 episode = encode_messages_stub(messages, id, ...)  # no extract, no store
+    #                 store.encode_episode_content(id, episode)         # stub: content + vector
+    #                 self.last_episode_id = id                          # follows chain
+    #                 enqueue(worker, id, episode)  ->  return response
+    #   worker:       episode = encode_messages_fill(episode, id)       # GLiNER + 10-pass Bonsai
+    #                 store.encode_episode_edges(id, episode)           # fill: graph edges
+    #
+    # Contract (see plan async-distill-stub.md): the stub runs on the main
+    # thread and may READ ``last_episode_id`` / ``session_id`` / ``user_id``
+    # (for the ``follows`` + scope fields); the fill runs on the worker and
+    # touches NONE of that state -- it only reads ``episode.full_text`` and the
+    # handed-in id. Neither calls ``next_episode_id`` (the caller pre-allocated
+    # the id so the persisted counter is main-thread-only). Neither touches
+    # ``last_episode_id`` (the orchestrator sets it on the main thread).
+
+    def encode_messages_stub(
+        self,
+        messages: list[dict],
+        episode_id: str,
+        *,
+        origin: str = "corpus",
+        salience: Optional[float] = None,
+        utility_decay_rate: Optional[float] = None,
+        summary_embedding: Optional[list[float]] = None,
+        embedder=None,
+    ) -> Episode:
+        """Build the stub episode: content fields + summary embedding, NO
+        extraction, NO store.
+
+        Derives ``full_text`` + ``summary`` from the role-tagged segments via
+        ``Episode.from_messages`` with empty extraction, applies the
+        salience/decay/embedding overrides (the embedding is the one synchronous
+        cost the async path keeps -- one embedder call, ms), and returns the
+        episode in memory. The caller (orchestrator) stores it via
+        ``store.encode_episode_content`` and sets ``last_episode_id``.
+
+        Does NOT call ``next_episode_id`` (``episode_id`` is pre-allocated by
+        the caller) and does NOT mutate ``last_episode_id`` (the caller sets it
+        after the stub write). Reads ``last_episode_id`` / ``session_id`` /
+        ``user_id`` for the ``follows`` + scope fields -- main-thread-only state.
+
+        Requires an open session (call ``start_session`` first).
+        """
+        if self.session_id is None:
+            raise RuntimeError(
+                "encode_messages_stub requires an open session; call start_session() first."
+            )
+
+        episode = Episode.from_messages(
+            episode_id=episode_id,
+            messages=messages,
+            extracted={},
+            relations=[],
+            follows=self.last_episode_id,
+            user_id=self.user_id,
+            session_id=self.session_id,
+            origin=origin,
+        )
+        self._apply_overrides(
+            episode, salience=salience, utility_decay_rate=utility_decay_rate,
+            summary_embedding=summary_embedding, embedder=embedder,
+        )
+        return episode
+
+    def encode_messages_fill(
+        self,
+        episode: Episode,
+        episode_id: str,
+        *,
+        degrade_on_extract_fail: bool = True,
+    ) -> Episode:
+        """Run the heavy extraction on a stub episode and populate its graph
+        fields in memory (NO store).
+
+        GLiNER (entities/topics/tones/decisions) + Bonsai relations + the
+        deterministic state-assertion normalizer run over ``episode.full_text``
+        (set by ``encode_messages_stub``); the results populate
+        ``entities``/``entity_classes``/``topics``/``tones``/``decisions``/
+        ``relations``/``state_assertions``. The caller (worker) then stores the
+        edges via ``store.encode_episode_edges(episode_id, episode)``.
+
+        Worker-safe: reads ONLY ``episode.full_text`` and ``episode_id``. Does
+        NOT call ``next_episode_id``, does NOT touch ``last_episode_id`` /
+        ``session_id`` / ``WorkingMemory``, does NOT store. Defaults
+        ``degrade_on_extract_fail=True`` (the live async path: a transient
+        GLiNER hiccup yields empty extraction, the stub keeps the turn
+        vector-retrievable).
+        """
+        full_text = episode.full_text
+        extracted = self._extract(full_text, degrade_on_extract_fail=degrade_on_extract_fail)
+        relations = self._extract_relations(full_text, episode_id)
+
+        episode.entities = extracted.get("entities", [])
+        episode.entity_classes = extracted.get("entity_classes", {})
+        episode.topics = extracted.get("topics", [])
+        episode.tones = extracted.get("tones", [])
+        episode.decisions = extracted.get("decisions", [])
+        episode.relations = relations
+        episode.state_assertions = self._build_state_assertions(
+            full_text, episode.decisions, relations
+        )
         return episode
 
     def encode_conversation(self, turns: list[tuple[str, str]]) -> list[Episode]:

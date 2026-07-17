@@ -62,6 +62,85 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
 # JSON mid-stream. Capping the kept set bounds output size and favors salience.
 _MAX_RELATIONS = 6
 
+# Per-class cap for the isolated 10-pass extractor. The whole point of
+# isolation is NO salience cap (the V1 "at most 6" is what loses has_state), so
+# this is a generous pure-safety valve against a pathological over-extract, not
+# a salience filter. Realistic input yields <10 relations per class
+# (~4.9 rels/doc total across all 10 classes per the probe).
+_MAX_RELATIONS_ISOLATED = 64
+
+
+# The 10 canonical predicate classes, each with a focused single-predicate
+# directive. Isolation removes the salience race: one pass per class, no
+# competing predicates, no "at most 6" cap -> has_state no longer loses to
+# decides/concerns/involves for the top slots. Proven 11/13 strict has_state
+# zero-shot (vs V1's 0/13), all 10 classes emit, neg FP 0
+# (scripts/_scratch/_probe_isolate_classes.py, uncommitted). The cost is 10 HTTP
+# round-trips (~22.8 s/doc) -> only viable behind async_distill_enabled.
+ISOLATION_CLASSES: list[tuple[str, str, str]] = [
+    ("has_state", "has_state(Entity, Value)",
+     "an ENTITY's current state/value/choice. The subject is a tool, team, "
+     "ticket, policy, project, system, framework, database, or service -- "
+     "NEVER a person, NEVER a topic. Use for explicit 'the team chose X', "
+     "'status: Y', 'X is now Z', 'switched to W', 'we use X', 'the framework "
+     "is X'. Value is the literal value (e.g. Postgres, React, red, v2), not "
+     "a topic. Extract one has_state per distinct entity-value pair."),
+    ("decides", "decides(Person, Decision)",
+     "a person decides, chooses, picks, or commits to a course of action or "
+     "option. The subject MUST be a person. The object is the decision/choice."),
+    ("expresses", "expresses(Person, Tone)",
+     "a person expresses a tone or emotion (e.g. frustrated, optimistic, "
+     "concerned, enthusiastic). Subject is a person; object is the tone."),
+    ("questions", "questions(Person, Concept)",
+     "a person asks a question about a concept or topic. Subject is a person; "
+     "object is the concept being asked about."),
+    ("suggests", "suggests(Person, Concept)",
+     "a person suggests, proposes, or recommends an idea or option. Subject "
+     "is a person; object is the suggested idea/option."),
+    ("explains", "explains(Person, Concept)",
+     "a person explains a concept to someone. Subject is a person; object is "
+     "the concept being explained."),
+    ("concerns", "concerns(Episode, Topic)",
+     "the conversation/episode is about a topic. Subject is the episode (use "
+     "'episode'); object is the topic."),
+    ("involves", "involves(Episode, Entity)",
+     "the conversation/episode involves an entity (tool, team, service, "
+     "person). Subject is the episode (use 'episode'); object is the entity."),
+    ("contradicts", "contradicts(Statement, Statement)",
+     "one statement in the conversation contradicts another. Subject and "
+     "object are the two contradicting statements (short quotes or summaries)."),
+    ("follows_up_on", "follows_up_on(Episode, Episode)",
+     "the conversation follows up on a prior episode. Both subject and object "
+     "are episodes."),
+]
+
+_ISO_TEMPLATE = """Extract ONLY __SIG__ relations from this conversation.
+Return ONLY valid JSON, no other text.
+A __PRED__ relation is: __DIRECTIVE__
+Extract EVERY __PRED__ relation you can find in the conversation. Do NOT
+extract any other relation type. Emit the predicate as the exact string
+"__PRED__".
+Conversation:
+{text}
+Return JSON:
+{{"relations": [{{"subject": "...", "predicate": "__PRED__", "object": "..."}}]}}"""
+
+
+def _iso_prompt(pred: str, sig: str, directive: str) -> str:
+    """Build the isolated single-predicate prompt for one class.
+
+    Uses ``__SIG__`` / ``__PRED__`` / ``__DIRECTIVE__`` placeholders (not
+    ``.format`` fields) so the per-call ``{text}`` substitution in ``extract``
+    is the only ``.format`` pass -- avoids a KeyError when the directive text
+    contains braces.
+    """
+    return (
+        _ISO_TEMPLATE
+        .replace("__SIG__", sig)
+        .replace("__PRED__", pred)
+        .replace("__DIRECTIVE__", directive)
+    )
+
 
 def _scan_complete_relation_objects(body: str) -> list[dict]:
     """Salvage complete ``{...}`` JSON objects from a possibly-truncated body.
@@ -131,6 +210,14 @@ class BonsaiRelationExtractor:
     defaults to ``config.bonsai_endpoint`` (``BONSAI_ENDPOINT`` env var).
     """
 
+    # Foreground-priority yielding hook (Phase 3c async-distill). Class-level
+    # default so ``object.__new__``-built instances (test fixtures) carry the
+    # attribute; ``extract_isolated`` reads it before each per-class HTTP call.
+    # The distill worker sets an instance attribute (shadowing this) to a
+    # blocking callable and clears it after the fill. ``None`` = no yielding,
+    # byte-identical to the synchronous single-pass path.
+    pause_gate: object | None = None
+
     def __init__(
         self,
         model: str | None = None,
@@ -143,30 +230,51 @@ class BonsaiRelationExtractor:
         self.temperature = temperature if temperature is not None else config.bonsai_temperature
         self.timeout = timeout
 
-    def extract(self, text: str) -> list[dict]:
+    def extract(self, text: str, *, isolated: bool | None = None) -> list[dict]:
         """Extract relations as (subject, predicate, object) triples.
+
+        Dispatches on ``config.bonsai_isolation_extraction`` (overridable via
+        the ``isolated`` kwarg): ``False`` (default) = the V1 single-pass
+        ``BONSAI_RELATION_PROMPT`` (byte-identical to pre-async); ``True`` = the
+        10-pass isolated per-class extractor (``extract_isolated``), which lifts
+        strict ``has_state`` catch 0 -> 11/13 zero-shot at the cost of 10 HTTP
+        round-trips. The isolation path is only viable behind
+        ``async_distill_enabled`` (the ~22.8 s/doc runs on the background
+        worker); enabling isolation without async would block the response.
 
         Raises ``RuntimeError`` with the exact server response if the request
         fails or the model returns non-JSON, so the caller can log the raw
         output rather than silently dropping relations.
         """
+        if isolated is None:
+            isolated = config.bonsai_isolation_extraction
+        if isolated:
+            return self.extract_isolated(text)
+        return self._extract_single(text)
+
+    def _post(self, prompt: str, text: str, *, max_tokens: int = 768) -> str:
+        """One HTTP round-trip to the Bonsai chat endpoint -> raw content string.
+
+        Shared by the V1 single pass and each isolated per-class pass. Raises
+        ``RuntimeError`` verbatim on network / HTTP / shape failures so the
+        caller's try/except (the encoder degrades a single failed pass to
+        empty) sees the real error.
+        """
         url = f"{self.endpoint}/chat/completions"
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": BONSAI_RELATION_PROMPT.format(text=text)}],
+            "messages": [{"role": "user", "content": prompt.format(text=text)}],
             "response_format": {"type": "json_object"},
             "temperature": self.temperature,
             # Bound the response so an over-extracting turn truncates the JSON
             # instead of running away. _parse_relations recovers complete
             # relation objects from a truncated stream.
-            "max_tokens": 768,
+            "max_tokens": max_tokens,
         }
 
         try:
             resp = requests.post(url, json=payload, timeout=self.timeout)
         except requests.RequestException as e:
-            # Network / connection error — surface verbatim. Common cause when
-            # the llama-server isn't up or the endpoint is wrong.
             raise RuntimeError(f"Bonsai request to {url} failed: {e}") from e
 
         if resp.status_code != 200:
@@ -180,14 +288,55 @@ class BonsaiRelationExtractor:
             raise RuntimeError(f"Bonsai returned non-JSON body: {resp.text}") from e
 
         try:
-            content = outer["choices"][0]["message"]["content"]
+            return outer["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
-            raise RuntimeError(f"Bonsai response missing choices[0].message.content: {outer}") from e
+            raise RuntimeError(
+                f"Bonsai response missing choices[0].message.content: {outer}"
+            ) from e
 
+    def _extract_single(self, text: str) -> list[dict]:
+        """The V1 single-pass extractor (the default). One HTTP call with the
+        merged ``BONSAI_RELATION_PROMPT``; output capped at ``_MAX_RELATIONS``."""
+        content = self._post(BONSAI_RELATION_PROMPT, text, max_tokens=768)
         return self._parse_relations(content)
 
+    def extract_isolated(self, text: str) -> list[dict]:
+        """The 10-pass isolated per-class extractor.
+
+        One focused single-predicate pass per class in ``ISOLATION_CLASSES``,
+        merged. Each pass's predicate is force-normalized to the exact class
+        name (the prompt asks for it, but the ternary 8B sometimes paraphrases
+        the predicate string). No salience cap: ``_MAX_RELATIONS_ISOLATED`` is a
+        generous per-class safety valve, not the V1 "at most 6" filter. A
+        failed pass degrades to empty for that class (the merged result keeps
+        the other classes) -- one class's HTTP/parse hiccup does not drop the
+        whole extraction, mirroring the V1 degrade-to-empty philosophy.
+        """
+        merged: list[dict] = []
+        for pred, sig, directive in ISOLATION_CLASSES:
+            # Yield to the foreground before each GPU-using HTTP call: a
+            # foreground query() that lands while this pass is mid-flight would
+            # queue behind it on the shared 8B. ``pause_gate`` blocks while the
+            # foreground is busy; None (sync path) is a no-op.
+            if self.pause_gate is not None:
+                self.pause_gate()
+            prompt = _iso_prompt(pred, sig, directive)
+            try:
+                content = self._post(prompt, text, max_tokens=768)
+                rels = self._parse_relations(content, max_relations=_MAX_RELATIONS_ISOLATED)
+            except Exception as e:  # noqa: BLE001 - one class fails, keep the rest
+                # Degrade this class to empty rather than failing the whole
+                # extraction; the caller (the async worker) logs via the
+                # encoder's _extract_relations try/except if ALL classes fail.
+                rels = []
+            for r in rels:
+                if isinstance(r, dict):
+                    r["predicate"] = pred
+            merged.extend(r for r in rels if isinstance(r, dict))
+        return merged
+
     @staticmethod
-    def _parse_relations(content: str) -> list[dict]:
+    def _parse_relations(content: str, *, max_relations: int = _MAX_RELATIONS) -> list[dict]:
         """Parse the model's JSON content into a list of relation dicts.
 
         Strips accidental ``` fences and, failing that, falls back to the
@@ -224,7 +373,7 @@ class BonsaiRelationExtractor:
             # complete relation objects we can find in the body.
             salvaged = _scan_complete_relation_objects(body)
             if salvaged:
-                return salvaged[:_MAX_RELATIONS]
+                return salvaged[:max_relations]
             raise RuntimeError(f"Bonsai returned unparseable JSON: {content!r}") from None
 
         relations = data.get("relations", []) if isinstance(data, dict) else []
@@ -237,4 +386,4 @@ class BonsaiRelationExtractor:
             r for r in relations
             if isinstance(r, dict) and {"subject", "predicate", "object"} <= r.keys()
         ]
-        return out[:_MAX_RELATIONS]
+        return out[:max_relations]

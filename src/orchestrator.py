@@ -62,6 +62,8 @@ from .tools import (
 if TYPE_CHECKING:
     from .encoding.encoder import HippocampalEncoder
 
+from .encoding.distill_worker import DistillWorker
+
 
 # Signal -> persistence profile (2026-07-14). The ``signal`` arg modulates HOW
 # strongly a live-encoded episode persists, not WHETHER (always-encode is the
@@ -176,6 +178,17 @@ class PonderOrchestrator:
         # construction) so ``query()`` never loads GLiNER unless a real encoder
         # was explicitly wired in.
         self._encoder = encoder
+        # Async episode distillation (Phase 3c): when ``async_distill_enabled``
+        # is on AND an encoder is wired, a single-worker background FIFO fills
+        # each turn's graph edges after the response returns (the 22 s
+        # extraction runs off-thread; the stub content + vector index is written
+        # synchronously so the turn is retrievable immediately). ``None`` (the
+        # default, flag off, or no encoder) -> the synchronous
+        # ``_persist_exchange`` path, byte-identical to pre-async. See
+        # async-distill-stub.md + src/encoding/distill_worker.py.
+        self._distill_worker: Optional[DistillWorker] = None
+        if encoder is not None and getattr(_runtime_config, "async_distill_enabled", False):
+            self._distill_worker = DistillWorker(encoder, store)
         # Self-chat tool-loop transcript surfaced onto the query result (D6).
         # Declared here so the attribute always exists; ``query`` resets it to
         # None before the synthesize call and sets it to the loop dict only when
@@ -242,6 +255,13 @@ class PonderOrchestrator:
         persistence failure is logged and never loses the response. The encoded
         episode id (when persisted) is returned as ``result["persisted_episode_id"]``.
         """
+        # Foreground-priority yielding (Phase 3c async-distill): mark the
+        # foreground busy for the duration of the response build so the
+        # background distill worker's GPU steps (GLiNER + 10-pass Bonsai) block
+        # and run only in the gaps between turns. Cleared at return. No-op when
+        # there is no worker (the synchronous default).
+        if self._distill_worker is not None:
+            self._distill_worker.foreground_busy.set()
         # 1. embed prompt; update WM (state persists across queries).
         prompt_emb = self.working_memory.embed([user_prompt])[0]
         self.working_memory.update(prompt_emb)
@@ -270,6 +290,12 @@ class PonderOrchestrator:
             pathway = route.pathway
             if not routing_result["supported"]:
                 # ssm_direct / process_exec / tool_plan — honest unsupported.
+                # Release the foreground gate on this early-return path too, or
+                # the distill worker would stay paused until the next query
+                # (foreground_busy.set() above is not re-cleared by the happy-
+                # path tail below, which this return skips).
+                if self._distill_worker is not None:
+                    self._distill_worker.foreground_busy.clear()
                 return {
                     "response": None, "route": route, "retrieved_episodes": [],
                     "context_used": None, "chunked": None,
@@ -458,6 +484,11 @@ class PonderOrchestrator:
         # failure never loses the response the user already has.
         if auto_persist:
             self._persist_exchange(user_prompt, result, signal)
+        # The foreground response is fully built + persisted; release the
+        # background distill worker so it can fill this turn's (and any queued
+        # turn's) graph edges in the now-idle GPU gap. No-op without a worker.
+        if self._distill_worker is not None:
+            self._distill_worker.foreground_busy.clear()
         return result
 
     def _classify_query(self, prompt: str) -> str:
@@ -518,15 +549,39 @@ class PonderOrchestrator:
             # instead, which yields one 1-D float vector per text. The encoder
             # coerces it to ``list[float]`` for JSON persistence.
             raw_encode = self.embedder.encode if self.embedder is not None else None
-            episode = encoder.encode_messages(
-                messages,
-                origin="live",
-                salience=prof["salience"],
-                utility_decay_rate=prof["decay_rate"],
-                embedder=raw_encode,
-                degrade_on_extract_fail=True,
-            )
-            result["persisted_episode_id"] = episode.id
+            if self._distill_worker is not None:
+                # Async-distill path: pre-allocate the id on the main thread
+                # (the persisted counter is never touched by the worker),
+                # build + write the stub (content + vector index -- the one
+                # synchronous cost the design keeps), set the follows chain,
+                # then hand the stub to the worker for the 22 s fill. The
+                # response has already returned by the time the fill runs.
+                episode_id = self.store.next_episode_id()
+                episode = encoder.encode_messages_stub(
+                    messages,
+                    episode_id,
+                    origin="live",
+                    salience=prof["salience"],
+                    utility_decay_rate=prof["decay_rate"],
+                    embedder=raw_encode,
+                )
+                self.store.encode_episode_content(episode_id, episode)
+                encoder.last_episode_id = episode_id
+                result["persisted_episode_id"] = episode_id
+                self._distill_worker.enqueue(episode, episode_id)
+            else:
+                # Synchronous path (the default, flag off): extract + build +
+                # store in one fused call on the main thread, byte-identical to
+                # pre-async. ``encode_messages`` sets last_episode_id itself.
+                episode = encoder.encode_messages(
+                    messages,
+                    origin="live",
+                    salience=prof["salience"],
+                    utility_decay_rate=prof["decay_rate"],
+                    embedder=raw_encode,
+                    degrade_on_extract_fail=True,
+                )
+                result["persisted_episode_id"] = episode.id
         except Exception as e:  # noqa: BLE001 - never lose the response
             print(f"[persist-fail] {e}", file=sys.stderr)
 
@@ -698,6 +753,20 @@ class PonderOrchestrator:
         if encoder is None or encoder.session_id is None:
             return
         encoder.end_session()
+
+    def drain(self, timeout: float = 5.0) -> bool:
+        """Teardown: stop the background distill worker, finish in-flight +
+        queued fills, join the worker thread. No-op when async-distill is off.
+
+        This PERMANENTLY stops the worker -- call at process exit / orchestrator
+        disposal (``serve_ponder.py`` calls it on shutdown), NOT per
+        conversation (the worker must stay alive across conversations). Returns
+        True if the worker joined within ``timeout``. Best-effort: a hard exit
+        may lose in-flight encodes -- the stub keeps the turn vector-retrievable.
+        """
+        if self._distill_worker is None:
+            return True
+        return self._distill_worker.drain(timeout=timeout)
 
     # ── session persistence (reuses the shipped state serializer) ──
 

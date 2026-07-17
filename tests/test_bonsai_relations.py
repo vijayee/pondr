@@ -105,6 +105,76 @@ def test_construct_is_offline():
     assert ext.endpoint == config.bonsai_endpoint.rstrip("/")
 
 
+# ── Isolated 10-pass extractor (offline, _post monkeypatched) ──────────────
+
+def _stub_post_factory(calls: list, payload_per_call=None):
+    """Return a _post stub that records each call and returns a fixed relation
+    JSON. ``payload_per_call`` lets a test vary the returned body by call index
+    (e.g. to make one pass raise)."""
+    def _post(self, prompt, text, *, max_tokens=768):
+        calls.append(prompt)
+        idx = len(calls) - 1
+        if payload_per_call is not None:
+            return payload_per_call(idx)
+        # Default: a relation whose predicate is a paraphrase -- isolation must
+        # force-normalize it to the class name (the prompt's exact string).
+        return '{"relations": [{"subject": "x", "predicate": "is_now", "object": "y"}]}'
+    return _post
+
+
+def test_extract_single_is_default_dispatch(monkeypatch):
+    """With bonsai_isolation_extraction=False (the default), extract() makes ONE
+    HTTP call (the V1 merged prompt), not 10."""
+    monkeypatch.setattr(config, "bonsai_isolation_extraction", False)
+    ext = BonsaiRelationExtractor()
+    calls = []
+    monkeypatch.setattr(BonsaiRelationExtractor, "_post", _stub_post_factory(calls))
+    rels = ext.extract("User: q\nAssistant: a")
+    assert len(calls) == 1, f"V1 path must be one call, got {len(calls)}"
+    assert BONSAI_RELATION_PROMPT.splitlines()[0] in calls[0]
+    # The paraphrased predicate is NOT force-normalized on the V1 path.
+    assert rels == [{"subject": "x", "predicate": "is_now", "object": "y"}]
+
+
+def test_isolated_runs_one_pass_per_class_and_normalizes_predicate(monkeypatch):
+    """Isolated mode runs one pass per class (10 calls) and force-normalizes
+    each relation's predicate to the exact class name -- the ternary 8B
+    paraphrases predicates, but the merged graph must carry canonical names."""
+    from src.encoding.bonsai_relations import ISOLATION_CLASSES
+    monkeypatch.setattr(config, "bonsai_isolation_extraction", True)
+    ext = BonsaiRelationExtractor()
+    calls = []
+    monkeypatch.setattr(BonsaiRelationExtractor, "_post", _stub_post_factory(calls))
+    rels = ext.extract("User: q\nAssistant: a")
+
+    assert len(calls) == len(ISOLATION_CLASSES) == 10
+    assert {r["predicate"] for r in rels} == {c[0] for c in ISOLATION_CLASSES}
+    # Every relation carries a canonical predicate (no paraphrased "is_now").
+    assert all(r["predicate"] != "is_now" for r in rels)
+
+
+def test_isolated_degrades_failed_pass_to_empty(monkeypatch):
+    """A single class's HTTP/parse failure degrades to empty for that class --
+    the other 9 classes still land. One hiccup does not drop the extraction."""
+    monkeypatch.setattr(config, "bonsai_isolation_extraction", True)
+    ext = BonsaiRelationExtractor()
+    calls = []
+
+    def per_call(idx):
+        if idx == 3:  # the 4th class (questions) raises mid-stream
+            raise RuntimeError("simulated HTTP 500")
+        return '{"relations": [{"subject": "x", "predicate": "p", "object": "y"}]}'
+
+    monkeypatch.setattr(BonsaiRelationExtractor, "_post", _stub_post_factory(calls, per_call))
+    rels = ext.extract("User: q\nAssistant: a")
+
+    assert len(calls) == 10            # all 10 passes attempted
+    assert len(rels) == 9              # the failed class contributed nothing
+    from src.encoding.bonsai_relations import ISOLATION_CLASSES
+    failed_pred = ISOLATION_CLASSES[3][0]
+    assert all(r["predicate"] != failed_pred for r in rels)
+
+
 # ── Live extraction tests (skipped when the endpoint is down) ─────────────
 
 @pytest.fixture(scope="session")

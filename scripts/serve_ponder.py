@@ -149,6 +149,15 @@ def main() -> int:
                 history.append({"role": "assistant", "content": response})
         return 0
     finally:
+        # Drain the background distill worker before the store closes so any
+        # queued stub episodes get their graph edges filled while WaveDB is
+        # still writable. No-op when async_distill_enabled is off (drain()
+        # returns immediately if there is no worker). Best-effort: a drain
+        # failure must not block store close.
+        try:
+            orch.drain()
+        except Exception as e:  # noqa: BLE001 - never crash on cleanup
+            print(f"[drain-fail] {e}", file=sys.stderr)
         try:
             orch.store.close()
         except Exception as e:  # noqa: BLE001 - never crash on cleanup

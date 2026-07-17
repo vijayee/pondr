@@ -182,11 +182,30 @@ class HippocampalStore:
         only submitted once every op has been built, so a mid-build exception
         leaves the store untouched.
         """
-        ops: list[dict] = []
         eid = episode.id
+        ops = self._content_ops(eid, episode) + self._edge_ops(eid, episode)
+        self.db.batch_sync(ops)
+        # Live upsert into the in-DB vector index. The VectorLayer insert is
+        # its own atomic op on the same database_t -- it cannot ride in the
+        # content batch_sync above -- so it happens after, best-effort. This
+        # closes the FAISS-sidecar "not updated live" caveat: a newly encoded
+        # episode is immediately searchable via search_sync, no offline rebuild.
+        if episode.summary_embedding:
+            self._index_embedding(eid, episode.summary_embedding, episode.summary or "")
 
-        # ── HBTrie: content (neocortical store), root namespace under content/ ──
-        ops += [
+    def _content_ops(self, eid: str, episode) -> list[dict]:
+        """Content (neocortical) puts under ``content/ep/{eid}/...`` -- the
+        stub half of an episode (no graph edges).
+
+        ``encode_episode`` merges these with ``_edge_ops`` into ONE atomic
+        ``batch_sync`` (the byte-identical synchronous path). The async-distill
+        path calls them separately: ``encode_episode_content`` writes the stub
+        (content + vector index) so a turn is immediately retrievable by
+        embedding while its extraction runs in the background; the worker later
+        calls ``encode_episode_edges`` to fill the graph index. Ordering is
+        always content-before-edges, never edges without content.
+        """
+        ops: list[dict] = [
             {"type": "put", "key": f"content/ep/{eid}/summary", "value": episode.summary},
             {"type": "put", "key": f"content/ep/{eid}/text", "value": episode.full_text},
             {"type": "put", "key": f"content/ep/{eid}/ts", "value": episode.timestamp},
@@ -217,11 +236,20 @@ class HippocampalStore:
             ops.append({"type": "put", "key": f"content/ep/{eid}/embedding", "value": json.dumps(episode.summary_embedding)})
         if episode.messages:
             ops.append({"type": "put", "key": f"content/ep/{eid}/messages", "value": json.dumps(episode.messages, ensure_ascii=False)})
+        return ops
 
+    def _edge_ops(self, eid: str, episode) -> list[dict]:
+        """Graph index ops (hippocampal sparse pointers) -- the fill half.
+
+        ``encode_episode`` merges these with ``_content_ops`` into one atomic
+        ``batch_sync``. The async-distill worker calls this via
+        ``encode_episode_edges`` AFTER the stub content is stored, populating
+        ``entities``/``relations``/``state_assertions``/etc. from extraction.
+        expand_triple returns root-namespace ops (the "memory/" subtree prefix
+        is already prepended by the C helper).
+        """
+        ops: list[dict] = []
         # ── Graph: sparse pointers (hippocampal index) via expand_triple ──
-        # expand_triple returns root-namespace ops (the "memory/" subtree prefix
-        # is already prepended by the C helper) — splice into the SAME batch_sync
-        # so content and graph indices share one atomic transaction / WAL record.
         for entity in episode.entities:
             ops += self.graph.expand_triple(eid, "has_entity", f"E:{entity}")
             ops += self.graph.expand_triple(f"E:{entity}", "in_episode", eid)
@@ -250,8 +278,8 @@ class HippocampalStore:
         # tombstone). Gated on ``assertion_extraction_enabled``; an empty
         # ``state_assertions`` list (no explicit state claims in the turn) is
         # a no-op, so a plain conversation is byte-identical to pre-Phase-3c.
+        from ..config import config as _master_config
         if episode.state_assertions:
-            from ..config import config as _master_config
             if _master_config.assertion_extraction_enabled:
                 for a in episode.state_assertions:
                     ent = a.get("entity")
@@ -271,7 +299,6 @@ class HippocampalStore:
         # reads + a ``default_document_ids`` scan per encode -- best-effort
         # for the first slice; a future title-index can replace the scan
         # (matters only for corpora with many docs AND many episodes).
-        from ..config import config as _master_config
         if _master_config.citation_resolution_enabled:
             text_lower = episode.full_text.lower()
             for _doc_id in self.default_document_ids():
@@ -306,15 +333,31 @@ class HippocampalStore:
             ops += self.graph.expand_triple(sess, "has_episode", eid)
             ops += self.graph.expand_triple(eid, "in_session", sess)
             ops += self.graph.expand_triple(eid, "at_time", episode.timestamp)
+        return ops
 
-        self.db.batch_sync(ops)
-        # Live upsert into the in-DB vector index. The VectorLayer insert is
-        # its own atomic op on the same database_t -- it cannot ride in the
-        # content batch_sync above -- so it happens after, best-effort. This
-        # closes the FAISS-sidecar "not updated live" caveat: a newly encoded
-        # episode is immediately searchable via search_sync, no offline rebuild.
+    def encode_episode_content(self, eid: str, episode) -> None:
+        """Stub write: content + vector index, NO graph edges.
+
+        The async-distill path: the main thread pre-allocates ``eid`` and calls
+        this so the turn is immediately retrievable by embedding (``search_sync``)
+        while its 22 s extraction runs on the background worker. The episode is
+        graph-invisible until ``encode_episode_edges`` fills the edges. Atomic:
+        one ``batch_sync`` of content puts + the best-effort vector-index upsert.
+        """
+        self.db.batch_sync(self._content_ops(eid, episode))
         if episode.summary_embedding:
             self._index_embedding(eid, episode.summary_embedding, episode.summary or "")
+
+    def encode_episode_edges(self, eid: str, episode) -> None:
+        """Fill write: graph edges only, for content already stored via
+        ``encode_episode_content`` (or ``encode_episode``).
+
+        The async-distill worker calls this after extraction populates the
+        episode's ``entities``/``topics``/``tones``/``decisions``/``relations``/
+        ``state_assertions``. One atomic ``batch_sync`` of edge ops; content is
+        untouched (the stub already wrote it).
+        """
+        self.db.batch_sync(self._edge_ops(eid, episode))
 
     # ---- retrieve ----
 

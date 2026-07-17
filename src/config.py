@@ -151,6 +151,25 @@ class Config:
     # written when the parser supplied reply maps, so a corpus with no
     # citations / no email is unchanged.
     citation_resolution_enabled: bool = True
+    # 10-pass isolated per-class relation extraction (Phase 3c async-distill).
+    # False (default) = the V1 single-pass BONSAI_RELATION_PROMPT (byte-identical
+    # to pre-async). True = one focused single-predicate pass per class, merged
+    # -- lifts strict has_state catch 0 -> 11/13 zero-shot (every class emits,
+    # no salience race for the "at most 6" slots) at the cost of 10 HTTP
+    # round-trips (~22.8 s/doc, untenable on the sync path -> only enable
+    # behind async_distill_enabled so it runs on the background worker). See
+    # docs/Phase 3c.md Sec 7 + memory pondr-bonsai-zeroshot-eval-finetune-warranted.
+    bonsai_isolation_extraction: bool = False
+    # Async episode distillation (Phase 3c). False (default) = the synchronous
+    # _persist_exchange (encode blocks the response, byte-identical to today).
+    # True = the response returns immediately; the episode is written as a stub
+    # (content + vector index) on the main thread and a single-worker background
+    # FIFO fills the graph edges (extraction + 10-pass Bonsai) in the gaps
+    # between turns (foreground-priority yielding). Flip on only after the
+    # live-dogfood latency assertions (plan async-distill-stub.md tests 10+11)
+    # AND the existing suite stay green. Compose with bonsai_isolation_extraction
+    # (async hides the 22.8 s, isolation provides the 11/13 quality).
+    async_distill_enabled: bool = False
 
     # ── Phase 2c+: feedback-driven salience ──
     # When True, after a synthesizing turn the consumer (the external LLM, or
