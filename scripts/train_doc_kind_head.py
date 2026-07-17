@@ -43,7 +43,15 @@ def _progress(epoch: int, train_loss: float, val_acc: float) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description="Train the DocKindHead JGS instance")
     p.add_argument("--pairs", default=DocKindHeadTrainingConfig().pairs_path,
-                   help="doc-kind pairs JSONL (section_texts + label)")
+                   help="doc-kind pairs JSONL (section_texts + label) -- used for the "
+                        "internal seed-split when --train/--val are not given")
+    p.add_argument("--train", default=None,
+                   help="pre-split train JSONL; requires --val. When BOTH --train "
+                        "and --val are given, skip the internal seed-split and train "
+                        "on exactly these docs (lets a fixed REAL val be re-used "
+                        "across retrains while synthetic is added to TRAIN only).")
+    p.add_argument("--val", default=None,
+                   help="pre-split val JSONL; requires --train (see --train).")
     p.add_argument("--export-from-db", default=None,
                    help="if set, export pairs from this HippocampalStore DB path before training")
     p.add_argument("--db", default=None,
@@ -90,51 +98,76 @@ def main() -> int:
                   file=sys.stderr)
             return 1
 
-    pairs_path = Path(args.pairs)
-    if not pairs_path.exists():
-        print(f"ERROR: doc-kind pairs not found at {pairs_path} "
-              f"(pass --export-from-db to create it)", file=sys.stderr)
-        return 1
     backbone_path = Path(args.backbone)
     if not backbone_path.exists():
         print(f"ERROR: backbone checkpoint not found at {backbone_path}", file=sys.stderr)
         return 1
 
-    print(f"Loading doc-kind pairs from {pairs_path}", flush=True)
-    records = load_doc_kind_pairs(str(pairs_path))
-    if len(records) < 10:
-        print(f"ERROR: only {len(records)} doc-kind pairs -- need >=10 to train",
-              file=sys.stderr)
-        return 1
+    def _load_and_dedup(path: str, label: str) -> list[dict]:
+        recs = load_doc_kind_pairs(path)
+        if not recs:
+            print(f"ERROR: no doc-kind pairs in {path}", file=sys.stderr)
+            return []
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for rec in recs:
+            did = rec.get("doc_id") or "\n".join(rec["section_texts"])
+            if did in seen:
+                continue
+            seen.add(did)
+            unique.append(rec)
+        if len(unique) < len(recs):
+            print(f"  {label} dedup: {len(recs)} -> {len(unique)} unique "
+                  f"({len(recs) - len(unique)} duplicates dropped)", flush=True)
+        return unique
 
-    # Dedup by doc_id (a re-ingest writes the same id; duplicates add no signal
-    # and could leak across the train/val split). Keep first occurrence.
-    seen: set[str] = set()
-    unique: list[dict] = []
-    for rec in records:
-        did = rec.get("doc_id") or "\n".join(rec["section_texts"])
-        if did in seen:
-            continue
-        seen.add(did)
-        unique.append(rec)
-    if len(unique) < len(records):
-        print(f"  dedup: {len(records)} -> {len(unique)} unique docs "
-              f"({len(records) - len(unique)} duplicates dropped)", flush=True)
-    records = unique
-    if len(records) < 10:
-        print(f"ERROR: only {len(records)} unique docs -- need >=10 to train",
-              file=sys.stderr)
-        return 1
-
-    # Train/val split (deterministic via seed).
-    import random
-    rng = random.Random(args.seed)
-    idx = list(range(len(records)))
-    rng.shuffle(idx)
-    n_val = max(1, int(len(records) * args.val_fraction))
-    val_data = [records[i] for i in idx[:n_val]]
-    train_data = [records[i] for i in idx[n_val:]]
-    print(f"  {len(train_data)} train / {len(val_data)} val (unique)", flush=True)
+    if args.train is not None or args.val is not None:
+        # Pre-split mode: both flags required. A fixed REAL val is re-used across
+        # retrains (so before/after is measured on the SAME distribution) while
+        # synthetic is added to TRAIN only. No seed-split here -- the caller owns
+        # the split (scripts/prep_doc_kind_v3_split.py reproduces the v2 seed-0
+        # split so the val is the exact 76 real docs the Bonsai-vs-head probe
+        # measures against).
+        if args.train is None or args.val is None:
+            print("ERROR: --train and --val must be given TOGETHER (or neither, "
+                  "for the internal seed-split via --pairs).", file=sys.stderr)
+            return 1
+        train_data = _load_and_dedup(args.train, "train")
+        val_data = _load_and_dedup(args.val, "val")
+        if len(train_data) < 10:
+            print(f"ERROR: only {len(train_data)} train docs -- need >=10",
+                  file=sys.stderr)
+            return 1
+        if len(val_data) < 2:
+            print(f"ERROR: only {len(val_data)} val docs -- need >=2 for a scorecard",
+                  file=sys.stderr)
+            return 1
+        print(f"  pre-split: {len(train_data)} train / {len(val_data)} val "
+              f"(from --train/--val; no seed-split)", flush=True)
+        pairs_path = Path(args.train)
+    else:
+        pairs_path = Path(args.pairs)
+        if not pairs_path.exists():
+            print(f"ERROR: doc-kind pairs not found at {pairs_path} "
+                  f"(pass --export-from-db to create it, or --train/--val)",
+                  file=sys.stderr)
+            return 1
+        print(f"Loading doc-kind pairs from {pairs_path}", flush=True)
+        records = _load_and_dedup(str(pairs_path), "pairs")
+        if len(records) < 10:
+            print(f"ERROR: only {len(records)} unique docs -- need >=10 to train",
+                  file=sys.stderr)
+            return 1
+        # Train/val split (deterministic via seed).
+        import random
+        rng = random.Random(args.seed)
+        idx = list(range(len(records)))
+        rng.shuffle(idx)
+        n_val = max(1, int(len(records) * args.val_fraction))
+        val_data = [records[i] for i in idx[:n_val]]
+        train_data = [records[i] for i in idx[n_val:]]
+        print(f"  {len(train_data)} train / {len(val_data)} val "
+              f"(unique, seed {args.seed})", flush=True)
 
     print(f"Loading frozen backbone from {backbone_path}", flush=True)
     backbone = load_backbone(str(backbone_path), BackboneConfig(), device=args.device)
