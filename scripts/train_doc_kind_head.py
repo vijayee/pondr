@@ -61,6 +61,17 @@ def main() -> int:
     p.add_argument("--device", default=DocKindHeadTrainingConfig().device, help="auto|cpu|cuda")
     p.add_argument("--dtype", default=DocKindHeadTrainingConfig().dtype,
                    help="float32 (bf16/autocast still unfixed in the 2a path)")
+    p.add_argument("--unsafe-penalty", type=float,
+                   default=DocKindHeadTrainingConfig().unsafe_confusion_penalty,
+                   help="severity-weighted loss knob: extra penalty on the "
+                        "snapshot->decision_update confusion (0.0 = plain CE, "
+                        "A/B baseline; default 5.0). The reverse direction stays "
+                        "on the base CE term (extra ask_user, not unsafe).")
+    p.add_argument("--temporal-feature", action="store_true",
+                   help="Phase 4: concatenate a doc-level temporal feature "
+                        "(date/as-of/decision/plan signal) with the pooled "
+                        "embedding before the head -- attacks the mean-pool blind "
+                        "spot. Off = the original embedding-only head (A/B).")
     args = p.parse_args()
 
     # Optional: export pairs from a live store first.
@@ -133,7 +144,16 @@ def main() -> int:
     print(f"Building embedder (source={args.embed_source})", flush=True)
     embedder = build_embedder(args.embed_source)
 
-    head = DocKindHead(backbone)
+    # Phase 4: --temporal-feature widens the head's first Linear to accept the
+    # temporal feature vector (feat_dim=TEMPORAL_FEAT_DIM). Off = feat_dim=0
+    # (the original embedding-only head, the A/B baseline).
+    if args.temporal_feature:
+        from src.ingestion.doc_kind import TEMPORAL_FEAT_DIM
+        feat_dim = TEMPORAL_FEAT_DIM
+        print(f"  temporal feature ON: head.feat_dim={feat_dim}", flush=True)
+    else:
+        feat_dim = 0
+    head = DocKindHead(backbone, feat_dim=feat_dim)
     n_head = sum(p.numel() for p in head.parameters() if p.requires_grad)
     print(f"  head trainable params: {n_head:,} (backbone excluded)", flush=True)
 
@@ -143,9 +163,13 @@ def main() -> int:
         dtype=args.dtype, checkpoint_dir=args.output,
         backbone_path=str(backbone_path), embedder_source=args.embed_source,
         pairs_path=str(pairs_path),
+        unsafe_confusion_penalty=args.unsafe_penalty,
+        temporal_feature=args.temporal_feature,
     )
     print(f"Training: {cfg.epochs} epochs, lr {cfg.learning_rate}, "
-          f"{cfg.dtype} on {cfg.device}", flush=True)
+          f"{cfg.dtype} on {cfg.device}, "
+          f"unsafe_penalty={cfg.unsafe_confusion_penalty} "
+          f"temporal_feature={cfg.temporal_feature}", flush=True)
 
     result = train_doc_kind_head_supervised(
         head, backbone, train_data, val_data, embedder, cfg, progress_cb=_progress,

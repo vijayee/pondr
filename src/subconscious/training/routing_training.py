@@ -158,23 +158,37 @@ def load_doc_kind_head(
 
     Pairs with ``load_backbone`` exactly as ``load_retrieval_gate`` does. The
     checkpoint is ``{"head": state_dict, "labels": [...], "val_accuracy": float,
-    "epoch": int}`` (see ``train_doc_kind_head_supervised``'s save). The head's
-    ``state_dict()`` EXCLUDES the shared backbone (stored via
+    "epoch": int, "feat_dim": int}`` (see ``train_doc_kind_head_supervised``'s
+    save; ``feat_dim`` is absent on pre-Phase-4 checkpoints -> defaults to 0).
+    The head's ``state_dict()`` EXCLUDES the shared backbone (stored via
     ``object.__setattr__`` on ``JGSInstance``), so loading ``ckpt["head"]``
     restores only the instance-owned params (input/output projections + LoRA,
     state_lora, decomposed gate) and the 5-class classifier head -- the
-    already-frozen ``backbone`` passed in is reused, NOT reloaded. Loads strict
-    (raises on any missing/unexpected key, mirroring ``load_backbone`` /
-    ``load_retrieval_gate``), validates the persisted label order against
-    ``DocKindHead.LABELS`` (a mismatch is a hard error -- the logits would map
-    to the wrong classes), moves to the resolved device, eval mode.
+    already-frozen ``backbone`` passed in is reused, NOT reloaded. ``feat_dim``
+    is read BEFORE constructing the head so the classifier Linear's in_features
+    matches the checkpoint (a feat-trained ckpt widens the Linear; a feat-less
+    ckpt keeps it at 256). Loads strict (raises on any missing/unexpected key,
+    mirroring ``load_backbone`` / ``load_retrieval_gate``), validates the
+    persisted label order against ``DocKindHead.LABELS`` (a mismatch is a hard
+    error -- the logits would map to the wrong classes), moves to the resolved
+    device, eval mode.
     """
     cfg = config or INSTANCE_CONFIGS["doc_kind"]
-    head = DocKindHead(backbone, cfg)
     # weights_only=False: the checkpoint is the user's own training output (a
     # plain {"head": sd, "labels": [...], ...} dict, no code). Safe here; do
     # NOT load arbitrary .pt files this way -- same contract as load_backbone.
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    # feat_dim (Phase 4): widen the head's first Linear to accept the temporal
+    # feature. Read BEFORE constructing the head so the Linear shape matches the
+    # checkpoint (a feat-trained ckpt into a feat-less head, or vice versa, is a
+    # shape mismatch -> load_state_dict would silently mis-wire the Linear).
+    # Default 0 = pre-Phase-4 checkpoint (no feature) -> backward-compatible.
+    feat_dim = int(ckpt.get("feat_dim", 0)) if isinstance(ckpt, dict) else 0
+    if feat_dim < 0:
+        raise RuntimeError(
+            f"doc-kind head checkpoint {path} has negative feat_dim={feat_dim}"
+        )
+    head = DocKindHead(backbone, cfg, feat_dim=feat_dim)
     sd = ckpt["head"] if isinstance(ckpt, dict) and "head" in ckpt else ckpt
     labels = ckpt.get("labels") if isinstance(ckpt, dict) else None
     if labels is not None and list(labels) != list(DocKindHead.LABELS):

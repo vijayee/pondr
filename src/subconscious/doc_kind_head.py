@@ -69,21 +69,36 @@ class DocKindHead(JGSInstance):
         "other",
     )
 
-    def __init__(self, backbone, config: Optional[InstanceConfig] = None):
+    def __init__(self, backbone, config: Optional[InstanceConfig] = None,
+                 feat_dim: int = 0):
         cfg = config or INSTANCE_CONFIGS["doc_kind"]
         super().__init__(backbone, cfg)
         d = cfg.output_dim  # 256 -- the step-output readout dim we pool
+        # feat_dim > 0 widens the head's first Linear to accept the temporal
+        # feature vector concatenated with the pooled embedding (Phase 4). 0
+        # = no feature (the original head). Persisted in the checkpoint +
+        # validated on load so a feat-trained head can't be loaded into a
+        # feat-less head (or vice versa) -- a mismatch would silently feed
+        # zeros/garbage into the Linear.
+        self.feat_dim = int(feat_dim)
         self.head = nn.Sequential(
-            nn.Linear(d, 128), nn.GELU(),
+            nn.Linear(d + self.feat_dim, 128), nn.GELU(),
             nn.Linear(128, len(self.LABELS)),
         )
 
-    def forward(self, section_embeddings: list[Tensor]) -> Tensor:
+    def forward(self, section_embeddings: list[Tensor],
+                feat: Optional[Tensor] = None) -> Tensor:
         """Step the SSM over the section embeddings, pool the step outputs, classify.
 
         Args:
             section_embeddings: one ``[1, 384]`` (or ``[384]``) bge-small embedding
                 per section, in document order.
+            feat: optional ``[1, feat_dim]`` temporal feature vector (Phase 4)
+                concatenated with the pooled embedding. ``None`` is
+                backward-compatible: a feat-trained head (``feat_dim > 0``) fed
+                ``feat=None`` gets a zeros vector (so old callers / a missing
+                feature at serve fall back to the embedding-only signal, not a
+                shape error); a feat-less head (``feat_dim == 0``) ignores it.
 
         Returns:
             Logits ``[1, len(LABELS)]``.
@@ -97,7 +112,10 @@ class DocKindHead(JGSInstance):
         pooling the raw recurrent state (an earlier design) mode-collapsed on
         real bge-small embeddings of similar enterprise prose (the frozen state
         was not linearly separable for the subtle doc-kind distinctions). The
-        step output is the backbone's learned readout, which is.
+        step output is the backbone's learned readout, which is. The temporal
+        feature (Phase 4) is concatenated AFTER the pool -- it re-injects the
+        date/framing signal the mean discards (which section carries the date
+        that distinguishes a snapshot "as of T" from a decision "made on T").
         """
         if not section_embeddings:
             raise ValueError("DocKindHead.forward called with no section embeddings")
@@ -110,10 +128,19 @@ class DocKindHead(JGSInstance):
         # (the readout of the SSM state after absorbing that section); the mean
         # is a doc-level summary that retains per-section signal.
         pooled = torch.stack(outputs, dim=1).mean(dim=1)
+        if self.feat_dim > 0:
+            if feat is None:
+                # Backward-compat: zeros so a feat-trained head still runs from a
+                # caller that did not compute the feature (no shape error; the
+                # head falls back to the embedding-only signal).
+                feat = torch.zeros(1, self.feat_dim, dtype=pooled.dtype,
+                                   device=pooled.device)
+            pooled = torch.cat([pooled, feat.to(pooled.dtype).to(pooled.device)], dim=-1)
         return self.head(pooled)
 
     @torch.no_grad()
-    def classify(self, section_texts: list[str], embedder) -> Optional[str]:
+    def classify(self, section_texts: list[str], embedder,
+                 feat: Optional[Tensor] = None) -> Optional[str]:
         """Tag a doc given its section texts -> one of ``LABELS``, or ``None``.
 
         Embeds each section text via ``embedder`` (bge-small, 384-d), runs
@@ -122,7 +149,8 @@ class DocKindHead(JGSInstance):
         (same contract as ``BonsaiDecider.classify_doc_kind`` -> no fabricated
         label). The caller owns the embedder (injected), keeping this module
         torch-only (no ``sentence_transformers`` import here -- mirrors
-        ``RetrievalGate.route_text``).
+        ``RetrievalGate.route_text``). ``feat`` is the optional temporal feature
+        (Phase 4); the caller computes it from the SAME section_texts.
         """
         section_texts = [s for s in section_texts if s and s.strip()]
         if not section_texts:
@@ -134,6 +162,6 @@ class DocKindHead(JGSInstance):
             torch.tensor(v, dtype=torch.float32, device=device).unsqueeze(0)
             for v in vecs
         ]
-        logits = self.forward(embs)
+        logits = self.forward(embs, feat=feat)
         idx = int(logits.argmax(dim=-1).item())
         return self.LABELS[idx]

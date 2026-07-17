@@ -59,15 +59,20 @@ _LABELS = (
     "other",
 )
 
-_PROMPT = """You are labeling an enterprise document with exactly one of five semantic kinds. Read the document text and return the single best-fitting kind.
+_PROMPT = """You are labeling an enterprise document with exactly one of five semantic kinds. Read the document text and return the single best-fitting kind, plus a confidence and a short reason.
 
 - point_in_time_snapshot: a record of state AS OF a date. A status report, quarterly snapshot, dashboard export, health check, "as of 2026-03-31 the deploy is green". Time-bound; a later snapshot supersedes it.
 - decision_update: a record of a decision or change and its rationale. An ADR, a policy change, "we switched from X to Y", an architecture decision. A later decision_update supersedes an earlier one.
 - plan: a description of intended future work. A roadmap, proposal, sprint plan, OKRs, project plan. Forward-looking, not yet executed.
 - reference: evergreen reference material. Runbooks, manuals, how-to guides, architecture references, glossaries, onboarding docs. Not time-bound, not a decision.
-- other: anything that does not clearly fit the above.
+- other: anything that does not clearly fit the above. If no kind clearly fits, return "other".
 
-Return JSON with exactly one key: {"doc_kind": "<one of the five labels above>"}
+Key distinction -- be careful: a STATUS report ("state as of date") is point_in_time_snapshot; a DECISION record ("we decided to switch") is decision_update. They are easy to confuse. If the doc records an observation of current state, label it point_in_time_snapshot; if it records a choice that was made, label it decision_update.
+
+Return JSON with exactly three keys:
+{"doc_kind": "<one of the five labels above>", "confidence": <0.0-1.0 float>, "reason": "<at most 12 words explaining the choice>"}
+
+`confidence` is how clearly the document fits the chosen kind (1.0 = unambiguous, 0.5 = plausible but uncertain). Keep `reason` to at most 12 words.
 
 Document:
 """
@@ -105,6 +110,60 @@ def _section_texts(content: str, chunker, parser) -> list[str]:
     return out
 
 
+def filter_labeled_results(
+    docs: list[tuple[str, str, list[str]]],
+    results: list,
+    min_confidence: float,
+    labels: tuple[str, ...] = _LABELS,
+) -> tuple[list[dict], dict[str, int], int, int, list[tuple[str, str, str]]]:
+    """Filter index-aligned Oracle results into writeable JSONL records.
+
+    The v1 corpus's 6/13 unsafe snapshot->decision_update confusion was teacher
+    noise; the confidence gate is the fix. A failure sentinel (``result.error``
+    set), an out-of-vocab label, OR a label with ``confidence < min_confidence``
+    is rejected (counted, NOT written) -- a wrong/uncertain label would silently
+    degrade the head. Returns ``(records, label_counts, failures, low_conf,
+    verdicts)`` where each ``record`` is the JSONL payload (doc_id, section_texts,
+    label, confidence, reason) and each ``verdict`` is ``(doc_id, status, line)``
+    with ``status`` in ``{OK, FAIL, REJECT_OOV, REJECT_LOWCONF}`` -- the
+    authoritative per-row outcome the caller prints in --verbose mode (so the
+    verbose log can never drift from the filter logic). Rejected rows are
+    retried on a re-run (the cache skips the OK docs). Pure function -- no I/O --
+    so the confidence gate is unit-testable without an Oracle call.
+    """
+    label_counts: dict[str, int] = {k: 0 for k in labels}
+    records: list[dict] = []
+    verdicts: list[tuple[str, str, str]] = []
+    failures = 0
+    low_conf = 0
+    for (doc_id, _title, sec_texts), result in zip(docs, results):
+        if result.error:
+            failures += 1
+            verdicts.append((doc_id, "FAIL", f"error: {result.error}"))
+            continue
+        kind = result.response.get("doc_kind")
+        if kind not in labels:
+            failures += 1
+            verdicts.append((doc_id, "REJECT_OOV", f"out-of-vocab label {kind!r}"))
+            continue
+        conf = result.response.get("confidence")
+        if not isinstance(conf, (int, float)) or conf < min_confidence:
+            low_conf += 1
+            verdicts.append((doc_id, "REJECT_LOWCONF",
+                            f"low confidence {conf!r} (gate {min_confidence})"))
+            continue
+        label_counts[kind] += 1
+        records.append({
+            "doc_id": doc_id,
+            "section_texts": sec_texts,
+            "label": kind,
+            "confidence": round(float(conf), 3),
+            "reason": str(result.response.get("reason") or "")[:200],
+        })
+        verdicts.append((doc_id, "OK", f"{kind} (conf={float(conf):.2f})"))
+    return records, label_counts, failures, low_conf, verdicts
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Label a doc-kind training corpus with the DeepSeek-flash Oracle.",
@@ -128,6 +187,10 @@ def main() -> int:
                     help="prompt-hash cache for resume (re-run skips labeled docs)")
     ap.add_argument("--max-chars", type=int, default=8000,
                     help="cap on doc text sent to the Oracle (mirrors _BONSAI_TEXT_CAP)")
+    ap.add_argument("--max-tokens", type=int, default=768,
+                    help="Oracle output token cap (default 768; the JSON now carries confidence+reason)")
+    ap.add_argument("--min-confidence", type=float, default=0.7,
+                    help="reject labels with confidence below this (0.0=keep all; default 0.7)")
     ap.add_argument("--verbose", action="store_true",
                     help="print each doc_id + label as it completes")
     args = ap.parse_args()
@@ -208,16 +271,17 @@ def main() -> int:
         model=args.model,
         endpoint=args.endpoint or _config.oracle_endpoint,
         temperature=0.1,           # near-deterministic for label consistency
-        max_tokens=512,            # one JSON object; thinking is OFF (see think=)
+        max_tokens=args.max_tokens,  # one JSON object (doc_kind+confidence+reason); think OFF
         batch_delay=0.0,
         cache_path=cache_path,
         # deepseek-v4-flash is a REASONING model: under the OpenAI /v1 path the
         # reasoning CoT shares the max_tokens budget with content, so a small
         # cap is eaten by reasoning and content comes back EMPTY (truncation).
         # think=False routes through Ollama's native /api/chat which honors the
-        # flag -- flash then emits the JSON object directly (no CoT), so 512
-        # output tokens is plenty and calls are fast + cheap. Verified on a
-        # runbook: 9 output tokens, clean {"doc_kind": "reference"}.
+        # flag -- flash then emits the JSON object directly (no CoT), so output
+        # tokens are cheap. The v2 prompt also asks for confidence + a <=12-word
+        # reason (~30-50 tokens); 768 is plenty. Verified on a runbook: 9 tokens
+        # for the v1 {doc_kind}-only object.
         think=False,
     )
     # Validate the cache dir exists before the client tries to flush to it.
@@ -238,32 +302,18 @@ def main() -> int:
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Tally + write in one pass over the index-aligned results. A failure
-    # sentinel (result.error) or an out-of-vocab label is counted + skipped,
-    # NOT written -- a wrong label would silently degrade the head.
-    label_counts: dict[str, int] = {k: 0 for k in _LABELS}
-    failures = 0
+    # filter_labeled_results is pure (no I/O); the write loop just serializes.
+    # verdicts is the authoritative per-row outcome -- print it in verbose mode
+    # so the diagnostic log can never drift from the filter logic.
+    records, label_counts, failures, low_conf, verdicts = filter_labeled_results(
+        docs, results, args.min_confidence)
+    if args.verbose:
+        for doc_id, status, line in verdicts:
+            print(f"  {status:<13} {doc_id}: {line}", flush=True)
     written = 0
     with open(out_path, "w", encoding="utf-8") as f:
-        for (doc_id, _title, sec_texts), result in zip(docs, results):
-            if result.error:
-                failures += 1
-                if args.verbose:
-                    print(f"  FAIL {doc_id}: {result.error}", flush=True)
-                continue
-            kind = result.response.get("doc_kind")
-            if kind not in _LABELS:
-                failures += 1
-                if args.verbose:
-                    print(f"  REJECT {doc_id}: out-of-vocab label {kind!r}", flush=True)
-                continue
-            label_counts[kind] += 1
-            if args.verbose:
-                print(f"  OK   {doc_id} -> {kind}", flush=True)
-            f.write(json.dumps(
-                {"doc_id": doc_id, "section_texts": sec_texts, "label": kind},
-                ensure_ascii=False,
-            ) + "\n")
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             written += 1
 
     stats = client.get_stats()
@@ -272,13 +322,15 @@ def main() -> int:
     print(f"label distribution: {dict(sorted(label_counts.items()))}", flush=True)
     print(f"oracle: {stats['total_calls']} calls, {stats['cached_calls']} cached, "
           f"{stats['total_tokens']} tokens, ${stats['total_cost']}", flush=True)
-    print(f"failures/rejections: {failures}", flush=True)
-    if failures:
-        print("note: failures are not written; re-run (cache skips the OK docs) "
+    print(f"failures/rejections: {failures} (low-confidence skipped: {low_conf}, "
+          f"gate={args.min_confidence})", flush=True)
+    if failures or low_conf:
+        print("note: skipped rows are not written; re-run (cache skips the OK docs) "
               "to retry them", flush=True)
     if written < 10:
         print(f"ERROR: only {written} usable pairs -- need >=10 to train. "
-              f"Raise --n or re-run to retry failures.", file=sys.stderr)
+              f"Raise --n, lower --min-confidence, or re-run to retry failures.",
+              file=sys.stderr)
         return 1
     print(f"next: python scripts/train_doc_kind_head.py --pairs {out_path} "
           f"--embed-source on-demand --device auto", flush=True)
