@@ -52,6 +52,7 @@ class UnifiedIngestionPipeline:
         extractor=None,
         relation_extractor=None,
         embedder=None,
+        doc_kind_tagger=None,
     ) -> tuple[str, bool]:
         """Ingest (or re-ingest) a source. Returns ``(doc_id, created)``.
 
@@ -74,6 +75,17 @@ class UnifiedIngestionPipeline:
         embeddings are written -- sections stay findable via the graph
         entity/topic axes but not via the semantic fallback (mirrors episodes'
         ``set_summary_embedding`` backfill model).
+
+        ``doc_kind_tagger`` (Phase 3c Sec 7.11; any object with
+        ``classify_doc_kind(text) -> Optional[str]`` -- a ``BonsaiDecider``
+        satisfies this) is optional -- when set, the doc's semantic KIND is
+        tagged at ingest (one zero-shot HTTP call over ``_doc_text``) and
+        written to ``doc.doc_kind``. When ``None`` (structure-only / cold-
+        start) OR the call fails / returns an out-of-vocab label, ``doc_kind``
+        stays the ``"other"`` default -> byte-identical to pre-7.11 (NO
+        fabricated label). The tag lets the complementary-temporal guard fire
+        on a semantic signal (both sources ``point_in_time_snapshot``) instead
+        of a filename month-prefix, which is inert on real enterprise docs.
         """
         if source_type == "auto":
             source_type = detect_type(source_path)
@@ -144,6 +156,23 @@ class UnifiedIngestionPipeline:
             # (set by the store when ``section`` is absent).
             state_assertions.append({"entity": a["entity"], "value": a["value"]})
         doc.state_assertions = state_assertions
+
+        # Phase 3c Sec 7.11: semantic doc-kind tag (zero-shot Bonsai at ingest).
+        # Injected (a BonsaiDecider or any duck-typed classify_doc_kind); when
+        # None (structure-only / cold-start) doc_kind stays the "other" default
+        # -> byte-identical to pre-7.11. Best-effort: a failed call (down
+        # server, parse error) or an out-of-vocab label (classify_doc_kind
+        # returns None) also leaves "other" -- NO fabricated label. The tag
+        # lets the complementary-temporal guard fire on a semantic signal
+        # (both sources point_in_time_snapshot) instead of a filename month-
+        # prefix, which is inert on real enterprise docs (the bench finding).
+        if doc_kind_tagger is not None:
+            try:
+                kind = doc_kind_tagger.classify_doc_kind(self._doc_text(parsed))
+            except Exception:  # noqa: BLE001 -- best-effort; cold-start safe
+                kind = None
+            if kind is not None:
+                doc.doc_kind = kind
 
         self.store.encode_document(doc, update=not created)
         return doc_id, created

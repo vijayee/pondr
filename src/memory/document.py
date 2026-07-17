@@ -98,6 +98,12 @@ class Document:
     source_path: str
     title: str
     ingested_at: str
+    # Phase 3c Sec 7.11: semantic doc-kind tag (zero-shot Bonsai at ingest).
+    # ``{point_in_time_snapshot, decision_update, plan, reference, other}``.
+    # ``other`` is the cold-start / tagger-failure / not-wired default (the
+    # complementary-temporal guard then falls through to the month-prefix
+    # fallback / the LLM, byte-identical to pre-7.11). NOT a forgetting field.
+    doc_kind: str = "other"
     sections: list[DocumentSection] = field(default_factory=list)
     authors: list[str] = field(default_factory=list)
     created_at: Optional[str] = None

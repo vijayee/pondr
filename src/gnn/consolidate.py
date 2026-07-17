@@ -1194,16 +1194,26 @@ class Consolidator:
                 # the guard falls through to the LLM (status quo). Section ids
                 # are ``{doc_id}_sec_{NNN}``; strip the ``_sec_`` tail to get the
                 # doc id, then one light ``document_source_path`` lookup.
+                # Phase 3c Sec 7.11: also resolve the doc's semantic ``doc_kind``
+                # (one light ``document_kind`` lookup on the same doc id) so the
+                # guard can fire on ``point_in_time_snapshot`` -- a content-
+                # derived signal -- instead of the filename month-prefix, which
+                # is inert on real enterprise docs that carry no month in their
+                # names. ``None`` for episode / missing / pre-7.11 docs (guard
+                # falls through to the month-prefix fallback / the LLM).
                 source_path = None
+                doc_kind = None
                 if isinstance(asserted_by, str) and not asserted_by.startswith("ep_"):
                     doc_id = (asserted_by.rsplit("_sec_", 1)[0]
                               if "_sec_" in asserted_by else asserted_by)
                     source_path = self.store.document_source_path(doc_id)
+                    doc_kind = self.store.document_kind(doc_id)
                 ctx["state_values"].append({
                     "value": v,
                     "asserted_by": asserted_by,
                     "asserted_at": meta.get("asserted_at"),
                     "source_path": source_path,
+                    "doc_kind": doc_kind,
                     "unit": meta.get("asserted_by"),
                 })
         finally:

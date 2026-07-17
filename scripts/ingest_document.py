@@ -42,17 +42,20 @@ def _build_store(db_path: str, doc_db: str):
 
 
 def _maybe_extractors(extract: bool):
-    """Construct GLiNER + Bonsai if available; return (gliner, bonsai).
+    """Construct GLiNER + Bonsai if available; return (gliner, bonsai, decider).
 
     When ``extract`` is False or the heavy deps are missing, returns
-    ``(None, None)`` so the pipeline runs structure-only. A missing dep prints
-    a warning (so the operator knows extraction was skipped) but does NOT
-    abort the ingest -- structure-only ingestion is still useful and re-
-    ingest later fills the entities/topics in place.
+    ``(None, None, None)`` so the pipeline runs structure-only. A missing dep
+    prints a warning (so the operator knows extraction was skipped) but does
+    NOT abort the ingest -- structure-only ingestion is still useful and re-
+    ingest later fills the entities/topics in place. ``decider`` (a
+    ``BonsaiDecider``) is the Phase 3c Sec 7.11 doc-kind tagger -- constructed
+    from the same Bonsai server as the relation extractor; ``None`` when
+    Bonsai is unavailable (doc_kind stays the cold-start "other" default).
     """
     if not extract:
-        return None, None
-    gliner = bonsai = None
+        return None, None, None
+    gliner = bonsai = decider = None
     try:
         from src.encoding.gliner_extractor import GLiNERExtractor
         gliner = GLiNERExtractor()
@@ -63,7 +66,12 @@ def _maybe_extractors(extract: bool):
         bonsai = BonsaiRelationExtractor()
     except Exception as exc:
         print(f"warning: Bonsai unavailable, skipping relation extraction: {exc}")
-    return gliner, bonsai
+    try:
+        from src.gnn.bonsai_decider import BonsaiDecider
+        decider = BonsaiDecider()
+    except Exception as exc:
+        print(f"warning: Bonsai decider unavailable, skipping doc-kind tagging: {exc}")
+    return gliner, bonsai, decider
 
 
 def _maybe_embedder(store, extract: bool):
@@ -103,7 +111,7 @@ def _ingest(args) -> int:
             min_section_tokens=ic.min_section_tokens,
             semantic_split_threshold=ic.semantic_split_threshold,
         )
-        gliner, bonsai = _maybe_extractors(not args.no_extract)
+        gliner, bonsai, decider = _maybe_extractors(not args.no_extract)
         embedder = _maybe_embedder(store, not args.no_extract)
         pipe = UnifiedIngestionPipeline(store, chunker=chunker)
         doc_id, created = pipe.ingest(
@@ -112,6 +120,7 @@ def _ingest(args) -> int:
             extractor=gliner,
             relation_extractor=bonsai,
             embedder=embedder,
+            doc_kind_tagger=decider,
         )
         print(f"{'created' if created else 'updated'} {doc_id}")
         return 0

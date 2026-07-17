@@ -284,6 +284,67 @@ Return ONLY valid JSON:
 {{"decision": "fix|ask_user|dismiss", "action": "...", "reasoning": "..."}}"""
 
 
+def bonsai_doc_kind_prompt(doc_text: str) -> str:
+    """Prompt for the zero-shot Bonsai doc-kind tagger (Phase 3c Sec 7.11).
+
+    A SINGLE document's text -> one of five content-derived kinds. The tag is
+    written at ingest (``Document.doc_kind``) and consumed by the
+    complementary-temporal guard (``_deterministic_non_conflict``) so the guard
+    fires on a SEMANTIC signal -- ``both sources are point_in_time_snapshot``
+    -- instead of a filename month-prefix, which is inert on real enterprise
+    docs that carry no month in their names (the EnterpriseRAG-Bench finding).
+
+    The taxonomy (see the plan, ``mellow-jumping-token.md``):
+      - ``point_in_time_snapshot`` -- a status / reading / telemetry at a
+        moment in time ("as of <date>", a monthly status, a snapshot). Two of
+        these with different values are COMPLEMENTARY, not a supersession.
+      - ``decision_update`` -- a decision that supersedes an earlier one ("we
+        switched to X", "the updated target is Y", a newer runbook). A REAL
+        conflict; the guard must NOT fire.
+      - ``plan`` -- a forward-looking plan / roadmap / intent.
+      - ``reference`` -- a stable reference / spec / manual (timeless).
+      - ``other`` -- anything else, or unclear.
+
+    The distinguishing rule the prompt drives: is this a READING of the world
+    at a moment (snapshot) or a DECISION that changes a prior state (update)?
+    The model returns ONLY the two fields the tagger validates (``doc_kind`` +
+    a one-sentence ``why``); ``classify_doc_kind`` returns ``None`` on a
+    missing / out-of-vocabulary label so the caller writes the cold-start
+    ``"other"`` default (no fabricated label).
+    """
+    return f"""You are classifying ONE document for a memory system. Read the text and
+return its KIND -- what role the document plays, derived from its CONTENT (not
+its filename). The kind is used by a contradiction guard: two documents that
+are both point-in-time snapshots carrying different values are COMPLEMENTARY
+(both true at their respective times), NOT a supersession.
+
+The five kinds (pick exactly one):
+- point_in_time_snapshot: a STATUS / READING / TELEMETRY at a moment in time.
+  Markers: "as of <date>", a monthly/weekly status report, a metrics snapshot,
+  a reading taken on a date. It describes the world AT a time, not a change.
+- decision_update: a DECISION that supersedes an earlier one. Markers: "we
+  switched to X", "the updated target is Y", "replacing the old policy with",
+  a newer runbook that overrides the prior. It CHANGES a prior state.
+- plan: a forward-looking plan / roadmap / intent (what we WILL do).
+- reference: a stable reference / spec / manual / documentation (timeless, not
+  dated).
+- other: anything else, or unclear.
+
+Distinguishing rule: is this a READING of the world at a moment
+(point_in_time_snapshot) or a DECISION that changes a prior state
+(decision_update)? A status report IS a snapshot even if it mentions a
+decision; a decision memo IS a decision_update. When unsure, prefer
+point_in_time_snapshot for dated status-like text and decision_update for
+explicit "we changed / switched / updated" text; otherwise other.
+
+DOCUMENT TEXT:
+{doc_text}
+
+Return ONLY valid JSON:
+{{"doc_kind": "point_in_time_snapshot|decision_update|plan|reference|other",
+  "why": "<one sentence>"}}"""
+
+
 def bonsai_gist_prompt(source_episodes: list[dict]) -> str:
     """Prompt for the deploy-time Bonsai gist decider (spec §2.5 deploy step).
 

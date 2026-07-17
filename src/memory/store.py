@@ -1325,6 +1325,8 @@ class HippocampalStore:
         "citations", "relations", "section_ids",
         # Phase 3c (D1/D5): persisted so update/delete are symmetric.
         "resolved_citations", "state_assertions",
+        # Phase 3c Sec 7.11: semantic doc-kind tag (zero-shot at ingest).
+        "doc_kind",
     )
     _SEC_FIELDS = (
         "heading", "level", "parent", "blob_hash", "entities", "topics",
@@ -1377,6 +1379,25 @@ class HippocampalStore:
         if not isinstance(doc_id, str) or not doc_id:
             return None
         raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/source_path"))
+        return raw or None
+
+    def document_kind(self, doc_id: str) -> Optional[str]:
+        """Light reverse lookup: the ``doc_kind`` tag for ``doc_id``, or ``None``.
+
+        Byte-identical shape to ``document_source_path``: one hot-store
+        ``get_sync`` on ``content/doc/{doc_id}/doc_kind`` (no section / cold-
+        body pull). Used by the Phase 3c Sec 7.11 contradiction decider context
+        (``_gather_entity_context``) so the complementary-temporal guard can
+        fire on the semantic ``point_in_time_snapshot`` tag instead of a
+        filename month-prefix -- production-sound on real enterprise docs that
+        carry no month in their names. ``None`` for a missing doc or an
+        episode/``None`` provenance id (caller falls through to the month-prefix
+        fallback / the LLM). A doc encoded before this field has no key ->
+        ``None`` (back-compatible, same as a never-tagged doc).
+        """
+        if not isinstance(doc_id, str) or not doc_id:
+            return None
+        raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/doc_kind"))
         return raw or None
 
     def _document_graph_ops(self, doc: Document, delete: bool) -> list[dict]:
@@ -1502,6 +1523,8 @@ class HippocampalStore:
         put(f"{d}/title", doc.title)
         put(f"{d}/source_type", doc.source_type)
         put(f"{d}/source_path", doc.source_path)
+        # Phase 3c Sec 7.11: semantic doc-kind tag (zero-shot at ingest).
+        put(f"{d}/doc_kind", doc.doc_kind)
         put(f"{d}/authors", json.dumps(doc.authors))
         put(f"{d}/ingested_at", doc.ingested_at)
         if doc.created_at:
@@ -1680,6 +1703,9 @@ class HippocampalStore:
             return None
         title = _b2s(self.db.get_sync(f"content/doc/{doc_id}/title"))
         source_path = _b2s(self.db.get_sync(f"content/doc/{doc_id}/source_path"))
+        # Phase 3c Sec 7.11: semantic doc-kind tag ("" for a pre-7.11 doc ->
+        # coerced to the "other" default by the ctor below, back-compatible).
+        doc_kind = _b2s(self.db.get_sync(f"content/doc/{doc_id}/doc_kind"))
         authors_raw = _b2s(self.db.get_sync(f"content/doc/{doc_id}/authors"))
         ingested_at = _b2s(self.db.get_sync(f"content/doc/{doc_id}/ingested_at"))
         created_at = _b2s(self.db.get_sync(f"content/doc/{doc_id}/created_at")) or None
@@ -1732,6 +1758,7 @@ class HippocampalStore:
             source_path=source_path,
             title=title,
             ingested_at=ingested_at,
+            doc_kind=doc_kind or "other",
             sections=sections,
             authors=_loads(authors_raw, []),
             created_at=created_at,

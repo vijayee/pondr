@@ -38,6 +38,7 @@ from ..config import config
 from ..training.prompts import (
     bonsai_anomaly_decision_prompt,
     bonsai_contradiction_decision_prompt,
+    bonsai_doc_kind_prompt,
     bonsai_gist_prompt,
     bonsai_typing_prompt,
 )
@@ -62,6 +63,15 @@ _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _MONTH_ABBREVS = frozenset(
     ("jan", "feb", "mar", "apr", "may", "jun",
      "jul", "aug", "sep", "oct", "nov", "dec")
+)
+
+# Phase 3c Sec 7.11: the doc-kind taxonomy. Written at ingest
+# (``Document.doc_kind``); the complementary-temporal guard fires when BOTH
+# asserting sources are ``point_in_time_snapshot``. ``classify_doc_kind``
+# validates the model's label against this set and returns ``None`` on a
+# missing / out-of-vocab label (caller writes the cold-start ``"other"``).
+_DOC_KIND_LABELS = frozenset(
+    ("point_in_time_snapshot", "decision_update", "plan", "reference", "other")
 )
 
 
@@ -255,6 +265,36 @@ class BonsaiDecider:
             "reasoning": str(data.get("reasoning", ""))[:1000],
         }
 
+    def classify_doc_kind(self, doc_text: str) -> Optional[str]:
+        """Zero-shot doc-kind tag (Phase 3c Sec 7.11).
+
+        One Bonsai HTTP call at ingest: ``doc_text`` -> one of the five
+        ``_DOC_KIND_LABELS``. Mirrors ``decide_contradiction``'s shape --
+        ``self._post_json(prompt)`` then validate the label against the
+        vocabulary. Returns the label string, or ``None`` on HTTP / parse
+        failure OR an out-of-vocabulary / missing label (the caller writes the
+        cold-start ``"other"`` default -- NO fabricated label, byte-identical
+        to a not-wired ingest). The complementary-temporal guard later fires
+        on ``point_in_time_snapshot`` (semantic) instead of a filename month-
+        prefix (fragile on real enterprise docs).
+
+        No deterministic pre-filter here (unlike ``decide_contradiction``):
+        the tagger is a single-label classifier, not an adjudicator, so there
+        is no non-conflict case to short-circuit. ``doc_text`` is capped by
+        the caller (``_doc_text`` in the ingestion pipeline) to the Bonsai
+        text cap before this call.
+        """
+        if not isinstance(doc_text, str) or not doc_text.strip():
+            return None
+        prompt = bonsai_doc_kind_prompt(doc_text)
+        data = self._post_json(prompt)
+        if not isinstance(data, dict):
+            return None
+        kind = str(data.get("doc_kind", "")).strip().lower()
+        if kind not in _DOC_KIND_LABELS:
+            return None
+        return kind
+
     # ---- HTTP + parse helpers --------------------------------------------
 
     def _post_json(self, prompt: str) -> Optional[dict]:
@@ -351,22 +391,36 @@ def _deterministic_non_conflict(state_values) -> Optional[dict]:
         8B capacity-boundedly false-fixes, see ``docs/Phase 3c.md`` Sec 7).
 
     (2) COMPLEMENTARY TEMPORAL -- two DIFFERENT values whose asserting sources
-        are BOTH month-named point-in-time records (``jan-status.md`` /
-        ``jul-status.md``). Two month-named snapshots carrying different values
-        are states at different dates -- both true at their respective times,
-        not a supersession -> ``ask_user`` (conservative, NON-MUTATING: the
-        ``_apply`` dispatcher only auto-applies a ``fix``+``supersede_assertion``,
-        so ``ask_user`` surfaces the pair to the human rather than auto-
-        tombstoning a possibly-complementary value). This is the guard that
-        closes the N14 false-tombstone -- the one production-real negative the
-        fine-tune AND the 27B both fail.
+        are BOTH point-in-time snapshots. Two snapshots carrying different
+        values are states at different dates -- both true at their respective
+        times, not a supersession -> ``ask_user`` (conservative, NON-MUTATING:
+        the ``_apply`` dispatcher only auto-applies a ``fix``+
+        ``supersede_assertion``, so ``ask_user`` surfaces the pair to the
+        human rather than auto-tombstoning a possibly-complementary value).
+        This is the guard that closes the N14 false-tombstone -- the one
+        production-real negative the fine-tune AND the 27B both fail.
 
-    Source-path resolution: ``_gather_entity_context`` enriches each
-    ``state_value`` with ``source_path`` (resolved from the doc/section
-    ``asserted_by`` id). The guard keys off ``source_path`` when present and
-    falls back to ``asserted_by`` (the eval harness passes the source_path
-    directly as ``asserted_by``). Episode-id / ``None`` provenance carries no
-    month token -> the guard falls through to the LLM (status quo).
+        The complementary signal is recognized in TWO ways (either fires the
+        guard), so it is production-sound on real enterprise docs:
+        (a) SEMANTIC (Phase 3c Sec 7.11, primary): both sources' ``doc_kind``
+            == ``"point_in_time_snapshot"`` -- a content-derived tag written at
+            ingest by ``classify_doc_kind``. This fires on docs that carry NO
+            month in their names (a Jira ticket, ``Q1-report-final.pdf``), the
+            exact case the bench found the filename guard inert on.
+        (b) FILENAME (fallback, defense-in-depth): both sources' path carries
+            a month-name prefix (``jan-status.md`` / ``jul-status.md``). Kept so
+            the guard still fires when ``doc_kind`` is absent -- cold-start
+            (no tagger wired), pre-7.11 docs, and the committed month-named
+            fixtures -- byte-identical to pre-7.11 on those.
+
+    Source-path / doc-kind resolution: ``_gather_entity_context`` enriches each
+    ``state_value`` with ``source_path`` AND ``doc_kind`` (resolved from the
+    doc/section ``asserted_by`` id). The guard keys off ``doc_kind`` first
+    (semantic), then ``source_path`` with an ``asserted_by`` fallback (the eval
+    harness passes the source_path directly as ``asserted_by``). Episode-id /
+    ``None`` provenance carries neither -> the guard falls through to the LLM
+    (status quo). A ``decision_update`` doc_kind is a REAL conflict -- it
+    bypasses this guard and hits Bonsai verbatim.
     """
     if not isinstance(state_values, list) or len(state_values) < 2:
         return None
@@ -392,29 +446,42 @@ def _deterministic_non_conflict(state_values) -> Optional[dict]:
             ),
         }
 
-    # Guard 2: complementary temporal -- only when BOTH asserting sources carry
-    # a month-name prefix (point-in-time status records). Two month-named
-    # snapshots with different values are complementary, not a supersession ->
-    # ask_user (non-mutating; do not auto-tombstone). Falls through to the LLM
-    # otherwise (real version-suffixed decision docs do not carry month prefixes).
-    paths = []
+    # Guard 2: complementary temporal -- fires when BOTH asserting sources are
+    # point-in-time snapshots. SEMANTIC primary (both doc_kind ==
+    # "point_in_time_snapshot", content-derived, fires on non-month-named docs)
+    # OR FILENAME fallback (both paths carry a month-name prefix, kept for
+    # cold-start / pre-7.11 / month-named fixtures). Two snapshots with different
+    # values are complementary, not a supersession -> ask_user (non-mutating;
+    # do not auto-tombstone). A decision_update / absent doc_kind + no month
+    # prefix falls through to the LLM (real version-suffixed decision docs).
+    kinds: list[str] = []
+    months: list[str] = []
     for v in state_values:
         if not isinstance(v, dict):
             continue
+        kinds.append(str(v.get("doc_kind") or "").strip().lower())
         path = v.get("source_path") or v.get("asserted_by")
-        paths.append(_month_prefix(path))
+        months.append(_month_prefix(path))
     # Consider the first two distinct-value sources (the conflicting pair).
-    if len(paths) >= 2 and paths[0] and paths[1]:
-        return {
-            "decision": "ask_user",
-            "action": "no_action",
-            "reasoning": (
-                f"Deterministic guard (complementary temporal): two DIFFERENT "
-                f"live state values ('{vals[0]}' vs '{vals[1]}') asserted by "
-                f"month-named point-in-time records ({paths[0]}- / {paths[1]}-). "
-                f"These are states at different dates, both true at their "
-                f"respective times -- not a supersession -> ask_user (do not "
-                f"auto-tombstone a possibly-complementary value)."
-            ),
-        }
+    if len(kinds) >= 2:
+        k0, k1 = kinds[0], kinds[1]
+        m0, m1 = months[0], months[1]
+        semantic = (k0 == k1 == "point_in_time_snapshot")
+        filename = bool(m0 and m1)
+        if semantic or filename:
+            signal = ("doc_kind=point_in_time_snapshot"
+                      if semantic else f"month-prefix {m0}-/{m1}-")
+            return {
+                "decision": "ask_user",
+                "action": "no_action",
+                "reasoning": (
+                    f"Deterministic guard (complementary temporal): two "
+                    f"DIFFERENT live state values ('{vals[0]}' vs "
+                    f"'{vals[1]}') asserted by point-in-time snapshots "
+                    f"({signal}). These are states at different dates, both "
+                    f"true at their respective times -- not a supersession "
+                    f"-> ask_user (do not auto-tombstone a possibly-"
+                    f"complementary value)."
+                ),
+            }
     return None

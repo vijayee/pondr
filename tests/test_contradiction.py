@@ -20,6 +20,7 @@ from src.gnn.anomaly_rules import enrich_subgraph, _detect_contradictory_state
 from src.memory.episode import Episode
 from src.memory.edge_meta import update_edge_meta, default_meta
 from src.memory.store import HippocampalStore
+from src.memory.document import Document, DocumentSection
 
 
 # ── fakes / helpers ───────────────────────────────────────────────────────
@@ -456,11 +457,16 @@ def test_gather_context_excludes_tombstoned_edges(tmp_path):
 # (not just the eval harness, which passes source_path directly as asserted_by).
 
 
-def _plant_doc(store, doc_id, source_path):
-    """Plant the minimal hot-store doc metadata so ``document_source_path``
-    resolves (the existence sentinel is ``source_type``; see ``get_document``)."""
+def _plant_doc(store, doc_id, source_path, doc_kind=None):
+    """Plant the minimal hot-store doc metadata so ``document_source_path`` /
+    ``document_kind`` resolve (the existence sentinel is ``source_type``; see
+    ``get_document``). ``doc_kind`` is optional -- when ``None`` the key is NOT
+    written (mirrors a pre-7.11 / cold-start doc so the back-compat fallback is
+    exercisable); when set it is written under ``content/doc/{id}/doc_kind``."""
     store.db.put_sync(f"content/doc/{doc_id}/source_type", "text")
     store.db.put_sync(f"content/doc/{doc_id}/source_path", source_path)
+    if doc_kind is not None:
+        store.db.put_sync(f"content/doc/{doc_id}/doc_kind", doc_kind)
 
 
 def test_gather_context_resolves_source_path_for_doc_provenance(tmp_path):
@@ -570,3 +576,229 @@ def test_decide_contradiction_real_conflict_bypasses_guard(tmp_path):
     out = dec.decide_contradiction(flag, {"state_values": state_values})
     assert out is None           # HTTP miss -> None (no fabricated decision)
     assert seen_prompt["p"] is not None  # the LLM path WAS reached (guard did not fire)
+
+
+# ── Phase 3c Sec 7.11: semantic doc-kind tagging at ingest ──
+#
+# The complementary-temporal guard now fires on a SEMANTIC signal -- both
+# sources' ``doc_kind == "point_in_time_snapshot"`` (content-derived, written
+# at ingest by ``classify_doc_kind``) -- instead of a filename month-prefix,
+# which is inert on real enterprise docs that carry no month in their names
+# (the EnterpriseRAG-Bench finding). The month-prefix check is kept as a
+# defense-in-depth fallback so cold-start / pre-7.11 / month-named fixtures
+# still fire. ``decision_update`` is a REAL conflict -> bypasses the guard.
+
+
+def _doc_with_sections(doc_id, source_path, doc_kind):
+    secs = [DocumentSection(id=f"{doc_id}_sec_000", heading="h", level=1,
+                           content="body")]
+    return Document(id=doc_id, source_type="text", source_path=source_path,
+                    title="T", ingested_at="2026-07-17T00:00:00",
+                    doc_kind=doc_kind, sections=secs)
+
+
+def test_doc_kind_persists_and_round_trips(tmp_path):
+    """``doc_kind`` is persisted by ``encode_document`` and read back by
+    ``get_document``; the light ``document_kind`` helper round-trips a single
+    key. A doc encoded before this field (no key) -> ``"other"`` default
+    (back-compatible)."""
+    store = _store(tmp_path)
+    doc = _doc_with_sections("doc_000001", "docs/q1-status.md",
+                             "point_in_time_snapshot")
+    store.encode_document(doc)
+    # round-trip via the full loader
+    loaded = store.get_document("doc_000001", load_bodies=False)
+    assert loaded is not None
+    assert loaded.doc_kind == "point_in_time_snapshot"
+    # round-trip via the light helper (one get_sync, no section/cold pull)
+    assert store.document_kind("doc_000001") == "point_in_time_snapshot"
+    # a never-encoded doc id -> None (caller falls through)
+    assert store.document_kind("doc_999999") is None
+    # a doc encoded with the default "other" persists "other"
+    doc2 = _doc_with_sections("doc_000002", "docs/ref.md", "other")
+    store.encode_document(doc2)
+    assert store.document_kind("doc_000002") == "other"
+    store.close()
+
+
+def test_gather_context_resolves_doc_kind_for_doc_provenance(tmp_path):
+    """A state_value whose ``asserted_by`` is a doc/section id carries the
+    resolved ``doc_kind`` so the guard can fire on the semantic signal. Episode-
+    id provenance -> ``doc_kind`` is None (guard falls through)."""
+    store = _store(tmp_path)
+    _plant_doc(store, "doc_000001", "docs/q1-status.md",
+               doc_kind="point_in_time_snapshot")
+    _plant_doc(store, "doc_000002", "docs/q2-status.md",
+               doc_kind="point_in_time_snapshot")
+    _plant_assertion(store, "dep", "green", "doc_000001_sec_002",
+                     "2026-07-01T10:00:00Z")
+    _plant_assertion(store, "dep", "red", "doc_000002",
+                     "2026-07-05T10:00:00Z")
+    cons = _cons(store)
+    ctx = cons._gather_entity_context("E:dep")
+    by_val = {v["value"]: v for v in ctx["state_values"]}
+    assert by_val["green"]["doc_kind"] == "point_in_time_snapshot"  # section id
+    assert by_val["red"]["doc_kind"] == "point_in_time_snapshot"     # doc id
+    store.close()
+
+
+def test_gather_context_doc_kind_none_for_episode_provenance(tmp_path):
+    """Episode-id (``ep_...``) provenance carries no doc_kind -> guard falls
+    through to the month-prefix fallback / the LLM (status quo)."""
+    store = _store(tmp_path)
+    _plant_assertion(store, "team", "MySQL", "ep_old",
+                     "2026-07-01T10:00:00Z")
+    _plant_assertion(store, "team", "Postgres", "ep_new",
+                     "2026-07-05T10:00:00Z")
+    cons = _cons(store)
+    ctx = cons._gather_entity_context("E:team")
+    for v in ctx["state_values"]:
+        assert v["doc_kind"] is None
+    store.close()
+
+
+def test_guard_fires_on_doc_kind_point_in_time_no_month_prefix(tmp_path):
+    """The NEW production-real case: two DIFFERENT values, both
+    ``doc_kind == point_in_time_snapshot``, on NON-month-named source_paths
+    (``docs/q1-status.md`` / ``docs/q2-status.md`` -- no jan/jul prefix). The
+    semantic signal fires the guard -> ask_user, NO HTTP (the filename guard
+    alone would be inert here; this is the whole point of Sec 7.11)."""
+    from src.gnn.bonsai_decider import BonsaiDecider
+    dec = BonsaiDecider()  # lazy HTTP -- never reached (guard short-circuits)
+    state_values = [
+        {"value": "green", "doc_kind": "point_in_time_snapshot",
+         "source_path": "docs/q1-status.md",
+         "asserted_by": "doc_000001_sec_002", "asserted_at": "2026-07-01"},
+        {"value": "red", "doc_kind": "point_in_time_snapshot",
+         "source_path": "docs/q2-status.md",
+         "asserted_by": "doc_000002", "asserted_at": "2026-07-05"},
+    ]
+    flag = {"node": "E:dep", "type": "contradictory_state",
+            "evidence": state_values}
+    out = dec.decide_contradiction(flag, {"state_values": state_values})
+    assert out is not None
+    assert out["decision"] == "ask_user"
+    assert out["action"] == "no_action"
+    assert "complementary temporal" in out["reasoning"]
+    assert "doc_kind=point_in_time_snapshot" in out["reasoning"]
+
+
+def test_guard_decision_update_bypasses_to_llm(tmp_path):
+    """A ``decision_update`` is a REAL conflict (a decision that supersedes an
+    earlier one) -> the guard does NOT fire and the LLM path runs. Verifies the
+    semantic guard never false-dismisses a genuine value change: ``_post_json``
+    IS reached even though both docs share a doc_kind (it is decision_update,
+    not point_in_time_snapshot)."""
+    from src.gnn.bonsai_decider import BonsaiDecider
+    dec = BonsaiDecider()
+    seen_prompt = {"p": None}
+
+    def fake_post_json(prompt):
+        seen_prompt["p"] = prompt
+        return None  # simulate a miss -> decide_contradiction returns None
+
+    dec._post_json = fake_post_json
+    state_values = [
+        {"value": "MySQL", "doc_kind": "decision_update",
+         "source_path": "docs/db-pick-v1.md",
+         "asserted_by": "doc_000003", "asserted_at": "2026-07-01"},
+        {"value": "Postgres", "doc_kind": "decision_update",
+         "source_path": "docs/db-pick-v2.md",
+         "asserted_by": "doc_000004", "asserted_at": "2026-07-05"},
+    ]
+    flag = {"node": "E:db", "type": "contradictory_state",
+            "evidence": state_values}
+    out = dec.decide_contradiction(flag, {"state_values": state_values})
+    assert out is None           # HTTP miss -> None (no fabricated decision)
+    assert seen_prompt["p"] is not None  # the LLM path WAS reached (guard did not fire)
+
+
+def test_guard_month_prefix_fallback_when_doc_kind_absent(tmp_path):
+    """Back-compat: when ``doc_kind`` is absent (cold-start / pre-7.11 / a doc
+    the tagger never ran on) the month-prefix fallback still fires the guard.
+    This is the pre-7.11 behavior preserved so existing fixtures stay green."""
+    from src.gnn.bonsai_decider import BonsaiDecider
+    dec = BonsaiDecider()
+    state_values = [
+        {"value": "green", "source_path": "docs/jan-status.md",
+         "asserted_by": "doc_000001_sec_002", "asserted_at": "2026-07-01"},
+        {"value": "red", "source_path": "docs/jul-status.md",
+         "asserted_by": "doc_000002", "asserted_at": "2026-07-05"},
+    ]
+    flag = {"node": "E:dep", "type": "contradictory_state",
+            "evidence": state_values}
+    out = dec.decide_contradiction(flag, {"state_values": state_values})
+    assert out is not None
+    assert out["decision"] == "ask_user"
+    assert "month-prefix" in out["reasoning"]
+
+
+# ── classify_doc_kind: zero-shot tagger (HTTP mocked) ──
+
+def test_classify_doc_kind_returns_valid_label(tmp_path):
+    """A valid in-vocabulary label is returned as-is (lowercased)."""
+    from src.gnn.bonsai_decider import BonsaiDecider
+    dec = BonsaiDecider()
+    dec._post_json = lambda prompt: {"doc_kind": "Decision_Update",
+                                    "why": "switched to X"}
+    assert dec.classify_doc_kind("we switched to postgres") == "decision_update"
+
+
+def test_classify_doc_kind_returns_none_on_out_of_vocab(tmp_path):
+    """An out-of-vocabulary label -> None (caller writes the cold-start
+    ``"other"`` default; NO fabricated label)."""
+    from src.gnn.bonsai_decider import BonsaiDecider
+    dec = BonsaiDecider()
+    dec._post_json = lambda prompt: {"doc_kind": "status_report", "why": "?"}
+    assert dec.classify_doc_kind("some text") is None
+
+
+def test_classify_doc_kind_returns_none_on_http_or_parse_failure(tmp_path):
+    """HTTP / parse failure (``_post_json`` -> None) or a missing field -> None
+    (cold-start safe; the pipeline leaves ``doc_kind`` at ``"other"``)."""
+    from src.gnn.bonsai_decider import BonsaiDecider
+    dec = BonsaiDecider()
+    dec._post_json = lambda prompt: None  # down server / non-JSON
+    assert dec.classify_doc_kind("some text") is None
+    dec._post_json = lambda prompt: {"why": "no doc_kind field"}
+    assert dec.classify_doc_kind("some text") is None
+    # empty / whitespace text -> None without an HTTP call
+    dec._post_json = lambda prompt: {"doc_kind": "plan", "why": "x"}
+    assert dec.classify_doc_kind("   ") is None
+
+
+def test_ingest_doc_kind_tagger_wired_writes_label(tmp_path):
+    """End-to-end at the pipeline: when a ``doc_kind_tagger`` is wired and
+    returns a valid label, the ingested doc's ``doc_kind`` is that label and it
+    persists. When the tagger returns None (failure / out-of-vocab) doc_kind
+    stays the cold-start ``"other"`` default (byte-identical to no tagger)."""
+    from src.ingestion.pipeline import UnifiedIngestionPipeline
+
+    class Tagger:
+        def __init__(self, kind):
+            self._kind = kind
+
+        def classify_doc_kind(self, text):
+            return self._kind
+
+    src = tmp_path / "status.md"
+    src.write_text("# Q1 status\n\ndep is green as of 2026-03-31.", encoding="utf-8")
+    store = _store(tmp_path)
+
+    pipe = UnifiedIngestionPipeline(store)
+    doc_id, _ = pipe.ingest(str(src), extractor=None, relation_extractor=None,
+                            doc_kind_tagger=Tagger("point_in_time_snapshot"))
+    assert store.document_kind(doc_id) == "point_in_time_snapshot"
+
+    src2 = tmp_path / "ref.md"
+    src2.write_text("# Manual\n\nreference text.", encoding="utf-8")
+    doc_id2, _ = pipe.ingest(str(src2), extractor=None, relation_extractor=None,
+                             doc_kind_tagger=Tagger(None))  # failed -> "other"
+    assert store.document_kind(doc_id2) == "other"
+
+    # no tagger at all -> cold-start "other" (byte-identical to pre-7.11)
+    src3 = tmp_path / "plan.md"
+    src3.write_text("# Plan\n\nwe will do X.", encoding="utf-8")
+    doc_id3, _ = pipe.ingest(str(src3), extractor=None, relation_extractor=None)
+    assert store.document_kind(doc_id3) == "other"
+    store.close()
