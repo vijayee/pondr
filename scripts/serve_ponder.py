@@ -24,6 +24,11 @@ Flags:
     --user-id ID           user the encoder attributes episodes to
     --query TEXT           one-shot query; omit for the interactive REPL
     --bonsai-endpoint URL  override the Bonsai LLM endpoint
+    --async-distill        background episode distillation (response returns
+                          immediately; extraction fills graph edges in the gaps
+                          between turns). Phase 3c async-distill.
+    --bonsai-isolation     10-pass isolated per-class Bonsai extractor (has_state
+                          0 -> 11/13 zero-shot, ~22.8 s/doc); needs --async-distill.
 
 Pre-warm the Bonsai server first (PTX-JIT cold-start ~18s/shape; see memory
 ``hippo-bonsai-local-server``). Live-encode (default on) loads GLiNER; the
@@ -39,6 +44,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.runtime import DEFAULT_BACKBONE_PATH, DEFAULT_GATE_PATH, build_ponder  # noqa: E402
+from src.config import config as _config  # noqa: E402
 
 
 def _print_result(res: dict) -> None:
@@ -94,7 +100,27 @@ def main() -> int:
     p.add_argument("--user-id", default="ponder", help="user the encoder attributes episodes to")
     p.add_argument("--query", default=None, help="one-shot query; omit for the interactive REPL")
     p.add_argument("--bonsai-endpoint", default=None, help="override the Bonsai LLM endpoint")
+    p.add_argument("--async-distill", action="store_true",
+                   help="enable background episode distillation: the response returns "
+                        "immediately while GLiNER + Bonsai extraction fills the graph "
+                        "edges on a single-worker FIFO in the gaps between turns "
+                        "(Phase 3c async-distill). Default off = synchronous encode.")
+    p.add_argument("--bonsai-isolation", action="store_true",
+                   help="enable the 10-pass isolated per-class Bonsai extractor (lifts "
+                        "strict has_state 0 -> 11/13 zero-shot) at ~22.8 s/doc. Only "
+                        "viable behind --async-distill (else the response blocks ~22s). "
+                        "Default off = the V1 single-pass extractor.")
     args = p.parse_args()
+
+    # The orchestrator reads these two flags off the global config singleton at
+    # __init__ (not the per-instance cfg), so set them BEFORE build_ponder. Both
+    # default off -> byte-identical to the synchronous pre-async path.
+    _config.async_distill_enabled = args.async_distill
+    _config.bonsai_isolation_extraction = args.bonsai_isolation
+    if args.bonsai_isolation and not args.async_distill:
+        print("WARNING: --bonsai-isolation without --async-distill will block the "
+              "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
+              "--async-distill too.", file=sys.stderr)
 
     backbone_path = Path(args.backbone)
     if not backbone_path.exists():
@@ -109,6 +135,9 @@ def main() -> int:
     print(f"[load] gate={gate_path}", file=sys.stderr)
     print(f"[load] live_encode={not args.no_live_encode} "
           f"gliner_device={args.gliner_device}", file=sys.stderr)
+    if args.async_distill or args.bonsai_isolation:
+        print(f"[load] async_distill={args.async_distill} "
+              f"bonsai_isolation={args.bonsai_isolation}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -154,8 +183,18 @@ def main() -> int:
         # still writable. No-op when async_distill_enabled is off (drain()
         # returns immediately if there is no worker). Best-effort: a drain
         # failure must not block store close.
+        #
+        # One-shot (--query): wait long enough for the single in-flight fill to
+        # complete so the episode is fully encoded when the process exits (the
+        # ~22.8 s isolated fill needs a >22 s budget). REPL: a snappy exit
+        # matters more than flushing the last fill -- the stub is already
+        # persisted, so a short budget abandons only in-flight extraction.
+        drain_timeout = 45.0 if args.query is not None else 8.0
         try:
-            orch.drain()
+            if args.query is not None and args.async_distill:
+                print(f"[drain] waiting up to {drain_timeout:.0f}s for the "
+                      f"background fill to finish...", file=sys.stderr)
+            orch.drain(timeout=drain_timeout)
         except Exception as e:  # noqa: BLE001 - never crash on cleanup
             print(f"[drain-fail] {e}", file=sys.stderr)
         try:

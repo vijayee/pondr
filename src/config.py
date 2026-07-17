@@ -165,10 +165,13 @@ class Config:
     # True = the response returns immediately; the episode is written as a stub
     # (content + vector index) on the main thread and a single-worker background
     # FIFO fills the graph edges (extraction + 10-pass Bonsai) in the gaps
-    # between turns (foreground-priority yielding). Flip on only after the
-    # live-dogfood latency assertions (plan async-distill-stub.md tests 10+11)
-    # AND the existing suite stay green. Compose with bonsai_isolation_extraction
-    # (async hides the 22.8 s, isolation provides the 11/13 quality).
+    # between turns (foreground-priority yielding). Live-dogfood passed
+    # 2026-07-16 against the real 8B: response 7.8 s << 22.8 s fill, stub
+    # content-retrievable immediately, has_state assertion edges
+    # (E:entity, state, value) fire after the fill (the Bonsai assertion arm
+    # goes no-op -> live). Default off (opt-in via serve_ponder --async-distill);
+    # compose with bonsai_isolation_extraction (async hides the 22.8 s, isolation
+    # provides the 11/13 has_state quality).
     async_distill_enabled: bool = False
 
     # ── Phase 2c+: feedback-driven salience ──
