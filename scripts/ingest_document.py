@@ -27,6 +27,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from src.ingestion.doc_kind import DEFAULT_DOC_KIND_ENSEMBLE_PATHS
+
 # Make ``src`` importable when run as a script (mirrors run_consolidation.py:
 # insert the REPO ROOT so ``src`` resolves as a package, not ``scripts/src``).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -122,6 +124,7 @@ def _ingest(args) -> int:
         from src.ingestion.doc_kind import build_doc_kind_tagger
         doc_kind_tagger = build_doc_kind_tagger(
             head_path=args.doc_kind_head,
+            ensemble_paths=args.doc_kind_ensemble,
             backbone_path=args.backbone,
             device=args.device,
             bonsai_decider=decider,
@@ -183,7 +186,14 @@ def main() -> int:
                     help="skip GLiNER/Bonsai extraction (structure-only ingest)")
     ap.add_argument("--doc-kind-head", default="data/training/doc_kind_head/best.pt",
                     help="trained doc-kind head checkpoint (default: data/training/doc_kind_head/best.pt; "
-                         "when present, a local forward pass tags doc_kind instead of the Bonsai HTTP call)")
+                         "used when --doc-kind-ensemble is disabled or absent; when present, "
+                         "a local forward pass tags doc_kind instead of the Bonsai HTTP call)")
+    ap.add_argument("--doc-kind-ensemble", nargs="*",
+                    default=list(DEFAULT_DOC_KIND_ENSEMBLE_PATHS),
+                    help="ensemble of doc-kind head checkpoints (logit-averaged on the shared "
+                         "frozen backbone); default ships the pen0+pen2 pair that clears the "
+                         "strict gate (both guard classes 13/17, unsafe=0). Pass --doc-kind-ensemble "
+                         "with no values to disable and fall back to --doc-kind-head.")
     ap.add_argument("--backbone",
                     default="data/pod_runs/phase2a_full/checkpoints/backbone/backbone_final.pt",
                     help="Phase 2a backbone checkpoint the doc-kind head runs on (frozen)")

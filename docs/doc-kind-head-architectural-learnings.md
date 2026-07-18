@@ -6,10 +6,13 @@ Status: Living document. The JGSBackbone + downstream classifier head is a
 its use, derived from the DocKindHead work (the first real downstream job for
 the trained SSM, Phase 3c Sec 7.11 deferred step).
 
-The DocKindHead is NOT yet shipped (fails the strict gate by one snapshot
-example on its best single-head variant). The learnings below are valid
-regardless of the ship decision -- they are about the *primitive*, not just
-this head.
+**The DocKindHead is SHIPPED (2026-07-17) as a 2-head logit-average ensemble
+(`pen0+pen2`) -- the multi-gate experiment below CONFIRMED the hypothesis:
+averaging two single heads at opposite ends of the penalty frontier breaks the
+snap/dec coupling no single head could, clearing the full strict gate with
+margin (snap 13/17=0.765, dec 13/17=0.765, unsafe=0, acc 0.632, snap CI_lo
+0.527). No single head clears the gate; the ensemble does.** The learnings
+below are about the *primitive* and stand regardless of which variant ships.
 
 ---
 
@@ -176,34 +179,58 @@ operating point.
 
 ---
 
-## 5. The multi-gate hypothesis (best-practice to TEST, deferred)
+## 5. The multi-gate hypothesis (CONFIRMED for the ensemble; binary + cascade deferred)
 
 The coupling above is the **cost of mutual exclusion** in a single 5-way
-softmax. Hypothesis (to test empirically, deferred): **multi-gate (multiple
-specialized per-criterion heads) helps when the target classes/criteria are
-NOT mutually exclusive; a single softmax is the natural fit when they ARE
-(mutually-exclusive single-label).** Doc-kind IS mutually exclusive, so the
-single head is the architecturally-correct default; a multi-gate would relax
-the softmax competition that produces the snap/dec tradeoff.
+softmax. Hypothesis: **multi-gate (multiple specialized per-criterion heads)
+helps when the target classes/criteria are NOT mutually exclusive -- or when
+mutual exclusion forces a costly tradeoff; a single softmax is the natural fit
+only when mutual exclusion is free.** Doc-kind IS mutually exclusive, but the
+mutual exclusion is NOT free (it couples the two date-stamped guard classes),
+so a multi-gate can help -- and it does.
 
-Deferred experiments to test the hypothesis (run LATER, not now):
-1. **Ensemble the penalty heads** (pen=0/1/2/5 best.pt, logit-average or
-   majority vote). Cheap (no retrain). Hope: pen=0 contributes snap=13/17
-   (CI clear), pen=2 contributes dec=12/17, the vote lands BOTH. Serve cost 3x
-   forward unless distilled back to 1 head.
+**CONFIRMED -- the ensemble (experiment 1) broke the coupling net-positive and
+SHIPPED.** Logit-averaging two single heads at opposite ends of the penalty
+frontier (`pen0` pure-CE: snap 13/17 / dec 11/17, snap-strong; `pen2`: snap
+12/17 / dec 12/17, dec-strong) lands **both guard classes at 13/17=0.765**,
+`unsafe=0` (safer than any single head, which all had unsafe 0-1), acc 0.632,
+snap CI_lo 0.527 -- clearing all five strict gate criteria with margin. The
+mechanism: each head spends its separability budget on a different guard class;
+averaging logits recovers BOTH (the softmax competition is relaxed because the
+two heads disagree productively). The served scorecard is byte-identical to the
+measured probe scorecard (verified end-to-end through the real
+`classify_doc_kind` entrypoint). Ship: `EnsembleBackboneDocKindTagger`,
+`build_doc_kind_tagger(ensemble_paths=...)`, CLI `--doc-kind-ensemble` (default
+on). Serve cost 2x SSM forward (acceptable: doc-kind tagging is per-ingest, not
+per-query). Distilling the ensemble back to 1 head is a deferred 1x-serve
+optimization -- not done because it would gamble the strict gate on a retrain
+(the ensemble's power IS the two-head disagreement; a single distilled head
+could collapse back to the coupling).
+
+Experiments:
+1. **Ensemble the penalty heads** -- DONE, SHIPPED. `pen0+pen2` logit-avg is the
+   shipped pair. (Majority-vote was identical to logit-avg for this pair. The
+   3-head `pen0+pen2+pen5` lifts dec to 0.824 / acc 0.658 but adds a head for a
+   margin the 2-head pair already clears; the 2-head pair is the cleanest ship.)
 2. **Specialized binary snap-vs-dec gate** (sigmoid, trained ONLY on snap+dec
    examples, excluding plan/other/ref). Gives the hard boundary dedicated
-   capacity instead of competing in a 5-way softmax. More build (new head +
-   training pipeline + serve cascade + tests + guard wiring), 1x serve.
-   Highest expected ceiling.
+   capacity. More build (new head + training pipeline + serve cascade + tests +
+   guard wiring), 1x serve. Highest expected ceiling on the snap/dec boundary
+   specifically. DEFERRED (the ensemble already ships; this is the next lever if a
+   higher bar is ever needed).
 3. **Cascade**: 5-way head for the easy classes (plan/reference/other) + binary
-   resolver only for the snap/dec boundary.
+   resolver only for the snap/dec boundary. DEFERRED (not needed -- the ensemble
+   cleared the gate).
 
-If a multi-gate experiment breaks the coupling net-positive, that is a
-best-practice for non-mutually-exclusive (or forced-tradeoff) criteria on this
-primitive. If it trades one problem for another, the single softmax is
-confirmed correct for mutually-exclusive cases. Either outcome is a
-best-practice learned from data.
+**Best-practice learned from data:** on this primitive, when a single softmax
+head couples two guard classes (a forced tradeoff from mutual exclusion), an
+ensemble of heads trained at opposite ends of the tradeoff frontier (here,
+different `unsafe_penalty`) recovers both -- WITHOUT a retrain, WITHOUT a new
+architecture, at N x serve forward. Try the cheap ensemble BEFORE building a
+dedicated binary gate or cascade. The multi-gate best-practice generalizes:
+anytime a downstream head on this primitive faces a criterion where mutual
+exclusion forces a costly tradeoff, split into heads that each spend their
+budget on a different side, and average. This is the architectural lesson.
 
 ---
 
@@ -217,7 +244,8 @@ best-practice learned from data.
 | Severity loss (unsafe_penalty) | suppress the unsafe snap->dec direction | crutch for mean-pool; load-bearing for unsafe but over-suppresses dec with attention |
 | Cleaner panel labels (v4) | remove teacher noise | partly confounded v3; snap up, dec DOWN (severity + coupling) |
 | More flash data (v3, 268 synth) | more dec examples | DECISIVE NEGATIVE: dec pinned 0.33 at 95 AND 199 train decisions (flash-contaminated) |
-| Penalty bracket (0/1/2) | thread snap+dec | EXHAUSTED: structural coupling; gets snap=13 OR dec>=12 at safe, never both |
+| Penalty bracket (0/1/2) | thread snap+dec | EXHAUSTED as a single-head lever: structural coupling; gets snap=13 OR dec>=12 at safe, never both. BECAME the ensemble ingredient (pen0 + pen2). |
+| Ensemble of penalty heads (pen0+pen2 logit-avg) | relax the softmax competition by averaging two heads at opposite ends of the frontier | SHIPPED: both guard classes 13/17=0.765, unsafe=0, acc 0.632, CI_lo 0.527 -- GATE CLEAR with margin; byte-identical served vs measured. Multi-gate hypothesis CONFIRMED. |
 | Lower lr at pen=2.0 | escape overfit, find a flat min with both | NEGATIVE: lr 1.5e-4 (half) at pen=2.0 -> best ep35 snap=12/17=0.706, dec=7/17=0.412, acc=0.368 (WORSE than lr=3e-4); no safe epoch has both guard classes >=0.70. Slower convergence landed on a worse minimum. |
 | More epochs | more training | RULED OUT: overfits after ~20-40ep, gate never improves |
 | Unfreeze backbone | representation is the ceiling | NOT TRIED; risks RetrievalGate (shared backbone, val 0.826) |
@@ -230,16 +258,22 @@ best-practice learned from data.
 - Architecture + wiring: `src/subconscious/doc_kind_head.py`,
   `src/subconscious/training/doc_kind_training.py`,
   `src/subconscious/training/routing_training.py`,
-  `src/ingestion/doc_kind.py`, `scripts/train_doc_kind_head.py`.
-- Tests: `tests/test_doc_kind_head.py` (39 tests) + `tests/test_contradiction.py`
-  (29 tests). All green.
-- Attention arch committed: `a116930`.
+  `src/ingestion/doc_kind.py` (`EnsembleBackboneDocKindTagger` +
+  `build_doc_kind_tagger` ensemble branch), `scripts/train_doc_kind_head.py`,
+  `scripts/ingest_document.py` (`--doc-kind-ensemble`).
+- Tests: `tests/test_doc_kind_head.py` (43 tests: 30 original + 9 attention + 4
+  ensemble) + `tests/test_contradiction.py` (29 tests). All green (72 passed).
+- Attention arch committed: `a116930`. Ensemble ship committed: see git log.
 - Training data: `data/training/doc_kind_head/pairs_clean_{train,val}.jsonl` (261
   train / 76 val, 3-teacher panel majority labels, gitignored).
-- Retrain artifacts: `data/training/doc_kind_head_attn*` (gitignored).
-- Cold-start invariant: the canonical `data/training/doc_kind_head/best.pt` is
-  kept ABSENT during experiments so `build_doc_kind_tagger` falls back to Bonsai.
-  It is restored to the canonical path ONLY after the gate is met.
+- Retrain artifacts: `data/training/doc_kind_head_attn*` (gitignored). The
+  shipped ensemble checkpoints are `data/training/doc_kind_head_attn_ce0/best.pt`
+  (pen0) and `data/training/doc_kind_head_attn_ce2/best.pt` (pen2), gitignored.
+- Cold-start invariant: the canonical single-head `data/training/doc_kind_head/
+  best.pt` is kept ABSENT (we ship the 2-head ensemble, not a single head).
+  `build_doc_kind_tagger` serves the ensemble when both ensemble ckpts exist
+  (auto-default via the CLI); on a fresh clone (no ckpts) it falls through to
+  single-head / Bonsai / None, leaving `doc_kind` at the cold-start `"other"`.
 
 See memory: `pondr-doc-kind-backbone-head-shipped`, `jgs-head-multi-gate-best-
 practice-hypothesis`.

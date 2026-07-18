@@ -456,6 +456,70 @@ def test_build_doc_kind_tagger_prefers_head_then_bonsai_then_none(tmp_path):
     assert isinstance(t, BonsaiDocKindTagger)
 
 
+# ── ensemble serve (pen0+pen2 logit-average) ──
+
+def test_build_doc_kind_tagger_ensemble_falls_through_when_absent(tmp_path):
+    """ensemble_paths present but files missing -> fall through to head/Bonsai/None
+    (cold-start invariant; a direct call with ensemble_paths=None stays single-head)."""
+    ens = [str(tmp_path / "a.pt"), str(tmp_path / "b.pt")]
+    # Both absent, no head, no decider -> None.
+    assert build_doc_kind_tagger(
+        ensemble_paths=ens, head_path=str(tmp_path / "absent.pt"),
+        bonsai_decider=None, verbose=False,
+    ) is None
+    # Both absent, decider present -> Bonsai.
+    class _Decider:
+        def classify_doc_kind(self, text):
+            return "reference"
+    t = build_doc_kind_tagger(
+        ensemble_paths=ens, head_path=str(tmp_path / "absent.pt"),
+        bonsai_decider=_Decider(), verbose=False,
+    )
+    assert isinstance(t, BonsaiDocKindTagger)
+    # ensemble_paths=None (the default) -> single-head path, NOT ensemble.
+    assert build_doc_kind_tagger(
+        ensemble_paths=None, head_path=str(tmp_path / "absent.pt"),
+        bonsai_decider=None, verbose=False,
+    ) is None
+
+
+def test_ensemble_tagger_logit_averages_heads():
+    """EnsembleBackboneDocKindTagger averages per-head logits and argmaxes -- the
+    exact combine the strict gate was measured on. Two heads on the SAME backbone
+    (mean-pool, feat-less) with a stub embedder: the ensemble label must equal
+    LABELS[argmax(mean(h0.forward, h1.forward))]."""
+    from src.ingestion.doc_kind import EnsembleBackboneDocKindTagger
+
+    bb = JGSBackbone(BackboneConfig())
+    h0, h1 = DocKindHead(bb), DocKindHead(bb)
+    embedder = build_embedder("stub")
+    secs = ["# Status as of 2026-03-31\n\ndep is green.",
+            "# Update\n\nwe switched to postgres."]
+    tagger = EnsembleBackboneDocKindTagger([h0, h1], embedder)
+    label = tagger.classify_doc_kind(secs)
+    assert label in DocKindHead.LABELS
+    # Reproduce the combine by hand: embed, forward both, average, argmax.
+    vecs = embedder.encode([s for s in secs if s.strip()])
+    embs = [torch.tensor(v, dtype=torch.float32).unsqueeze(0) for v in vecs]
+    with torch.no_grad():
+        avg = torch.stack([h0.forward(embs), h1.forward(embs)], dim=0).mean(dim=0)
+    assert label == DocKindHead.LABELS[int(avg.argmax(dim=-1).item())]
+
+
+def test_ensemble_tagger_returns_none_for_empty():
+    from src.ingestion.doc_kind import EnsembleBackboneDocKindTagger
+    bb = JGSBackbone(BackboneConfig())
+    tagger = EnsembleBackboneDocKindTagger([DocKindHead(bb)], build_embedder("stub"))
+    assert tagger.classify_doc_kind([]) is None
+    assert tagger.classify_doc_kind(["   ", "\n\n"]) is None
+
+
+def test_ensemble_tagger_rejects_empty_heads():
+    from src.ingestion.doc_kind import EnsembleBackboneDocKindTagger
+    with pytest.raises(ValueError):
+        EnsembleBackboneDocKindTagger([], build_embedder("stub"))
+
+
 # ── temporal feature (Phase 4) ──
 
 def test_extract_temporal_features_shape_and_signatures():

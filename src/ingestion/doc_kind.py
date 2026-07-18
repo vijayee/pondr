@@ -8,11 +8,23 @@ Two adapters satisfying the pipeline's ``doc_kind_tagger`` contract
   the Sec 7.11 zero-shot HTTP path) and calls ``decider.classify_doc_kind``.
 - ``BackboneDocKindTagger``: the deferred step -- a local forward pass through
   the trained ``DocKindHead`` on the frozen backbone (no :8080 contention).
+- ``EnsembleBackboneDocKindTagger``: ensemble serve -- N trained heads on the
+  SHARED frozen backbone, logit-averaged. Ships the gate-clearing pen0+pen2 pair
+  (two attention+temporal heads at opposite ends of the penalty frontier whose
+  averaged logits land BOTH guard classes at 13/17, unsafe=0; no single head
+  clears the strict gate -- the snap/dec coupling is the cost of the 5-way
+  softmax's mutual exclusion, and the ensemble relaxes it). The backbone is
+  loaded ONCE and shared; the embedder + temporal feature are computed ONCE per
+  doc; only the per-head SSM forward is N x (acceptable: doc-kind tagging is
+  per-ingest, not per-query).
 
-``build_doc_kind_tagger`` centralizes the policy: prefer the trained head when
-its checkpoint exists; fall back to the Bonsai adapter when a decider is
+``build_doc_kind_tagger`` centralizes the policy: prefer the ENSEMBLE when
+``ensemble_paths`` are supplied and all exist; fall back to a single trained
+head when ``head_path`` exists; then the Bonsai adapter when a decider is
 supplied; else ``None`` (the pipeline leaves ``doc_kind`` at the cold-start
-``"other"``, byte-identical to pre-7.11).
+``"other"``, byte-identical to pre-7.11). ``ensemble_paths`` defaults to ``None``
+so a direct library call is backward-compatible (single-head); the ingest CLI
+passes the shipped pair so production serves the ensemble by default.
 
 The interface widens from Sec 7.11's ``classify_doc_kind(text: str)`` to
 ``classify_doc_kind(section_texts: list[str])`` so the head gets the section
@@ -40,6 +52,21 @@ _BONSAI_TEXT_CAP = 8000
 DEFAULT_DOC_KIND_HEAD_PATH = "data/training/doc_kind_head/best.pt"
 DEFAULT_BACKBONE_PATH = (
     "data/pod_runs/phase2a_full/checkpoints/backbone/backbone_final.pt"
+)
+# Shipped ensemble: pen0 (pure CE, snap-strong: snap 13/17 / dec 11/17) +
+# pen2 (dec-strong: snap 12/17 / dec 12/17), logit-averaged. The averaged logits
+# land BOTH guard classes at 13/17=0.765 with unsafe=0 on the 76-doc clean val
+# -- clearing the full strict gate (snap>=0.70, dec>=0.70, acc>=0.55,
+# unsafe<=1, snap Wilson-CI95 lower>=0.50) that NO single head clears. The
+# two heads sit at opposite ends of the penalty frontier; averaging their
+# logits relaxes the snap/dec coupling that the 5-way softmax's mutual
+# exclusion forces on any one head. Both are attention + temporal-feature
+# heads on the shared frozen backbone. Paths are ``data/`` (gitignored); the
+# ensemble auto-serves when both exist, else falls through to single-head /
+# Bonsai / None (cold-start preserved on a fresh clone).
+DEFAULT_DOC_KIND_ENSEMBLE_PATHS = (
+    "data/training/doc_kind_head_attn_ce0/best.pt",  # pen0 -- pure CE, snap-strong
+    "data/training/doc_kind_head_attn_ce2/best.pt",  # pen2 -- dec-strong
 )
 
 
@@ -210,29 +237,112 @@ class BackboneDocKindTagger:
         return self._head.classify(section_texts, self._embedder, feat=feat)
 
 
+class EnsembleBackboneDocKindTagger:
+    """Ensemble serve: N trained ``DocKindHead``s on the SHARED frozen backbone,
+    logit-averaged (the gate-clearing pen0+pen2 pair).
+
+    Holds N loaded ``DocKindHead``s (each on the SAME frozen backbone object, so
+    the 19.5M backbone params load ONCE) and a bge-small embedder. Tags a doc by
+    embedding its sections + computing the temporal feature ONCE, running each
+    head's ``forward`` on the shared embeddings, AVERAGING the per-head logits,
+    and taking the argmax -- the exact combine the strict gate was measured on
+    (the eval-probe ``EnsembleHead`` averages ``head.forward`` logits; this class
+    replicates that, so the served scorecard IS the measured scorecard, no
+    re-implementation drift). Returns ``None`` on empty sections -> caller writes
+    ``"other"``.
+
+    The temporal feature is computed ONCE from the SAME filtered
+    ``section_texts`` (byte-identical to the single-head + train/eval path); every
+    head gets the SAME feature vector (all shipped ensemble heads are
+    feat-trained, ``feat_dim > 0``). A feat-less head in a custom mix would get
+    the vector too and ignore it inside ``forward`` (``feat_dim == 0`` path) --
+    no skew, no shape error. ``forward`` moves the feature to the head's device,
+    so building it on CPU here matches the single-head path.
+    """
+
+    def __init__(self, heads, embedder) -> None:
+        if not heads:
+            raise ValueError("EnsembleBackboneDocKindTagger needs >=1 head")
+        self._heads = list(heads)
+        self._embedder = embedder
+        for h in self._heads:
+            h.eval()
+
+    def classify_doc_kind(self, section_texts: list[str]) -> Optional[str]:
+        if not section_texts:
+            return None
+        import torch
+        section_texts = [s for s in section_texts if s and s.strip()]
+        if not section_texts:
+            return None
+        # Temporal feature computed ONCE; every head gets the same vector. Any
+        # feat-trained head (feat_dim > 0) consumes it; a feat-less head ignores
+        # it. Matches the single-head tagger's feat path (CPU tensor; forward
+        # moves it to device).
+        feat = None
+        if any(getattr(h, "feat_dim", 0) > 0 for h in self._heads):
+            fv = extract_temporal_features(section_texts)
+            feat = torch.tensor(fv, dtype=torch.float32).unsqueeze(0)  # [1, k]
+        device = next(self._heads[0].parameters()).device
+        vecs = self._embedder.encode(section_texts)
+        embs = [
+            torch.tensor(v, dtype=torch.float32, device=device).unsqueeze(0)
+            for v in vecs
+        ]
+        with torch.no_grad():
+            logits = [h.forward(embs, feat=feat) for h in self._heads]  # each [1,5]
+            avg = torch.stack(logits, dim=0).mean(dim=0)               # [1,5]
+        idx = int(avg.argmax(dim=-1).item())
+        return self._heads[0].LABELS[idx]
+
+
 def build_doc_kind_tagger(
     *,
     head_path: Optional[str] = DEFAULT_DOC_KIND_HEAD_PATH,
+    ensemble_paths: Optional[list[str]] = None,
     backbone_path: str = DEFAULT_BACKBONE_PATH,
     device: str = "auto",
     embedder_source: str = "on-demand",
     bonsai_decider=None,
     verbose: bool = True,
 ) -> Optional[DocKindTagger]:
-    """Construct the best available doc-kind tagger (head > Bonsai > None).
+    """Construct the best available doc-kind tagger
+    (ensemble > single-head > Bonsai > None).
 
-    Prefers the trained ``BackboneDocKindTagger`` when the head checkpoint
-    exists (local forward pass, no :8080 contention). Falls back to
-    ``BonsaiDocKindTagger`` when a ``bonsai_decider`` is supplied. Returns
-    ``None`` when neither is available -- the pipeline then leaves ``doc_kind``
-    at the cold-start ``"other"`` default (byte-identical to pre-7.11). A
-    head-load failure prints a warning and falls through to the Bonsai fallback
+    Prefers the ``EnsembleBackboneDocKindTagger`` when ``ensemble_paths`` are
+    supplied and ALL exist (N heads logit-averaged on the shared frozen backbone
+    -- the shipped gate-clearing pen0+pen2 pair). Falls back to the single
+    ``BackboneDocKindTagger`` when ``head_path`` exists, then to
+    ``BonsaiDocKindTagger`` when a ``bonsai_decider`` is supplied, then
+    ``None`` (the pipeline leaves ``doc_kind`` at the cold-start ``"other"``,
+    byte-identical to pre-7.11). ``ensemble_paths`` defaults to ``None`` so a
+    direct library call is backward-compatible (single-head); the ingest CLI
+    passes the shipped pair so production serves the ensemble by default. A
+    load failure prints a warning and falls through to the next fallback
     rather than aborting the ingest.
 
     Heavy deps (torch, the backbone checkpoint, ``sentence_transformers``) are
-    imported lazily INSIDE the head branch so this module imports cheaply and
-    the no-tag (cold-start) path never pulls them.
+    imported lazily INSIDE the ensemble/head branches so this module imports
+    cheaply and the no-tag (cold-start) path never pulls them.
     """
+    paths = list(ensemble_paths) if ensemble_paths else []
+    if paths and all(Path(p).exists() for p in paths):
+        try:
+            from ..subconscious.configs import BackboneConfig
+            from ..subconscious.training.routing_training import (
+                build_embedder, load_backbone, load_doc_kind_head,
+            )
+            backbone = load_backbone(backbone_path, BackboneConfig(), device=device)
+            heads = [load_doc_kind_head(p, backbone, device=device) for p in paths]
+            embedder = build_embedder(embedder_source)
+            if verbose:
+                print(f"doc-kind tagger: ensemble of {len(heads)} heads on "
+                      f"frozen backbone (logit-avg): {paths}")
+            return EnsembleBackboneDocKindTagger(heads, embedder)
+        except Exception as exc:  # noqa: BLE001 -- best-effort; fall through
+            if verbose:
+                print(f"warning: doc-kind ensemble load failed ({exc}); "
+                      f"falling back to single-head/Bonsai/None")
     if head_path and Path(head_path).exists():
         try:
             from ..subconscious.configs import BackboneConfig
