@@ -75,6 +75,19 @@ class DocKindHeadTrainingConfig:
     # False keeps the original head for the Phase 3 baseline.
     temporal_feature: bool = False
 
+    # Phase 5: attention-over-sections readout. When True the head's section
+    # reduction is a learned additive attention (vs the equal-weight mean-pool),
+    # letting it FIND the date-bearing section instead of averaging it away --
+    # attacks root cause #3 (decision_update separability ceiling under
+    # mean-pool + frozen backbone), which more data (v3), cleaner labels (v4),
+    # and the severity loss all failed to break. ORTHOGONAL to
+    # ``temporal_feature`` (feat adds a doc-level regex signal; attention finds
+    # the section) -- the two compose. When True the trainer (a) expects the
+    # head to have been constructed with ``attention_readout=True``, and (b)
+    # persists ``attention`` in the checkpoint so the loader builds the
+    # attention modules on load. Default False keeps the mean-pool head for A/B.
+    attention_readout: bool = False
+
     # Hardware / IO.
     dtype: str = "float32"   # gate training is fp32-only; same here
     device: str = "auto"
@@ -447,6 +460,26 @@ def train_doc_kind_head_supervised(
         train_feats = None
         val_feats = None
 
+    # Phase 5 attention-over-sections: cross-check cfg vs head construction (a
+    # flag/head mismatch would silently train the wrong readout). Mirrors the
+    # temporal-feature guards above.
+    use_attn = bool(cfg.attention_readout)
+    if use_attn and not head.attention_readout:
+        raise RuntimeError(
+            f"attention_readout=True but head.attention_readout=False -- "
+            f"construct the head with attention_readout=True (or set "
+            f"attention_readout=False)"
+        )
+    if not use_attn and head.attention_readout:
+        raise RuntimeError(
+            f"attention_readout=False but head.attention_readout=True -- a "
+            f"head built with the attention readout must be trained with "
+            f"attention_readout=True (set it or construct a mean-pool head)"
+        )
+    if use_attn:
+        print(f"  attention readout ON (attn_dim={head.ATTN_DIM}): "
+              f"additive attention over per-section step outputs")
+
     # Inverse-frequency class weights so the head can't collapse to the majority
     # class (``other`` / ``decision_update`` typically dominate a real store).
     # CAPPED at 3.0: an uncapped inverse-freq weight on a 3-example class
@@ -540,8 +573,8 @@ def train_doc_kind_head_supervised(
         # satisfies the SHIP gate (safe first, then the binding guard class,
         # then acc) -- NOT the best-val_acc epoch (a lower-acc epoch can be far
         # more gate-safe; the selection flaw Phase 3 surfaced). best.pt is the
-        # head we'd actually ship-evaluate; feat_dim is persisted so the loader
-        # widens the Linear on load.
+        # head we'd actually ship-evaluate; feat_dim + attention are persisted so
+        # the loader rebuilds the head's Linear width + attention modules on load.
         score = _gate_score(pc)
         if best_score is None or score > best_score:
             best_score = score
@@ -549,12 +582,14 @@ def train_doc_kind_head_supervised(
             best_epoch = epoch
             torch.save({"head": head.state_dict(), "labels": list(DocKindHead.LABELS),
                         "val_accuracy": val_acc, "epoch": epoch,
-                        "feat_dim": head.feat_dim},
+                        "feat_dim": head.feat_dim,
+                        "attention": head.attention_readout},
                        ckpt_dir / "best.pt")
 
     torch.save({"head": head.state_dict(), "labels": list(DocKindHead.LABELS),
                 "val_accuracy": best_val, "epoch": cfg.epochs - 1,
-                "feat_dim": head.feat_dim},
+                "feat_dim": head.feat_dim,
+                "attention": head.attention_readout},
                ckpt_dir / "final.pt")
     with open(ckpt_dir / "train_log.json", "w", encoding="utf-8") as f:
         json.dump({"best_val": best_val, "log": log,

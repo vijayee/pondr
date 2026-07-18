@@ -188,7 +188,14 @@ def load_doc_kind_head(
         raise RuntimeError(
             f"doc-kind head checkpoint {path} has negative feat_dim={feat_dim}"
         )
-    head = DocKindHead(backbone, cfg, feat_dim=feat_dim)
+    # attention (Phase 5): build the attention readout modules so the head's
+    # state_dict matches (attn_key + attn_query). Read BEFORE constructing the
+    # head, like feat_dim. Default False = pre-Phase-5 checkpoint (mean-pool) ->
+    # backward-compatible. A mismatch (attention ckpt into a mean-pool head or
+    # vice versa) is caught by the strict state_dict check below.
+    attention = bool(ckpt.get("attention", False)) if isinstance(ckpt, dict) else False
+    head = DocKindHead(backbone, cfg, feat_dim=feat_dim,
+                       attention_readout=attention)
     sd = ckpt["head"] if isinstance(ckpt, dict) and "head" in ckpt else ckpt
     labels = ckpt.get("labels") if isinstance(ckpt, dict) else None
     if labels is not None and list(labels) != list(DocKindHead.LABELS):

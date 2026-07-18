@@ -659,3 +659,175 @@ def test_gate_score_prefers_safe_then_guard_min():
     safe_strong = {"unsafe_cell": 0, "snapshot_recall": 0.8,
                    "decision_update_recall": 0.8, "acc": 0.60}
     assert _gate_score(safe_strong) > _gate_score(safe_weak)
+
+
+# ── Phase 5: attention-over-sections readout ──
+
+def test_attention_head_constructs_modules_and_forward_shape():
+    """An attention head owns attn_key + attn_query (zeros init) and returns [1,5]."""
+    bb = JGSBackbone(BackboneConfig())
+    head = DocKindHead(bb, attention_readout=True)
+    assert head.attention_readout is True
+    assert hasattr(head, "attn_key")
+    assert head.attn_key.in_features == 256
+    assert head.attn_key.out_features == DocKindHead.ATTN_DIM
+    assert hasattr(head, "attn_query")
+    # zeros init -> uniform attention == mean-pool at init (clean A/B start).
+    assert torch.allclose(head.attn_query, torch.zeros(DocKindHead.ATTN_DIM))
+    # a mean-pool head has neither attention module.
+    plain = DocKindHead(bb)
+    assert not plain.attention_readout
+    assert not hasattr(plain, "attn_key")
+    with torch.no_grad():
+        assert head.forward(_secs(3)).shape == (1, len(DocKindHead.LABELS))
+
+
+def test_attention_forward_single_section_is_well_defined():
+    """N=1 (single-section doc): softmax over 1 element -> weight 1.0, no degenerate
+    path; still [1,5]."""
+    bb = JGSBackbone(BackboneConfig())
+    head = DocKindHead(bb, attention_readout=True)
+    head.eval()
+    with torch.no_grad():
+        assert head.forward(_secs(1)).shape == (1, len(DocKindHead.LABELS))
+
+
+def test_attention_zeros_init_equals_mean_pool():
+    """With attn_query=zeros (init), softmax over equal scores is uniform, so the
+    attention readout == the mean-pool readout EXACTLY (clean A/B baseline, no
+    random-init luck)."""
+    bb = JGSBackbone(BackboneConfig())
+    plain = DocKindHead(bb, attention_readout=False)
+    attn = DocKindHead(bb, attention_readout=True)
+    # Share the head + instance params so the only difference is the readout.
+    plain.load_state_dict({k: v for k, v in attn.state_dict().items()
+                           if k in plain.state_dict()}, strict=False)
+    plain.eval(); attn.eval()
+    secs = _secs(4)
+    with torch.no_grad():
+        assert torch.allclose(plain.forward(secs), attn.forward(secs), atol=1e-6)
+
+
+def test_attention_logits_differ_from_mean_pool_after_a_step():
+    """After one training step that moves attn_query off zero, the attention readout
+    produces DIFFERENT logits than the mean-pool on the same sections (the path is
+    live, not silently falling back to mean)."""
+    bb = JGSBackbone(BackboneConfig())
+    attn = DocKindHead(bb, attention_readout=True)
+    for p in bb.parameters():
+        p.requires_grad = False
+    secs = _secs(4)
+    target = torch.tensor([1])  # decision_update
+    opt = torch.optim.AdamW(attn.parameters(), lr=1e-2)
+    attn.train()
+    logits = attn.forward(secs)
+    loss = torch.nn.functional.cross_entropy(logits, target)
+    opt.zero_grad(); loss.backward(); opt.step()
+    # attn_query moved off zero -> attention is no longer uniform.
+    assert not torch.allclose(attn.attn_query, torch.zeros(DocKindHead.ATTN_DIM))
+    # Build a mean-pool head sharing the (post-step) head + instance params.
+    plain = DocKindHead(bb, attention_readout=False)
+    plain.load_state_dict({k: v for k, v in attn.state_dict().items()
+                           if k in plain.state_dict()}, strict=False)
+    plain.eval(); attn.eval()
+    with torch.no_grad():
+        assert not torch.allclose(plain.forward(secs), attn.forward(secs), atol=1e-5)
+
+
+def test_load_doc_kind_head_round_trips_attention(tmp_path):
+    """An attention checkpoint round-trips into an attention head with matching
+    attn_key/attn_query weights; the loader reads 'attention' before construction."""
+    bb = JGSBackbone(BackboneConfig())
+    head = DocKindHead(bb, attention_readout=True)
+    # Move attn_query off zero so round-trip is observable.
+    with torch.no_grad():
+        head.attn_query.add_(0.37)
+    ckpt_path = tmp_path / "best.pt"
+    torch.save({"head": head.state_dict(), "labels": list(DocKindHead.LABELS),
+                "val_accuracy": 0.6, "epoch": 3, "feat_dim": 0,
+                "attention": True}, ckpt_path)
+    from src.subconscious.training.routing_training import load_doc_kind_head
+    out = load_doc_kind_head(str(ckpt_path), bb, device="cpu")
+    assert out.attention_readout is True
+    assert torch.equal(out.attn_key.weight, head.attn_key.weight)
+    assert torch.equal(out.attn_query, head.attn_query)
+
+
+def test_load_doc_kind_head_old_mean_pool_ckpt_still_loads(tmp_path):
+    """A pre-Phase-5 checkpoint with no 'attention' field loads into a mean-pool head
+    (backward-compat)."""
+    bb = JGSBackbone(BackboneConfig())
+    plain = DocKindHead(bb, attention_readout=False)
+    ckpt_path = tmp_path / "best.pt"
+    torch.save({"head": plain.state_dict(), "labels": list(DocKindHead.LABELS),
+                "val_accuracy": 0.5, "epoch": 0, "feat_dim": 0}, ckpt_path)
+    from src.subconscious.training.routing_training import load_doc_kind_head
+    out = load_doc_kind_head(str(ckpt_path), bb, device="cpu")
+    assert out.attention_readout is False
+    assert not hasattr(out, "attn_key")
+
+
+def test_load_doc_kind_head_rejects_attention_mismatch(tmp_path):
+    """An attention checkpoint loaded into a mean-pool head is a state_dict mismatch
+    (the strict check catches the attn_key/attn_query unexpected keys)."""
+    bb = JGSBackbone(BackboneConfig())
+    attn = DocKindHead(bb, attention_readout=True)
+    ckpt_path = tmp_path / "best.pt"
+    # ckpt carries the attention state_dict + attention=True, but we drop the
+    # 'attention' field so the loader builds a mean-pool head -> mismatch.
+    sd = attn.state_dict()
+    torch.save({"head": sd, "labels": list(DocKindHead.LABELS),
+                "val_accuracy": 0.5, "epoch": 0, "feat_dim": 0}, ckpt_path)
+    from src.subconscious.training.routing_training import load_doc_kind_head
+    with pytest.raises(RuntimeError, match="mismatch"):
+        load_doc_kind_head(str(ckpt_path), bb, device="cpu")
+
+
+def test_supervised_training_attention_runs_and_persists_attention(tmp_path):
+    """attention_readout=True trains without error, the checkpoint carries
+    'attention'=True, and the loader round-trips into an attention head."""
+    bb = JGSBackbone(BackboneConfig())
+    head = DocKindHead(bb, attention_readout=True)
+    for p in bb.parameters():
+        p.requires_grad = False
+    embedder = build_embedder("stub")
+    train = [
+        {"doc_id": "s1", "section_texts": ["# status\n\ngreen as of 2026-03-31"],
+         "label": "point_in_time_snapshot"},
+        {"doc_id": "d1", "section_texts": ["# decision\n\nwe switched to postgres"],
+         "label": "decision_update"},
+        {"doc_id": "p1", "section_texts": ["# roadmap\n\nwe will migrate next quarter"],
+         "label": "plan"},
+    ] * 3
+    val = train[:2]
+    cfg = DocKindHeadTrainingConfig(epochs=4, device="cpu", embedder_source="stub",
+                                    checkpoint_dir=str(tmp_path / "attnhead"),
+                                    attention_readout=True, accum_steps=1)
+    result = train_doc_kind_head_supervised(head, bb, train, val, embedder, cfg,
+                                            progress_cb=None)
+    assert result["best_per_class"] is not None
+    ckpt = torch.load(tmp_path / "attnhead" / "best.pt", map_location="cpu",
+                      weights_only=False)
+    assert ckpt["attention"] is True
+    from src.subconscious.training.routing_training import load_doc_kind_head
+    out = load_doc_kind_head(str(tmp_path / "attnhead" / "best.pt"), bb, device="cpu")
+    assert out.attention_readout is True
+
+
+def test_supervised_training_rejects_attention_flag_head_mismatch(tmp_path):
+    """attention_readout=True with a mean-pool head (attention_readout=False) is a
+    hard error (would silently train the wrong readout)."""
+    bb = JGSBackbone(BackboneConfig())
+    head = DocKindHead(bb, attention_readout=False)   # mean-pool, but flag on
+    for p in bb.parameters():
+        p.requires_grad = False
+    embedder = build_embedder("stub")
+    train = [{"doc_id": "s1", "section_texts": ["# s\n\nbody"],
+              "label": "point_in_time_snapshot"}] * 3
+    val = train[:1]
+    cfg = DocKindHeadTrainingConfig(epochs=1, device="cpu", embedder_source="stub",
+                                    checkpoint_dir=str(tmp_path / "bad"),
+                                    attention_readout=True, accum_steps=1)
+    with pytest.raises(RuntimeError, match="attention_readout=True but head"):
+        train_doc_kind_head_supervised(head, bb, train, val, embedder, cfg,
+                                       progress_cb=None)

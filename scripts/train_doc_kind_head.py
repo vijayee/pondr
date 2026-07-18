@@ -80,6 +80,13 @@ def main() -> int:
                         "(date/as-of/decision/plan signal) with the pooled "
                         "embedding before the head -- attacks the mean-pool blind "
                         "spot. Off = the original embedding-only head (A/B).")
+    p.add_argument("--attention", action="store_true",
+                   help="Phase 5: replace the mean-pool with a learned additive "
+                        "attention over per-section step outputs -- lets the head "
+                        "FIND the date-bearing section instead of averaging it away "
+                        "(attacks root cause #3, decision_update separability). "
+                        "Off = the original mean-pool head (A/B). Orthogonal to "
+                        "--temporal-feature.")
     args = p.parse_args()
 
     # Optional: export pairs from a live store first.
@@ -186,7 +193,13 @@ def main() -> int:
         print(f"  temporal feature ON: head.feat_dim={feat_dim}", flush=True)
     else:
         feat_dim = 0
-    head = DocKindHead(backbone, feat_dim=feat_dim)
+    # Phase 5: --attention swaps the section reduction from mean-pool to a
+    # learned additive attention (attn_key + attn_query). Off = mean-pool.
+    if args.attention:
+        print(f"  attention readout ON (attn_dim={DocKindHead.ATTN_DIM})",
+              flush=True)
+    head = DocKindHead(backbone, feat_dim=feat_dim,
+                       attention_readout=args.attention)
     n_head = sum(p.numel() for p in head.parameters() if p.requires_grad)
     print(f"  head trainable params: {n_head:,} (backbone excluded)", flush=True)
 
@@ -198,11 +211,13 @@ def main() -> int:
         pairs_path=str(pairs_path),
         unsafe_confusion_penalty=args.unsafe_penalty,
         temporal_feature=args.temporal_feature,
+        attention_readout=args.attention,
     )
     print(f"Training: {cfg.epochs} epochs, lr {cfg.learning_rate}, "
           f"{cfg.dtype} on {cfg.device}, "
           f"unsafe_penalty={cfg.unsafe_confusion_penalty} "
-          f"temporal_feature={cfg.temporal_feature}", flush=True)
+          f"temporal_feature={cfg.temporal_feature} "
+          f"attention_readout={cfg.attention_readout}", flush=True)
 
     result = train_doc_kind_head_supervised(
         head, backbone, train_data, val_data, embedder, cfg, progress_cb=_progress,
