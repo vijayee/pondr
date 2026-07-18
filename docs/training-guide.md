@@ -151,7 +151,9 @@ python scripts/train_backbone.py \
 - `--backend` (default `reference`): the pivot for the Mamba3 swap (§7).
 - `--device` (default `auto`): `cpu` | `cuda` | `auto`.
 - `--dtype` (default `bfloat16`): **use `float32` on the reference backend**
-  — the bf16/autocast path is unfixed in the 2a code. Mamba3-CUDA on a pod
+  — the cold-start baseline trains in float32 (the bf16/autocast path in
+  `pretrain.py:206` IS fixed via the modern `torch.amp.autocast` API; fp32
+  is the deliberate baseline, not a workaround). Mamba3-CUDA on a pod
   uses `bfloat16`.
 - `--total-steps` 3000, `--batch-size` 32, `--val-fraction` 0.1, `--seed` 0.
 - Config defaults (`BackboneTrainingConfig`): `learning_rate=3e-4`,
@@ -204,7 +206,8 @@ python scripts/train_retrieval_gate.py \
 
 - Trains the `retrieval_gate` JGS instance (LoRA rank 4, 3 context features:
   entity_recency, topic_recency, query_complexity). Backbone frozen.
-- `--dtype float32` (bf16 path unfixed). Shipped val accuracy: **0.826**.
+- `--dtype float32` (cold-start baseline; bf16/autocast path is fixed but
+  fp32 is the deliberate baseline). Shipped val accuracy: **0.826**.
 - Output: `data/training/routing_gate/best.pt`, `final.pt`, `train_log.json`.
 - A REINFORCE online path exists in config (`online_lr=1e-5`,
   `replay_buffer_capacity=1000`) but is driven by live pipeline signals, not

@@ -486,8 +486,9 @@ class RetrievalGateTrainingConfig:
     outcome_batch_size: int = 32
     min_buffer: int = 50        # no-op until this many outcomes
     # Hardware
-    dtype: str = "float32"     # bf16/autocast still unfixed in the 2a path;
-                               # gate params are small → fp32 is fine
+    dtype: str = "float32"     # bf16/autocast IS fixed (pretrain.py:206 uses the
+                               # modern torch.amp.autocast API); gate params are
+                               # small → fp32 is fine regardless
     device: str = "auto"
     val_fraction: float = 0.2
     seed: int = 0
@@ -719,10 +720,12 @@ possible without a trained checkpoint or a model download.
 
 ## 7. Open Notes
 
-- **bf16/autocast dtype-mix bug** in `pretrain.py` / `ReferenceSSM` is still
-  unfixed (deferred 2a work); 2b gate training uses `--dtype float32` (gate
-  params small, fp32 fine) — not in scope for 2b.
-- `scripts/train_backbone.py` remains uncommitted (deferred 2a) — not touched.
+- **bf16/autocast dtype-mix bug** in `pretrain.py` / `ReferenceSSM` is FIXED
+  (`pretrain.py:206` uses the modern `torch.amp.autocast(device_type=..., dtype=...)`
+  API; landed in the 2a commit `191fe97`). 2b gate training uses `--dtype float32`
+  (gate params small, fp32 fine).
+- `scripts/train_backbone.py` IS committed (commit `cc21f7d`); CLI wrapping
+  `pretrain_backbone` with `--backend {reference,mamba3-pytorch,mamba3-cuda}`.
 - **Gate context features** (entity_recency, topic_recency, query_complexity)
   default to **zeros** in 2b — assembling them from the store/conversation is a
   Phase 2.5 concern; supervised training uses zeros (documented, not faked).

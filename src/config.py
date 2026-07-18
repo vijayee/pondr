@@ -111,12 +111,10 @@ class Config:
     oracle_batch_delay: float = 0.0       # throttle between calls (0 = no throttle)
     oracle_timeout: float = 120.0         # :cloud routing can be slow
 
-    # ── Phase 2+ (Shared Backbone + Retrieval Gate) — placeholders, unused in 1a ──
-    ssm_state_dim: int = 512
-    jepa_backbone_model: str = "mamba-2.8b"
-
     # ── Phase 3+ (GNN Consolidator) — placeholder, unused in 1a ──
-    gnn_hidden_dim: int = 256
+    # (The pre-2a SSM/JEPA placeholders ``ssm_state_dim`` / ``jepa_backbone_model``
+    # were removed: the shipped backbone is BackboneConfig d_model=384
+    # ReferenceSSM, not a 512-dim mamba-2.8b, and nothing consumed them.)
 
     # ── Phase 4+ (Instance-Specific Gates) — placeholder, unused in 1a ──
     gate_hidden_dim: int = 128

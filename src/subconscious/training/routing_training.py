@@ -16,9 +16,10 @@ The shared backbone is the Phase 2a full-corpus retrain at
 ``data/pod_runs/phase2a_full/checkpoints/backbone/backbone_final.pt`` (better
 than the bounded 1,108-pair slice — see ``hippo-phase-2a-status``).
 
-bf16/autocast is still unfixed in the 2a path, so the gate trains in **float32**
-(the instance params + heads are small — fp32 is fine and matches the doc's
-``RetrievalGateTrainingConfig.dtype="float32"``).
+bf16/autocast IS now fixed in the 2a path (``pretrain.py:206`` uses the modern
+``torch.amp.autocast`` API), but the gate still trains in **float32** as the
+cold-start baseline (the instance params + heads are small — fp32 is fine and
+matches the doc's ``RetrievalGateTrainingConfig.dtype="float32"``).
 """
 
 from __future__ import annotations
@@ -62,8 +63,9 @@ def _resolve_dtype(name: str) -> torch.dtype:
     # expecting a speedup doesn't misread their own wall-clock.
     import sys
     if name not in ("float32", "fp32", "auto"):
-        print(f"  NOTE: dtype '{name}' requested but bf16/autocast is unfixed in the "
-              f"2a path — training runs float32 (no speedup).", file=sys.stderr)
+        print(f"  NOTE: dtype '{name}' requested — the 2a bf16/autocast path is "
+              f"fixed, but the cold-start baseline trains float32 (no speedup).",
+              file=sys.stderr)
     return torch.float32
 
 

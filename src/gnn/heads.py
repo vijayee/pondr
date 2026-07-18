@@ -300,8 +300,12 @@ class OntologyHead(nn.Module):
     Honest scope (deferred, NOT faked): (a) class->class ``subClassOf`` refinement
     -- no class->class labels exist, so this head does not propose taxonomy edges;
     (b) new-class creation is a Bonsai-gated consolidation ACTION, not a head
-    output; (c) Bonsai gating on the ontology step is not wired (only link-pred
-    calls the verifier today) -- consolidation records proposals but writes none.
+    output; (c) Bonsai gating on the ontology step IS wired
+    (``consolidate.py:893-940`` calls ``decider.verify_typing`` above
+    ``ontology_bonsai_threshold``, writes ``instanceOf`` edges, and creates new
+    classes) -- this head scores entity->class typing and the consolidator
+    applies the Bonsai-verified results. Only (a) (class->class labels) is
+    still deferred.
     """
 
     def __init__(self, hidden_dim: int, dropout: float = 0.1) -> None:

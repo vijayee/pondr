@@ -41,11 +41,12 @@ import numpy as np
 import torch
 from torch import Tensor
 
-# Only float32 is stored. The Phase 2a backbone is float32; bf16/autocast is
-# an open 2a bug (see memory hippo-phase-2a-status). A non-floating-point state
-# (int/bool) raises — it's a semantic type change, not a precision loss. Other
-# floating-point dtypes (float16/bfloat16) are losslessly widened to float32.
-# Add a stored-dtype path here only when 2a's dtype bug is fixed.
+# Only float32 is stored. The Phase 2a backbone trains in float32; the bf16
+# autocast path (pretrain.py:206) uses the modern torch.amp.autocast API and is
+# fixed, but the serialized recurrent state is still widened to float32 for
+# stable cross-dtype round-trips. A non-floating-point state (int/bool) raises
+# — it's a semantic type change, not a precision loss. Other floating-point
+# dtypes (float16/bfloat16) are losslessly widened to float32.
 _SUPPORTED_DTYPE = torch.float32
 _FORMAT_VERSION = 1
 

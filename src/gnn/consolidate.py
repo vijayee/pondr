@@ -520,11 +520,11 @@ class Consolidator:
         refinement -- no class->class labels exist, so this head does NOT propose
         taxonomy edges (it scores entity->class typing, not class hierarchy); (b)
         new-class creation is a Bonsai-gated consolidation ACTION, not a head
-        output; (c) Bonsai gating on the ontology step is not wired (only
-        link-pred calls the verifier today) -- proposals are RECORDED only; ``_apply``
-        writes no ontology edges. The vision-complete path (Bonsai-gated promotion
-        of entity->class to a real ``instanceOf``/membership edge, + new-class
-        creation) is future work; the cold-start loop records proposals honestly.
+        output; (c) Bonsai gating on the ontology step IS wired (this method,
+        below, calls ``decider.verify_typing`` above ``ontology_bonsai_threshold``,
+        writes ``instanceOf`` edges, and creates new classes). The vision-complete
+        path still open is (a) class->class ``subClassOf`` labels; the cold-start
+        loop records + applies entity->class typing honestly.
         """
         if self._class_emb is None:
             tax_data, _ = build_taxonomy_data(self.store)

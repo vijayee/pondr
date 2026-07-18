@@ -163,8 +163,20 @@ Return ONLY valid JSON:
 ]}}"""
 
 
+# NOTE: anomaly labels are NO LONGER produced by an Oracle prompt. The 6-type
+# ``gnn_anomaly_prompt`` schema below was superseded in Phase 3a Task 3 by an
+# Oracle-FREE injection path: ``anomaly_injector.inject_anomalies`` plants
+# synthetic anomalies into a clean subgraph and ``anomaly_rules`` (the canonical
+# ``ANOMALY_TYPES`` tuple + ``enrich_subgraph`` + ``node_label_vectors``) detects
+# them and emits the per-node 9-type label vector the ``AnomalyHead`` trains on
+# (see ``src/gnn/heads.py:AnomalyHead`` and ``src/gnn/anomaly_rules.py``). The
+# live generator (``scripts/generate_gnn_training_data.py``) imports
+# ``inject_anomalies`` + ``anomaly_rules`` and never calls an Oracle for
+# anomalies; the snippet kept below this comment is the HISTORICAL 6-type prompt
+# for reference only and is NOT used.
 def gnn_anomaly_prompt(subgraph_json: str) -> str:
-    """Prompt for GNN anomaly detection labels."""
+    """HISTORICAL — superseded by the Oracle-FREE injection path (see comment
+    above). Kept for reference; do NOT call in the live generator."""
     return f"""You are labeling a memory graph for GNN training.
 Flag structural anomalies — patterns that don't fit a well-formed memory graph.
 
@@ -624,9 +636,13 @@ from src.training.prompts import (
     gnn_salience_prompt,
     gnn_cluster_prompt,
     gnn_link_prediction_prompt,
-    gnn_anomaly_prompt,
+    gnn_anomaly_prompt,  # HISTORICAL — anomalies now Oracle-FREE (see below)
     gnn_ontology_prompt,
 )
+# Oracle-FREE anomaly labels (the live path, replaces the gnn_anomaly_prompt
+# Oracle call for the anomaly task):
+from src.gnn.anomaly_injector import inject_anomalies
+from src.gnn.anomaly_rules import ANOMALY_TYPES, enrich_subgraph, node_label_vectors
 
 
 def main():
@@ -652,11 +668,16 @@ def main():
     print(f"Extracted {len(subgraphs)} subgraphs")
     
     # ── 2. Generate labels for each task ──
+    # NOTE: anomalies are Oracle-FREE. ``inject_anomalies`` plants synthetic
+    # anomalies and ``anomaly_rules`` detects them -> per-node 9-type label
+    # vector (NOT the historical ``gnn_anomaly_prompt`` Oracle call). The
+    # live ``scripts/generate_gnn_training_data.py`` does the injection pass
+    # alongside the Oracle-driven salience/cluster/linkpred/ontology tasks.
     tasks = [
         ("salience", gnn_salience_prompt, "salience_labels.jsonl"),
         ("clusters", gnn_cluster_prompt, "cluster_labels.jsonl"),
         ("link_prediction", gnn_link_prediction_prompt, "link_prediction_labels.jsonl"),
-        ("anomalies", gnn_anomaly_prompt, "anomaly_labels.jsonl"),
+        ("anomalies", gnn_anomaly_prompt, "anomaly_labels.jsonl"),  # superseded — see note above
         ("ontology", gnn_ontology_prompt, "ontology_labels.jsonl"),
     ]
     

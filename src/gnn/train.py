@@ -98,7 +98,8 @@ class GNNTrainConfig:
     lr: float = 1e-3
     epochs: int = 20
     device: str = "auto"
-    dtype: str = "float32"          # float32-only (bf16/autocast unfixed in the 2a SSM path)
+    dtype: str = "float32"          # float32-only cold-start baseline (bf16/autocast path in
+                                   # pretrain.py:206 IS fixed; fp32 is the deliberate baseline)
     val_fraction: float = 0.1
     seed: int = 0
     checkpoint_dir: str = field(default_factory=lambda: Phase3aConfig().checkpoint_dir)
@@ -125,8 +126,9 @@ def _resolve_dtype(name: str) -> torch.dtype:
     # misread their own wall-clock (mirrors routing_training._resolve_dtype).
     if name not in ("float32", "fp32", "auto"):
         print(f"  NOTE: dtype '{name}' requested but the GNN trains float32-only "
-              "(bf16/autocast is unfixed in the 2a SSM path; the GNN is independent "
-              "of it but kept fp32 for the cold-start baseline). Using float32.",
+              "(the bf16/autocast path in pretrain.py:206 IS fixed; the GNN is "
+              "independent of it and kept fp32 for the cold-start baseline). "
+              "Using float32.",
               file=sys.stderr, flush=True)
     return torch.float32
 
