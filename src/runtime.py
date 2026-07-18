@@ -115,6 +115,15 @@ def build_ponder(
         embedder=embedder,
     )
 
+    # Phase 1c Refinement 1: attach the document-aware aggregator so multi-
+    # section hits surface as one document result. Guarded by a cheap
+    # ``has_section`` POS probe -- conversation-only corpora (no document
+    # edges) skip aggregation entirely (``document_retriever`` stays ``None``
+    # -> retrieval is byte-identical to the pre-1c path).
+    from .retrieval.document_retriever import DocumentRetriever, store_has_documents
+    if store_has_documents(store):
+        retriever.document_retriever = DocumentRetriever(store)
+
     gen = mode_a if mode_a is not None else ModeAGenerator(retriever, endpoint=endpoint)
 
     # Live-encode (default on): the encoder runs GLiNER on the resolved device

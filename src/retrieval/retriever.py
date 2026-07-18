@@ -37,6 +37,7 @@ from .query_planner import BonsaiQueryPlanner
 if TYPE_CHECKING:  # torch/subconscious only needed for type hints, not at runtime
     from ..subconscious.retrieval_gate import RetrievalGate
     from ..subconscious.routing import RoutingDecision, RoutingOutcome
+    from .document_retriever import DocumentRetriever
 
 
 class HippocampalRetriever:
@@ -75,6 +76,15 @@ class HippocampalRetriever:
         if self.gate is not None and self._route_embedder is None and self.vector_search is not None:
             self._route_embedder = self.vector_search
         self._outcome_trainer = None  # lazily built on first record_outcome
+
+        # Phase 1c: document-aware aggregation (Refinement 1). Set externally by
+        # ``runtime.build_ponder`` (only when the store has document section
+        # edges -- ``store_has_documents`` probe). ``None`` = conversation-only
+        # corpus -> aggregation is a no-op and retrieval is byte-identical to
+        # the pre-1c path. When set, ``retrieve`` post-processes its results
+        # through ``DocumentRetriever.aggregate_results`` so multi-section hits
+        # surface as one document result.
+        self.document_retriever: Optional["DocumentRetriever"] = None
 
     def _try_load_vector_index(self) -> None:
         """Attach a vector backend for the semantic fallback.
@@ -147,6 +157,14 @@ class HippocampalRetriever:
         # this is a pure score sort (the pre-2c+ behavior). Independent of
         # feedback_salience_enabled. Replaces the old bare ``results.sort``.
         results = self._kind_aware_rerank(results)
+
+        # Phase 1c: aggregate multi-section hits into one document result when a
+        # ``DocumentRetriever`` is attached (set by ``runtime.build_ponder`` for
+        # corpora that have document section edges). No-op when ``None``
+        # (conversation-only corpus). ``retrieve_with_routing`` calls this
+        # method, so the routed graph path is covered transitively.
+        if self.document_retriever is not None:
+            results = self.document_retriever.aggregate_results(results)
 
         return results
 
