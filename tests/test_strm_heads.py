@@ -21,9 +21,20 @@ from src.subconscious.latent_dynamics_head import (
     STATE_DIM,
     load_latent_dynamics_head,
 )
+from src.subconscious.recoverability_head import (
+    ANCHOR_DIM,
+    INPUT_DIM,
+    STATE_DIM_POOLED,
+    RecoverabilityHead,
+    load_recoverability_head,
+)
 from src.subconscious.training.latent_dynamics_training import (
     LatentDynamicsTrainingConfig,
     fit_latent_dynamics,
+)
+from src.subconscious.training.recoverability_training import (
+    RecoverabilityTrainingConfig,
+    fit_recoverability,
 )
 from src.subconscious.training.strm_traces import (
     auc,
@@ -276,3 +287,157 @@ def test_load_latent_dynamics_head_state_dim_mismatch_raises(tmp_path):
     # size-mismatch (strict=False still rejects shape mismatches).
     with pytest.raises(RuntimeError, match="size mismatch"):
         load_latent_dynamics_head(str(tmp_path / "mismatch.pt"), device="cpu")
+
+
+# ── 2b recoverability head ──
+#
+# A synthetic whose pooled last-layer state is a LEAKY SUM of NON-NEGATIVE
+# sparse anchors (state_last = c*prev + u_t, c=0.7). Forgetting is real: each
+# anchor u_i is encoded with weight c^k (k=t-i) plus interference from later
+# anchors, so the decoder D's reconstruction error e(i,t) grows with k. The
+# within-k variation that lets P beat the k-baseline comes from ||u_i||^2:
+# non-negative inputs make ||u_i||^2 monotonically rankable by a linear
+# functional (a linear P with positive weights on u_i ranks ||u_i||^2), and
+# the leaky-sum dynamics give a clean forgetting signal. (With signed inputs
+# a linear P cannot rank the quadratic ||u_i||^2 and the gate fails -- the
+# non-negativity is load-bearing, mirroring how the real 0a probe's e happens
+# to be linearly-rankable over the real embedding distribution.)
+
+def _synthetic_recoverability_traces(
+    n_chains=20, length=30, active=32, c=0.7, n_anchors=5, seed=0,
+):
+    """Pooled last layer = leaky sum of non-negative sparse anchors; 3 layers zero."""
+    rng = np.random.default_rng(seed)
+    traces = []
+    for _ in range(n_chains):
+        us = [np.zeros(ANCHOR_DIM, dtype=np.float32) for _ in range(length)]
+        anchor_pos = sorted(rng.choice(
+            length, size=min(n_anchors, length), replace=False).tolist())
+        for p in anchor_pos:
+            u = np.zeros(ANCHOR_DIM, dtype=np.float32)
+            u[:active] = rng.uniform(0.0, 1.0, active).astype(np.float32)
+            us[p] = u
+        state_last = np.zeros(ANCHOR_DIM, dtype=np.float32)
+        states, inputs = [], []
+        for t in range(length):
+            state_last = c * state_last + us[t]
+            layer = np.zeros((4, 16, ANCHOR_DIM), dtype=np.float32)
+            # all 16 d_state channels = state_last -> pooled last block == state_last
+            layer[-1] = np.tile(state_last, (16, 1))
+            states.append(layer)
+            inputs.append(us[t].copy())
+        states_t = torch.from_numpy(np.stack(states))     # [T,4,16,384]
+        inputs_t = torch.from_numpy(np.stack(inputs))     # [T,384]
+        traces.append({"inputs": inputs_t, "states": states_t})
+    return traces
+
+
+# ── RecoverabilityHead module ──
+
+def test_recoverability_head_project_state_shape():
+    head = RecoverabilityHead()
+    # 4 per-layer [1,16,384] state tensors (the live WM shape).
+    state_tensors = [torch.zeros(1, 16, ANCHOR_DIM) for _ in range(4)]
+    state_tensors[-1] = torch.rand(1, 16, ANCHOR_DIM)
+    z = head.project_state(state_tensors)                  # [1, 1536]
+    assert z.shape == (1, STATE_DIM_POOLED)
+    # 3 of 4 layers zero -> first three 384-blocks zero, last block == last mean.
+    assert np.allclose(z[0, :3 * ANCHOR_DIM].numpy(), 0.0, atol=1e-6)
+
+
+def test_recoverability_head_predict_shape():
+    head = RecoverabilityHead()
+    s = torch.rand(1, STATE_DIM_POOLED)
+    u = torch.rand(1, ANCHOR_DIM)
+    e = head.predict(s, u)                                   # [1, 1]
+    assert e.shape == (1, 1)
+    # 1-D inputs broadcast -> [1, 1]
+    e1 = head.predict(torch.rand(STATE_DIM_POOLED), torch.rand(ANCHOR_DIM))
+    assert e1.shape == (1, 1)
+
+
+def test_recoverability_head_project_rejects_bad_ndim():
+    head = RecoverabilityHead()
+    state_tensors = [torch.zeros(1, 16, ANCHOR_DIM) for _ in range(4)]
+    state_tensors[-1] = torch.randn(ANCHOR_DIM)             # 1-D, not 2/3
+    with pytest.raises(ValueError, match="unsupported ndim"):
+        head.project_state(state_tensors)
+
+
+def test_recoverability_head_project_rejects_wrong_count():
+    head = RecoverabilityHead()
+    # 3 layers, not 4
+    with pytest.raises(ValueError, match="expected 4 per-layer"):
+        head.project_state([torch.zeros(1, 16, ANCHOR_DIM) for _ in range(3)])
+
+
+# ── closed-form fit + checkpoint round-trip ──
+
+def test_fit_recoverability_clears_gate_on_synthetic(tmp_path):
+    traces = _synthetic_recoverability_traces(
+        n_chains=20, length=30, active=32, c=0.7, n_anchors=5, seed=7)
+    cfg = RecoverabilityTrainingConfig(
+        k_max=6, lam=10.0, gate_auc=0.75, val_fraction=0.2,
+        seed=0, checkpoint_dir=str(tmp_path),
+    )
+    result = fit_recoverability(traces, cfg)
+    assert result["go"] is True
+    # P must clear the AUC gate AND beat the free k-baseline.
+    assert result["ridge_auc"] > 0.75
+    assert result["ridge_auc"] > result["k_auc"]
+    assert result["k_auc"] < 0.6        # k alone is a weak baseline here
+    # best.pt == final.pt (one closed-form fit, no epoch selection)
+    best = torch.load(tmp_path / "best.pt", weights_only=False)
+    final = torch.load(tmp_path / "final.pt", weights_only=False)
+    assert best["ridge_auc"] == final["ridge_auc"]
+    assert best["go"] is True
+    assert torch.equal(best["linear"]["linear.weight"],
+                       final["linear"]["linear.weight"])
+    assert best["state_dim_pooled"] == STATE_DIM_POOLED
+    assert best["anchor_dim"] == ANCHOR_DIM
+    assert best["input_dim"] == INPUT_DIM
+
+
+def test_fit_recoverability_round_trips_through_loader(tmp_path):
+    traces = _synthetic_recoverability_traces(
+        n_chains=20, length=30, active=32, c=0.7, n_anchors=5, seed=8)
+    cfg = RecoverabilityTrainingConfig(k_max=6, lam=10.0,
+                                       checkpoint_dir=str(tmp_path))
+    fit_recoverability(traces, cfg)
+    head = load_recoverability_head(str(tmp_path / "best.pt"), device="cpu")
+    # The loaded head's predict must match the fit's ridge (X @ W + b) on raw
+    # [state ; anchor].
+    tr = traces[0]
+    S, U, _ = sample_recoverability_pairs([tr], k_max=cfg.k_max,
+                                          state_rep="pooled")
+    payload = torch.load(tmp_path / "best.pt", weights_only=False)
+    W = payload["linear"]["linear.weight"].numpy().reshape(-1)   # [1920]
+    b = payload["linear"]["linear.bias"].numpy()[0]
+    X = np.hstack([S, U]).astype(np.float32)
+    expected = X @ W + b
+    with torch.no_grad():
+        got = head.predict(torch.from_numpy(S), torch.from_numpy(U)).squeeze(-1).numpy()
+    assert np.allclose(got, expected, atol=1e-4)
+
+
+def test_fit_recoverability_raises_on_too_few_chains(tmp_path):
+    traces = _synthetic_recoverability_traces(n_chains=3, length=12, seed=9)
+    cfg = RecoverabilityTrainingConfig(checkpoint_dir=str(tmp_path))
+    with pytest.raises(RuntimeError, match=">=5 chains"):
+        fit_recoverability(traces, cfg)
+
+
+def test_load_recoverability_head_dim_mismatch_raises(tmp_path):
+    # save a 1920-input head, then hand-build a checkpoint claiming a smaller
+    # state_dim_pooled -> the constructed Linear's in_features won't match.
+    traces = _synthetic_recoverability_traces(
+        n_chains=12, length=20, active=32, seed=11)
+    fit_recoverability(traces, RecoverabilityTrainingConfig(
+        k_max=6, lam=10.0, checkpoint_dir=str(tmp_path)))
+    ckpt = torch.load(tmp_path / "best.pt", weights_only=False)
+    ckpt["state_dim_pooled"] = 64                            # lie about the dim
+    torch.save(ckpt, tmp_path / "mismatch.pt")
+    # A head built for 64+384=448 inputs can't absorb the 1920-input Linear
+    # state_dict -> torch raises a size-mismatch.
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        load_recoverability_head(str(tmp_path / "mismatch.pt"), device="cpu")
