@@ -75,7 +75,6 @@ from src.subconscious.configs import BackboneConfig  # noqa: E402
 from src.subconscious.latent_dynamics_head import load_latent_dynamics_head  # noqa: E402
 from src.subconscious.recoverability_head import load_recoverability_head  # noqa: E402
 from src.subconscious.relevance_head import load_relevance_head  # noqa: E402
-from src.subconscious.relevance_score import score_ring_slots  # noqa: E402
 from src.subconscious.salience import (  # noqa: E402
     SalienceThresholds,
     load_salience_thresholds,
@@ -157,17 +156,19 @@ def _percentile(values: list[float], q: float) -> float:
 
 def _capture_turn(orch: PonderOrchestrator, user_text: str) -> dict:
     """Score the current WM ring against this turn's query. Returns one record:
-    ``{user_text, slots: [{source_id, text, r_i, cos}]}`` where ``cos`` is the
-    bge cosine between the slot text and THIS turn's user_text (the probe/filler
-    label signal). Only text-bearing slots are scored (``score_ring_slots``
-    returns None for the rest -> filtered out)."""
+    ``{user_text, slots: [{source_id, text, r_i, logit, cos}]}`` where ``cos`` is
+    the bge cosine between the slot text and THIS turn's user_text (the
+    probe/filler label signal) and ``logit`` is the pre-sigmoid relevance logit
+    (captured so the ``--ablate-yt`` run can report the LOGIT gap, which is the
+    decisive signal when the sigmoid is saturated -- see the ablation note
+    below). Only text-bearing slots are scored."""
     prompt_emb = orch.working_memory.embed([user_text])[0]
     slots = orch.working_memory.ring_buffer()
-    slots, r_is = score_ring_slots(
-        orch.working_memory, orch.relevance_head, orch.embedder, prompt_emb, slots=slots)
+    slots, r_is, logits = _score_ring_with_logits(
+        orch.working_memory, orch.relevance_head, orch.embedder, prompt_emb, slots)
     # Embed each scored slot's text once for the cosine probe/filler label.
     out_slots = []
-    for s, r in zip(slots, r_is):
+    for s, r, lg in zip(slots, r_is, logits):
         if r is None or not s.text:
             continue
         slot_emb = orch.working_memory.embed([s.text])[0]
@@ -175,15 +176,62 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str) -> dict:
             "source_id": str(s.source_id) if s.source_id is not None else None,
             "text": s.text,
             "r_i": r,
+            "logit": lg,
             "cos": _cosine(prompt_emb, slot_emb),
         })
     return {"user_text": user_text, "slots": out_slots}
 
 
+def _score_ring_with_logits(working_memory, relevance_head, embedder,
+                            prompt_emb, slots):
+    """Mirror ``relevance_score._score`` but return the pre-sigmoid LOGIT too
+    (so the ablation can measure the bilinear gap that the saturated sigmoid
+    hides). Returns ``(slots, r_is, logits)`` length-``len(slots)`` with ``None``
+    at unscored positions (matching ``score_ring_slots``)."""
+    r_is: list = [None] * len(slots)
+    logits: list = [None] * len(slots)
+    if relevance_head is None or embedder is None:
+        return slots, r_is, logits
+    idx_text = [(i, s.text) for i, s in enumerate(slots)
+                if s.text is not None and str(s.text).strip()]
+    if not idx_text:
+        return slots, r_is, logits
+    head_dev = next(relevance_head.parameters()).device
+    doc_emb_tensors = working_memory.embed([t for _, t in idx_text])
+    ys = torch.cat([slots[i].y.to(torch.float32).squeeze(0).reshape(1, -1)
+                    for i, _ in idx_text], dim=0).to(head_dev)
+    ds = torch.cat([e.to(torch.float32).squeeze(0).reshape(1, -1)
+                    for e in doc_emb_tensors], dim=0).to(head_dev)
+    q = prompt_emb.to(torch.float32).squeeze(0).reshape(1, -1).to(head_dev)
+    with torch.no_grad():
+        lg = relevance_head.logits(ys, ds, q)          # [K', 1]
+        r = torch.sigmoid(lg)
+    for j, (i, _) in enumerate(idx_text):
+        logits[i] = float(lg[j].item())
+        r_is[i] = float(r[j].item())
+    return slots, r_is, logits
+
+
+def _ablate_yt_sidepath(head) -> None:
+    """Zero the ``yt_sidepath`` final layer so ``logits = bilinear + bias`` (the
+    WM-state readout term removed). The shipped head learned a large ~-8.5
+    ``yt`` offset that centers the sigmoid; with it zeroed, r_i = sigmoid(bilinear
+    + bias) still saturates high for everything (bilinear is large-positive), so
+    the DEcisive ablation signal is the pre-sigmoid LOGIT gap (bias cancels ->
+    logit gap == bilinear gap == the real discrimination). Zeroing weight+bias of
+    the final Linear makes the sidepath output 0 for any input."""
+    final = head.yt_sidepath[2]   # Sequential: [Linear(256,64), GELU, Linear(64,1)]
+    final.weight.data.zero_()
+    final.bias.data.zero_()
+    print("[ablate] zeroed yt_sidepath final layer "
+          f"(weight norm was {final.weight.norm().item():.4f}, bias {final.bias.item():.4f})",
+          flush=True)
+
+
 def replay_and_capture(
     *, transcripts: list[str], backbone_path: str, rel_head_path: str,
     ring_capacity: int, max_turns: int, device: str, salience: str,
-    user_id: str, rec_head_path: str, ld_head_path: str,
+    user_id: str, rec_head_path: str, ld_head_path: str, ablate_yt: bool,
 ) -> tuple[list[dict], dict]:
     """Replay every transcript turn through the orchestrator and capture per-
     turn per-slot r_i on the real recalled ring slots. Returns (turn_records,
@@ -198,6 +246,8 @@ def replay_and_capture(
         embedder = build_embedder("on-demand")
         backbone = load_backbone(str(backbone_path), BackboneConfig(), device=device)
         relevance_head = load_relevance_head(str(rel_head_path), device=device)
+        if ablate_yt:
+            _ablate_yt_sidepath(relevance_head)
         # Salience arming needs all three heads + thresholds (``_salience_armed``
         # in the orchestrator). OFF (the default) measures the head alone on the
         # prompt-driven recalled slots; permissive/real arm the trigger so
@@ -305,10 +355,16 @@ def replay_and_capture(
 
 
 def _analyze(turn_records: list[dict]) -> dict:
-    """Compute (1) the r_i distribution across all scored (slot, turn) pairs
-    and (2) the per-source selectivity gap (probe r_i minus mean filler r_i)."""
-    # (1) distribution across every scored slot occurrence.
+    """Compute (1) the r_i + logit distributions across all scored (slot, turn)
+    pairs and (2) the per-source selectivity gap (probe minus mean filler) for
+    BOTH r_i and the pre-sigmoid logit. The logit gap is the decisive signal
+    under ``--ablate-yt``: the shipped head's large ~-8.5 yt offset centers the
+    sigmoid, so r_i saturates even when the bilinear term discriminates; the
+    logit gap (bias cancels) == the bilinear gap == the real discrimination."""
+    # (1) distributions across every scored slot occurrence.
     all_r = [s["r_i"] for rec in turn_records for s in rec["slots"]]
+    all_lg = [s["logit"] for rec in turn_records for s in rec["slots"]
+              if s.get("logit") is not None]
     dist = {
         "n_scored": len(all_r),
         "min": min(all_r) if all_r else None,
@@ -319,11 +375,17 @@ def _analyze(turn_records: list[dict]) -> dict:
         "mean": statistics.fmean(all_r) if all_r else None,
         "stdev": statistics.pstdev(all_r) if len(all_r) >= 2 else 0.0,
         "frac_ge_0p99": (sum(1 for r in all_r if r >= 0.99) / len(all_r)) if all_r else 0.0,
+        "logit_min": min(all_lg) if all_lg else None,
+        "logit_p10": _percentile(all_lg, 0.10),
+        "logit_p50": _percentile(all_lg, 0.50),
+        "logit_p90": _percentile(all_lg, 0.90),
+        "logit_max": max(all_lg) if all_lg else None,
+        "logit_stdev": statistics.pstdev(all_lg) if len(all_lg) >= 2 else 0.0,
     }
-    # (2) per-source selectivity. Group scored occurrences by source_id; for
-    # each source seen on >= 3 turns, the probe turn = max-cos turn, fillers =
-    # the remaining turns; gap = probe_r - mean(filler_r). Report the min +
-    # median gap (the gate is min gap >= 0.2, matching Probe 3).
+    # (2) per-source selectivity for r_i AND logit. Group scored occurrences by
+    # source_id; for each source seen on >= 3 turns, the probe turn = max-cos
+    # turn, fillers = the remaining turns; gap = probe - mean(filler). Report
+    # the min + median gap (the r_i gate is min gap >= 0.2, matching Probe 3).
     by_source: dict[str, list[dict]] = {}
     for rec in turn_records:
         for s in rec["slots"]:
@@ -331,9 +393,11 @@ def _analyze(turn_records: list[dict]) -> dict:
             if sid is None:
                 continue
             by_source.setdefault(sid, []).append({
-                "turn_index": rec["turn_index"], "r_i": s["r_i"], "cos": s["cos"],
+                "turn_index": rec["turn_index"], "r_i": s["r_i"],
+                "logit": s.get("logit"), "cos": s["cos"],
             })
-    gaps: list[float] = []
+    r_gaps: list[float] = []
+    lg_gaps: list[float] = []
     per_source_examples: list[dict] = []
     for sid, occs in by_source.items():
         if len(occs) < 3:
@@ -341,23 +405,33 @@ def _analyze(turn_records: list[dict]) -> dict:
         occs_sorted = sorted(occs, key=lambda o: o["cos"], reverse=True)
         probe = occs_sorted[0]
         fillers = occs_sorted[1:]
-        mean_filler = statistics.fmean(o["r_i"] for o in fillers)
-        gap = probe["r_i"] - mean_filler
-        gaps.append(gap)
+        mean_filler_r = statistics.fmean(o["r_i"] for o in fillers)
+        r_gap = probe["r_i"] - mean_filler_r
+        r_gaps.append(r_gap)
+        lg_gap = None
+        if probe["logit"] is not None and all(o["logit"] is not None for o in fillers):
+            lg_gap = probe["logit"] - statistics.fmean(o["logit"] for o in fillers)
+            lg_gaps.append(lg_gap)
         if len(per_source_examples) < 12:
             per_source_examples.append({
                 "source_id": sid, "n_turns": len(occs),
                 "probe_cos": probe["cos"], "probe_r_i": probe["r_i"],
-                "mean_filler_r_i": mean_filler, "gap": gap,
+                "mean_filler_r_i": mean_filler_r, "r_gap": r_gap,
+                "probe_logit": probe["logit"], "logit_gap": lg_gap,
             })
     selectivity = {
         "n_sources_total": len(by_source),
-        "n_sources_eligible": len(gaps),
-        "min_gap": min(gaps) if gaps else None,
-        "median_gap": statistics.median(gaps) if gaps else None,
-        "mean_gap": statistics.fmean(gaps) if gaps else None,
-        "n_gap_ge_0p2": sum(1 for g in gaps if g >= 0.2),
-        "gate_min_gap_ge_0p2": (min(gaps) >= 0.2) if gaps else False,
+        "n_sources_eligible": len(r_gaps),
+        "min_r_gap": min(r_gaps) if r_gaps else None,
+        "median_r_gap": statistics.median(r_gaps) if r_gaps else None,
+        "mean_r_gap": statistics.fmean(r_gaps) if r_gaps else None,
+        "n_r_gap_ge_0p2": sum(1 for g in r_gaps if g >= 0.2),
+        "gate_min_r_gap_ge_0p2": (min(r_gaps) >= 0.2) if r_gaps else False,
+        "min_logit_gap": min(lg_gaps) if lg_gaps else None,
+        "median_logit_gap": statistics.median(lg_gaps) if lg_gaps else None,
+        "mean_logit_gap": statistics.fmean(lg_gaps) if lg_gaps else None,
+        "n_logit_gap_ge_2": sum(1 for g in lg_gaps if g >= 2.0),
+        "gate_median_logit_gap_ge_2": (statistics.median(lg_gaps) >= 2.0) if lg_gaps else False,
         "examples": per_source_examples,
     }
     return {"distribution": dist, "selectivity": selectivity}
@@ -380,6 +454,9 @@ def _main() -> int:
                    help="off=measure the head alone on prompt-driven slots; "
                         "permissive=arm with upper-bound thresholds; "
                         "real=arm with the shipped thresholds.json")
+    p.add_argument("--ablate-yt", action="store_true",
+                   help="zero the yt_sidepath so logits = bilinear + bias; the "
+                        "LOGIT gap (reported alongside r_i) is the decisive signal")
     p.add_argument("--user-id", default="pondr")
     p.add_argument("--out", default="", help="write the JSON report to this path")
     args = p.parse_args()
@@ -412,42 +489,59 @@ def _main() -> int:
         rel_head_path=args.relevance_head, ring_capacity=args.ring_capacity,
         max_turns=args.max_turns, device=args.device, salience=args.salience,
         user_id=args.user_id, rec_head_path=args.recoverability_head,
-        ld_head_path=args.latent_dynamics_head)
+        ld_head_path=args.latent_dynamics_head, ablate_yt=args.ablate_yt)
     analysis = _analyze(turn_records)
     report = {"run": run_stats, **analysis, "n_turn_records": len(turn_records)}
 
-    print("=" * 68)
-    print(f"STRM Probe 4a -- 2a relevance-head selectivity on REAL serve data")
+    print("=" * 72)
+    print(f"STRM Probe 4a -- 2a relevance-head selectivity on REAL serve data"
+          f"{' [ABLATE yt_sidepath]' if args.ablate_yt else ''}")
     print(f"  transcripts={args.transcripts} ring={run_stats['ring_capacity']} "
           f"salience={run_stats['salience']} turns={run_stats['n_turns']} "
           f"(encoded={run_stats['n_encoded']} skipped={run_stats['n_skipped']})")
-    print("-" * 68)
+    print("-" * 72)
     d = report["distribution"]
     print(f"  r_i DISTRIBUTION on real recalled slots ({d['n_scored']} scored):")
     print(f"    min={d['min']:.4f}  p10={d['p10']:.4f}  p50={d['p50']:.4f}  "
           f"p90={d['p90']:.4f}  max={d['max']:.4f}")
     print(f"    mean={d['mean']:.4f}  stdev={d['stdev']:.4f}  frac>=0.99={d['frac_ge_0p99']:.2%}")
+    print(f"  LOGIT distribution (pre-sigmoid; the ablation signal):")
+    print(f"    min={d['logit_min']:.3f}  p10={d['logit_p10']:.3f}  "
+          f"p50={d['logit_p50']:.3f}  p90={d['logit_p90']:.3f}  max={d['logit_max']:.3f}  "
+          f"stdev={d['logit_stdev']:.3f}")
     print(f"    (Probe 3 synthetic saturation: r_i ~ 0.9998, stdev ~ 0 -> near-constant)")
     s = report["selectivity"]
-    print(f"  SELECTIVITY GAP (probe r_i - mean filler r_i, per recalled episode):")
-    print(f"    sources total={s['n_sources_total']}  eligible(>=3 turns)={s['n_sources_eligible']}")
-    if s["min_gap"] is not None:
-        print(f"    min gap={s['min_gap']:+.4f}  median={s['median_gap']:+.4f}  "
-              f"mean={s['mean_gap']:+.4f}  n>=0.2={s['n_gap_ge_0p2']}")
-        print(f"    gate (min gap >= 0.2): {'PASS' if s['gate_min_gap_ge_0p2'] else 'FAIL'}")
+    print(f"  SELECTIVITY (probe turn = max bge-cosine turn vs this slot; "
+          f"{s['n_sources_eligible']} eligible of {s['n_sources_total']}):")
+    if s["min_r_gap"] is not None:
+        print(f"    r_i  gap: min={s['min_r_gap']:+.4f} median={s['median_r_gap']:+.4f} "
+              f"mean={s['mean_r_gap']:+.4f}  n>=0.2={s['n_r_gap_ge_0p2']}/"
+              f"{s['n_sources_eligible']}  "
+              f"gate(min>=0.2): {'PASS' if s['gate_min_r_gap_ge_0p2'] else 'FAIL'}")
     else:
-        print("    (no source seen on >=3 turns -- run longer / raise --ring-capacity)")
-    print("-" * 68)
-    print("  per-source examples (probe turn = max bge-cosine turn vs this slot):")
+        print("    r_i  gap: (no source seen on >=3 turns -- run longer / raise --ring-capacity)")
+    if s["min_logit_gap"] is not None:
+        print(f"    logit gap: min={s['min_logit_gap']:+.3f} median={s['median_logit_gap']:+.3f} "
+              f"mean={s['mean_logit_gap']:+.3f}  n>=2.0={s['n_logit_gap_ge_2']}/"
+              f"{s['n_sources_eligible']}  "
+              f"gate(median>=2.0): {'PASS' if s['gate_median_logit_gap_ge_2'] else 'FAIL'}")
+    print("-" * 72)
+    print("  per-source examples:")
     for ex in s["examples"]:
+        lg = ex.get("logit_gap")
+        lg_s = f"{lg:+.3f}" if lg is not None else "  n/a"
         print(f"    {ex['source_id'][:28]:<28} n={ex['n_turns']:>2} "
               f"cos={ex['probe_cos']:.3f} probe_r={ex['probe_r_i']:.4f} "
-              f"filler_r={ex['mean_filler_r_i']:.4f} gap={ex['gap']:+.4f}")
-    print("=" * 68)
-    print("VERDICT: healthy dist (stdev>0, p10<<p90) + min gap>=0.2 => head discriminates")
-    print("         on real serve data => synthetic Probe 3 NO-GO was OOD; move to Probe 4b.")
-    print("         saturated dist (stdev~0, frac>=0.99~100%) => head broken on serve;")
-    print("         train on serve-distribution data, not ERAG.")
+              f"filler_r={ex['mean_filler_r_i']:.4f} r_gap={ex['r_gap']:+.4f} "
+              f"probe_lg={ex['probe_logit']:+.2f} lg_gap={lg_s}")
+    print("=" * 72)
+    print("VERDICT (ablate-yt): a healthy LOGIT gap (median >= 2.0) => the bilinear")
+    print("  term discriminates on real serve data and yt_sidepath was the culprit;")
+    print("  retrain with yt_sidepath zeroed/regularized. A ~0 logit gap => the bilinear")
+    print("  proj itself collapses on serve -> train on serve-distribution data.")
+    print("VERDICT (no ablate): healthy r_i dist (stdev>0) + min r_gap>=0.2 => head")
+    print("  discriminates on real serve data => synthetic Probe 3 NO-GO was OOD.")
+    print("  saturated r_i (stdev~0, frac>=0.99~100%) => head broken on serve.")
 
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
