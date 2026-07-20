@@ -101,8 +101,10 @@ tests/
 ├── test_presentation_gate.py     # NEW — chunking axis (§5.2-5.4) + end-state axis (§5.6)
 ├── test_end_state.py            # NEW — direct/format/synthesize/extract dispatch + override buffer
 ├── test_chunked_context.py       # NEW
-├── test_expand_handler.py        # NEW
-└── integration/test_phase2c_pipeline.py  # NEW
+├── test_expand_handler.py        # NEW — focused ExpandHandler unit tests
+└── test_orchestrator.py          # the Task-8 integration scenarios live here
+                                  # (folded in to avoid duplicating the shared
+                                  # _orchestrator/_ep/_Stub* helpers; see §10)
 docs/adr/
 ├── 006-working-memory-design.md  # NEW
 └── 007-ssm-chunking-strategy.md  # NEW
@@ -739,7 +741,12 @@ GPU (if available) meets the draft targets; CPU targets above are the test/basel
 
 ## 10. Task 8 — Integration Tests
 
-**File:** `tests/integration/test_phase2c_pipeline.py`
+**File:** `tests/test_orchestrator.py` (the scenarios were folded into the
+orchestrator test module rather than a separate `tests/integration/` file, to
+avoid duplicating the shared `_orchestrator` / `_ep` / `_StubPlanner` /
+`_StubModeA` / `_StubEmbedder` helpers across two files). The EXPAND mechanism
+is additionally pinned at the handler unit level in
+`tests/test_expand_handler.py`.
 
 | Test | Description | Expected |
 |---|---|---|
@@ -819,20 +826,20 @@ Task 9  ADRs                           (parallel with Task 8)
 
 ## 14. Definition of Done
 
-- [ ] All unit tests pass (Tasks 1-5).
-- [ ] All integration tests pass (Task 8).
-- [ ] WM state persists across queries within a session (verified).
-- [ ] SSM chunking splits episodes into primary/compressed correctly.
-- [ ] Presentation Gate selects the appropriate strategy for the 8 test scenarios.
-- [ ] **End-state routing** dispatches correctly: `direct`/`extract`/`format` return **without an LLM call**; only `synthesize` calls Bonsai; a caller override is recorded in the override `ReplayBuffer` (§5.6 / §8.1).
-- [ ] EXPAND loads full text of compressed episodes and updates WM.
-- [ ] Prompt compression activates for long prompts and preserves planning accuracy (90% test).
-- [ ] Full pipeline latency < 300ms (CPU, excl. LLM).
-- [ ] **No regression** on Phase 1b/2b retrieval + routing tests.
-- [ ] Session save/load round-trip preserves state.
-- [ ] ADRs 006/007 written.
-- [ ] All public APIs documented (Google-style docstrings).
-- [ ] **de-wonk clean** (no CRITICAL/HIGH/MEDIUM): no untrained-dead-params, no faked
+- [x] All unit tests pass (Tasks 1-5).
+- [x] All integration tests pass (Task 8).
+- [x] WM state persists across queries within a session (verified).
+- [x] SSM chunking splits episodes into primary/compressed correctly.
+- [x] Presentation Gate selects the appropriate strategy for the 8 test scenarios.
+- [x] **End-state routing** dispatches correctly: `direct`/`extract`/`format` return **without an LLM call**; only `synthesize` calls Bonsai; a caller override is recorded in the override `ReplayBuffer` (§5.6 / §8.1).
+- [x] EXPAND loads full text of compressed episodes and updates WM.
+- [x] Prompt compression activates for long prompts and preserves planning accuracy (90% test).
+- [x] Full pipeline latency < 300ms (CPU, excl. LLM).
+- [x] **No regression** on Phase 1b/2b retrieval + routing tests.
+- [x] Session save/load round-trip preserves state.
+- [x] ADRs 006/007 written.
+- [x] All public APIs documented (Google-style docstrings).
+- [x] **de-wonk clean** (no CRITICAL/HIGH/MEDIUM): no untrained-dead-params, no faked
       `ssm_direct`/`process_exec`/`tool_plan`/learned-gate, no TODO/stub left in scope.
 
 ---
