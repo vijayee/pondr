@@ -31,6 +31,8 @@ the package stays free of a ``sentence_transformers`` hard dep.
 from __future__ import annotations
 
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -44,6 +46,28 @@ from .state_serializer import JGSSnapshot
 # Working Memory state == a JGS snapshot (state tensors + bookkeeping). Reused,
 # not duplicated — the serializer already round-trips this exact shape.
 WorkingMemoryState = JGSSnapshot
+
+
+@dataclass(frozen=True, eq=False)
+class RingSlot:
+    """One entry in the JST ring buffer: a step output plus its provenance.
+
+    ``y`` is the step output vector (``[1, output_dim]`` — for the working_memory
+    instance, ``output_dim=256``), detached+cloned so the slot is independent of
+    the live computation graph and of later steps. ``source_id`` / ``text`` map
+    the slot back to the event/episode that produced it, so the context-builder
+    (Phase 3) can attend over slot vectors and return the *text* of the selected
+    slots rather than a continuous vector. Provenance is optional — recalled
+    episodes injected without a source id carry ``None`` (the slot is still
+    selectable; it just has no text to surface).
+
+    The slot vector dim is config-driven (``output_dim``), NOT a hardcoded 384:
+    the buffer is dimension-agnostic and stores whatever the step emits.
+    """
+
+    y: Tensor
+    source_id: Optional[str]
+    text: Optional[str]
 
 
 class WorkingMemory(JGSInstance):
@@ -61,6 +85,7 @@ class WorkingMemory(JGSInstance):
         config: Optional[InstanceConfig] = None,
         embedder: Optional[Embedder] = None,
         decay_alpha: float = 1.0,
+        ring_capacity: Optional[int] = None,
     ) -> None:
         cfg = config or INSTANCE_CONFIGS["working_memory"]
         super().__init__(backbone, cfg)
@@ -71,6 +96,13 @@ class WorkingMemory(JGSInstance):
         self.decay_alpha = float(decay_alpha)
         self._input_count = 0
         self._metadata: dict[str, object] = {}
+        # JST ring buffer of recent step outputs with provenance. Capacity is
+        # config-driven (``InstanceConfig.ring_capacity``); the ``ring_capacity``
+        # kwarg overrides the config for tests. 0 = OFF: no buffer is allocated
+        # and step() does no extra work, so the shipped Phase 2c path is
+        # byte-identical. K>0 retains the last K slots (FIFO).
+        self._ring_capacity = int(ring_capacity) if ring_capacity is not None else int(cfg.ring_capacity)
+        self._ring: deque[RingSlot] = deque(maxlen=self._ring_capacity)
 
     # ── state evolution ──
 
@@ -78,6 +110,9 @@ class WorkingMemory(JGSInstance):
         self,
         input_embedding: Tensor,
         retrieved_embeddings: Optional[list[Tensor]] = None,
+        source_id: Optional[str] = None,
+        text: Optional[str] = None,
+        retrieved_sources: Optional[list[tuple[Optional[str], Optional[str]]]] = None,
     ) -> WorkingMemoryState:
         """Step the SSM with the query embedding, then inject each retrieved
         episode embedding as a step. State evolves in place; NOT reset.
@@ -86,25 +121,43 @@ class WorkingMemory(JGSInstance):
             input_embedding: ``[1, 384]`` (or ``[384]``) — the query embedding.
             retrieved_embeddings: optional list of ``[1, 384]`` episode-summary
                 embeddings to absorb as gist after the query step.
+            source_id / text: optional provenance for the query step — the
+                episode id and source text of the input. Carried into the ring
+                buffer (when ``ring_capacity > 0``) so the context-builder can map
+                a selected slot back to its text. Ignored when the ring is OFF.
+            retrieved_sources: optional parallel list of ``(source_id, text)``
+                tuples, one per ``retrieved_embeddings`` entry, carrying each
+                recalled episode's provenance into its ring slot. ``None`` (the
+                default) means injected recalls carry ``None`` provenance.
 
         Returns:
             A detached ``WorkingMemoryState`` snapshot (clones; caller-independent
             of the live state).
         """
-        self.step(input_embedding)
+        self.step(input_embedding, source_id=source_id, text=text)
         self._input_count += 1
         if retrieved_embeddings:
-            for emb in retrieved_embeddings:
-                self.inject(emb)
+            if retrieved_sources is not None and len(retrieved_sources) != len(retrieved_embeddings):
+                raise ValueError(
+                    f"retrieved_sources length ({len(retrieved_sources)}) must match "
+                    f"retrieved_embeddings length ({len(retrieved_embeddings)}) — a mismatch "
+                    "would silently drop or misalign episode steps."
+                )
+            srcs = retrieved_sources if retrieved_sources is not None else [None] * len(retrieved_embeddings)
+            for emb, src in zip(retrieved_embeddings, srcs):
+                sid, txt = src if isinstance(src, tuple) else (None, None)
+                self.inject(emb, source_id=sid, text=txt)
         return self.snapshot()
 
-    def inject(self, embedding: Tensor) -> None:
+    def inject(self, embedding: Tensor, source_id: Optional[str] = None, text: Optional[str] = None) -> None:
         """One SSM step with ``embedding`` without incrementing ``input_count``.
 
         Used to absorb retrieved episodes (and, in the chunker, secondary chunks)
         into the recurrent state as gist. Does not reset; mutates ``self.state``.
+        ``source_id`` / ``text`` carry the recalled episode's provenance into the
+        ring buffer (when ``ring_capacity > 0``); ignored when the ring is OFF.
         """
-        self.step(embedding)
+        self.step(embedding, source_id=source_id, text=text)
 
     def _apply_decay(self) -> None:
         """Post-step forget factor on the recurrent state.
@@ -121,16 +174,24 @@ class WorkingMemory(JGSInstance):
         if self.decay_alpha != 1.0 and self.state is not None:
             self.state = [self.decay_alpha * s for s in self.state]
 
-    def step(self, input_embedding: Tensor, context=None):  # type: ignore[override]
-        """Wrap ``JGSInstance.step`` to apply ``decay_alpha`` after each step.
+    def step(self, input_embedding: Tensor, context=None, source_id=None, text=None):  # type: ignore[override]
+        """Wrap ``JGSInstance.step`` to apply ``decay_alpha`` and record the ring.
 
         The SSM step already mixes the new input into the state; ``decay_alpha``
         is an additional global forget factor applied post-step (not a second EMA
-        — that would double-apply). Returns the same ``(output, predicted, gate
-        decision)`` triple as the base instance.
+        — that would double-apply). When ``ring_capacity > 0``, the step output is
+        detached+cloned into the ring buffer with its provenance. The ring append
+        is strictly post-step and post-decay; it never touches the state
+        computation, so the K=0 path is byte-identical to Phase 2c.
+
+        Returns the same ``(output, predicted, gate decision)`` triple as the base
+        instance (the triple is unchanged; the ring records ``output`` only).
         """
         result = super().step(input_embedding, context)
         self._apply_decay()
+        if self._ring_capacity > 0:
+            output, _predicted, _decision = result
+            self._ring.append(RingSlot(output.detach().clone(), source_id, text))
         return result
 
     # ── snapshot / restore / reset ──
@@ -182,6 +243,46 @@ class WorkingMemory(JGSInstance):
         self.reset_state(1)
         self._input_count = 0
         self._metadata = {}
+        self._ring.clear()
+
+    # ── JST read-out: ring buffer + live state ──
+
+    @property
+    def ring_capacity(self) -> int:
+        """Configured ring capacity (K). 0 = OFF (no buffer, byte-identical)."""
+        return self._ring_capacity
+
+    def ring_buffer(self) -> list[RingSlot]:
+        """Read-only snapshot of the current ring contents (oldest-first).
+
+        Returns a list (not the internal deque) so callers can iterate without
+        the ring mutating under them. Empty when ``ring_capacity == 0`` or before
+        any step. The slot tensors are detached clones; mutating them does not
+        affect the live state (and the live state does not affect them).
+        """
+        return list(self._ring)
+
+    def state_tensors(self) -> list[Tensor]:
+        """Live per-layer recurrent state for read-only head use.
+
+        Returns ``self.state`` directly — the live, on-device per-layer state
+        (one ``[1, d_state=16, d_model=384]`` tensor per SSM layer). The tensors
+        are already detached (the SSM detaches after each step — no BPTT), so a
+        head treating this as a frozen input feature gets gradients into its own
+        params only, not into the (frozen) backbone. This is the head-facing
+        accessor; it is distinct from ``snapshot()``, which detaches+clones+CPU-
+        copies for serialization.
+
+        Contract: READ-ONLY. Do not mutate the returned list or tensors — the
+        SSM steps in place against this state. Raises if ``state`` is ``None``
+        (call ``reset()`` or ``update()`` first so shapes/device/dtype are known).
+        """
+        if self.state is None:
+            raise ValueError(
+                "WorkingMemory.state is None — call reset() or update() before "
+                "reading state_tensors so the per-layer shapes/device/dtype are known."
+            )
+        return self.state
 
     # ── bookkeeping ──
 

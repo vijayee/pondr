@@ -62,6 +62,12 @@ class InstanceConfig:
     d_state: int = 16
     lora_rank: int = 4
     gate_config: GateConfig = field(default_factory=GateConfig)
+    # JST ring buffer: how many recent step outputs (with provenance back to
+    # the episode that produced them) to retain for the context-builder to
+    # select from. 0 = OFF (the shipped Phase 2c behavior, byte-identical). The
+    # buffer is a temporal lookback window (K); it is NOT the SSM channel depth
+    # (d_state=16). See docs/JST-architecture-proposal.md §4.4.
+    ring_capacity: int = 0
 
 
 # The 8 cognitive functions that will be instantiated in Phases 2b-7b. Defined
@@ -81,6 +87,7 @@ INSTANCE_CONFIGS: dict[str, InstanceConfig] = {
         input_dim=384, output_dim=256,
         lora_rank=8,  # rich state
         gate_config=GateConfig(num_context_features=2),  # input_novelty, state_saturation
+        ring_capacity=0,  # JST ring buffer OFF by default (byte-identical to Phase 2c)
     ),
     "presentation_gate": InstanceConfig(
         name="presentation_gate",
