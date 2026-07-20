@@ -65,6 +65,7 @@ def build_ponder(
     relevance_head_path: Optional[str] = None,
     graduation_proxy: bool = False,
     ring_capacity: int = 0,
+    context_builder_path: Optional[str] = None,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -109,6 +110,16 @@ def build_ponder(
             state; pass K>0 (e.g. 16) to turn it on at serve. Provenance
             (episode_id + summary) is threaded into each recalled-episode
             inject so the ring slots carry ``source_id``/``text``.
+        context_builder_path: optional STRM Phase 3 context-builder checkpoint
+            (``best.pt`` from ``scripts/train_context_builder.py`` -- the
+            learned PresentationGate selector/reranker). When set, the
+            orchestrator attends over the WM ring with the 2a ``r_i`` as a
+            bias and selects top-m primary context instead of the heuristic
+            PresentationGate. Requires the ring ON (``ring_capacity > 0``) AND
+            a loaded relevance head (``relevance_head_path``); the orchestrator
+            falls back to the heuristic PresentationGate on any exception, empty
+            ring, or no matching slots, so the turn never crashes. ``None``
+            (default) -> heuristic PresentationGate (byte-identical to pre-3).
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -176,6 +187,18 @@ def build_ponder(
         from .subconscious.relevance_head import load_relevance_head
         relevance_head = load_relevance_head(relevance_head_path, device=device)
 
+    # STRM Phase 3 context-builder (optional, the learned PresentationGate).
+    # Loaded only when a checkpoint path is given (default off, mirroring the
+    # 2a relevance head + --doc-kind-ensemble). The builder reads ring slots +
+    # a query at serve -- no backbone -- so it loads independently of the frozen
+    # backbone. Requires the 2a relevance head (the builder's r_i bias comes
+    # from it) -- serve_ponder warns + the orchestrator falls back to the
+    # heuristic PresentationGate if the builder flag is set without the head.
+    context_builder = None
+    if context_builder_path:
+        from .subconscious.context_builder import load_context_builder
+        context_builder = load_context_builder(context_builder_path, device=device)
+
     # STRM Phase 2d v1 graduation proxy (optional, parameter-free). Attached
     # only when graduation_proxy is True (default off). No checkpoint -- the
     # proxy is the integral(r_i dt) heuristic the v2 head must beat. Full
@@ -197,6 +220,7 @@ def build_ponder(
         relevance_head=relevance_head,
         graduation_proxy=graduation_proxy_head,
         ring_capacity=ring_capacity,
+        context_builder=context_builder,
     )
     return orch
 

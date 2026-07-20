@@ -50,14 +50,16 @@ from .retrieval.expand_handler import ExpandHandler
 from .retrieval.prompt_compress import compress_prompt_for_planning
 from .retrieval.retriever import HippocampalRetriever
 from .subconscious.presentation_gate import (
-    PresentationGate, PresentationOutcome,
+    CHUNKED, DIRECT, PresentationGate, PresentationOutcome, PresentationPlan,
 )
 from .subconscious.ssm_chunker import SSMChunker
 from .subconscious.state_serializer import (
     deserialize, serialize, snapshot_from_instance,
 )
 from .subconscious.recoverability_head import pool_state_tensors
-from .subconscious.relevance_score import score_ring_slots
+from .subconscious.relevance_score import (
+    score_ring_slots, score_ring_slots_with_doc_embs,
+)
 from .subconscious.working_memory import WorkingMemory, WorkingMemoryState
 from .tools import (
     LOOP_TOOLS, SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
@@ -172,6 +174,7 @@ class PonderOrchestrator:
         relevance_head=None,
         graduation_proxy=None,
         ring_capacity: Optional[int] = None,
+        context_builder=None,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -190,6 +193,15 @@ class PonderOrchestrator:
         # Phase 4's LTM-promotion path consumes the decision. ``None`` (default,
         # flag off) -> no graduation scoring at serve (byte-identical to pre-2d).
         self.graduation_proxy = graduation_proxy
+        # STRM Phase 3 context-builder (optional, DI like the relevance head).
+        # When wired it attends over the WM ring with the 2a ``r_i`` as an
+        # additive bias and selects top-m primary context instead of the
+        # heuristic PresentationGate (see ``_plan_with_context_builder``).
+        # Requires the ring ON + a relevance head; any exception / empty ring /
+        # no matching slots falls back to the heuristic so the turn never
+        # crashes. ``None`` (default, flag off) -> heuristic PresentationGate
+        # (byte-identical to pre-3).
+        self.context_builder = context_builder
         # Live-encode (2026-07-14): persist each exchange as an episode. The
         # encoder is injected (DI pattern, like retriever/mode_a/embedder) -- a
         # caller that wants live-encode constructs a ``HippocampalEncoder`` and
@@ -386,10 +398,34 @@ class PonderOrchestrator:
                 print(f"[graduation-replay-fail] {e}", file=sys.stderr)
 
         # 5. Presentation Gate axis (a): chunking strategy.
-        presentation_plan = self.presentation_gate.plan(
-            user_prompt, episodes, working_memory=wm_snapshot,
-            retrieval_gate_pathway=pathway,
-        )
+        # STRM Phase 3: when the context-builder is wired AND the ring is on AND
+        # a 2a relevance head is loaded, attend over the WM ring with r_i as a
+        # bias and select top-m primary context instead of the heuristic
+        # PresentationGate. The builder reorders ``episodes`` (selected first) +
+        # emits a PresentationPlan with ``primary_chunk_count = m``; the chunker
+        # then takes the first m (the selected ones) as primary. Any exception,
+        # empty ring, or no matching slots falls back to the heuristic so the
+        # turn never crashes. The ``else`` branch is the pre-Phase-3 code
+        # verbatim -> byte-identical when the builder flag is off.
+        if (self.context_builder is not None
+                and self.working_memory.ring_capacity > 0
+                and self.relevance_head is not None):
+            try:
+                presentation_plan, ordered_episodes = self._plan_with_context_builder(
+                    user_prompt, episodes, prompt_emb)
+            except Exception as e:  # noqa: BLE001 - builder is best-effort
+                print(f"[context-builder-fail] {e}", file=sys.stderr)
+                presentation_plan = self.presentation_gate.plan(
+                    user_prompt, episodes, working_memory=wm_snapshot,
+                    retrieval_gate_pathway=pathway,
+                )
+                ordered_episodes = episodes
+        else:
+            presentation_plan = self.presentation_gate.plan(
+                user_prompt, episodes, working_memory=wm_snapshot,
+                retrieval_gate_pathway=pathway,
+            )
+            ordered_episodes = episodes
 
         # 6b. Presentation Gate axis (b): end state (heuristic default or override).
         end_state_plan = self.presentation_gate.plan_end_state(
@@ -399,7 +435,7 @@ class PonderOrchestrator:
         )
 
         # 7. chunk → ChunkedContext.
-        chunked = self.ssm_chunker.chunk(episodes, presentation_plan)
+        chunked = self.ssm_chunker.chunk(ordered_episodes, presentation_plan)
 
         # 8/9. format + dispatch on end state.
         # Reset the expand handler's per-query counter for the outcome signal.
@@ -735,6 +771,107 @@ class PonderOrchestrator:
                     "later_needed": None,
                 }
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    # ── STRM Phase 3: learned context-builder (learned PresentationGate) ──
+
+    def _plan_with_context_builder(
+        self,
+        user_prompt: str,
+        episodes: list[dict],
+        prompt_emb: Tensor,
+    ) -> tuple[PresentationPlan, list[dict]]:
+        """Attend over the WM ring with the 2a ``r_i`` as a bias and select
+        top-m primary context. Returns ``(PresentationPlan, ordered_episodes)``
+        where ``ordered_episodes`` is ``episodes`` reordered with the builder-
+        selected ones first and the plan's ``primary_chunk_count = m``.
+
+        Caller guards: this is only invoked when ``self.context_builder`` is
+        wired, the ring is ON, and a 2a relevance head is loaded. Any failure
+        here (empty ring, no matching slots, builder exception) propagates to
+        the ``try/except`` at the call site, which falls back to the heuristic
+        PresentationGate so the turn never crashes.
+
+        The builder attends over WM ring slots that (a) carry text AND (b) map
+        to a retrieved episode via ``source_id``. Episodes with no ring slot
+        stay compressed (no ``y_t`` to score); ring slots with no matching
+        retrieved episode are excluded (not surfaced -- avoids a context leak).
+        """
+        if not episodes:
+            # nothing to plan -- let the caller's heuristic fallback handle it
+            raise RuntimeError("no episodes to plan with")
+
+        slots = self.working_memory.ring_buffer()
+        if not slots:
+            raise RuntimeError("WM ring empty (ring off / not yet populated)")
+
+        # Only ring slots that map to a retrieved episode AND carry text can be
+        # scored + surfaced. Episodes are dicts with ``episode_id``.
+        ep_ids = {ep.get("episode_id") for ep in episodes if ep.get("episode_id")}
+        matching = [s for s in slots
+                    if s.source_id in ep_ids and s.text and str(s.text).strip()]
+        if not matching:
+            raise RuntimeError("no ring slots map to a retrieved episode with text")
+
+        # r_i for the matching slots (frozen 2a head) + the re-embedded doc
+        # vectors the builder's W_doc path fuses. ``score_ring_slots_with_doc_embs``
+        # is the same r_i loop as the graduation logger's ``score_ring_slots``;
+        # the doc_embs are slot-aligned (None where unscored, but ``matching``
+        # has no None-text slots so all are scored).
+        m_slots, r_is, doc_embs = score_ring_slots_with_doc_embs(
+            self.working_memory, self.relevance_head, self.embedder,
+            prompt_emb, slots=matching,
+        )
+
+        # Stack the per-slot tensors the builder consumes. ``s.y`` is [1,256];
+        # squeeze to [256]. ``r`` defaults to 0.5 where r_i is None (defensive --
+        # matching slots all have text so r_i should be non-None, but a None
+        # head/embedder path returns None and we degrade rather than crash).
+        slots_y = torch.stack(
+            [s.y.to(torch.float32).squeeze(0).reshape(-1) for s in m_slots]
+        )                                                            # [K, 256]
+        slots_doc_emb = torch.stack(
+            [e.to(torch.float32).squeeze(0).reshape(-1) for e in doc_embs
+             if e is not None]
+        )                                                            # [K, 384]
+        r = torch.tensor(
+            [ri if ri is not None else 0.5 for ri in r_is],
+            dtype=torch.float32,
+        )                                                            # [K]
+
+        # Builder selects top-m slot indices (descending score). ``m`` is the
+        # builder's serve-time fixed top_m (from the checkpoint); clamped to K
+        # + to len(episodes) inside predict (topk clamps to K).
+        top_m_idx, _ = self.context_builder.predict(
+            slots_y, slots_doc_emb, prompt_emb, r,
+        )
+        if not top_m_idx:
+            raise RuntimeError("context-builder returned no selection")
+
+        # Map selected slot indices -> source_ids -> retrieved episodes, reorder
+        # (selected first), preserving first-seen order within each group.
+        selected_ids = [m_slots[i].source_id for i in top_m_idx]
+        ep_by_id = {ep.get("episode_id"): ep
+                    for ep in episodes if ep.get("episode_id")}
+        selected_eps = [ep_by_id[sid] for sid in selected_ids if sid in ep_by_id]
+        # de-dup by episode_id (a source_id could in principle map to one ep)
+        seen: set = set()
+        selected_eps = [e for e in selected_eps
+                        if not (e.get("episode_id") in seen
+                                or seen.add(e.get("episode_id")))]
+        selected_id_set = {e.get("episode_id") for e in selected_eps}
+        rest = [ep for ep in episodes if ep.get("episode_id") not in selected_id_set]
+        ordered = selected_eps + rest
+
+        m = min(len(selected_eps), len(episodes))
+        strategy = DIRECT if m >= len(ordered) else CHUNKED
+        return PresentationPlan(
+            strategy=strategy,
+            primary_chunk_count=m,
+            primary_chunk_size=0,
+            compressed_chunk_count=max(0, len(ordered) - m),
+            expand_threshold=self.presentation_gate.cfg.expand_threshold,
+            rationale=f"context-builder: {m} selected of {len(matching)} ring slots",
+        ), ordered
 
     # ── Phase 2c+: feedback salience + consumer tool surface ──
 

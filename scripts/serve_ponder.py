@@ -162,6 +162,14 @@ def main() -> int:
                         "relevance head + graduation replay logger need the ring "
                         "ON to populate per-slot state; pass K>0 (e.g. 16) when "
                         "running --strm-relevance-head or --strm-graduation-logging.")
+    p.add_argument("--strm-context-builder", default=None,
+                   help="optional STRM Phase 3 context-builder checkpoint (best.pt, "
+                        "the learned PresentationGate selector/reranker). When set, "
+                        "the orchestrator attends over the WM ring with the 2a r_i "
+                        "as a bias and selects top-m primary context instead of the "
+                        "heuristic PresentationGate. Requires --strm-relevance-head "
+                        "AND --strm-ring-capacity > 0; otherwise warns + falls back "
+                        "to the heuristic. DEFAULT OFF (byte-identical to pre-3).")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -184,6 +192,23 @@ def main() -> int:
               "--strm-ring-capacity 16 (or similar), or the relevance head scores "
               "an empty ring and the replay logger writes nothing.",
               file=sys.stderr)
+    # STRM Phase 3 context-builder: requires the ring ON + a 2a relevance head
+    # (the builder's r_i bias comes from it). Warn on either missing; the
+    # orchestrator also falls back to the heuristic PresentationGate at runtime,
+    # so this is a warning, not a hard error (matches the 2a/2d flag style).
+    if args.strm_context_builder:
+        if args.strm_ring_capacity <= 0:
+            print("WARNING: --strm-context-builder needs the WM ring ON "
+                  "(--strm-ring-capacity > 0) to attend over ring slots, but "
+                  "the ring is OFF. The orchestrator will fall back to the "
+                  "heuristic PresentationGate. Pass --strm-ring-capacity 16.",
+                  file=sys.stderr)
+        if not args.strm_relevance_head:
+            print("WARNING: --strm-context-builder needs --strm-relevance-head "
+                  "(its r_i bias comes from the 2a relevance head), but no "
+                  "relevance head is set. The orchestrator will fall back to "
+                  "the heuristic PresentationGate. Pass --strm-relevance-head "
+                  "PATH.", file=sys.stderr)
 
     backbone_path = Path(args.backbone)
     if not backbone_path.exists():
@@ -201,6 +226,14 @@ def main() -> int:
                   f"{relevance_head_path}", file=sys.stderr)
             return 1
         relevance_head_path = str(relevance_head_path)
+    context_builder_path = None
+    if args.strm_context_builder:
+        context_builder_path = Path(args.strm_context_builder)
+        if not context_builder_path.exists():
+            print(f"ERROR: STRM context-builder checkpoint not found at "
+                  f"{context_builder_path}", file=sys.stderr)
+            return 1
+        context_builder_path = str(context_builder_path)
 
     print(f"[load] backbone={backbone_path}", file=sys.stderr)
     print(f"[load] gate={gate_path}", file=sys.stderr)
@@ -213,7 +246,8 @@ def main() -> int:
           f"strm_relevance_logging={args.strm_relevance_logging} "
           f"strm_graduation_proxy={args.strm_graduation_proxy} "
           f"strm_graduation_logging={args.strm_graduation_logging} "
-          f"strm_ring_capacity={args.strm_ring_capacity}", file=sys.stderr)
+          f"strm_ring_capacity={args.strm_ring_capacity} "
+          f"strm_context_builder={context_builder_path or '(off)'}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -229,6 +263,7 @@ def main() -> int:
         relevance_head_path=relevance_head_path,
         graduation_proxy=args.strm_graduation_proxy,
         ring_capacity=args.strm_ring_capacity,
+        context_builder_path=context_builder_path,
     )
 
     try:
