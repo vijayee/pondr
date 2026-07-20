@@ -17,13 +17,22 @@ reason it is deferred. Nothing here is claimed as done.
 
 ## Why deferred (common prerequisites)
 
-- **Bonsai is DOWN.** The local 8B `llama-server` was killed at the user's
-  request (gaming) — see memory `hippo-bonsai-local-server`. Every item that
-  hits the Bonsai endpoint (`localhost:8080/v1`) is blocked until it is
-  restarted.
-- **No Oracle budget approved.** The Oracle is DeepSeek-v4-flash via Ollama
-  (`localhost:11434/v1`, `think=False`); gate/label generation at 200k
-  examples is ~$20 of tokens but the spend was not approved for this pass.
+- **Bonsai status (runtime, not generation).** The local 8B `llama-server`
+  (`localhost:8080/v1`) was killed at the user's request (gaming) — see memory
+  `hippo-bonsai-local-server` — and restarted 2026-07-19 for the live dogfood.
+  Note: **none of the generation follow-ups below actually need Bonsai.** The
+  training-data generators use the **Oracle** (DeepSeek) as the teacher; the
+  8B Bonsai is the *student* the data trains, served by Bonsai only at runtime
+  (live dogfood / `serve_ponder`). Bonsai up is incidental to generation.
+  (Earlier draft of this doc mislabeled 1d-2/1d-3 as "Bonsai-dependent" —
+  corrected 2026-07-19 after reading `make_oracle` + the 1d-2 cache.)
+- **Oracle status + budget.** The Oracle is DeepSeek via Ollama
+  (`localhost:11434/v1`, `think=False`); up 2026-07-19. **Use
+  `deepseek-v4-flash:cloud`** (memory `deepseek-flash-over-pro`), not the
+  `deepseek-v4-pro:cloud` config default — the cost-tracker records $0 for
+  `:cloud` models (no price table), so do NOT read $0.0000 as free. Full-scale
+  gate/label generation (200k examples) is real spend, not approved for this
+  pass; the validate-slices below are cheap on flash.
 - **No GPU pod.** Retrains (GNN, linkpred, LoRA) need an L4/A5000 pod with
   `torch_geometric>=2.8` and the `[gnn]` extra; the local box is CPU-dev.
 - **`data/` is gitignored** and lives off-disk (HF `vijayee/pondr-datasets`,
@@ -53,18 +62,56 @@ generators run + the trainers load). The production-scale runs are deferred.
   giant-component bug) verified not to recur at scale.
 
 ### 1d-2 Bonsai query + relation pairs — 5k query / 2k relation
-- **Command:** `python scripts/generate_bonsai_training_data.py` (needs Bonsai
-  up — it generates by querying the 8B).
-- **Prerequisites:** Bonsai up. **Budget:** Bonsai GPU time (5k+2k calls).
-- **Why deferred:** files absent; Bonsai down.
+- **Command:** `python scripts/generate_bonsai_training_data.py
+  --oracle-model deepseek-v4-flash:cloud` (the teacher is the **Oracle**
+  via Ollama `localhost:11434`; the 8B Bonsai is the *student* the pairs
+  train, NOT the thing queried. "Bonsai" in the generator/prompt names = the
+  target, not the teacher).
+- **Prerequisites:** Oracle (DeepSeek) up — NOT Bonsai. **Budget:** Oracle
+  tokens (use **flash**, not the `deepseek-v4-pro:cloud` default — see memory
+  `deepseek-flash-over-pro`; the cost-tracker records $0 for `:cloud` models
+  because it has no price table for them, so do NOT read $0.0000 as free).
+- **Validate-slice RAN 2026-07-19:** `--num-query-pairs 10
+  --num-relation-pairs 10` → 10 query-planning + 10 relation-extraction
+  pairs, ~20 new Oracle calls (much served from the persistent
+  `.oracle_cache.json`), `quality_report.json` written. Generator works
+  end-to-end against the Oracle. (Slice used the pro default; full run uses
+  flash.)
+- **Why deferred:** the full 5k+2k run is hours of Oracle calls + the
+  output is gitignored (HF backup); the slice proves the generator.
 
 ### 1d-3 anomaly_decision_pairs
-- **Command:** run the anomaly-decision pass (Bonsai up; the decider is the 8B
-  `decide_anomaly` path).
-- **Prerequisites:** Bonsai up. **Budget:** Bonsai GPU time.
-- **Why deferred:** the file is empty (cold-start); Bonsai down. The anomaly
-  *labels* are Oracle-FREE (1d-1), but the *decision pairs* distill the 8B
-  decider.
+- **Command:** `python scripts/generate_gnn_training_data.py
+  --oracle-model deepseek-v4-flash:cloud --heads anomaly --num-subgraphs 3
+  --subgraph-radius 1 --anomaly-radius 1 --anomaly-fanout-cap 16
+  --max-decision-pairs-per-subgraph 5` WITHOUT
+  `--skip-anomaly-decision-pairs` — the decision pairs are a sub-task of the
+  GNN generator (`_run_anomaly_decision` at line 379), produced from the SAME
+  injected anomalies as the anomaly head. Use `--subgraph-radius 1` for a
+  slice; radius-3 hits the giant-component landmine (memory
+  `hippo-phase3a-head-fixes`).
+- **Prerequisites:** Oracle (DeepSeek-flash via Ollama `localhost:11434`) up.
+  The *teacher* is the **Oracle**, NOT the 8B — `run_batches(oracle, ...)` in
+  `_run_anomaly_decision`. The 8B `decide_anomaly`
+  (`src/gnn/bonsai_decider.py:190`) is the *student* the pairs distill INTO.
+  (Earlier draft of this doc mis-stated the prereq as Bonsai — corrected
+  2026-07-19 after reading the generator.)
+- **Budget:** Oracle tokens (cheap on flash; ~$0 if a local Ollama model is
+  used). Coupled to the GNN radius-fanout, so the pod/CPU cost of 1d-1 applies
+  too.
+- **Validate-slice RAN 2026-07-19** (`--heads anomaly --num-subgraphs 3
+  --subgraph-radius 1 --anomaly-radius 1 --anomaly-fanout-cap 16
+  --max-decision-pairs-per-subgraph 5 --oracle-model deepseek-v4-flash:cloud`):
+  3 radius-1 subgraphs (max 10 nodes — NO giant-component), 3 anomaly records
+  (Oracle-FREE injection) + 15 decision candidates → **15 anomaly_decision_pairs**
+  distilled via the Oracle flash teacher (15 calls, 24084 tokens). Record
+  shape verified: `{flagged_entity, retrieved_context, anomaly_type, decision,
+  action, reasoning}`; sample decision `ask_user` on a `contradictory_state`
+  anomaly (consistent with the shipped 877d29e guards). Generator works
+  end-to-end.
+- **Why deferred:** the file is empty (cold-start). The anomaly *labels* are
+  Oracle-FREE (1d-1 injection), but the *decision pairs* use the Oracle
+  teacher.
 
 ### 1d-4 gates — 50k each × 4 gates (incl. the new CSR)
 - **Command:** `python scripts/generate_gate_training_data.py --num-examples 200000`

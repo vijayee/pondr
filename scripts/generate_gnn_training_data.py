@@ -615,11 +615,12 @@ def main() -> int:
             print(f"  anomaly: {len(anomaly_records)} records (0 Oracle calls), "
                   f"{len(decision_items)} decision candidates")
 
-        # ── 5. anomaly_decision_pairs — Bonsai distillation data (spec §2.5) ──
+        # ── 5. anomaly_decision_pairs — distillation data for the 8B Bonsai
+        #    decide_anomaly STUDENT; the teacher is the Oracle (spec §2.5) ──
         if "anomaly" not in requested:
             all_stats["anomaly_decision"] = {"skipped": True}
         else:
-            print(f"\n{'=' * 60}\nGenerating anomaly_decision_pairs (Bonsai)...\n{'=' * 60}")
+            print(f"\n{'=' * 60}\nGenerating anomaly_decision_pairs (Oracle teacher)...\n{'=' * 60}")
             _, decision_stats = _run_anomaly_decision(oracle, decision_items, bonsai_output_dir, args)
             all_stats["anomaly_decision"] = decision_stats
             print(f"  anomaly_decision: {decision_stats.get('labeled', 0)} pairs, "
