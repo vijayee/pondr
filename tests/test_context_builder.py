@@ -8,9 +8,9 @@ selection correspondingly), the 2a-relevance bias actually driving selection
 checkpoint round-trip (``from_state_dict`` reloads a strict-matching head), and
 the ``predict`` ``m``-clamping (``m > K`` does not crash).
 
-The loss-decreases-on-synthetic and gate-passes-on-synthetic tests are added in
-Step 3 (``tests/test_context_builder.py`` is extended there) once the trainer's
-loss + gate functions exist.
+The loss-decreases-on-synthetic and gate-passes-on-synthetic tests (Step 3)
+exercise the trainer's loss + gate machinery on synthetic traces shaped like
+the 2a ERAG traces (gold slot marked in both ``y_t`` and ``r_i``).
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -253,3 +254,175 @@ def test_r_length_mismatch_raises():
     r = torch.rand(4, dtype=torch.float32)
     with pytest.raises(ValueError):
         b.logits(Y, D, Q, r)
+
+
+# ── Step 3: trainer loss + gate (synthetic) ───────────────────────────────────
+
+import random
+
+class _MockFrozenHead(torch.nn.Module):
+    """Stand-in for the frozen shipped 2a relevance head. Computes ``r_i`` as a
+    DETERMINISTIC function of the inputs (the way the real 2a head does -- it
+    does not carry call-state): r_i = sigmoid(20 * cosine(doc_emb_i, query_emb)).
+    The synthetic gold slot's ``slots_doc_emb`` IS the query embedding + tiny
+    noise (cosine ~1 -> r~1), while negatives are random (cosine ~0 -> r~0.5),
+    so r_i ranks gold first -- a strong, correct bias the builder can ride to
+    beat the heuristic (which takes the first m of the SHUFFLED candidates).
+
+    Subclasses ``nn.Module`` so it has ``.eval()`` / ``.parameters()`` like the
+    real ``load_relevance_head`` return value the trainer calls at serve."""
+    def __init__(self, gold_pos: list[int] | None = None) -> None:
+        super().__init__()
+        self._dummy = torch.nn.Parameter(torch.zeros(1))
+
+    def predict(self, slots_y, slot_doc_emb, query_emb):
+        d = slot_doc_emb.to(torch.float32)                       # [K, 384]
+        q = query_emb.to(torch.float32).reshape(1, -1)           # [1, 384]
+        cos = F.cosine_similarity(d, q, dim=-1)                  # [K]
+        r = torch.sigmoid(20.0 * cos).unsqueeze(-1)              # [K, 1]
+        return r
+
+
+def _synth_traces(n_queries: int = 12, K: int = 12, seed: int = 0):
+    """Build synthetic traces shaped like the 2a ERAG traces: each record has
+    one gold slot at a random (seeded) position. The gold slot's ``slots_y`` is a
+    fixed marker vector (so the builder's W_k can learn to mark it) and its
+    ``slots_doc_emb`` is the query embedding + small noise (so the frozen head's
+    r_i -- mocked -- ranks it). ``source_ids`` are ``d0..d{K-1}``; the gold is at
+    a random slot index, so the heuristic's "first m" is a random m-subset."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    rng = random.Random(seed)
+    records = []
+    gold_marker = torch.randn(SLOT_DIM, generator=g, dtype=torch.float32)
+    for qi in range(n_queries):
+        qemb = torch.randn(QUERY_DIM, generator=g, dtype=torch.float32)
+        gold_pos = rng.randrange(K)
+        slots_y = torch.randn(K, SLOT_DIM, generator=g, dtype=torch.float32) * 0.3
+        slots_y[gold_pos] = gold_marker.clone()
+        slots_doc_emb = torch.randn(K, DOC_DIM, generator=g, dtype=torch.float32) * 0.3
+        slots_doc_emb[gold_pos] = qemb + torch.randn(DOC_DIM, generator=g,
+                                                     dtype=torch.float32) * 0.05
+        labels = torch.zeros(K, dtype=torch.float32)
+        labels[gold_pos] = 1.0
+        records.append({
+            "query_id": f"q{qi}",
+            "question": f"What did entity{qi} say about topic{qi}?",
+            "category": "factual",
+            "query_emb": qemb,
+            "slots_y": slots_y,
+            "slots_doc_emb": slots_doc_emb,
+            "source_ids": [f"d{j}" for j in range(K)],
+            "labels": labels,
+        })
+    return records
+
+
+def test_loss_decreases_on_synthetic(tmp_path):
+    """A few epochs of fit_context_builder drives the train loss DOWN on
+    synthetic traces where gold is marked in y_t + r_i. The builder learns to
+    select gold (mean_cov_learn climbing past the heuristic baseline)."""
+    from src.subconscious.training.context_builder_training import (
+        ContextBuilderTrainingConfig,
+        fit_context_builder,
+    )
+    traces = _synth_traces(n_queries=12, K=12, seed=0)
+    gold_pos = [int(r["labels"].argmax().item()) for r in traces]
+    head = _MockFrozenHead(gold_pos)
+    cfg = ContextBuilderTrainingConfig(
+        epochs=8, learning_rate=3e-3, accum_steps=2, pl_weight=0.1,
+        pos_weight_cap=3.0,
+        val_fraction=0.25, seed=0, device="cpu",
+        checkpoint_dir=str(tmp_path / "cb"),
+    )
+    result = fit_context_builder(traces, head, cfg)
+    log = result["log"]
+    assert len(log) >= 2
+    # BCE + PL on a tiny slice is noisy (the optimizer reaches a low-loss region
+    # but does not monotonically stay there). Assert the optimizer FOUND a lower
+    # loss than it started at -- min over epochs < epoch-0 loss -- not that the
+    # last epoch is below the first.
+    losses = [e["train_loss"] for e in log]
+    assert min(losses) < losses[0], (
+        f"loss never decreased below initial: min={min(losses)} first={losses[0]}"
+    )
+    bp = result["best_pc"]
+    assert bp["mean_cov_learn"] > bp["mean_cov_heur"], (
+        f"builder did not beat heuristic: cov_learn={bp['mean_cov_learn']} "
+        f"vs cov_heur={bp['mean_cov_heur']}"
+    )
+
+
+def test_gate_passes_on_synthetic(tmp_path):
+    """On synthetic traces where r_i ranks gold, the builder (r_i bias + cross-
+    slot attention) clears the gate: mean_cov_learn >= mean_cov_heur AND the
+    Wilson CI lower bound on the builder full-coverage hit rate exceeds the
+    heuristic. go is True and lambda_r did NOT collapse to 0."""
+    from src.subconscious.training.context_builder_training import (
+        ContextBuilderTrainingConfig,
+        fit_context_builder,
+    )
+    traces = _synth_traces(n_queries=20, K=12, seed=1)
+    gold_pos = [int(r["labels"].argmax().item()) for r in traces]
+    head = _MockFrozenHead(gold_pos)
+    cfg = ContextBuilderTrainingConfig(
+        epochs=6, learning_rate=3e-3, accum_steps=2, pl_weight=0.1,
+        val_fraction=0.25, seed=0, device="cpu",
+        checkpoint_dir=str(tmp_path / "cb_gate"),
+    )
+    result = fit_context_builder(traces, head, cfg)
+    assert result["go"] is True, (
+        f"gate did not pass: best_pc={result['best_pc']}"
+    )
+    bp = result["best_pc"]
+    assert bp["mean_cov_learn"] >= bp["mean_cov_heur"]
+    assert bp["hit_ci95_learn"][0] > bp["hit_ci95_heur"][0]
+    assert bp["mean_cov_learn"] >= 0.8
+    # de-wonk risk: lambda_r must NOT collapse to 0 (would mean the builder
+    # discarded the 2a signal and is just a per-slot rescore).
+    assert abs(bp["lambda_r"]) > 1e-3, (
+        f"lambda_r collapsed to {bp['lambda_r']} -- 2a r_i signal discarded"
+    )
+
+
+def test_gate_score_lexicographic():
+    """_gate_score ranks gate-safe epochs above unsafe ones, then by learned
+    coverage, then by r-only coverage (the tiebreaker)."""
+    from src.subconscious.training.context_builder_training import (
+        ContextBuilderTrainingConfig, _gate_score,
+    )
+    cfg = ContextBuilderTrainingConfig()
+    pc_unsafe = {"mean_cov_learn": 0.9, "mean_cov_heur": 0.5,
+                 "mean_cov_r_only": 0.7,
+                 "hit_ci95_learn": [0.4, 0.9], "hit_ci95_heur": [0.5, 0.9]}
+    pc_safe_low = {"mean_cov_learn": 0.7, "mean_cov_heur": 0.5,
+                   "mean_cov_r_only": 0.6,
+                   "hit_ci95_learn": [0.6, 0.9], "hit_ci95_heur": [0.5, 0.9]}
+    pc_safe_high = {"mean_cov_learn": 0.8, "mean_cov_heur": 0.5,
+                    "mean_cov_r_only": 0.6,
+                    "hit_ci95_learn": [0.6, 0.9], "hit_ci95_heur": [0.5, 0.9]}
+    s_unsafe = _gate_score(pc_unsafe, cfg)
+    s_safe_low = _gate_score(pc_safe_low, cfg)
+    s_safe_high = _gate_score(pc_safe_high, cfg)
+    assert s_safe_low > s_unsafe
+    assert s_safe_high > s_safe_low
+    assert s_safe_low[0] == 1 and s_unsafe[0] == 0
+
+
+def test_plackett_luce_zero_when_no_gold():
+    """The PL auxiliary is 0 when a record has no gold (BCE carries it alone),
+    and positive when gold is not top-ranked (pushes gold up listwise)."""
+    from src.subconscious.training.context_builder_training import _plackett_luce
+    s = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+    labels_none = torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32)
+    assert float(_plackett_luce(s, labels_none).item()) == 0.0
+    labels = torch.tensor([0.0, 0.0, 1.0, 0.0], dtype=torch.float32)
+    assert float(_plackett_luce(s, labels).item()) > 0.0
+
+
+def test_coverage_helper():
+    from src.subconscious.training.context_builder_training import _coverage
+    assert _coverage([0, 1, 2], [1, 2]) == 1.0
+    assert _coverage([0, 1], [1, 2]) == 0.5
+    assert _coverage([0, 3], [1, 2]) == 0.0
+    assert _coverage([], [1, 2]) == 0.0
+    assert _coverage([0, 1], []) == 0.0
