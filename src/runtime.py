@@ -64,6 +64,9 @@ def build_ponder(
     config_override: Optional[Phase2cConfig] = None,
     relevance_head_path: Optional[str] = None,
     graduation_proxy: bool = False,
+    graduation_head_path: Optional[str] = None,
+    recoverability_head_path: Optional[str] = None,
+    latent_dynamics_head_path: Optional[str] = None,
     ring_capacity: int = 0,
     context_builder_path: Optional[str] = None,
 ) -> PonderOrchestrator:
@@ -104,6 +107,34 @@ def build_ponder(
             (byte-identical to pre-2d). Full graduation -> LTM promotion is
             Phase 4; this round only makes the proxy attachable + the flag
             plumbed.
+        graduation_head_path: optional STRM Phase 2d v2 graduation-head
+            checkpoint (``best.pt`` from
+            ``scripts/train_graduation_head.py`` -- the LEARNED ``later_needed``
+            classifier the v1 proxy is the baseline for). When set,
+            ``load_graduation_head`` builds the head and it is attached to the
+            orchestrator. ``None`` (default) -> no v2 graduation head at serve
+            (byte-identical to pre-Phase-4; only the v1 proxy is attachable).
+            Completes the "full serve-wiring of all STRM heads" with the other
+            read-out heads; Phase 4's LTM-promotion path consumes the decision.
+        recoverability_head_path: optional STRM Phase 2b recoverability-head
+            checkpoint (``best.pt`` from
+            ``scripts/train_recoverability_head.py``). When set,
+            ``load_recoverability_head`` builds the head and it is attached to
+            the orchestrator. The head reads the live WM pooled state + a past
+            anchor at serve -- no backbone -- so it loads independently of the
+            frozen backbone. ``None`` (default) -> no recoverability head
+            (byte-identical to pre-Phase-4). Phase 4's salience trigger consumes
+            the ``recoverability < theta`` term (low = likely forgotten =
+            salient).
+        latent_dynamics_head_path: optional STRM Phase 2c latent-dynamics-head
+            checkpoint (``best.pt`` from
+            ``scripts/train_latent_dynamics_head.py`` -- the linear
+            ``z_{t+1} = A z_t + b`` next-state predictor). When set,
+            ``load_latent_dynamics_head`` builds the head and it is attached to
+            the orchestrator. The head reads the live WM last-layer state at
+            serve -- no backbone. ``None`` (default) -> no latent-dynamics head
+            (byte-identical to pre-Phase-4). Phase 4's salience trigger consumes
+            the ``surprise < surprise_cap`` term (high surprise -> suppress).
         ring_capacity: WM ring buffer capacity K (default 0 = OFF, byte-
             identical to Phase 2c). The STRM 2a relevance head + the 2d
             graduation replay logger need the ring ON to populate per-slot
@@ -208,6 +239,39 @@ def build_ponder(
         from .subconscious.graduation_head import GraduationProxyV1
         graduation_proxy_head = GraduationProxyV1()
 
+    # STRM Phase 2d v2 graduation head (optional, the learned later_needed
+    # classifier the v1 proxy is the baseline for). Loaded only when a
+    # checkpoint path is given (default off, mirroring the 2a relevance head).
+    # The head reads the live WM pooled state + a slot at serve -- no backbone
+    # -- so it loads independently of the frozen backbone above. Phase 4's
+    # LTM-promotion path consumes the decision; this round only wires it in
+    # (completes the full serve-wiring of all STRM read-out heads).
+    graduation_head = None
+    if graduation_head_path:
+        from .subconscious.graduation_head import load_graduation_head
+        graduation_head = load_graduation_head(graduation_head_path, device=device)
+
+    # STRM Phase 2b recoverability head (optional). Loaded only when a
+    # checkpoint path is given (default off). The head reads the live WM pooled
+    # state + a past anchor at serve -- no backbone -- so it loads independently
+    # of the frozen backbone above. Phase 4's salience trigger consumes the
+    # ``recoverability < theta`` term; this round only wires it in.
+    recoverability_head = None
+    if recoverability_head_path:
+        from .subconscious.recoverability_head import load_recoverability_head
+        recoverability_head = load_recoverability_head(
+            recoverability_head_path, device=device)
+
+    # STRM Phase 2c latent-dynamics head (optional). Loaded only when a
+    # checkpoint path is given (default off). The head reads the live WM last-
+    # layer state at serve -- no backbone. Phase 4's salience trigger consumes
+    # the ``surprise < surprise_cap`` term; this round only wires it in.
+    latent_dynamics_head = None
+    if latent_dynamics_head_path:
+        from .subconscious.latent_dynamics_head import load_latent_dynamics_head
+        latent_dynamics_head = load_latent_dynamics_head(
+            latent_dynamics_head_path, device=device)
+
     orch = PonderOrchestrator(
         store=store,
         retriever=retriever,
@@ -219,6 +283,9 @@ def build_ponder(
         encoder=encoder,
         relevance_head=relevance_head,
         graduation_proxy=graduation_proxy_head,
+        graduation_head=graduation_head,
+        recoverability_head=recoverability_head,
+        latent_dynamics_head=latent_dynamics_head,
         ring_capacity=ring_capacity,
         context_builder=context_builder,
     )

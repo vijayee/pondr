@@ -173,6 +173,9 @@ class PonderOrchestrator:
         encoder: Optional[HippocampalEncoder] = None,
         relevance_head=None,
         graduation_proxy=None,
+        graduation_head=None,
+        recoverability_head=None,
+        latent_dynamics_head=None,
         ring_capacity: Optional[int] = None,
         context_builder=None,
     ) -> None:
@@ -193,6 +196,28 @@ class PonderOrchestrator:
         # Phase 4's LTM-promotion path consumes the decision. ``None`` (default,
         # flag off) -> no graduation scoring at serve (byte-identical to pre-2d).
         self.graduation_proxy = graduation_proxy
+        # STRM Phase 2d v2 graduation head (optional, DI like the proxy). When
+        # wired it scores each WM ring slot's ``later_needed`` probability (the
+        # learned classifier the v1 proxy is the baseline for). Phase 4's LTM-
+        # promotion path consumes the decision; this round only attaches it
+        # (completes the full serve-wiring of all STRM read-out heads).
+        # ``None`` (default, flag off / no checkpoint) -> no v2 graduation
+        # scoring at serve (byte-identical to pre-Phase-4).
+        self.graduation_head = graduation_head
+        # STRM Phase 2b recoverability head (optional, DI like the relevance
+        # head). When wired it scores how forgotten a past anchor is from the
+        # live WM pooled state; Phase 4's salience trigger consumes the
+        # ``recoverability < theta`` term (low = likely forgotten = salient).
+        # ``None`` (default, flag off / no checkpoint) -> no recoverability
+        # scoring at serve (byte-identical to pre-Phase-4).
+        self.recoverability_head = recoverability_head
+        # STRM Phase 2c latent-dynamics head (optional, DI like the relevance
+        # head). When wired it predicts the next WM state + emits a per-turn
+        # surprise signal; Phase 4's salience trigger consumes the
+        # ``surprise < surprise_cap`` term (high surprise -> suppress).
+        # ``None`` (default, flag off / no checkpoint) -> no latent-dynamics
+        # scoring at serve (byte-identical to pre-Phase-4).
+        self.latent_dynamics_head = latent_dynamics_head
         # STRM Phase 3 context-builder (optional, DI like the relevance head).
         # When wired it attends over the WM ring with the 2a ``r_i`` as an
         # additive bias and selects top-m primary context instead of the

@@ -170,6 +170,29 @@ def main() -> int:
                         "heuristic PresentationGate. Requires --strm-relevance-head "
                         "AND --strm-ring-capacity > 0; otherwise warns + falls back "
                         "to the heuristic. DEFAULT OFF (byte-identical to pre-3).")
+    p.add_argument("--strm-recoverability-head", default=None,
+                   help="optional STRM Phase 2b recoverability-head checkpoint "
+                        "(best.pt from scripts/train_recoverability_head.py). When "
+                        "set, the head is loaded + attached; Phase 4's salience "
+                        "trigger consumes it as the 'recoverability < theta' term "
+                        "(low = likely forgotten = salient). Requires the ring ON. "
+                        "DEFAULT OFF (byte-identical to pre-Phase-4).")
+    p.add_argument("--strm-latent-dynamics-head", default=None,
+                   help="optional STRM Phase 2c latent-dynamics-head checkpoint "
+                        "(best.pt from scripts/train_latent_dynamics_head.py -- the "
+                        "linear z_{t+1}=A z_t+b next-state predictor). When set, the "
+                        "head is loaded + attached; Phase 4's salience trigger "
+                        "consumes its surprise() as the 'surprise < surprise_cap' "
+                        "term (high surprise -> suppress). Requires the ring ON. "
+                        "DEFAULT OFF (byte-identical to pre-Phase-4).")
+    p.add_argument("--strm-graduation-head", default=None,
+                   help="optional STRM Phase 2d v2 graduation-head checkpoint "
+                        "(best.pt from scripts/train_graduation_head.py -- the "
+                        "learned later_needed classifier the v1 proxy is the "
+                        "baseline for). When set, the head is loaded + attached "
+                        "(completes the full serve-wiring of all STRM read-out "
+                        "heads). Phase 4's LTM-promotion path consumes the "
+                        "decision. DEFAULT OFF (byte-identical to pre-Phase-4).")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -192,6 +215,18 @@ def main() -> int:
               "--strm-ring-capacity 16 (or similar), or the relevance head scores "
               "an empty ring and the replay logger writes nothing.",
               file=sys.stderr)
+    # STRM Phase 4 read-out heads (2b recoverability, 2c latent-dynamics, 2d v2
+    # graduation) all score per-slot WM state at serve, so they need the ring
+    # ON. Warn on a missing ring (a warning, not a hard error -- the orchestrator
+    # stores the head inert when the ring is off, byte-identical to flag-off).
+    if (args.strm_recoverability_head or args.strm_latent_dynamics_head
+            or args.strm_graduation_head) and args.strm_ring_capacity <= 0:
+        print("WARNING: --strm-recoverability-head / --strm-latent-dynamics-head / "
+              "--strm-graduation-head need the WM ring ON (--strm-ring-capacity > "
+              "0) to score per-slot state, but the ring is OFF. The heads load "
+              "but stay inert at serve this round (they are attached only; the "
+              "salience trigger that reads them is a later Phase 4 step). Pass "
+              "--strm-ring-capacity 16.", file=sys.stderr)
     # STRM Phase 3 context-builder: requires the ring ON + a 2a relevance head
     # (the builder's r_i bias comes from it). Warn on either missing; the
     # orchestrator also falls back to the heuristic PresentationGate at runtime,
@@ -234,6 +269,30 @@ def main() -> int:
                   f"{context_builder_path}", file=sys.stderr)
             return 1
         context_builder_path = str(context_builder_path)
+    recoverability_head_path = None
+    if args.strm_recoverability_head:
+        recoverability_head_path = Path(args.strm_recoverability_head)
+        if not recoverability_head_path.exists():
+            print(f"ERROR: STRM recoverability-head checkpoint not found at "
+                  f"{recoverability_head_path}", file=sys.stderr)
+            return 1
+        recoverability_head_path = str(recoverability_head_path)
+    latent_dynamics_head_path = None
+    if args.strm_latent_dynamics_head:
+        latent_dynamics_head_path = Path(args.strm_latent_dynamics_head)
+        if not latent_dynamics_head_path.exists():
+            print(f"ERROR: STRM latent-dynamics-head checkpoint not found at "
+                  f"{latent_dynamics_head_path}", file=sys.stderr)
+            return 1
+        latent_dynamics_head_path = str(latent_dynamics_head_path)
+    graduation_head_path = None
+    if args.strm_graduation_head:
+        graduation_head_path = Path(args.strm_graduation_head)
+        if not graduation_head_path.exists():
+            print(f"ERROR: STRM graduation-head (v2) checkpoint not found at "
+                  f"{graduation_head_path}", file=sys.stderr)
+            return 1
+        graduation_head_path = str(graduation_head_path)
 
     print(f"[load] backbone={backbone_path}", file=sys.stderr)
     print(f"[load] gate={gate_path}", file=sys.stderr)
@@ -247,7 +306,10 @@ def main() -> int:
           f"strm_graduation_proxy={args.strm_graduation_proxy} "
           f"strm_graduation_logging={args.strm_graduation_logging} "
           f"strm_ring_capacity={args.strm_ring_capacity} "
-          f"strm_context_builder={context_builder_path or '(off)'}", file=sys.stderr)
+          f"strm_context_builder={context_builder_path or '(off)'} "
+          f"strm_recoverability_head={recoverability_head_path or '(off)'} "
+          f"strm_latent_dynamics_head={latent_dynamics_head_path or '(off)'} "
+          f"strm_graduation_head={graduation_head_path or '(off)'}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -262,6 +324,9 @@ def main() -> int:
         user_id=args.user_id,
         relevance_head_path=relevance_head_path,
         graduation_proxy=args.strm_graduation_proxy,
+        graduation_head_path=graduation_head_path,
+        recoverability_head_path=recoverability_head_path,
+        latent_dynamics_head_path=latent_dynamics_head_path,
         ring_capacity=args.strm_ring_capacity,
         context_builder_path=context_builder_path,
     )
