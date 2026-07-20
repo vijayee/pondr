@@ -72,6 +72,7 @@ from src.orchestrator import PonderOrchestrator  # noqa: E402
 from src.retrieval.query_planner import BonsaiQueryPlanner  # noqa: E402
 from src.retrieval.retriever import HippocampalRetriever  # noqa: E402
 from src.subconscious.configs import BackboneConfig  # noqa: E402
+from src.subconscious.context_builder import load_context_builder  # noqa: E402
 from src.subconscious.latent_dynamics_head import load_latent_dynamics_head  # noqa: E402
 from src.subconscious.recoverability_head import load_recoverability_head  # noqa: E402
 from src.subconscious.relevance_head import load_relevance_head  # noqa: E402
@@ -94,6 +95,14 @@ from scripts.replay_chat_to_graduation import (  # noqa: E402
 
 DEFAULT_BACKBONE_PATH = "data/pod_runs/phase2a_full/checkpoints/backbone/backbone_final.pt"
 DEFAULT_RELEVANCE_HEAD = "data/training/strm_relevance/best.pt"
+# The shipped Phase 3 ContextBuilder (the small Transformer that attends over
+# the WM ring of y_t with the 2a r_i as an additive bias). Loaded when present
+# so the probe can ALSO capture the transformer's per-slot score s_i -- the
+# DeepSeek-Hole-1 test of whether restoring the transformer to the relevance-
+# locator role would discriminate on real serve data where the 2a bilinear head
+# saturates. Optional: if the checkpoint is absent the probe falls back to the
+# r_i-only run (byte-identical to the prior behavior).
+DEFAULT_CONTEXT_BUILDER = "data/training/strm_context_builder/best.pt"
 # Only needed when ``--salience permissive`` (arming the trigger requires all
 # three heads + thresholds, matching ``_salience_armed`` in the orchestrator).
 DEFAULT_RECOVERABILITY_HEAD = "data/training/strm_recoverability/best.pt"
@@ -154,48 +163,76 @@ def _percentile(values: list[float], q: float) -> float:
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
-def _capture_turn(orch: PonderOrchestrator, user_text: str) -> dict:
+def _capture_turn(orch: PonderOrchestrator, user_text: str,
+                  context_builder=None) -> dict:
     """Score the current WM ring against this turn's query. Returns one record:
-    ``{user_text, slots: [{source_id, text, r_i, logit, cos}]}`` where ``cos`` is
-    the bge cosine between the slot text and THIS turn's user_text (the
-    probe/filler label signal) and ``logit`` is the pre-sigmoid relevance logit
-    (captured so the ``--ablate-yt`` run can report the LOGIT gap, which is the
-    decisive signal when the sigmoid is saturated -- see the ablation note
-    below). Only text-bearing slots are scored."""
+    ``{user_text, slots: [{source_id, text, r_i, logit, s_i, s_i_pure, cos}]}``
+    where ``cos`` is the bge cosine between the slot text and THIS turn's
+    user_text (the probe/filler label signal); ``logit`` is the pre-sigmoid 2a
+    relevance logit (the decisive signal under ``--ablate-yt`` when the sigmoid
+    is saturated); and ``s_i`` / ``s_i_pure`` are the ContextBuilder's
+    transformer scores (as-shipped with the 2a r_i bias, and pure with that bias
+    zeroed -- the DeepSeek-Hole-1 test), present only when a builder is passed.
+    Only text-bearing slots are scored."""
     prompt_emb = orch.working_memory.embed([user_text])[0]
     slots = orch.working_memory.ring_buffer()
-    slots, r_is, logits = _score_ring_with_logits(
-        orch.working_memory, orch.relevance_head, orch.embedder, prompt_emb, slots)
+    slots, r_is, logits, s_is, s_is_pure = _score_ring_with_logits(
+        orch.working_memory, orch.relevance_head, orch.embedder, prompt_emb,
+        slots, context_builder=context_builder)
     # Embed each scored slot's text once for the cosine probe/filler label.
     out_slots = []
-    for s, r, lg in zip(slots, r_is, logits):
+    for s, r, lg, si, sip in zip(slots, r_is, logits, s_is, s_is_pure):
         if r is None or not s.text:
             continue
         slot_emb = orch.working_memory.embed([s.text])[0]
-        out_slots.append({
+        rec = {
             "source_id": str(s.source_id) if s.source_id is not None else None,
             "text": s.text,
             "r_i": r,
             "logit": lg,
             "cos": _cosine(prompt_emb, slot_emb),
-        })
+        }
+        if si is not None:
+            rec["s_i"] = si
+        if sip is not None:
+            rec["s_i_pure"] = sip
+        out_slots.append(rec)
     return {"user_text": user_text, "slots": out_slots}
 
 
 def _score_ring_with_logits(working_memory, relevance_head, embedder,
-                            prompt_emb, slots):
+                            prompt_emb, slots, context_builder=None):
     """Mirror ``relevance_score._score`` but return the pre-sigmoid LOGIT too
     (so the ablation can measure the bilinear gap that the saturated sigmoid
-    hides). Returns ``(slots, r_is, logits)`` length-``len(slots)`` with ``None``
-    at unscored positions (matching ``score_ring_slots``)."""
-    r_is: list = [None] * len(slots)
-    logits: list = [None] * len(slots)
+    hides), and -- when a ContextBuilder is supplied -- the transformer's per-
+    slot score ``s_i`` in TWO variants:
+
+      * ``s_i``       -- AS-SHIPPED: the 2a ``r_i`` is the additive bias
+        (``lambda_r * r``), i.e. the score a rewired salience gate would
+        actually consume if the shipped builder were wired into the gate.
+      * ``s_i_pure``  -- the ``r`` bias ZEROED, so ``s_i_pure = (q . h)*scale +
+        bias`` -- the pure cross-slot-attention score over ``y_t`` + doc-identity
+        against the query. This isolates DeepSeek Hole 1: does the transformer
+        attending over the WM state readouts ``y_t`` discriminate on real serve
+        data, INDEPENDENT of the saturated 2a ``r_i`` bias? (The constant
+        ``bias`` cancels in the probe-minus-filler selectivity gap, so the
+        ``s_i_pure`` gap == the cross-slot attention gap == the test of whether
+        ``y_t`` carries enough signal for the transformer to locate relevance.)
+
+    Returns ``(slots, r_is, logits, s_is, s_is_pure)`` length-``len(slots)`` with
+    ``None`` at unscored positions (matching ``score_ring_slots``); the two
+    transformer lists stay ``[None]*n`` when no builder is passed."""
+    n = len(slots)
+    r_is: list = [None] * n
+    logits: list = [None] * n
+    s_is: list = [None] * n
+    s_is_pure: list = [None] * n
     if relevance_head is None or embedder is None:
-        return slots, r_is, logits
+        return slots, r_is, logits, s_is, s_is_pure
     idx_text = [(i, s.text) for i, s in enumerate(slots)
                 if s.text is not None and str(s.text).strip()]
     if not idx_text:
-        return slots, r_is, logits
+        return slots, r_is, logits, s_is, s_is_pure
     head_dev = next(relevance_head.parameters()).device
     doc_emb_tensors = working_memory.embed([t for _, t in idx_text])
     ys = torch.cat([slots[i].y.to(torch.float32).squeeze(0).reshape(1, -1)
@@ -205,11 +242,20 @@ def _score_ring_with_logits(working_memory, relevance_head, embedder,
     q = prompt_emb.to(torch.float32).squeeze(0).reshape(1, -1).to(head_dev)
     with torch.no_grad():
         lg = relevance_head.logits(ys, ds, q)          # [K', 1]
-        r = torch.sigmoid(lg)
+        r = torch.sigmoid(lg)                           # [K', 1]
+        if context_builder is not None:
+            r_flat = r.reshape(-1)                      # [K'] -- the 2a bias
+            # as-shipped transformer score (2a r_i as the additive bias).
+            s = context_builder.logits(ys, ds, q, r_flat)              # [K']
+            # pure transformer score: r bias zeroed -> (q . h)*scale + bias only.
+            s_pure = context_builder.logits(ys, ds, q, torch.zeros_like(r_flat))
     for j, (i, _) in enumerate(idx_text):
         logits[i] = float(lg[j].item())
         r_is[i] = float(r[j].item())
-    return slots, r_is, logits
+        if context_builder is not None:
+            s_is[i] = float(s[j].item())
+            s_is_pure[i] = float(s_pure[j].item())
+    return slots, r_is, logits, s_is, s_is_pure
 
 
 def _ablate_yt_sidepath(head) -> None:
@@ -232,10 +278,12 @@ def replay_and_capture(
     *, transcripts: list[str], backbone_path: str, rel_head_path: str,
     ring_capacity: int, max_turns: int, device: str, salience: str,
     user_id: str, rec_head_path: str, ld_head_path: str, ablate_yt: bool,
+    context_builder_path: Optional[str] = None,
 ) -> tuple[list[dict], dict]:
     """Replay every transcript turn through the orchestrator and capture per-
-    turn per-slot r_i on the real recalled ring slots. Returns (turn_records,
-    run_stats)."""
+    turn per-slot r_i (and, when a ContextBuilder checkpoint is supplied, the
+    transformer's s_i / s_i_pure) on the real recalled ring slots. Returns
+    (turn_records, run_stats)."""
     tmpdir = tempfile.mkdtemp(prefix="pondr_probe4a_")
     turn_records: list[dict] = []
     store = None
@@ -248,6 +296,21 @@ def replay_and_capture(
         relevance_head = load_relevance_head(str(rel_head_path), device=device)
         if ablate_yt:
             _ablate_yt_sidepath(relevance_head)
+        # The ContextBuilder is OPTIONAL -- load it when a checkpoint path is
+        # supplied and present so the probe also captures the transformer's s_i
+        # (the DeepSeek-Hole-1 test). Absent path -> r_i-only run (the prior
+        # behavior). The builder is query-conditioned + reads y_t, so it is
+        # independent of the salience arming below; load it in every salience
+        # mode.
+        context_builder = None
+        if context_builder_path and Path(context_builder_path).exists():
+            context_builder = load_context_builder(str(context_builder_path),
+                                                   device=device)
+            print(f"[probe] ContextBuilder loaded: {context_builder_path} "
+                  f"(capturing s_i + s_i_pure alongside r_i)", flush=True)
+        elif context_builder_path:
+            print(f"[probe] ContextBuilder checkpoint not found at "
+                  f"{context_builder_path} -- r_i-only run.", file=sys.stderr)
         # Salience arming needs all three heads + thresholds (``_salience_armed``
         # in the orchestrator). OFF (the default) measures the head alone on the
         # prompt-driven recalled slots; permissive/real arm the trigger so
@@ -319,7 +382,7 @@ def replay_and_capture(
                 # injects populate text-bearing slots). prompt_emb is re-derived
                 # from the user text (deterministic -- same embed call query()
                 # uses internally).
-                rec = _capture_turn(orch, u)
+                rec = _capture_turn(orch, u, context_builder=context_builder)
                 rec["session_id"] = session_id
                 rec["turn_index"] = i
                 turn_records.append(rec)
@@ -343,6 +406,7 @@ def replay_and_capture(
             "n_turns": total_queries, "n_encoded": total_encoded,
             "n_skipped": total_skipped, "ring_capacity": ring_capacity,
             "salience": salience, "device": device,
+            "context_builder": context_builder is not None,
         }
         return turn_records, run_stats
     finally:
@@ -355,16 +419,37 @@ def replay_and_capture(
 
 
 def _analyze(turn_records: list[dict]) -> dict:
-    """Compute (1) the r_i + logit distributions across all scored (slot, turn)
-    pairs and (2) the per-source selectivity gap (probe minus mean filler) for
-    BOTH r_i and the pre-sigmoid logit. The logit gap is the decisive signal
-    under ``--ablate-yt``: the shipped head's large ~-8.5 yt offset centers the
-    sigmoid, so r_i saturates even when the bilinear term discriminates; the
-    logit gap (bias cancels) == the bilinear gap == the real discrimination."""
+    """Compute (1) the r_i + logit + s_i + s_i_pure distributions across all
+    scored (slot, turn) pairs and (2) the per-source selectivity gap (probe minus
+    mean filler) for each. The logit gap is the decisive signal under
+    ``--ablate-yt`` (the shipped head's ~-8.5 yt offset centers the sigmoid, so
+    r_i saturates even when the bilinear term discriminates; the logit gap, bias
+    cancels, == the bilinear gap). The ``s_i_pure`` gap is the DeepSeek-Hole-1
+    test: it is the cross-slot-attention score over y_t with the saturated r_i
+    bias removed, so its gap == whether the transformer can locate relevance from
+    the WM state readouts alone. ``s_i`` (as-shipped, with the r_i bias) tests
+    what a rewired salience gate would actually consume."""
     # (1) distributions across every scored slot occurrence.
     all_r = [s["r_i"] for rec in turn_records for s in rec["slots"]]
     all_lg = [s["logit"] for rec in turn_records for s in rec["slots"]
               if s.get("logit") is not None]
+    all_s = [s["s_i"] for rec in turn_records for s in rec["slots"]
+             if s.get("s_i") is not None]
+    all_sp = [s["s_i_pure"] for rec in turn_records for s in rec["slots"]
+              if s.get("s_i_pure") is not None]
+
+    def _dist(vals: list[float]) -> dict:
+        return {
+            "n": len(vals),
+            "min": min(vals) if vals else None,
+            "p10": _percentile(vals, 0.10),
+            "p50": _percentile(vals, 0.50),
+            "p90": _percentile(vals, 0.90),
+            "max": max(vals) if vals else None,
+            "mean": statistics.fmean(vals) if vals else None,
+            "stdev": statistics.pstdev(vals) if len(vals) >= 2 else 0.0,
+        }
+
     dist = {
         "n_scored": len(all_r),
         "min": min(all_r) if all_r else None,
@@ -381,11 +466,15 @@ def _analyze(turn_records: list[dict]) -> dict:
         "logit_p90": _percentile(all_lg, 0.90),
         "logit_max": max(all_lg) if all_lg else None,
         "logit_stdev": statistics.pstdev(all_lg) if len(all_lg) >= 2 else 0.0,
+        "s_i": _dist(all_s),
+        "s_i_pure": _dist(all_sp),
     }
-    # (2) per-source selectivity for r_i AND logit. Group scored occurrences by
-    # source_id; for each source seen on >= 3 turns, the probe turn = max-cos
-    # turn, fillers = the remaining turns; gap = probe - mean(filler). Report
-    # the min + median gap (the r_i gate is min gap >= 0.2, matching Probe 3).
+    # (2) per-source selectivity for r_i, logit, s_i, s_i_pure. Group scored
+    # occurrences by source_id; for each source seen on >= 3 turns, the probe
+    # turn = max-cos turn, fillers = the remaining turns; gap = probe -
+    # mean(filler). Report min + median gap (the r_i gate is min gap >= 0.2,
+    # matching Probe 3). s_i / s_i_pure are unbounded logits like the 2a logit,
+    # so they use the same >= 2.0 logit gap gate.
     by_source: dict[str, list[dict]] = {}
     for rec in turn_records:
         for s in rec["slots"]:
@@ -395,9 +484,13 @@ def _analyze(turn_records: list[dict]) -> dict:
             by_source.setdefault(sid, []).append({
                 "turn_index": rec["turn_index"], "r_i": s["r_i"],
                 "logit": s.get("logit"), "cos": s["cos"],
+                "s_i": s.get("s_i"), "s_i_pure": s.get("s_i_pure"),
             })
+
     r_gaps: list[float] = []
     lg_gaps: list[float] = []
+    s_gaps: list[float] = []
+    sp_gaps: list[float] = []
     per_source_examples: list[dict] = []
     for sid, occs in by_source.items():
         if len(occs) < 3:
@@ -412,13 +505,34 @@ def _analyze(turn_records: list[dict]) -> dict:
         if probe["logit"] is not None and all(o["logit"] is not None for o in fillers):
             lg_gap = probe["logit"] - statistics.fmean(o["logit"] for o in fillers)
             lg_gaps.append(lg_gap)
+        s_gap = None
+        if probe["s_i"] is not None and all(o["s_i"] is not None for o in fillers):
+            s_gap = probe["s_i"] - statistics.fmean(o["s_i"] for o in fillers)
+            s_gaps.append(s_gap)
+        sp_gap = None
+        if probe["s_i_pure"] is not None and all(o["s_i_pure"] is not None for o in fillers):
+            sp_gap = probe["s_i_pure"] - statistics.fmean(o["s_i_pure"] for o in fillers)
+            sp_gaps.append(sp_gap)
         if len(per_source_examples) < 12:
             per_source_examples.append({
                 "source_id": sid, "n_turns": len(occs),
                 "probe_cos": probe["cos"], "probe_r_i": probe["r_i"],
                 "mean_filler_r_i": mean_filler_r, "r_gap": r_gap,
                 "probe_logit": probe["logit"], "logit_gap": lg_gap,
+                "probe_s_i": probe["s_i"], "s_gap": s_gap,
+                "probe_s_i_pure": probe["s_i_pure"], "s_pure_gap": sp_gap,
             })
+
+    def _gap_stats(gaps: list[float], thr: float):
+        return {
+            "min": min(gaps) if gaps else None,
+            "median": statistics.median(gaps) if gaps else None,
+            "mean": statistics.fmean(gaps) if gaps else None,
+            "n_ge_thr": sum(1 for g in gaps if g >= thr),
+            "n_eligible": len(gaps),
+            "gate_median_ge_thr": (statistics.median(gaps) >= thr) if gaps else False,
+        }
+
     selectivity = {
         "n_sources_total": len(by_source),
         "n_sources_eligible": len(r_gaps),
@@ -432,6 +546,8 @@ def _analyze(turn_records: list[dict]) -> dict:
         "mean_logit_gap": statistics.fmean(lg_gaps) if lg_gaps else None,
         "n_logit_gap_ge_2": sum(1 for g in lg_gaps if g >= 2.0),
         "gate_median_logit_gap_ge_2": (statistics.median(lg_gaps) >= 2.0) if lg_gaps else False,
+        "s_i": _gap_stats(s_gaps, 2.0),
+        "s_i_pure": _gap_stats(sp_gaps, 2.0),
         "examples": per_source_examples,
     }
     return {"distribution": dist, "selectivity": selectivity}
@@ -457,6 +573,10 @@ def _main() -> int:
     p.add_argument("--ablate-yt", action="store_true",
                    help="zero the yt_sidepath so logits = bilinear + bias; the "
                         "LOGIT gap (reported alongside r_i) is the decisive signal")
+    p.add_argument("--context-builder", default=DEFAULT_CONTEXT_BUILDER,
+                   help="ContextBuilder checkpoint to ALSO capture the "
+                        "transformer's s_i / s_i_pure (the DeepSeek-Hole-1 test). "
+                        "Default = the shipped Phase 3 builder; pass '' to skip.")
     p.add_argument("--user-id", default="pondr")
     p.add_argument("--out", default="", help="write the JSON report to this path")
     args = p.parse_args()
@@ -489,7 +609,8 @@ def _main() -> int:
         rel_head_path=args.relevance_head, ring_capacity=args.ring_capacity,
         max_turns=args.max_turns, device=args.device, salience=args.salience,
         user_id=args.user_id, rec_head_path=args.recoverability_head,
-        ld_head_path=args.latent_dynamics_head, ablate_yt=args.ablate_yt)
+        ld_head_path=args.latent_dynamics_head, ablate_yt=args.ablate_yt,
+        context_builder_path=args.context_builder or None)
     analysis = _analyze(turn_records)
     report = {"run": run_stats, **analysis, "n_turn_records": len(turn_records)}
 
@@ -525,15 +646,32 @@ def _main() -> int:
               f"mean={s['mean_logit_gap']:+.3f}  n>=2.0={s['n_logit_gap_ge_2']}/"
               f"{s['n_sources_eligible']}  "
               f"gate(median>=2.0): {'PASS' if s['gate_median_logit_gap_ge_2'] else 'FAIL'}")
+
+    def _print_transformer(label: str, dist_key: str, sel_key: str) -> None:
+        dd = d.get(dist_key)
+        ss = s.get(sel_key)
+        if not dd or dd["n"] == 0 or not ss or ss["n_eligible"] == 0:
+            print(f"    {label}: (not captured -- no ContextBuilder loaded)")
+            return
+        print(f"  {label} distribution ({dd['n']} scored):")
+        print(f"    min={dd['min']:+.3f}  p10={dd['p10']:+.3f}  p50={dd['p50']:+.3f}  "
+              f"p90={dd['p90']:+.3f}  max={dd['max']:+.3f}  stdev={dd['stdev']:.3f}")
+        print(f"    {label} gap: min={ss['min']:+.3f} median={ss['median']:+.3f} "
+              f"mean={ss['mean']:+.3f}  n>=2.0={ss['n_ge_thr']}/{ss['n_eligible']}  "
+              f"gate(median>=2.0): {'PASS' if ss['gate_median_ge_thr'] else 'FAIL'}")
+
+    _print_transformer("s_i      (as-shipped, 2a r_i bias)", "s_i", "s_i")
+    _print_transformer("s_i_pure (r bias zeroed -- Hole 1)", "s_i_pure", "s_i_pure")
     print("-" * 72)
     print("  per-source examples:")
     for ex in s["examples"]:
         lg = ex.get("logit_gap")
         lg_s = f"{lg:+.3f}" if lg is not None else "  n/a"
-        print(f"    {ex['source_id'][:28]:<28} n={ex['n_turns']:>2} "
-              f"cos={ex['probe_cos']:.3f} probe_r={ex['probe_r_i']:.4f} "
-              f"filler_r={ex['mean_filler_r_i']:.4f} r_gap={ex['r_gap']:+.4f} "
-              f"probe_lg={ex['probe_logit']:+.2f} lg_gap={lg_s}")
+        sp = ex.get("s_pure_gap")
+        sp_s = f"{sp:+.3f}" if sp is not None else "  n/a"
+        print(f"    {ex['source_id'][:24]:<24} n={ex['n_turns']:>2} "
+              f"cos={ex['probe_cos']:.3f} r_gap={ex['r_gap']:+.4f} "
+              f"lg_gap={lg_s} s_pure_gap={sp_s}")
     print("=" * 72)
     print("VERDICT (ablate-yt): a healthy LOGIT gap (median >= 2.0) => the bilinear")
     print("  term discriminates on real serve data and yt_sidepath was the culprit;")
@@ -542,6 +680,12 @@ def _main() -> int:
     print("VERDICT (no ablate): healthy r_i dist (stdev>0) + min r_gap>=0.2 => head")
     print("  discriminates on real serve data => synthetic Probe 3 NO-GO was OOD.")
     print("  saturated r_i (stdev~0, frac>=0.99~100%) => head broken on serve.")
+    print("VERDICT (s_i_pure -- DeepSeek Hole 1): a healthy s_i_pure gap (median >= 2.0)")
+    print("  => the Transformer attending over y_t discriminates on real serve data")
+    print("  INDEPENDENT of the saturated r_i bias -> restoring it to the relevance-")
+    print("  locator role is viable (then address labels/cost/two-pass in the retrain).")
+    print("  A ~0 s_i_pure gap => y_t carries insufficient signal for the transformer")
+    print("  to locate relevance -> must store actual SSM states, not just y_t readouts.")
 
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
