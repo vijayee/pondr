@@ -1,20 +1,26 @@
-"""Generate gate training data (Uncertainty Detector, Aspirational Model, Self-Model).
+"""Generate gate training data (Uncertainty Detector, Aspirational Model,
+Self-Model, Common Sense Resolver).
 
 Usage (validate slice):
     python scripts/generate_gate_training_data.py \\
         --db data/pod_runs/phase1b_scale/ingest_db_dialogsum \\
-        --output data/training/gates/ --num-examples 30
+        --output data/training/gates/ --num-examples 40
 
 Adapted from ``docs/Phase 1d.md`` §8 to the REAL WaveDB API: episodes come
 from ``sample_episode_centers`` + ``GraphTraversal.hydrate_episode``; related
 episodes via the public ``episodes_by_entity`` / ``episodes_by_topic`` aliases
 (the doc's ``in_("in_episode")`` was the wrong direction). ``--seed`` makes the
 validate slice reproducible.
+
+The Common Sense Resolver (4th gate, Phase 4d) produces deliberately-ambiguous
+query variants from a polyseme vocabulary so the Oracle labels the three CSR
+branches: not-ambiguous / context-resolves / genuinely-ambiguous.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import sys
 import time
@@ -34,6 +40,7 @@ from src.training.generator_common import (  # noqa: E402
 from src.training.oracle_labeling import sample_episode_centers  # noqa: E402
 from src.training.prompts import (  # noqa: E402
     aspirational_model_prompt,
+    common_sense_resolver_prompt,
     self_model_prompt,
     uncertainty_detector_prompt,
 )
@@ -135,10 +142,77 @@ def _generate_query(episode: dict) -> str:
     return "What was this conversation about?"
 
 
+# A small polyseme vocabulary for building deliberately-ambiguous CSR inputs.
+# Each entry maps a surface word to its plausible readings; the generator picks
+# a word + a branch (not-ambiguous / context-resolves / genuinely-ambiguous) and
+# the Oracle labels which CSR check applies. Extended freely; the point is to
+# exercise all three branches of ``common_sense_resolver_prompt``.
+_POLYSEMES: dict[str, list[str]] = {
+    "bank": ["a financial institution", "the side of a river"],
+    "pitch": ["a sales presentation", "a playing field", "the slope of a roof"],
+    "match": ["a game or contest", "a small fire-starting stick"],
+    "rock": ["a stone", "a musical genre"],
+    "sentence": ["a grammatical unit", "a prison term"],
+    "current": ["happening right now", "an electrical flow"],
+    "frame": ["a picture border", "a structural support"],
+    "draft": ["a written document", "a current of air"],
+}
+
+
+def _build_common_sense_inputs(store, traversal, count, rng):
+    """Build deliberately-ambiguous CSR inputs (Phase 4d, the 4th gate).
+
+    For each sampled episode, build an ambiguous query from a polyseme and a
+    disambiguating context (the episode + related episodes), exercising all
+    three CSR branches so the Oracle labels a balanced mix:
+      ~40% NOT AMBIGUOUS       -- one candidate only (a clear reading).
+      ~40% CONTEXT RESOLVES    -- 2-3 candidates, context present (the Oracle
+                                  checks whether the episode summary supports
+                                  one reading).
+      ~20% GENUINELY AMBIGUOUS  -- 2 candidates, context stripped so neither
+                                  reading is favored (should_ask_clarification).
+    """
+    episodes = _all_episodes(store, traversal, count, rng)
+    inputs = []
+    for ep in episodes:
+        related = _get_related_episodes(traversal, ep["episode_id"],
+                                        ep.get("entities"), limit=3)
+        ctx_lines = [f"[{ep['episode_id']}] {ep.get('summary', '')}"]
+        ctx_lines += [f"[{r['id']}] {r['summary']}" for r in related]
+        retrieved_context = "\n".join(ctx_lines) or "(no related episodes)"
+
+        word = rng.choice(list(_POLYSEMES))
+        readings = _POLYSEMES[word]
+        roll = rng.random()
+        if roll < 0.4:
+            # NOT AMBIGUOUS: a single candidate -> the only sensible reading.
+            input_text = f"What did we decide about {word}?"
+            candidates = json.dumps([readings[0]], ensure_ascii=False)
+        elif roll < 0.8:
+            # CONTEXT RESOLVES: the full candidate set + the disambiguating
+            # context -- the Oracle checks whether the episode summary favors
+            # one reading.
+            input_text = f"What did we decide about {word}?"
+            candidates = json.dumps(readings, ensure_ascii=False)
+        else:
+            # GENUINELY AMBIGUOUS: two candidates, context stripped so neither
+            # reading is favored -> the honest CSR answer is ask_clarification.
+            input_text = f"I need to get to the {word}."
+            retrieved_context = "(no related context)"
+            candidates = json.dumps(readings[:2], ensure_ascii=False)
+        inputs.append({
+            "input_text": input_text,
+            "retrieved_context": retrieved_context,
+            "candidate_interpretations": candidates,
+        })
+    return inputs
+
+
 GATES = [
     ("uncertainty_detector", uncertainty_detector_prompt, _build_uncertainty_inputs),
     ("aspirational_model", aspirational_model_prompt, _build_aspirational_inputs),
     ("self_model", self_model_prompt, _build_self_model_inputs),
+    ("common_sense_resolver", common_sense_resolver_prompt, _build_common_sense_inputs),
 ]
 
 
@@ -147,8 +221,8 @@ def main() -> int:
     parser.add_argument("--db", default="data/pod_runs/phase1b_scale/ingest_db_dialogsum",
                         help="WaveDB store path (ingested corpus)")
     parser.add_argument("--output", default="data/training/gates/", help="Output directory")
-    parser.add_argument("--num-examples", type=int, default=30,
-                        help="Total examples across all 3 gates (validate-slice default 30)")
+    parser.add_argument("--num-examples", type=int, default=40,
+                        help="Total examples across all 4 gates (validate-slice default 40)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true", help="Resume from per-gate checkpoints")
     add_oracle_args(parser)

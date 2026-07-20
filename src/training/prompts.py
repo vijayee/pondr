@@ -606,6 +606,75 @@ Return ONLY valid JSON:
  "reasoning": "Brief explanation"}}"""
 
 
+def common_sense_resolver_prompt(
+    input_text: str,
+    retrieved_context: str,
+    candidate_interpretations: str,
+) -> str:
+    """Prompt for Common Sense Resolver (CSR) gate training (Phase 4d).
+
+    The CSR resolves AMBIGUITY before the system commits to an action: it
+    detects ambiguity in the input / query / retrieved results, evaluates the
+    candidate interpretations the world-model graph surfaced, and either picks
+    the best-supported interpretation or asks the user for clarification (the
+    "I need to get to the bank" -> financial institution vs. riverbank case,
+    resolved by context). This is the 4th gate alongside Uncertainty Detector,
+    Aspirational Model, and Self-Model (master roadmap sec 198: 50k each).
+
+    Input shape mirrors the deploy-time CSR: ``input_text`` is the user turn
+    or retrieved passage that may be ambiguous, ``retrieved_context`` is the
+    surrounding memory (recent turns + retrieved episodes) that disambiguates,
+    and ``candidate_interpretations`` is the list of readings the world-model
+    graph proposed (e.g. ["financial institution", "riverbank"] for "bank").
+    Returns the formatted prompt string (the body is built by the f-string
+    below; the checks run IN ORDER and default to ask_clarification when the
+    context does not disambiguate).
+    """
+    return f"""You are generating training data for a Common Sense Resolver: a gate that
+detects AMBIGUITY in an input, query, or retrieved result and resolves it BEFORE
+the system commits to an action. It evaluates candidate interpretations the
+world-model graph surfaced and either selects the best-supported reading or asks
+the user for clarification (the "I need to get to the bank" -> financial
+institution vs. riverbank case, resolved by context).
+
+Decide by running these checks IN ORDER. The FIRST check that matches gives the
+decision; stop there. Default to should_ask_clarification=true when no
+interpretation is clearly supported -- the CSR must NOT silently guess when the
+context does not disambiguate.
+- Check 1 -- NOT AMBIGUOUS: the input has only one sensible reading (the
+  candidates list is empty or all candidates collapse to the same meaning)
+  -> is_ambiguous=false, interpretation = that reading,
+  should_ask_clarification=false.
+- Check 2 -- CONTEXT RESOLVES: the retrieved context clearly supports one
+  candidate over the others (a recent turn / retrieved episode mentions
+  money, so "bank" = financial institution) -> is_ambiguous=true,
+  interpretation = the supported candidate, should_ask_clarification=false.
+- Check 3 -- GENUINELY AMBIGUOUS: multiple candidates remain plausible and
+  the context does not favor one -> is_ambiguous=true, interpretation=null,
+  should_ask_clarification=true (ask the user; do not guess).
+
+INPUT (the user turn / retrieved passage that may be ambiguous):
+{input_text}
+
+RETRIEVED CONTEXT (recent turns + retrieved episodes that disambiguate):
+{retrieved_context}
+
+CANDIDATE INTERPRETATIONS (readings the world-model graph proposed):
+{candidate_interpretations}
+
+Decide whether the input is ambiguous and which interpretation (if any) the
+context supports, then explain it. Default to should_ask_clarification=true
+when the context does not clearly favor one candidate.
+
+Return ONLY valid JSON:
+{{"is_ambiguous": true|false,
+  "interpretation": "<the supported reading, or null if genuinely ambiguous>",
+  "candidates": ["<candidate 1>", "<candidate 2>", "..."],
+  "should_ask_clarification": true|false,
+  "confidence": 0.0,
+  "reasoning": "Brief explanation"}}"""
+
+
 # ═══════════════════════════════════════════════════════════════
 # CODE-AWARE SYNTHETIC DATA
 # ═══════════════════════════════════════════════════════════════

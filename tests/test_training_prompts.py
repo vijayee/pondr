@@ -1,4 +1,4 @@
-"""Tests for the 11 Phase 1d prompt builders.
+"""Tests for the 13 Phase 1d prompt builders.
 
 Each prompt function is a pure string builder. These tests assert it returns a
 ``str`` that embeds its input slots and the ``Return ONLY valid JSON`` contract,
@@ -15,6 +15,7 @@ from src.training.prompts import (
     bonsai_query_planning_prompt,
     bonsai_relation_extraction_prompt,
     code_aware_synthetic_prompt,
+    common_sense_resolver_prompt,
     gnn_cluster_prompt,
     gnn_link_prediction_prompt,
     gnn_ontology_prompt,
@@ -111,6 +112,29 @@ def test_self_model_prompt_embeds_slots():
     p = self_model_prompt("sparse knowledge", "What is X?")
     _assert_json_contract(p)
     assert "sparse knowledge" in p and "What is X?" in p
+
+
+def test_common_sense_resolver_prompt_embeds_slots_and_schema():
+    p = common_sense_resolver_prompt(
+        "I need to get to the bank.",
+        "[ep_1] We discussed the riverbank trail.",
+        '["a financial institution", "the side of a river"]',
+    )
+    _assert_json_contract(p)
+    # All three input slots are embedded.
+    assert "I need to get to the bank." in p
+    assert "riverbank" in p
+    assert "financial institution" in p
+    # The three CSR decision fields named in the JSON schema are present.
+    assert "is_ambiguous" in p
+    assert "should_ask_clarification" in p
+    assert "interpretation" in p
+    assert "candidates" in p
+    # The schema's JSON example must parse (it is a json5-ish single-quoted
+    # template literal; the rendered prompt keeps the braces). Sanity: the
+    # rendered prompt still contains the literal schema braces, not the
+    # f-string-evaluated form (the prompt body uses doubled braces).
+    assert "{{" not in p, "doubled braces should have been collapsed by render"
 
 
 def test_code_aware_synthetic_prompt_embeds_domain_and_ontology():
