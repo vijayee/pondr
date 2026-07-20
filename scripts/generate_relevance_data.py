@@ -204,6 +204,8 @@ def build_records(
     device,
     seed: int,
     hard_neg_map: dict[str, list[str]] | None = None,
+    emit_raw_state: bool = False,
+    raw_state_rep: str = "flat_last",
 ) -> tuple[list[dict], dict]:
     """Step the WM ring over each query's candidate docs; emit labeled records.
 
@@ -221,6 +223,13 @@ def build_records(
     shortfall (missing query or short list) is backfilled with random non-gold
     so the record shape stays stable. Labels are gold-membership in BOTH cases
     (unchanged) -- only WHICH non-gold docs are sampled changes.
+
+    Phase 0b: when ``emit_raw_state`` is True, each record ALSO carries
+    ``slots_h_raw`` -- the raw flattened SSM recurrent state per slot
+    (``flat_last`` [K,6144] or ``flat_all`` [K,24576]) -- for the learned
+    StateReadout (``scripts/train_state_readout.py``). Default False -> the
+    ``slots_h_raw`` key is ABSENT from every record -> traces.pt byte-identical
+    to the pre-Phase-0b generator (no new key, no downstream consumer change).
     """
     rng = np.random.default_rng(seed)
     gold_doc_ids: set[str] = set()
@@ -328,6 +337,35 @@ def build_records(
             ld_head.project(s.h).squeeze(0).detach().to("cpu").to(torch.float32)
             for s in ring
         ])                                                 # [K, 384]
+        # Phase 0b: the RAW flattened SSM recurrent state per slot, for the
+        # learned StateReadout (scripts/train_state_readout.py -> CompositeZHead).
+        # Phase 0a (probe_state_signal_distribution.py) showed the FIXED mean-pool
+        # ``project`` (mean over 16 d_state channels) cancels opposing-sign channel
+        # signal to near-constant, while the flattened state varies 0.45-0.76x as
+        # much as the doc embeddings -- so the state carries doc-identity
+        # VARIANCE the mean-pool hides. ``slots_h_raw`` is that flattened state;
+        # the composite head's StateReadout learns to MIX the channels into a
+        # query-relevant z_i. GATE 0b RESULT: the learned readout does NOT clear
+        # the TRAIN gate (flat_last Linear/MLP top3 ~0.27 == mean-pool 0.285;
+        # flat_all MLP best 0.564, real but sub-gate, overfits by ~epoch 33) -- the
+        # state carries only PARTIAL query-relevance (across all 4 layers,
+        # nonlinearly mixed); the JEPA-trained backbone encodes doc-identity in a
+        # mostly query-orthogonal subspace. -> Phase 1 (relevance-objective
+        # backbone fine-tune).
+        # ``flat_last`` [K,6144] = last layer's 16 d_state x 384 d_model;
+        # ``flat_all``  [K,24576] = all 4 layers flattened. Only emitted when
+        # ``emit_raw_state`` (default off -> records byte-identical to today).
+        slots_h_raw = None
+        if emit_raw_state:
+            if raw_state_rep == "flat_all":
+                slots_h_raw = torch.stack([
+                    torch.cat([layer.float().reshape(-1) for layer in s.h]).detach()
+                    for s in ring
+                ])                                         # [K, 24576]
+            else:                                          # flat_last (default)
+                slots_h_raw = torch.stack([
+                    s.h[-1].float().reshape(-1).detach() for s in ring
+                ])                                         # [K, 6144]
         # The RAW bge doc embedding per slot -- the step INPUT to wm.step, in the
         # SAME order as the ring (== cand_vecs order). The 2a head reads this
         # alongside y_t: a probe (scripts/_scratch/_probe_relevance_bge_baseline)
@@ -350,7 +388,7 @@ def build_records(
         query_emb = torch.tensor(np.asarray(qv, dtype=np.float32))   # [384]
         n_pos += int(labels.sum().item())
         n_neg += int((1 - labels).sum().item())
-        records.append({
+        rec = {
             "query_id": q["question_id"],
             "question": q["question"],
             "category": q["category"],
@@ -361,7 +399,12 @@ def build_records(
             "slots_z": slots_z,                # [K, 384]  (projected SSM state, Phase B)
             "source_ids": source_ids,          # [K]
             "labels": labels,                  # [K]
-        })
+        }
+        # Phase 0b raw state -- only present when --emit-raw-state (default off
+        # -> the record dict, and thus traces.pt, is byte-identical to today).
+        if emit_raw_state:
+            rec["slots_h_raw"] = slots_h_raw   # [K, 6144 or 24576]
+        records.append(rec)
         if (qi + 1) % 20 == 0:
             print(f"  built {qi + 1}/{len(questions)} queries "
                   f"({time.time() - t0:.1f}s, cache={len(doc_cache)})", flush=True)
@@ -393,6 +436,16 @@ def main() -> int:
                         "sample). Default None -> random negatives (byte-identical to pre-2026-07).")
     p.add_argument("--retrace", action="store_true",
                    help="regenerate even if the output file exists")
+    p.add_argument("--emit-raw-state", action="store_true",
+                   help="Phase 0b: also emit ``slots_h_raw`` (the raw flattened SSM "
+                        "recurrent state per slot) for the learned StateReadout. "
+                        "Default off -> records byte-identical to today.")
+    p.add_argument("--raw-state-rep", default="flat_last",
+                   choices=["flat_last", "flat_all"],
+                   help="raw-state representation: ``flat_last`` [6144] = last SSM "
+                        "layer flattened (default, apples-to-apples vs the mean-pool); "
+                        "``flat_all`` [24576] = all 4 layers flattened. Only used with "
+                        "--emit-raw-state.")
     args = p.parse_args()
 
     out_path = Path(args.output)
@@ -460,11 +513,13 @@ def main() -> int:
               flush=True)
 
     print(f"Building records (ring ON, neg_per_query={args.neg_per_query}, "
-          f"device={dev}, hard_neg={'ON' if hard_neg_map else 'OFF'}) -> {out_path}",
-          flush=True)
+          f"device={dev}, hard_neg={'ON' if hard_neg_map else 'OFF'}, "
+          f"raw_state={'ON(' + args.raw_state_rep + ')' if args.emit_raw_state else 'OFF'}) "
+          f"-> {out_path}", flush=True)
     records, stats = build_records(
         questions, docs_tbl, doc_idx, all_doc_ids, backbone, embedder,
         parser, chunker, args.neg_per_query, dev, args.seed, hard_neg_map,
+        emit_raw_state=args.emit_raw_state, raw_state_rep=args.raw_state_rep,
     )
     if not records:
         print(f"ERROR: no records built (all candidates failed to load?)",
