@@ -201,12 +201,24 @@ def build_records(
     neg_per_query: int,
     device,
     seed: int,
+    hard_neg_map: dict[str, list[str]] | None = None,
 ) -> tuple[list[dict], dict]:
     """Step the WM ring over each query's candidate docs; emit labeled records.
 
     Doc vectors are cached by ``doc_id`` (a gold doc is a candidate for many
     queries; a sampled negative may recur). Returns the records + a small stats
-    dict (n_queries, n_pos, n_neg, n_unique_docs).
+    dict (n_queries, n_pos, n_neg, n_unique_docs, hard_negatives_used).
+
+    Negatives: when ``hard_neg_map`` is None (default), negatives are sampled
+    UNIFORM-RANDOM from the non-gold pool (the original Phase 0a path -- random
+    negatives are trivially unrelated to the query, so the head never learns
+    "close-but-wrong -> low" -> saturates at serve; see
+    ``scripts/mine_hard_negatives.py``). When ``hard_neg_map`` is provided (a
+    ``{query_id: [doc_id, ...]}`` map of the non-gold docs CLOSEST to the query by
+    bge cosine), the per-query negatives are taken from that map instead; any
+    shortfall (missing query or short list) is backfilled with random non-gold
+    so the record shape stays stable. Labels are gold-membership in BOTH cases
+    (unchanged) -- only WHICH non-gold docs are sampled changes.
     """
     rng = np.random.default_rng(seed)
     gold_doc_ids: set[str] = set()
@@ -225,9 +237,27 @@ def build_records(
     max_k = 1
     for q in questions:
         gold = q["expected_doc_ids"]
+        gold_set = set(gold)
         k_neg = min(neg_per_query, len(non_gold))
-        neg_ids = list(rng.choice(non_gold, size=k_neg, replace=False))
-        candidate_ids = list(gold) + [d for d in neg_ids if d not in gold]
+        if hard_neg_map is not None:
+            # Hard negatives: the non-gold docs closest to this query (mined by
+            # bge cosine in scripts/mine_hard_negatives.py). Validate each mined
+            # id exists in the parquet and is not THIS query's gold (the miner
+            # already drops gold, but a stale id or a gold-for-another-query id
+            # that the miner kept -- a valid hard neg -- must survive here, so we
+            # check existence not non_gold membership).
+            mined = [d for d in hard_neg_map.get(q["question_id"], [])
+                     if d not in gold_set and d in doc_idx]
+            if len(mined) < k_neg:
+                pool = [d for d in non_gold if d not in mined]
+                need = k_neg - len(mined)
+                if pool and need > 0:
+                    mined = mined + list(rng.choice(
+                        pool, size=min(need, len(pool)), replace=False))
+            neg_ids = mined
+        else:
+            neg_ids = list(rng.choice(non_gold, size=k_neg, replace=False))
+        candidate_ids = list(gold) + [d for d in neg_ids if d not in gold_set]
         rng.shuffle(candidate_ids)
         plans.append((q, candidate_ids))
         max_k = max(max_k, len(candidate_ids))
@@ -306,7 +336,8 @@ def build_records(
             print(f"  built {qi + 1}/{len(questions)} queries "
                   f"({time.time() - t0:.1f}s, cache={len(doc_cache)})", flush=True)
     stats = {"n_queries": len(records), "n_pos": n_pos, "n_neg": n_neg,
-             "n_unique_docs": len(doc_cache)}
+             "n_unique_docs": len(doc_cache),
+             "hard_negatives_used": hard_neg_map is not None}
     return records, stats
 
 
@@ -325,6 +356,11 @@ def main() -> int:
                    help="comma-separated ERAG categories to include (default: all 8 gold-bearing)")
     p.add_argument("--device", default="auto", help="cpu|cuda|auto")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--hard-neg-json", default=None,
+                   help="path to a {query_id: [doc_id, ...]} hard-negative map from "
+                        "scripts/mine_hard_negatives.py; when set, per-query negatives are "
+                        "the non-gold docs CLOSEST to the query (vs the default uniform-random "
+                        "sample). Default None -> random negatives (byte-identical to pre-2026-07).")
     p.add_argument("--retrace", action="store_true",
                    help="regenerate even if the output file exists")
     args = p.parse_args()
@@ -382,17 +418,30 @@ def main() -> int:
     parser = MarkdownParser()
     chunker = HierarchicalChunker()
 
+    hard_neg_map: dict[str, list[str]] | None = None
+    if args.hard_neg_json:
+        hn_path = Path(args.hard_neg_json)
+        if not hn_path.exists():
+            print(f"ERROR: --hard-neg-json not found at {hn_path}", file=sys.stderr)
+            return 1
+        with open(hn_path, "r", encoding="utf-8") as f:
+            hard_neg_map = json.load(f)
+        print(f"Loaded hard-negative map: {len(hard_neg_map)} queries from {hn_path}",
+              flush=True)
+
     print(f"Building records (ring ON, neg_per_query={args.neg_per_query}, "
-          f"device={dev}) -> {out_path}", flush=True)
+          f"device={dev}, hard_neg={'ON' if hard_neg_map else 'OFF'}) -> {out_path}",
+          flush=True)
     records, stats = build_records(
         questions, docs_tbl, doc_idx, all_doc_ids, backbone, embedder,
-        parser, chunker, args.neg_per_query, dev, args.seed,
+        parser, chunker, args.neg_per_query, dev, args.seed, hard_neg_map,
     )
     if not records:
         print(f"ERROR: no records built (all candidates failed to load?)",
               file=sys.stderr)
         return 1
     torch.save(records, out_path)
+    hard_neg_used = bool(hard_neg_map)
     with open(meta_path, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps({
@@ -401,11 +450,13 @@ def main() -> int:
                 "expected_doc_ids": r["expected_doc_ids"],
                 "source_ids": r["source_ids"],
                 "labels": r["labels"].tolist(),
+                "hard_negatives": hard_neg_used,
             }, ensure_ascii=False) + "\n")
 
     mb = out_path.stat().st_size / 1e6
     print(f"DONE. {stats['n_queries']} queries, {stats['n_pos']} pos / "
           f"{stats['n_neg']} neg slots, {stats['n_unique_docs']} unique docs "
+          f"(hard_neg={'ON' if hard_neg_used else 'OFF'}) "
           f"-> {out_path} ({mb:.1f} MB)", flush=True)
     print(f"  meta -> {meta_path}", flush=True)
     print(f"  Next: python scripts/train_relevance_head.py --traces {out_path}",

@@ -265,3 +265,77 @@ def test_build_records_neg_per_query_bounds_candidate_count(tmp_path):
     # 1 gold + 2 negatives = 3 candidates (all 6 docs available, so 2 negatives fit)
     assert r["slots_y"].shape[0] == 3
     assert int(r["labels"].sum()) == 1
+
+
+def test_build_records_hard_negatives_used_when_map_provided(tmp_path):
+    """When hard_neg_map is provided, per-query negatives come from the map (the
+    non-gold docs closest to the query), not the uniform-random sample. Labels
+    stay gold-membership: a doc gold for ANOTHER query is a valid hard neg for
+    THIS query and must be labeled 0 here.
+    """
+    docs = _synthetic_docs()
+    dp = tmp_path / "docs.parquet"
+    _write_docs_parquet(dp, docs)
+    questions = _synthetic_questions()
+    idx, all_ids = build_doc_index(str(dp))
+    tbl = open_docs_table(str(dp))
+    backbone = JGSBackbone(BackboneConfig())
+    for p in backbone.parameters():
+        p.requires_grad = False
+    # d2,d3 are gold for qst_0002 but valid HARD negatives for qst_0001; d5,d6 are
+    # non-gold for everyone; d1,d2 are gold-for-others / valid hard negs for q3.
+    hard_neg_map = {
+        "qst_0001": ["d2", "d3"],
+        "qst_0002": ["d5", "d6"],
+        "qst_0003": ["d1", "d2"],
+    }
+    records, stats = build_records(
+        questions, tbl, idx, all_ids, backbone, _StubEmbedder(),
+        MarkdownParser(), HierarchicalChunker(),
+        neg_per_query=2, device=torch.device("cpu"), seed=0,
+        hard_neg_map=hard_neg_map,
+    )
+    assert stats["hard_negatives_used"] is True
+    by_q = {r["query_id"]: r for r in records}
+    # qst_0001: gold {d1} labeled 1; mined negs {d2,d3} labeled 0 (NOT gold for q1)
+    r1 = by_q["qst_0001"]
+    sids = r1["source_ids"]
+    assert "d1" in sids and r1["labels"].tolist()[sids.index("d1")] == 1
+    assert "d2" in sids and r1["labels"].tolist()[sids.index("d2")] == 0
+    assert "d3" in sids and r1["labels"].tolist()[sids.index("d3")] == 0
+    # qst_0002: gold {d2,d3} labeled 1; mined negs {d5,d6} labeled 0
+    r2 = by_q["qst_0002"]
+    sids2 = r2["source_ids"]
+    for g in ("d2", "d3"):
+        assert g in sids2 and r2["labels"].tolist()[sids2.index(g)] == 1
+    for n in ("d5", "d6"):
+        assert n in sids2 and r2["labels"].tolist()[sids2.index(n)] == 0
+    # total positives unchanged (gold-membership labels are identical)
+    total_pos = sum(int(r["labels"].sum()) for r in records)
+    assert total_pos == 1 + 2 + 1
+
+
+def test_build_records_hard_neg_map_missing_query_falls_back_to_random(tmp_path):
+    """A query missing from hard_neg_map falls back to random non-gold sampling
+    so the record shape stays stable (no crash, still k_neg negatives)."""
+    docs = _synthetic_docs()
+    dp = tmp_path / "docs.parquet"
+    _write_docs_parquet(dp, docs)
+    questions = _synthetic_questions()[:2]   # q1, q2
+    idx, all_ids = build_doc_index(str(dp))
+    tbl = open_docs_table(str(dp))
+    backbone = JGSBackbone(BackboneConfig())
+    for p in backbone.parameters():
+        p.requires_grad = False
+    # only q1 in the map; q2 missing -> random fallback
+    hard_neg_map = {"qst_0001": ["d5", "d6"]}
+    records, stats = build_records(
+        questions, tbl, idx, all_ids, backbone, _StubEmbedder(),
+        MarkdownParser(), HierarchicalChunker(),
+        neg_per_query=2, device=torch.device("cpu"), seed=0,
+        hard_neg_map=hard_neg_map,
+    )
+    assert len(records) == 2
+    r2 = records[1]   # qst_0002 (missing from map) -- still got 2 negs + 2 gold
+    assert r2["slots_y"].shape[0] == 4
+    assert int(r2["labels"].sum()) == 2   # both gold d2,d3 present + labeled 1
