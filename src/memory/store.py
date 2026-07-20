@@ -704,7 +704,8 @@ class HippocampalStore:
         """Single-point convenience wrapper over ``write_unit_boost_batch``."""
         self.write_unit_boost_batch({unit_id: boost})
 
-    def record_feedback(self, judgments: list[dict]) -> int:
+    def record_feedback(self, judgments: list[dict],
+                        query: Optional[str] = None) -> int:
         """Apply per-unit 1-5 usefulness ratings -> boost mutations.
 
         Each judgment is ``{"unit_id": str, "rating": int 1..5}``. The rating
@@ -716,6 +717,18 @@ class HippocampalStore:
         ``write_unit_boost_batch`` (idempotent re-rating of the same unit in one
         call applies them in sorted-id order).
 
+        STRM Phase 2a raw-rating tap: when ``strm_relevance_logging`` is ON, the
+        RAW per-unit rating is appended to
+        ``data/training/strm_relevance/feedback.jsonl`` BEFORE the boost
+        reduction -- today only the reduced multiplier is persisted and the raw
+        rating / query / slot_index (the 2a relevance head's training signal)
+        are lost. The tap record is ``{unit_id, rating, query, slot_index,
+        timestamp}`` (``slot_index`` from the judgment if the consumer knew
+        which ring slot it was rating, else ``null``; ``query`` threaded from
+        the orchestrator's current query). Best-effort, NEVER raises: a tap
+        failure is logged and swallowed (a logging failure must never break the
+        boost reduction or the consumer's loop).
+
         Best-effort, NEVER raises: a bad rating / unknown unit / store error is
         logged to stderr and swallowed (mirror ``_persist_exchange`` -- a
         feedback failure must never break the consumer's loop or lose the
@@ -724,6 +737,15 @@ class HippocampalStore:
         """
         if not judgments:
             return 0
+        # STRM 2a raw-rating tap (BEFORE the reduction; best-effort, never
+        # raises -- a tap failure must not break the boost write).
+        try:
+            from ..config import config as _master_config
+            if getattr(_master_config, "strm_relevance_logging", False):
+                self._append_relevance_tap(judgments, query)
+        except Exception as e:  # noqa: BLE001 - tap is best-effort
+            import sys
+            print(f"[record_feedback-tap-fail] {e}", file=sys.stderr)
         try:
             updates: dict[str, float] = {}
             for j in judgments:
@@ -747,6 +769,43 @@ class HippocampalStore:
             import sys
             print(f"[record_feedback-fail] {e}", file=sys.stderr)
             return 0
+
+    def _append_relevance_tap(self, judgments: list[dict],
+                              query: Optional[str]) -> None:
+        """Append the raw per-unit rating to the STRM 2a feedback JSONL.
+
+        ``data/training/strm_relevance/feedback.jsonl`` (gitignored,
+        regenerable). One line per judgment: ``{unit_id, rating, query,
+        slot_index, timestamp}``. ``slot_index`` is taken from the judgment if
+        the consumer supplied it (the external LLM / tool layer that knows
+        which ring slot it is rating), else ``null``. ``query`` is the
+        orchestrator's current query (threaded through ``record_feedback``),
+        else ``null``. The tap is a side-effect-only append -- it never
+        affects the boost reduction and never raises (the caller wraps it).
+        """
+        tap_path = os.path.join("data", "training", "strm_relevance",
+                                "feedback.jsonl")
+        os.makedirs(os.path.dirname(tap_path), exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        with open(tap_path, "a", encoding="utf-8") as f:
+            for j in judgments:
+                try:
+                    unit_id = j.get("unit_id")
+                    rating = j.get("rating")
+                    slot_index = j.get("slot_index")  # may be absent -> None
+                except (AttributeError, TypeError):
+                    continue
+                if not isinstance(unit_id, str) or not unit_id:
+                    continue
+                if not isinstance(rating, int):
+                    continue
+                f.write(json.dumps({
+                    "unit_id": unit_id,
+                    "rating": rating,
+                    "query": query if isinstance(query, str) else None,
+                    "slot_index": slot_index if isinstance(slot_index, int) else None,
+                    "timestamp": ts,
+                }, ensure_ascii=False) + "\n")
 
     # ---- user / session / global ids ----
 

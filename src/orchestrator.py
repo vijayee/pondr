@@ -164,12 +164,19 @@ class PonderOrchestrator:
         config: Phase2cConfig,
         user_id: Optional[str] = None,
         encoder: Optional[HippocampalEncoder] = None,
+        relevance_head=None,
     ) -> None:
         self.store = store
         self.retriever = retriever
         self.mode_a = mode_a
         self.config = config
         self.user_id = user_id
+        # STRM Phase 2a relevance head (optional, DI like the encoder). When
+        # wired it scores each WM ring slot's relevance to the current query
+        # (``r_i in [0,1]``); Phase 3's context-builder consumes ``r_i`` as the
+        # slot-selection bias. ``None`` (default, flag off / no checkpoint) ->
+        # no relevance scoring at serve (byte-identical to pre-2a).
+        self.relevance_head = relevance_head
         # Live-encode (2026-07-14): persist each exchange as an episode. The
         # encoder is injected (DI pattern, like retriever/mode_a/embedder) -- a
         # caller that wants live-encode constructs a ``HippocampalEncoder`` and
@@ -194,6 +201,10 @@ class PonderOrchestrator:
         # None before the synthesize call and sets it to the loop dict only when
         # the loop path ran (the non-loop path leaves it None).
         self._last_loop = None
+        # STRM 2a raw-rating tap: the current user query, set at the top of
+        # query() and cleared on every return path so the record_feedback tool
+        # path can thread it into feedback.jsonl. None outside a query.
+        self._current_query: Optional[str] = None
 
         # The cross-query Working Memory (persistent state). embedder injected so
         # WM can embed episodes/queries on demand.
@@ -262,6 +273,12 @@ class PonderOrchestrator:
         # there is no worker (the synchronous default).
         if self._distill_worker is not None:
             self._distill_worker.foreground_busy.set()
+        # STRM 2a raw-rating tap: remember the current query so the
+        # record_feedback tool path (tools.dispatch_tool -> store.record_feedback)
+        # can thread it into feedback.jsonl. Cleared on every return path (the
+        # early-return at the route gate below + the happy-path tail) so it never
+        # leaks into the next query -- if a new return path is added, clear there.
+        self._current_query = user_prompt
         # 1. embed prompt; update WM (state persists across queries).
         prompt_emb = self.working_memory.embed([user_prompt])[0]
         self.working_memory.update(prompt_emb)
@@ -296,6 +313,7 @@ class PonderOrchestrator:
                 # path tail below, which this return skips).
                 if self._distill_worker is not None:
                     self._distill_worker.foreground_busy.clear()
+                self._current_query = None
                 return {
                     "response": None, "route": route, "retrieved_episodes": [],
                     "context_used": None, "chunked": None,
@@ -489,6 +507,7 @@ class PonderOrchestrator:
         # turn's) graph edges in the now-idle GPU gap. No-op without a worker.
         if self._distill_worker is not None:
             self._distill_worker.foreground_busy.clear()
+        self._current_query = None
         return result
 
     def _classify_query(self, prompt: str) -> str:
@@ -664,7 +683,7 @@ class PonderOrchestrator:
         judgments = _parse_json_array(text)
         if not judgments:
             return 0
-        return self.store.record_feedback(judgments)
+        return self.store.record_feedback(judgments, query=self._current_query)
 
     def expand_unit(self, unit_id: str) -> Optional[str]:
         """Consumer tool: return the FULL text of a retrieved unit.

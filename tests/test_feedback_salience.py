@@ -619,3 +619,76 @@ def test_self_chat_loop_feedback_disabled_offers_no_record_feedback(tmp_path):
     assert len(mode_a.calls) == 1                       # clean answer, no fallback
     assert mode_a.calls[0]["tools"] is LOOP_TOOLS       # record_feedback excluded
     store.close()
+
+# ── STRM Phase 2a raw-rating JSONL tap ──
+
+def test_record_feedback_tap_writes_only_when_flag_on(tmp_path, monkeypatch):
+    """The raw-rating tap appends {unit_id, rating, query, slot_index,
+    timestamp} to feedback.jsonl ONLY when strm_relevance_logging is on. The
+    tap is cwd-relative (data/training/strm_relevance/feedback.jsonl), so chdir
+    to tmp_path for isolation. The boost reduction still runs (and is
+    unaffected) in both positions of the flag."""
+    import os
+    monkeypatch.chdir(tmp_path)
+    store = HippocampalStore(str(tmp_path / "db"))
+    tap_path = os.path.join("data", "training", "strm_relevance", "feedback.jsonl")
+
+    saved = _config.strm_relevance_logging
+    _config.strm_relevance_logging = True
+    try:
+        # the boost reduction still applies (returns 1); the tap is a side effect
+        n = store.record_feedback(
+            [{"unit_id": "ep_a", "rating": 5, "slot_index": 2},
+             {"unit_id": "ep_b", "rating": 1}],
+            query="why postgres?",
+        )
+        assert n == 2
+    finally:
+        _config.strm_relevance_logging = saved
+    store.close()
+
+    # the tap file was written with both records
+    with open(tap_path, encoding="utf-8") as f:
+        lines = [json.loads(l) for l in f if l.strip()]
+    assert len(lines) == 2
+    a, b = lines
+    assert a["unit_id"] == "ep_a" and a["rating"] == 5
+    assert a["query"] == "why postgres?" and a["slot_index"] == 2
+    assert "timestamp" in a
+    # slot_index absent on the second judgment -> null
+    assert b["unit_id"] == "ep_b" and b["rating"] == 1
+    assert b["slot_index"] is None
+
+    # flag OFF: a further call writes NO new lines (the tap is gated).
+    store2 = HippocampalStore(str(tmp_path / "db2"))
+    saved = _config.strm_relevance_logging
+    _config.strm_relevance_logging = False
+    try:
+        store2.record_feedback([{"unit_id": "ep_c", "rating": 4}], query="x")
+    finally:
+        _config.strm_relevance_logging = saved
+    store2.close()
+    with open(tap_path, encoding="utf-8") as f:
+        assert len([l for l in f if l.strip()]) == 2          # unchanged
+
+
+def test_record_feedback_tap_never_breaks_reduction(tmp_path, monkeypatch):
+    """A tap failure (e.g. an unwritable path) is swallowed -- the boost
+    reduction still returns the applied count and never raises."""
+    import os
+    # point the tap at a path whose parent is a FILE (mkdir will fail) by chdir
+    # into tmp and pre-creating a file at data/training/strm_relevance.
+    monkeypatch.chdir(tmp_path)
+    block = tmp_path / "data" / "training" / "strm_relevance"
+    block.parent.mkdir(parents=True, exist_ok=True)
+    block.write_text("i am a file not a dir")     # makedirs on this path fails
+    store = HippocampalStore(str(tmp_path / "db"))
+    saved = _config.strm_relevance_logging
+    _config.strm_relevance_logging = True
+    try:
+        # the tap raises internally + is swallowed; the reduction still applies
+        n = store.record_feedback([{"unit_id": "ep_a", "rating": 5}], query="q")
+        assert n == 1
+    finally:
+        _config.strm_relevance_logging = saved
+    store.close()

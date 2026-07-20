@@ -441,3 +441,219 @@ def test_load_recoverability_head_dim_mismatch_raises(tmp_path):
     # state_dict -> torch raises a size-mismatch.
     with pytest.raises(RuntimeError, match="size mismatch"):
         load_recoverability_head(str(tmp_path / "mismatch.pt"), device="cpu")
+
+
+# ── 2a relevance head ──
+#
+# A synthetic that models the REAL relevance task: the gold slot's doc_emb is
+# SIMILAR to the query_emb (high cosine), the negatives' doc_embs are
+# near-orthogonal to the query. slots_y is PURE NOISE -- mirroring the real
+# finding that the relevance signal lives in the raw bge doc embedding, NOT in
+# the frozen routing-trained backbone's y_t readout (see relevance_head.py
+# docstring + scripts/_scratch/_probe_relevance_bge_baseline). This is a
+# SIMILARITY task (gold close to query), which the bilinear head learns (it can
+# represent cosine) and an additive MLP cannot -- matching the real finding
+# (MLP tops out at 0.60 on ERAG while bge cosine clears at 1.0). Validates the
+# TRAINER MACHINERY (the fit loop, the top-3 recall + Wilson CI gate, the
+# checkpoint round-trip) on a clean signal, mirroring how the 2b/2c tests use
+# a clean synthetic.
+
+from src.subconscious.relevance_head import (  # noqa: E402
+    DOC_DIM as REL_DOC_DIM,
+    PROJ_DIM as REL_PROJ_DIM,
+    QUERY_DIM as REL_QUERY_DIM,
+    SLOT_DIM as REL_SLOT_DIM,
+    RelevanceHead,
+    load_relevance_head,
+)
+from src.subconscious.training.relevance_training import (  # noqa: E402
+    RelevanceTrainingConfig,
+    evaluate_relevance,
+    fit_relevance,
+    load_relevance_traces,
+)
+
+
+def _synthetic_relevance_traces(n_queries=40, k=15, seed=0):
+    """Gold doc_emb ~ query_emb (high cosine); negs near-orthogonal; slot_y noise.
+
+    Models real relevance: the gold slot is the doc whose embedding is similar
+    to the query. 1 gold/query. The bilinear head learns the cosine similarity
+    and ranks gold in the top-3."""
+    rng = np.random.default_rng(seed)
+    traces = []
+    for qi in range(n_queries):
+        # query direction; gold doc_emb is this direction + small noise (high
+        # cosine with the query); negatives are random (near-orthogonal).
+        q = rng.standard_normal(REL_QUERY_DIM).astype(np.float32)
+        query_emb = q
+        doc_embs = []
+        slots_y = []
+        labels = []
+        # gold slot first (the trainer shuffles; order is irrelevant to the gate)
+        doc_embs.append(q + 0.3 * rng.standard_normal(REL_DOC_DIM).astype(np.float32))
+        slots_y.append(0.3 * rng.standard_normal(REL_SLOT_DIM).astype(np.float32))  # noise
+        labels.append(1)
+        for _ in range(k - 1):
+            doc_embs.append(0.3 * rng.standard_normal(REL_DOC_DIM).astype(np.float32))
+            slots_y.append(0.3 * rng.standard_normal(REL_SLOT_DIM).astype(np.float32))
+            labels.append(0)
+        traces.append({
+            "query_id": f"q{qi}",
+            "question": f"question {qi}",
+            "category": "basic",
+            "expected_doc_ids": [f"gold_{qi}"],
+            "query_emb": torch.from_numpy(query_emb),
+            "slots_y": torch.from_numpy(np.stack(slots_y)).float(),    # [k, 256] noise
+            "slots_doc_emb": torch.from_numpy(np.stack(doc_embs)).float(),  # [k, 384] signal
+            "source_ids": [f"gold_{qi}"] + [f"neg_{qi}_{j}" for j in range(k - 1)],
+            "labels": torch.tensor(labels, dtype=torch.long),        # [k]
+        })
+    return traces
+
+
+# ── RelevanceHead module ──
+
+def test_relevance_head_predict_shape_and_range():
+    head = RelevanceHead()
+    slots = torch.randn(7, REL_SLOT_DIM)
+    doc = torch.randn(7, REL_DOC_DIM)
+    query = torch.randn(REL_QUERY_DIM)
+    r = head.predict(slots, doc, query)                          # [7, 1]
+    assert r.shape == (7, 1)
+    # sigmoid -> [0, 1]
+    assert bool((r >= 0.0).all()) and bool((r <= 1.0).all())
+    # 1-D inputs broadcast -> [1, 1]
+    r1 = head.predict(torch.randn(REL_SLOT_DIM), torch.randn(REL_DOC_DIM),
+                      torch.randn(REL_QUERY_DIM))
+    assert r1.shape == (1, 1)
+
+
+def test_relevance_head_predict_rejects_bad_dims():
+    head = RelevanceHead()
+    doc = torch.randn(3, REL_DOC_DIM)
+    # slot dim mismatch
+    with pytest.raises(ValueError, match="slot_y dim"):
+        head.predict(torch.randn(3, 64), doc, torch.randn(REL_QUERY_DIM))
+    # doc dim mismatch
+    with pytest.raises(ValueError, match="slot_doc_emb dim"):
+        head.predict(torch.randn(3, REL_SLOT_DIM), torch.randn(3, 100),
+                     torch.randn(REL_QUERY_DIM))
+    # query dim mismatch
+    with pytest.raises(ValueError, match="query dim"):
+        head.predict(torch.randn(3, REL_SLOT_DIM), doc, torch.randn(100))
+    # batch mismatch (slot batch != query batch, neither is 1)
+    with pytest.raises(ValueError, match="incompatible"):
+        head.predict(torch.randn(3, REL_SLOT_DIM), torch.randn(3, REL_DOC_DIM),
+                     torch.randn(5, REL_QUERY_DIM))
+
+
+def test_relevance_head_is_query_conditioned():
+    # the SAME slot scores differently against different queries (the query is
+    # an input, not a parameter) -- r differs across queries for one slot.
+    head = RelevanceHead()
+    slot = torch.randn(REL_SLOT_DIM)
+    doc = torch.randn(REL_DOC_DIM)
+    q_a = torch.randn(REL_QUERY_DIM)
+    q_b = torch.randn(REL_QUERY_DIM)
+    ra = head.predict(slot, doc, q_a).item()
+    rb = head.predict(slot, doc, q_b).item()
+    assert ra != rb
+
+
+# ── load_relevance_traces ──
+
+def test_load_relevance_traces_drops_no_gold(tmp_path):
+    traces = _synthetic_relevance_traces(n_queries=4, k=5, seed=1)
+    # inject a no-gold record (all-zero labels) -> dropped
+    traces.append({
+        "query_id": "qbad", "question": "x", "category": "basic",
+        "expected_doc_ids": [],
+        "query_emb": torch.randn(REL_QUERY_DIM),
+        "slots_y": torch.randn(5, REL_SLOT_DIM),
+        "slots_doc_emb": torch.randn(5, REL_DOC_DIM),
+        "source_ids": [f"n{j}" for j in range(5)],
+        "labels": torch.zeros(5, dtype=torch.long),
+    })
+    p = tmp_path / "traces.pt"
+    torch.save(traces, p)
+    loaded = load_relevance_traces(str(p))
+    assert len(loaded) == 4                     # the no-gold record dropped
+
+
+def test_load_relevance_traces_rejects_missing_doc_emb(tmp_path):
+    # a stale trace file (pre-doc_emb) is rejected with a regenerate pointer,
+    # not silently fed to a head that would have no signal.
+    traces = _synthetic_relevance_traces(n_queries=3, k=5, seed=2)
+    for r in traces:
+        del r["slots_doc_emb"]
+    p = tmp_path / "traces.pt"
+    torch.save(traces, p)
+    with pytest.raises(RuntimeError, match="slots_doc_emb"):
+        load_relevance_traces(str(p))
+
+
+# ── closed-form fit + gate + checkpoint round-trip ──
+
+def test_fit_relevance_clears_gate_on_synthetic(tmp_path):
+    traces = _synthetic_relevance_traces(n_queries=60, k=15, seed=7)
+    cfg = RelevanceTrainingConfig(
+        epochs=20, gate_top3=0.6, gate_wilson_low=0.5,
+        val_fraction=0.2, seed=0, checkpoint_dir=str(tmp_path),
+        # the synthetic's similarity signal (gold doc_emb ~ query_emb) is strong
+        # enough that the mild pos_weight_cap=3.0 suffices -- this exercises the
+        # fit loop + gate + checkpoint machinery without the heavy 14.0 class
+        # weight the moderate real signal needs (see relevance_training config).
+        pos_weight_cap=3.0,
+    )
+    result = fit_relevance(traces, cfg)
+    assert result["go"] is True
+    assert result["best_pc"]["mean_top3_recall"] >= 0.6
+    assert result["best_pc"]["hit_ci95"][0] > 0.5
+    # best.pt written with the gate payload
+    best = torch.load(tmp_path / "best.pt", weights_only=False)
+    assert best["slot_dim"] == REL_SLOT_DIM
+    assert best["doc_dim"] == REL_DOC_DIM
+    assert best["query_dim"] == REL_QUERY_DIM
+    assert best["proj_dim"] == REL_PROJ_DIM
+    assert best["go"] is True
+    # final.pt written (last epoch)
+    assert (tmp_path / "final.pt").exists()
+    assert (tmp_path / "train_log.json").exists()
+
+
+def test_fit_relevance_round_trips_through_loader(tmp_path):
+    traces = _synthetic_relevance_traces(n_queries=60, k=15, seed=8)
+    cfg = RelevanceTrainingConfig(epochs=15, checkpoint_dir=str(tmp_path),
+                                  pos_weight_cap=3.0)   # mild cap suffices on the strong synthetic
+    fit_relevance(traces, cfg)
+    head = load_relevance_head(str(tmp_path / "best.pt"), device="cpu")
+    # the loaded head's predict matches a fresh head's predict on the same
+    # state_dict (the loader rebuilds the shared-projection head + loads the
+    # weights).
+    rec = traces[0]
+    r_loaded = head.predict(rec["slots_y"], rec["slots_doc_emb"],
+                            rec["query_emb"]).squeeze(-1)
+    # gold slot (index 0) should rank highest -- the loaded head retained the fit
+    assert int(r_loaded.argmax().item()) == 0
+    assert float(r_loaded[0].item()) > float(r_loaded[1:].max().item())
+
+
+def test_fit_relevance_raises_on_too_few_queries(tmp_path):
+    traces = _synthetic_relevance_traces(n_queries=2, k=5, seed=9)
+    cfg = RelevanceTrainingConfig(checkpoint_dir=str(tmp_path))
+    with pytest.raises(RuntimeError, match=">=2 train queries"):
+        fit_relevance(traces, cfg)
+
+
+def test_load_relevance_head_dim_mismatch_raises(tmp_path):
+    traces = _synthetic_relevance_traces(n_queries=20, k=10, seed=11)
+    fit_relevance(traces, RelevanceTrainingConfig(
+        epochs=10, checkpoint_dir=str(tmp_path)))
+    ckpt = torch.load(tmp_path / "best.pt", weights_only=False)
+    ckpt["slot_dim"] = 64                                      # lie about the dim
+    torch.save(ckpt, tmp_path / "mismatch.pt")
+    # A head built with slot_dim=64 has yt_sidepath Linear(64,64), but the
+    # state_dict was saved with Linear(256,64) -> torch raises a size-mismatch.
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        load_relevance_head(str(tmp_path / "mismatch.pt"), device="cpu")

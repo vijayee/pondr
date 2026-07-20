@@ -117,7 +117,7 @@ def test_build_doc_index_and_get_doc(tmp_path):
     ]
     p = tmp_path / "docs.parquet"
     _write_docs_parquet(p, rows)
-    idx, all_ids = build_doc_index(str(p), {"d1"})
+    idx, all_ids = build_doc_index(str(p))
     assert all_ids == ["d1", "d2", "d3"]
     assert idx["d2"] == 1
     tbl = open_docs_table(str(p))
@@ -189,8 +189,7 @@ def test_build_records_shapes_labels_and_no_leakage(tmp_path):
     dp = tmp_path / "docs.parquet"
     _write_docs_parquet(dp, docs)
     questions = _synthetic_questions()
-    gold_ids = {d for q in questions for d in q["expected_doc_ids"]}
-    idx, all_ids = build_doc_index(str(dp), gold_ids)
+    idx, all_ids = build_doc_index(str(dp))
     tbl = open_docs_table(str(dp))
 
     backbone = JGSBackbone(BackboneConfig())   # fresh random init, CPU
@@ -212,6 +211,7 @@ def test_build_records_shapes_labels_and_no_leakage(tmp_path):
     assert r1["query_emb"].shape == (384,)
     K = r1["slots_y"].shape[0]
     assert r1["slots_y"].shape == (K, 256)
+    assert r1["slots_doc_emb"].shape == (K, 384)   # raw bge doc identity (the signal)
     assert r1["labels"].shape == (K,)
     # exactly the gold docs are labeled 1
     gold_set = set(r1["expected_doc_ids"])
@@ -251,8 +251,7 @@ def test_build_records_neg_per_query_bounds_candidate_count(tmp_path):
     dp = tmp_path / "docs.parquet"
     _write_docs_parquet(dp, docs)
     questions = _synthetic_questions()[:1]   # one query, gold d1
-    gold_ids = {"d1"}
-    idx, all_ids = build_doc_index(str(dp), gold_ids)
+    idx, all_ids = build_doc_index(str(dp))
     tbl = open_docs_table(str(dp))
     backbone = JGSBackbone(BackboneConfig())
     for p in backbone.parameters():

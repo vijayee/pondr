@@ -62,6 +62,7 @@ def build_ponder(
     user_id: str = "ponder",
     mode_a: Optional[ModeAGenerator] = None,
     config_override: Optional[Phase2cConfig] = None,
+    relevance_head_path: Optional[str] = None,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -87,6 +88,12 @@ def build_ponder(
             a real ``ModeAGenerator`` against ``bonsai_endpoint``.
         config_override: inject a ``Phase2cConfig``; ``None`` builds a default
             (with ``session.state_dir`` set under the store's parent dir).
+        relevance_head_path: optional STRM Phase 2a relevance-head checkpoint
+            (``best.pt`` from ``scripts/train_relevance_head.py``). When set,
+            ``load_relevance_head`` builds the head and it is attached to the
+            orchestrator (it scores each WM ring slot's relevance to the query;
+            Phase 3's context-builder consumes ``r_i``). ``None`` (default) ->
+            no relevance head at serve (byte-identical to pre-2a).
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -144,6 +151,16 @@ def build_ponder(
         # Put session state beside the memory DB so one data dir holds everything.
         cfg.session.state_dir = _sessions_dir_for(db_path or config.db_path)
 
+    # STRM Phase 2a relevance head (optional). Loaded only when a checkpoint
+    # path is given (default off, mirroring --doc-kind-ensemble). The head reads
+    # a ring slot + a query at serve -- no backbone -- so it loads independently
+    # of the frozen backbone above. Full r_i -> context-builder consumption is
+    # Phase 3; this round only makes the head loadable + the flag plumbed.
+    relevance_head = None
+    if relevance_head_path:
+        from .subconscious.relevance_head import load_relevance_head
+        relevance_head = load_relevance_head(relevance_head_path, device=device)
+
     orch = PonderOrchestrator(
         store=store,
         retriever=retriever,
@@ -153,6 +170,7 @@ def build_ponder(
         config=cfg,
         user_id=user_id,
         encoder=encoder,
+        relevance_head=relevance_head,
     )
     return orch
 

@@ -43,3 +43,19 @@ def test_isolation_coupled_with_async_distill_default():
         "the two flags must default ON together -- isolation without async_distill "
         "blocks the response ~22.8 s/doc"
     )
+
+
+def test_strm_relevance_logging_defaults_off():
+    assert Config().strm_relevance_logging is False, (
+        "strm_relevance_logging default flipped on -- the raw-rating JSONL tap is "
+        "side-effect-only and the labels only matter once a 2a head is in training; "
+        "a cold start must accumulate nothing"
+    )
+
+
+def test_strm_graduation_logging_defaults_off():
+    assert Config().strm_graduation_logging is False, (
+        "strm_graduation_logging default flipped on -- the replay JSONL tap is "
+        "side-effect-only and the v2 labels only matter once a graduation training "
+        "run is gated on them; a cold start must accumulate nothing"
+    )

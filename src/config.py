@@ -209,6 +209,24 @@ class Config:
     # answer turn inside the 4K context.
     self_chat_tool_loop_max_iters: int = 4
 
+    # ── STRM Phase 2a/2d: raw-rating + replay JSONL taps (default OFF) ──
+    # ``strm_relevance_logging``: when ON, ``store.record_feedback`` appends the
+    # RAW per-unit rating ``{unit_id, rating, query, slot_index, timestamp}`` to
+    # ``data/training/strm_relevance/feedback.jsonl`` BEFORE the boost reduction
+    # (today only the reduced multiplier is persisted -- the raw rating, query,
+    # and slot_index are lost, which are the 2a relevance head's training
+    # signal). Default OFF: the tap is a side-effect-only best-effort append
+    # that must never break the consumer's loop, and the labels only matter once
+    # a 2a head is in training; a cold start accumulates nothing.
+    strm_relevance_logging: bool = False
+    # ``strm_graduation_logging``: when ON, the orchestrator's serve ``query()``
+    # path appends per-turn ring-slot state to
+    # ``data/training/strm_graduation/replay.jsonl`` so the 2d v2 graduation
+    # labels accumulate while the other heads train. Default OFF for the same
+    # reason (side-effect-only; labels only matter once a v2 training run is
+    # gated on them).
+    strm_graduation_logging: bool = False
+
     # ── Paths ──
     data_dir: Path = Path("./data")
     sample_conversations: Path = Path("./data/sample_conversations.jsonl")

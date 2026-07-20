@@ -33,6 +33,18 @@ Flags:
                           0 -> 11/13 zero-shot, ~22.8 s/doc); DEFAULT ON and
                           viable because --async-distill is also on. --no-bonsai-
                           isolation for the V1 single-pass extractor.
+    --strm-relevance-head PATH  optional STRM Phase 2a relevance-head checkpoint
+                          (best.pt from scripts/train_relevance_head.py). When
+                          set, the head is loaded + attached to the orchestrator
+                          (it scores each WM ring slot's relevance to the query;
+                          Phase 3's context-builder consumes r_i). Default off.
+    --strm-relevance-logging   append the raw per-unit rating to the STRM 2a
+                          feedback.jsonl tap (data/training/strm_relevance/).
+                          DEFAULT OFF; the tap is side-effect-only and the
+                          labels only matter once a 2a head is in training.
+    --strm-graduation-logging append per-turn ring-slot state to the STRM 2d
+                          replay.jsonl tap (data/training/strm_graduation/) so
+                          the v2 graduation labels accumulate. DEFAULT OFF.
 
 Pre-warm the Bonsai server first (PTX-JIT cold-start ~18s/shape; see memory
 ``hippo-bonsai-local-server``). Live-encode (default on) loads GLiNER; the
@@ -117,6 +129,19 @@ def main() -> int:
                         "22.8 s). Use --no-bonsai-isolation for the V1 single-pass "
                         "extractor. Do NOT pass --no-async-distill without also passing "
                         "--no-bonsai-isolation, or the response blocks ~22s/turn.")
+    p.add_argument("--strm-relevance-head", default=None,
+                   help="optional STRM Phase 2a relevance-head checkpoint (best.pt). "
+                        "When set, the head is loaded + attached to the orchestrator. "
+                        "Default off (no relevance scoring at serve).")
+    p.add_argument("--strm-relevance-logging", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="append the raw per-unit rating to the STRM 2a feedback.jsonl "
+                        "tap. DEFAULT OFF (side-effect-only; labels only matter once a "
+                        "2a head is in training).")
+    p.add_argument("--strm-graduation-logging", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="append per-turn ring-slot state to the STRM 2d replay.jsonl "
+                        "tap so the v2 graduation labels accumulate. DEFAULT OFF.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -125,6 +150,8 @@ def main() -> int:
     # are the production path; --no-async-distill / --no-bonsai-isolation opt out.
     _config.async_distill_enabled = args.async_distill
     _config.bonsai_isolation_extraction = args.bonsai_isolation
+    _config.strm_relevance_logging = args.strm_relevance_logging
+    _config.strm_graduation_logging = args.strm_graduation_logging
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
@@ -138,6 +165,14 @@ def main() -> int:
     if not gate_path.exists():
         print(f"ERROR: gate checkpoint not found at {gate_path}", file=sys.stderr)
         return 1
+    relevance_head_path = None
+    if args.strm_relevance_head:
+        relevance_head_path = Path(args.strm_relevance_head)
+        if not relevance_head_path.exists():
+            print(f"ERROR: STRM relevance-head checkpoint not found at "
+                  f"{relevance_head_path}", file=sys.stderr)
+            return 1
+        relevance_head_path = str(relevance_head_path)
 
     print(f"[load] backbone={backbone_path}", file=sys.stderr)
     print(f"[load] gate={gate_path}", file=sys.stderr)
@@ -146,6 +181,9 @@ def main() -> int:
           file=sys.stderr)
     print(f"[load] async_distill={args.async_distill} "
           f"bonsai_isolation={args.bonsai_isolation}", file=sys.stderr)
+    print(f"[load] strm_relevance_head={relevance_head_path or '(off)'} "
+          f"strm_relevance_logging={args.strm_relevance_logging} "
+          f"strm_graduation_logging={args.strm_graduation_logging}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -158,6 +196,7 @@ def main() -> int:
         gliner_timing=args.gliner_timing,
         live_encode=not args.no_live_encode,
         user_id=args.user_id,
+        relevance_head_path=relevance_head_path,
     )
 
     try:

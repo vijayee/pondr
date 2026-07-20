@@ -61,6 +61,14 @@ TOOL_SCHEMAS: list[dict] = [
                             "properties": {
                                 "unit_id": {"type": "string"},
                                 "rating": {"type": "integer", "minimum": 1, "maximum": 5},
+                                "slot_index": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Optional: the 0-based index of the WM ring slot "
+                                        "this unit occupied when it was surfaced (for STRM "
+                                        "relevance-head training). Omit if unknown."
+                                    ),
+                                },
                             },
                             "required": ["unit_id", "rating"],
                         },
@@ -149,7 +157,10 @@ def dispatch_tool(orchestrator, name: str, args: Any) -> str:
             store = getattr(orchestrator, "store", None)
             if store is None:
                 return _err("no store configured; feedback not persisted")
-            n = store.record_feedback(judgments)
+            # Thread the orchestrator's current query into the STRM 2a raw-rating
+            # tap (set at the top of query(); None outside a query / in tests).
+            query = getattr(orchestrator, "_current_query", None)
+            n = store.record_feedback(judgments, query=query)
             return json.dumps({"ok": True, "applied": n})
 
         if name == "expand":

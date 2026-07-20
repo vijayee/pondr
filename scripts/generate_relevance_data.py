@@ -115,14 +115,15 @@ def load_questions(path: str, categories, max_queries: int) -> list[dict]:
     return out
 
 
-def build_doc_index(path: str, gold_doc_ids: set[str]) -> tuple[dict, list[str]]:
+def build_doc_index(path: str) -> tuple[dict, list[str]]:
     """Read the documents parquet ``doc_id`` column -> ``{doc_id: row_index}``.
 
     Returns the index and the full ordered ``doc_id`` list (the negative-sampling
     pool). Only the ``doc_id`` column is read (column projection) -- the 1.41 GB
     documents parquet is NOT loaded into memory; ``title``/``content`` for a
     sampled doc are read on demand by slicing the memory-mapped table opened by
-    ``open_docs_table``.
+    ``open_docs_table``. The gold-vs-missing check is the caller's job (it has
+    the gold set already); this builder is a pure index over all docs.
     """
     import pyarrow.parquet as pq
 
@@ -268,6 +269,20 @@ def build_records(
         slots_y = torch.stack([s.y.detach().to("cpu").to(torch.float32)
                                for s in ring]).squeeze(1)   # [K, 256]
         source_ids = [str(s.source_id) for s in ring]
+        # The RAW bge doc embedding per slot -- the step INPUT to wm.step, in the
+        # SAME order as the ring (== cand_vecs order). The 2a head reads this
+        # alongside y_t: a probe (scripts/_scratch/_probe_relevance_bge_baseline)
+        # showed raw bge cosine(query, doc) clears the top-3 gate at 1.000 on this
+        # slice, while y_t alone (the frozen routing-trained backbone's readout)
+        # carries NO relevance signal -- the backbone was trained for routing, not
+        # retrieval-similarity, so its 256-d readout does not preserve query-doc
+        # relevance. The head fuses [y_t ; doc_bge ; query_emb]: y_t keeps it a
+        # genuine WM-ring-slot head (and lets a future backbone fine-tune activate
+        # it); doc_bge is where the signal lives.
+        slots_doc_emb = torch.stack([
+            v.detach().to("cpu").to(torch.float32).squeeze(0)
+            for d, v in cand_vecs
+        ])                                                 # [K, 384]
         gold_set = set(gold)
         labels = torch.tensor([1 if sid in gold_set else 0 for sid in source_ids],
                               dtype=torch.long)
@@ -282,7 +297,8 @@ def build_records(
             "category": q["category"],
             "expected_doc_ids": list(gold),
             "query_emb": query_emb,            # [384]
-            "slots_y": slots_y,                # [K, 256]
+            "slots_y": slots_y,                # [K, 256]  (WM recurrent readout)
+            "slots_doc_emb": slots_doc_emb,    # [K, 384]  (raw bge doc identity)
             "source_ids": source_ids,          # [K]
             "labels": labels,                  # [K]
         })
@@ -346,7 +362,7 @@ def main() -> int:
           flush=True)
 
     print(f"Indexing documents parquet {docs_path} (doc_id column only)", flush=True)
-    doc_idx, all_doc_ids = build_doc_index(str(docs_path), gold_doc_ids)
+    doc_idx, all_doc_ids = build_doc_index(str(docs_path))
     missing = [d for d in gold_doc_ids if d not in doc_idx]
     if missing:
         print(f"  WARNING: {len(missing)} gold doc_ids not in documents parquet "
