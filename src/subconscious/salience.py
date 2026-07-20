@@ -270,3 +270,23 @@ def compute_salience(
 def salient_anchors(anchors: list[SalienceAnchor]) -> list[SalienceAnchor]:
     """Convenience: the subset of ``anchors`` with ``salient=True`` (oldest-first)."""
     return [a for a in anchors if a.salient]
+
+
+def format_salience_gap(signals: list[dict]) -> str:
+    """Build the consumer-facing gap statement for ``stale_uncertain`` signals.
+
+    Proposal sec 5: do not lie by omission. When the salience trigger fired
+    retrieval for a young anchor and got nothing back (the episode may be known
+    but not yet fully ingested by Thread 2's async-distill worker), surface a
+    STATED gap so the consumer can wait / re-ask / proceed with eyes open rather
+    than being silently suppressed. Returns ``""`` when there are no
+    ``stale_uncertain`` signals (the byte-identical flag-off case).
+    """
+    stale = [s for s in signals if s.get("kind") == "stale_uncertain"]
+    if not stale:
+        return ""
+    texts = [s.get("text") for s in stale if s.get("text")]
+    if texts:
+        joined = "; ".join(texts)
+        return (f"I may know this but have not finished ingesting it: {joined}.")
+    return "I may know this but have not finished ingesting it."

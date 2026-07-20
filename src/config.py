@@ -226,6 +226,21 @@ class Config:
     # reason (side-effect-only; labels only matter once a v2 training run is
     # gated on them).
     strm_graduation_logging: bool = False
+    # ``strm_salience_freshness_lag``: STRM Phase 4 Step 6 freshness watermark.
+    # When the salience trigger fires retrieval for an anchor and gets NOTHING
+    # back (the LTM pointer returned no episode), the engine must not silently
+    # suppress the pointer if the anchor is YOUNGER than the async-distill
+    # ingestion lag -- the episode may be known but not yet fully ingested
+    # (Thread 2's background distill worker is still filling its graph edges,
+    # ~22.8s/doc). Instead emit a typed ``stale_uncertain`` signal so the
+    # consumer can state the gap rather than lie by omission (proposal sec 5).
+    # This field is the lag in TURNS (a young anchor = age < lag). Turn-count
+    # proxy for the real wall-clock-since-encode vs distill-latency comparison;
+    # the deferred Step 7 eval decides whether a wall-clock watermark is worth
+    # it. Default 3 (an anchor seen in the ring within the last 3 turns is
+    # "fresh" -- possibly still being distilled). Only read when
+    # ``--strm-salience`` is armed.
+    strm_salience_freshness_lag: int = 3
 
     # ── Paths ──
     data_dir: Path = Path("./data")

@@ -52,6 +52,7 @@ from .retrieval.retriever import HippocampalRetriever
 from .subconscious.presentation_gate import (
     CHUNKED, DIRECT, PresentationGate, PresentationOutcome, PresentationPlan,
 )
+from .subconscious.salience import format_salience_gap
 from .subconscious.ssm_chunker import SSMChunker
 from .subconscious.state_serializer import (
     deserialize, serialize, snapshot_from_instance,
@@ -249,6 +250,20 @@ class PonderOrchestrator:
         # when the trigger is off / disarmed / failed -> no merge -> byte-
         # identical to pre-Step-5.
         self._salience_fired_episodes: Optional[list] = None
+        # Step 6: freshness watermark. ``_turn_count`` increments per armed
+        # query; ``_source_entry_turn`` records the turn each source_id first
+        # appeared in the ring at salience-scoring time (age = turn_count -
+        # entry_turn). A young anchor (age < strm_salience_freshness_lag) whose
+        # retrieval returned nothing emits a ``stale_uncertain`` signal instead
+        # of being silently suppressed (the episode may be known but not yet
+        # fully ingested by Thread 2's async-distill worker). Both inert when
+        # the trigger is off / disarmed -> byte-identical.
+        self._salience_turn_count = 0
+        self._source_entry_turn: dict = {}
+        # Step 6: the per-turn salience signals (recall | stale_uncertain) +
+        # the consumer-facing gap text. None when off / disarmed / failed ->
+        # absent from the result dict -> byte-identical.
+        self._salience_signals: Optional[list] = None
         # Live-encode (2026-07-14): persist each exchange as an episode. The
         # encoder is injected (DI pattern, like retriever/mode_a/embedder) -- a
         # caller that wants live-encode constructs a ``HippocampalEncoder`` and
@@ -341,7 +356,7 @@ class PonderOrchestrator:
         """Score the WM ring for salience + fire state-conditioned retrieval.
 
         Step 4: compute ``SalienceAnchor`` per ring slot and stash on
-        ``self._salience_anchors`` (for Step 6's freshness watermark).
+        ``self._salience_anchors``.
         Step 5: for each SALIENT anchor (budget-capped), fire
         ``retrieve_by_embedding`` with the anchor's 384-d doc vector as the
         state-conditioned query (the episode the WM state flagged as being-
@@ -349,19 +364,27 @@ class PonderOrchestrator:
         ``self._salience_fired_episodes`` -- the caller merges it into the
         prompt-driven ``episodes`` (salience first) and injects with
         ``pin=True`` so ``W_A`` retains the proactive recall.
+        Step 6: per salient anchor, emit a typed consumer signal on
+        ``self._salience_signals`` -- ``recall`` (retrieval returned hits) or
+        ``stale_uncertain`` (young anchor, age < ``strm_salience_freshness_lag``,
+        retrieval returned nothing -- the episode may still be ingesting by
+        Thread 2's async-distill worker; do not lie by omission). An OLD anchor
+        that got nothing back is silently dropped. The caller surfaces
+        ``salience_signals`` + ``format_salience_gap(...)`` in the result dict.
 
         Flag-off (when the hook never runs) is byte-identical: no anchors, no
-        fired episodes, no merge. Best-effort: any failure is swallowed
-        (``_salience_anchors`` AND ``_salience_fired_episodes`` stay ``None``,
-        the turn proceeds unchanged) -- a proactive-recall heuristic must never
-        crash the turn. Caller (``query``) only invokes this when
-        ``_salience_armed``.
+        fired episodes, no signals, no merge. Best-effort: any failure is
+        swallowed (``_salience_anchors`` AND ``_salience_fired_episodes`` AND
+        ``_salience_signals`` stay ``None``, the turn proceeds unchanged) -- a
+        proactive-recall heuristic must never crash the turn. Caller (``query``)
+        only invokes this when ``_salience_armed``.
         """
         try:
             ring_slots = self.working_memory.ring_buffer()
             if not ring_slots:
                 self._salience_anchors = None
                 self._salience_fired_episodes = None
+                self._salience_signals = None
                 return
             state_tensors = self.working_memory.state_tensors()
             from src.subconscious.salience import (
@@ -382,30 +405,74 @@ class PonderOrchestrator:
                 thresholds=self.salience_thresholds,
             )
             # Step 5: fire state-conditioned retrieval per salient anchor.
+            # Step 6: track per-anchor retrieval outcome + age to emit the
+            # ``recall`` (got hits) / ``stale_uncertain`` (young anchor, no hits)
+            # consumer signals. A young anchor (age < freshness lag) that got
+            # nothing back is NOT silently suppressed -- the episode may be known
+            # but not yet fully ingested by Thread 2's async-distill worker, so
+            # surface a stated gap (proposal sec 5: don't lie by omission). An
+            # OLD anchor that got nothing back is silently dropped (it had its
+            # chance). A retrieval exception is treated as no hits.
+            lag = int(getattr(_runtime_config, "strm_salience_freshness_lag", 3))
             fired: list[dict] = []
             seen_ids: set = set()
+            signals: list[dict] = []
             for anchor in salient_anchors(self._salience_anchors)[:SALIENCE_RETRIEVAL_BUDGET]:
-                if anchor.doc_emb is None or self.retriever is None:
+                sid = anchor.source_id
+                # Freshness watermark: record the turn this source_id first
+                # appeared at salience-scoring time. age = turns since.
+                if sid is not None and sid not in self._source_entry_turn:
+                    self._source_entry_turn[sid] = self._salience_turn_count
+                age = (self._salience_turn_count
+                       - self._source_entry_turn.get(sid, self._salience_turn_count))
+                hits: list = []
+                if anchor.doc_emb is not None and self.retriever is not None:
+                    try:
+                        hits = self.retriever.retrieve_by_embedding(
+                            anchor.doc_emb, signal=signal,
+                        )
+                    except Exception:  # noqa: BLE001 - per-anchor best-effort
+                        hits = []
+                    for ep in hits:
+                        eid = ep.get("episode_id")
+                        if eid is None or eid in seen_ids:
+                            continue
+                        seen_ids.add(eid)
+                        fired.append(ep)
+                got_hits = bool(hits)
+                # Emit the per-anchor consumer signal.
+                if got_hits:
+                    kind = "recall"
+                elif age < lag:
+                    # Young + failed -> stale-uncertain (the episode may still be
+                    # ingesting). Not suppressed.
+                    kind = "stale_uncertain"
+                else:
+                    # Old + failed -> silently dropped (had its chance).
                     continue
-                try:
-                    hits = self.retriever.retrieve_by_embedding(
-                        anchor.doc_emb, signal=signal,
-                    )
-                except Exception:  # noqa: BLE001 - per-anchor best-effort
-                    continue
-                for ep in hits:
-                    eid = ep.get("episode_id")
-                    if eid is None or eid in seen_ids:
-                        continue
-                    seen_ids.add(eid)
-                    fired.append(ep)
+                signals.append({
+                    "anchor_source_id": sid,
+                    "kind": kind,
+                    "text": anchor.text,
+                    "r_i": anchor.r_i,
+                    "rec_i": anchor.rec_i,
+                    "age": age,
+                })
             self._salience_fired_episodes = fired
+            self._salience_signals = signals
+            # Prune the entry-turn watermark to source_ids still in the ring so
+            # it does not grow unbounded across a long session.
+            live = {s.source_id for s in ring_slots if s.source_id is not None}
+            self._source_entry_turn = {
+                k: v for k, v in self._source_entry_turn.items() if k in live
+            }
         except Exception:
             # A proactive-recall heuristic must never crash the turn. Swallow,
-            # leave no anchors + no fired episodes, and the rest of query()
-            # proceeds unchanged.
+            # leave no anchors + no fired episodes + no signals, and the rest of
+            # query() proceeds unchanged.
             self._salience_anchors = None
             self._salience_fired_episodes = None
+            self._salience_signals = None
 
     # ── main entry ──
 
@@ -464,6 +531,11 @@ class PonderOrchestrator:
         if not salience_armed:
             self._salience_anchors = None
             self._salience_fired_episodes = None
+            self._salience_signals = None
+        else:
+            # Step 6: advance the freshness-watermark turn counter for this
+            # armed query (the hook computes anchor age = turn_count - entry_turn).
+            self._salience_turn_count += 1
         prev_state_tensors = None
         if salience_armed and self.working_memory.state is not None:
             prev_state_tensors = [t.clone() for t in self.working_memory.state_tensors()]
@@ -518,9 +590,13 @@ class PonderOrchestrator:
                     "supported": False,
                     # Armed-only (see the happy-path augmentation): the
                     # salience hook ran before this route gate, so report its
-                    # retrieval count even on the unsupported-route early return
-                    # for a consistent budget contract. Absent when off.
+                    # retrieval count + signals even on the unsupported-route
+                    # early return for a consistent budget/signal contract.
+                    # Absent when off.
                     **({"salience_retrieval_count": len(self._salience_fired_episodes or [])}
+                       if salience_armed else {}),
+                    **({"salience_signals": self._salience_signals or [],
+                        "salience_gap_text": format_salience_gap(self._salience_signals or [])}
                        if salience_armed else {}),
                 }
             episodes = routing_result.get("results", [])
@@ -739,6 +815,15 @@ class PonderOrchestrator:
         # (byte-identical result dict to pre-Step-5).
         if salience_armed:
             result["salience_retrieval_count"] = len(self._salience_fired_episodes or [])
+        # STRM Phase 4 Step 6: surface the per-anchor salience signals
+        # (recall | stale_uncertain) + the consumer-facing gap text. A young
+        # anchor whose retrieval returned nothing emits ``stale_uncertain`` ("I
+        # may know this but have not finished ingesting it") instead of being
+        # silently suppressed (proposal sec 5: don't lie by omission). Armed-
+        # only -> both keys ABSENT when the flag is off (byte-identical).
+        if salience_armed:
+            result["salience_signals"] = self._salience_signals or []
+            result["salience_gap_text"] = format_salience_gap(self._salience_signals or [])
 
         # Phase 3a Task 7: auto-record the presentation outcome with the
         # MEASURED expand_count (the durable salience signal from 2c §15).
