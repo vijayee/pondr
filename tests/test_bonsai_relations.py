@@ -123,8 +123,10 @@ def _stub_post_factory(calls: list, payload_per_call=None):
 
 
 def test_extract_single_is_default_dispatch(monkeypatch):
-    """With bonsai_isolation_extraction=False (the default), extract() makes ONE
-    HTTP call (the V1 merged prompt), not 10."""
+    """With bonsai_isolation_extraction=False (the V1 single-pass path),
+    extract() makes ONE HTTP call (the V1 merged prompt), not 10. (The flag now
+    defaults ON in config; this test sets it False explicitly to exercise the
+    single-pass branch, so the default change does not affect it.)"""
     monkeypatch.setattr(config, "bonsai_isolation_extraction", False)
     ext = BonsaiRelationExtractor()
     calls = []

@@ -57,7 +57,7 @@ def build_ponder(
     bonsai_endpoint: Optional[str] = None,
     device: str = "auto",
     gliner_device: str = "auto",
-    gliner_timing: bool = False,
+    gliner_timing: bool = True,
     live_encode: bool = True,
     user_id: str = "ponder",
     mode_a: Optional[ModeAGenerator] = None,

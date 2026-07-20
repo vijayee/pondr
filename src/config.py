@@ -36,8 +36,11 @@ class Config:
     # OOM-safe -> per-model CPU fallback.
     gliner_device: str = "cpu"
     # Log per-stage GLiNER extraction timing ([gliner-timing] stable/open/total)
-    # to stderr. Off by default; enable to measure the CPU-vs-CUDA bottleneck.
-    gliner_timing: bool = False
+    # to stderr. ON by default (Phase 1c-3c hardening): the log line is stderr-
+    # only and safe; it surfaces the CPU-vs-CUDA extraction latency on every
+    # encode so the ~24s/conv bottleneck is visible without an opt-in flag.
+    # Disable via serve_ponder --no-gliner-timing (or env) when the log is noise.
+    gliner_timing: bool = True
     # Extraction threshold. The matching spans sit far below the model's
     # "natural" 0.3 on CPU: a sweep over the 20 sample conversations showed
     # topic recall 0.09 at 0.3 / 0.22 at 0.05 / 0.27 at 0.03, with ZERO
@@ -154,23 +157,28 @@ class Config:
     # to pre-async). True = one focused single-predicate pass per class, merged
     # -- lifts strict has_state catch 0 -> 11/13 zero-shot (every class emits,
     # no salience race for the "at most 6" slots) at the cost of 10 HTTP
-    # round-trips (~22.8 s/doc, untenable on the sync path -> only enable
-    # behind async_distill_enabled so it runs on the background worker). See
-    # docs/Phase 3c.md Sec 7 + memory pondr-bonsai-zeroshot-eval-finetune-warranted.
-    bonsai_isolation_extraction: bool = False
-    # Async episode distillation (Phase 3c). False (default) = the synchronous
+    # round-trips (~22.8 s/doc, untenable on the sync path). COUPLED to
+    # async_distill_enabled: isolation is only viable because async_distill
+    # moves extraction to the background worker. Do NOT enable isolation
+    # without async_distill, or the main thread pays 22.8 s/doc. Both flip ON
+    # together by default (Phase 1c-3c hardening); the ingest-path extract is
+    # wrapped (pipeline.py) so a Bonsai outage degrades to [] rather than
+    # raising. See docs/Phase 3c.md Sec 7 + memory
+    # pondr-bonsai-zeroshot-eval-finetune-warranted.
+    bonsai_isolation_extraction: bool = True
+    # Async episode distillation (Phase 3c). False = the synchronous
     # _persist_exchange (encode blocks the response, byte-identical to today).
-    # True = the response returns immediately; the episode is written as a stub
-    # (content + vector index) on the main thread and a single-worker background
-    # FIFO fills the graph edges (extraction + 10-pass Bonsai) in the gaps
-    # between turns (foreground-priority yielding). Live-dogfood passed
-    # 2026-07-16 against the real 8B: response 7.8 s << 22.8 s fill, stub
-    # content-retrievable immediately, has_state assertion edges
-    # (E:entity, state, value) fire after the fill (the Bonsai assertion arm
-    # goes no-op -> live). Default off (opt-in via serve_ponder --async-distill);
-    # compose with bonsai_isolation_extraction (async hides the 22.8 s, isolation
-    # provides the 11/13 has_state quality).
-    async_distill_enabled: bool = False
+    # True (default, Phase 1c-3c hardening) = the response returns immediately;
+    # the episode is written as a stub (content + vector index) on the main
+    # thread and a single-worker background FIFO fills the graph edges
+    # (extraction + 10-pass Bonsai) in the gaps between turns (foreground-
+    # priority yielding). Live-dogfood passed 2026-07-16 against the real 8B:
+    # response 7.8 s << 22.8 s fill, stub content-retrievable immediately,
+    # has_state assertion edges (E:entity, state, value) fire after the fill
+    # (the Bonsai assertion arm goes no-op -> live). Compose with
+    # bonsai_isolation_extraction (async hides the 22.8 s, isolation provides
+    # the 11/13 has_state quality) -- both are ON by default together.
+    async_distill_enabled: bool = True
 
     # ── Phase 2c+: feedback-driven salience ──
     # When True, after a synthesizing turn the consumer (the external LLM, or

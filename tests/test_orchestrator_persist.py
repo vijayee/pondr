@@ -161,8 +161,17 @@ def _has_graph_edge(store: HippocampalStore, s: str, p: str, o: str) -> bool:
 
 # ── 1. two queries persist two chained episodes ──
 
-def test_two_queries_persist_two_chained_episodes(tmp_path):
-    """Two synthesize queries -> two live episodes; ep2 follows ep1 in-session."""
+def test_two_queries_persist_two_chained_episodes(tmp_path, monkeypatch):
+    """Two synthesize queries -> two live episodes; ep2 follows ep1 in-session.
+
+    Sync-path invariant: the ``follows`` edge is written by the FOREGROUND
+    ``encode_messages`` call, so it is present immediately after ``query()``
+    returns. ``async_distill_enabled`` now defaults ON (the stub-then-fill path
+    defers graph edges to the background worker, filled by ``drain()`` -- see
+    ``test_async_distill_stub_then_fill_end_to_end``); this test selects the
+    SYNC path explicitly so the immediate-edge contract it asserts holds.
+    """
+    monkeypatch.setattr(config, "async_distill_enabled", False)
     plan = {"entities": ["Postgres"], "entity_mode": "union"}
     eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
     orch, store, _ = _orch_with_encoder(tmp_path, plan, eps)
@@ -257,7 +266,16 @@ def test_no_encoder_injected_is_noop(tmp_path):
 
 # ── 6. a forced encode failure is logged; the response is not lost ──
 
-def test_encode_failure_logged_response_still_returned(tmp_path, capsys):
+def test_encode_failure_logged_response_still_returned(tmp_path, capsys, monkeypatch):
+    """Sync-path invariant: a foreground ``encode_messages`` failure logs and
+    prevents persistence (no ``persisted_episode_id``). Under async distill
+    (now the default) the foreground calls ``encode_messages_stub`` -- which
+    succeeds and persists a stub -- while ``encode_messages`` runs on the
+    background worker, so this contract only holds on the sync path. Select it
+    explicitly; the async failure surface is covered by
+    ``test_async_distill_stub_then_fill_end_to_end``.
+    """
+    monkeypatch.setattr(config, "async_distill_enabled", False)
     plan = {"entities": ["Postgres"], "entity_mode": "union"}
     eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
     orch, store, encoder = _orch_with_encoder(tmp_path, plan, eps, reply="MY REPLY")

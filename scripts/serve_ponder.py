@@ -19,16 +19,20 @@ Flags:
     --embed-source NAME    on-demand (real bge) | stub (shape-only smoke)
     --device NAME          backbone+gate device (auto|cpu|cuda)
     --gliner-device NAME   GLiNER device (auto|cpu|cuda); OOM-safe fallback
-    --gliner-timing        log per-stage GLiNER extraction timing
+    --gliner-timing        log per-stage GLiNER extraction timing (DEFAULT ON;
+                          --no-gliner-timing to disable)
     --no-live-encode       do not persist exchanges (skip the encoder + GLiNER)
     --user-id ID           user the encoder attributes episodes to
     --query TEXT           one-shot query; omit for the interactive REPL
     --bonsai-endpoint URL  override the Bonsai LLM endpoint
     --async-distill        background episode distillation (response returns
                           immediately; extraction fills graph edges in the gaps
-                          between turns). Phase 3c async-distill.
+                          between turns). DEFAULT ON; --no-async-distill to
+                          disable (synchronous encode).
     --bonsai-isolation     10-pass isolated per-class Bonsai extractor (has_state
-                          0 -> 11/13 zero-shot, ~22.8 s/doc); needs --async-distill.
+                          0 -> 11/13 zero-shot, ~22.8 s/doc); DEFAULT ON and
+                          viable because --async-distill is also on. --no-bonsai-
+                          isolation for the V1 single-pass extractor.
 
 Pre-warm the Bonsai server first (PTX-JIT cold-start ~18s/shape; see memory
 ``hippo-bonsai-local-server``). Live-encode (default on) loads GLiNER; the
@@ -93,34 +97,38 @@ def main() -> int:
     p.add_argument("--device", default="auto", help="backbone+gate device: auto|cpu|cuda")
     p.add_argument("--gliner-device", default="auto",
                    help="GLiNER device: auto|cpu|cuda (OOM-safe CPU fallback)")
-    p.add_argument("--gliner-timing", action="store_true",
-                   help="log per-stage GLiNER extraction timing to stderr")
+    p.add_argument("--gliner-timing", action=argparse.BooleanOptionalAction, default=True,
+                   help="log per-stage GLiNER extraction timing to stderr (default on; "
+                        "use --no-gliner-timing to disable)")
     p.add_argument("--no-live-encode", action="store_true",
                    help="do not persist exchanges (skip the encoder + GLiNER)")
     p.add_argument("--user-id", default="ponder", help="user the encoder attributes episodes to")
     p.add_argument("--query", default=None, help="one-shot query; omit for the interactive REPL")
     p.add_argument("--bonsai-endpoint", default=None, help="override the Bonsai LLM endpoint")
-    p.add_argument("--async-distill", action="store_true",
-                   help="enable background episode distillation: the response returns "
-                        "immediately while GLiNER + Bonsai extraction fills the graph "
-                        "edges on a single-worker FIFO in the gaps between turns "
-                        "(Phase 3c async-distill). Default off = synchronous encode.")
-    p.add_argument("--bonsai-isolation", action="store_true",
-                   help="enable the 10-pass isolated per-class Bonsai extractor (lifts "
-                        "strict has_state 0 -> 11/13 zero-shot) at ~22.8 s/doc. Only "
-                        "viable behind --async-distill (else the response blocks ~22s). "
-                        "Default off = the V1 single-pass extractor.")
+    p.add_argument("--async-distill", action=argparse.BooleanOptionalAction, default=True,
+                   help="background episode distillation: the response returns immediately "
+                        "while GLiNER + Bonsai extraction fills the graph edges on a "
+                        "single-worker FIFO in the gaps between turns (Phase 3c). "
+                        "DEFAULT ON; use --no-async-distill for synchronous encode.")
+    p.add_argument("--bonsai-isolation", action=argparse.BooleanOptionalAction, default=True,
+                   help="10-pass isolated per-class Bonsai extractor (lifts strict "
+                        "has_state 0 -> 11/13 zero-shot) at ~22.8 s/doc. DEFAULT ON; "
+                        "viable because --async-distill is also on (async hides the "
+                        "22.8 s). Use --no-bonsai-isolation for the V1 single-pass "
+                        "extractor. Do NOT pass --no-async-distill without also passing "
+                        "--no-bonsai-isolation, or the response blocks ~22s/turn.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
     # __init__ (not the per-instance cfg), so set them BEFORE build_ponder. Both
-    # default off -> byte-identical to the synchronous pre-async path.
+    # default ON (Phase 1c-3c hardening) -> async distill + the 10-pass extractor
+    # are the production path; --no-async-distill / --no-bonsai-isolation opt out.
     _config.async_distill_enabled = args.async_distill
     _config.bonsai_isolation_extraction = args.bonsai_isolation
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
-              "--async-distill too.", file=sys.stderr)
+              "--async-distill too (or pass --no-bonsai-isolation).", file=sys.stderr)
 
     backbone_path = Path(args.backbone)
     if not backbone_path.exists():
@@ -134,10 +142,10 @@ def main() -> int:
     print(f"[load] backbone={backbone_path}", file=sys.stderr)
     print(f"[load] gate={gate_path}", file=sys.stderr)
     print(f"[load] live_encode={not args.no_live_encode} "
-          f"gliner_device={args.gliner_device}", file=sys.stderr)
-    if args.async_distill or args.bonsai_isolation:
-        print(f"[load] async_distill={args.async_distill} "
-              f"bonsai_isolation={args.bonsai_isolation}", file=sys.stderr)
+          f"gliner_device={args.gliner_device} gliner_timing={args.gliner_timing}",
+          file=sys.stderr)
+    print(f"[load] async_distill={args.async_distill} "
+          f"bonsai_isolation={args.bonsai_isolation}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,

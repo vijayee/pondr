@@ -110,9 +110,20 @@ class UnifiedIngestionPipeline:
                 })
 
         # Doc-level relations (Bonsai) over a capped concatenation of the doc.
+        # Wrapped to degrade to [] on any failure -- relations are supplementary
+        # (a doc with no relations is still fully usable for entity/topic +
+        # semantic retrieval), and with bonsai_isolation_extraction ON by default
+        # the ingest path hits Bonsai 10x per doc (~22.8 s/doc), so a transient
+        # server error / unparseable JSON must not drop the whole ingest. Mirrors
+        # encoder._extract_relations (the encode path's try/except guard).
         relations: list[dict] = []
         if relation_extractor is not None:
-            relations = list(relation_extractor.extract(self._doc_text(parsed)))
+            try:
+                relations = list(relation_extractor.extract(self._doc_text(parsed)))
+            except Exception as e:  # noqa: BLE001 - intentional broad guard
+                import sys
+                print(f"[bonsai-fail] doc relations: {e}", file=sys.stderr)
+                relations = []
 
         # Per-section embeddings (the per-chunk vector-index path): ONE batched
         # encode over every section's chunk text. Assigned to the RawSection so

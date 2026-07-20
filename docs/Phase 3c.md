@@ -609,7 +609,8 @@ Design (`/.claude/plans/async-distill-stub.md`):
   writable. Idempotent + force-clears `foreground_busy` so a blocked worker can
   exit.
 
-**Gating (both default OFF, byte-identical when off):**
+**Gating (both default ON as of the Phase 1c-3c hardening; overridable via
+`serve_ponder --no-async-distill` / `--no-bonsai-isolation` or env):**
 - `config.bonsai_isolation_extraction` -- the 10-pass isolated extractor (vs the
   V1 single-pass). Only viable behind async (22.8 s/doc).
 - `config.async_distill_enabled` -- the background worker (vs the fused sync
@@ -618,7 +619,12 @@ Design (`/.claude/plans/async-distill-stub.md`):
 
 Both flags off = the synchronous V1 path, byte-identical to pre-async. The
 flags are independent but isolation-without-async would block the response
-(only enable isolation when async is also on).
+(`serve_ponder` warns and refuses to compose them silently). The defaults are
+pinned by `tests/test_defaults.py`; the sync-path invariants (immediate
+`follows` edge; foreground encode failure prevents persistence) are pinned by
+`tests/test_orchestrator_persist.py`, which selects the sync path explicitly
+now that the default is async. `gliner_timing` (the per-stage extraction
+stderr log) also flipped default ON in the same hardening pass.
 
 **Tests.** 15 new offline tests: store split lossless + graph-invisibility
 (`test_store_stub_fill.py`, 4); encoder stub/fill contract -- fill never touches

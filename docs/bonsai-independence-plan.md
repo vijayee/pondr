@@ -68,8 +68,8 @@ Call sites:
   `RuntimeError` → `[]`; called by `encode_messages` 236-237 and
   `encode_messages_fill` 290-291).
 - `src/encoding/distill_worker.py:100-117` (async-distill background worker).
-- `src/ingestion/pipeline.py:114-115` (doc-level extract — **no try/except**;
-  see §3.1 safety bug).
+- `src/ingestion/pipeline.py` (doc-level extract — **wrapped** try/except →
+  `[]` as of the Phase 1c-3c hardening; see §3.1).
 
 Extracted `has_state` triples merge with the deterministic normalizer in
 `extract_state_assertions` (`src/encoding/assertion_extractor.py:229-275`)
@@ -141,18 +141,20 @@ The runtime **already survives Bonsai being unreachable**:
 So path (b) is about **quality** without the GPU LLM and about not *shipping*
 `:8080` as a requirement — not about preventing crashes.
 
-### 3.1 Safety fix (do regardless of strategy) — the one hard-failure window
+### 3.1 Safety fix (do regardless of strategy) — the one hard-failure window — DONE
 
-`src/ingestion/pipeline.py:114-115` calls `relation_extractor.extract(...)`
-**without a try/except**, while the encode path (`encoder.py:128-142`) does
-catch. A Bonsai that is up at construct time but drops mid-ingest raises
-`RuntimeError` and propagates.
+`src/ingestion/pipeline.py` previously called `relation_extractor.extract(...)`
+**without a try/except**, while the encode path (`encoder.py:128-142`) did
+catch. A Bonsai that is up at construct time but drops mid-ingest raised
+`RuntimeError` and propagated.
 
-Fix: mirror `encoder.py:128-142` — wrap the ingest `extract` call, degrade to
-`[]` on `RuntimeError`, let the deterministic normalizer run. This makes
-"Bonsai optional/unreachable" a safe, tested runtime state and de-risks every
-roadmap demo. **Low effort, correctness not optimization — the one item from
-this plan worth doing before the roadmap assessment.**
+**DONE (Phase 1c-3c hardening):** mirrored `encoder.py:128-142` — the ingest
+`extract` call is wrapped, degrades to `[]` on any `Exception` (logs
+`[bonsai-fail]` to stderr), and the deterministic normalizer still runs. This
+matters more now that `bonsai_isolation_extraction` defaults ON (ingest hits
+Bonsai 10x/doc, ~22.8 s/doc) — a transient server error or unparseable JSON
+no longer drops the whole ingest. "Bonsai optional/unreachable" is now a safe
+runtime state.
 
 ---
 
