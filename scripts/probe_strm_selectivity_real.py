@@ -1,0 +1,459 @@
+"""STRM Probe 4a: 2a relevance-head SELECTIVITY on REAL serve data (no LLM).
+
+The truer ship gate after the OOD finding. Probe 3 ([[pondr-strm-probe3-cost-
+parity]]) showed the 2a relevance head SATURATES at serve on SYNTHETIC
+fact-summaries (r_i ~ 0.9998 for both probe and filler turns -> probe-minus-
+filler gap ~ 1e-4; gate needs >= 0.2). Decomposing the shipped head's logits
+on real ERAG-trace tensors ([[pondr-strm-probe3-hardneg-retrain]]) showed it
+DISCRIMINATES CLEANLY on its training distribution (gold r_i 0.974 vs neg
+0.034 vs gold-with-unrelated-query 0.014). So the synthetic Probe 3 facts may
+simply be OUT OF DISTRIBUTION for an ERAG-trained projection. Whether the head
+discriminates on the ACTUAL serve distribution (real Onyx transcripts) is
+untested -- that is this probe.
+
+WHAT. Replays the real local chat transcripts (``docs/*.json``, Onyx export
+shape) through the TRAINED backbone with the WM ring ON + the trained 2a
+relevance head loaded -- salience OFF (we are measuring the head, not the
+trigger), no Bonsai, no GLiNER, no Onyx, no secrets -- and captures per-turn
+per-slot ``r_i`` on the REAL recalled episodes the retriever injects into the
+ring every turn (``orchestrator.py`` injects retrieved episodes with
+``source_id`` + ``text`` at :624-647 regardless of salience). Then asks two
+questions of the captured r_i:
+
+  1. DISTRIBUTION -- does r_i vary at all on real serve data? If the head
+     saturates (Probe 3 finding), r_i ~ 0.9998 for everything -> tiny std, a
+     near-degenerate percentile range. If it discriminates on real data, r_i
+     spreads across [0, 1] -> a healthy std + wide p10/p90 range. This needs
+     NO probe/filler labeling: a near-constant r_i is the saturation signature.
+  2. SELECTIVITY GAP -- per recalled episode E, across the turns E is in the
+     ring, label the turn whose user-text is most bge-cosine-similar to E's
+     text as the "probe" turn (the turn E is most relevant to) and the rest as
+     "fillers"; gap = probe_r - mean_filler_r. Gate: min gap >= 0.2 (matches
+     Probe 3's _selectivity gate). This mirrors Probe 3 but on REAL slots +
+     REAL queries, with cosine (not hand-authoring) picking probe vs filler.
+
+VERDICT. If the distribution is healthy AND the selectivity gap >= 0.2 on real
+data, the synthetic Probe 3 NO-GO was a scenario artifact (OOD), and the ship
+decision should move to Probe 4b (answer-quality LLM-judge). If r_i still
+saturates on real data, the head is genuinely broken on the serve
+distribution -> train on serve-distribution data, not ERAG.
+
+This script uses NO secrets (the transcripts are already on disk). The
+relevance-head checkpoint is a trained artifact, not a secret. Probe-only --
+no src changes, no shipped artifacts.
+
+Usage:
+    python scripts/probe_strm_selectivity_real.py
+    python scripts/probe_strm_selectivity_real.py --transcripts docs/a.json \\
+        --ring-capacity 16 --max-turns 0 --out report.json
+    # salience-ON (permissive) variant for comparison (does arming change the
+    # slot population / r_i distribution?):
+    python scripts/probe_strm_selectivity_real.py --salience permissive \\
+        --out report_salience.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import shutil
+import statistics
+import sys
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import torch  # noqa: E402
+
+from src.config import Phase2cConfig  # noqa: E402
+from src.orchestrator import PonderOrchestrator  # noqa: E402
+from src.retrieval.query_planner import BonsaiQueryPlanner  # noqa: E402
+from src.retrieval.retriever import HippocampalRetriever  # noqa: E402
+from src.subconscious.configs import BackboneConfig  # noqa: E402
+from src.subconscious.latent_dynamics_head import load_latent_dynamics_head  # noqa: E402
+from src.subconscious.recoverability_head import load_recoverability_head  # noqa: E402
+from src.subconscious.relevance_head import load_relevance_head  # noqa: E402
+from src.subconscious.relevance_score import score_ring_slots  # noqa: E402
+from src.subconscious.salience import (  # noqa: E402
+    SalienceThresholds,
+    load_salience_thresholds,
+)
+from src.subconscious.training.routing_training import build_embedder, load_backbone  # noqa: E402
+
+# Reuse the committed transcript-replay helpers verbatim (the same loader +
+# episode builder the 2d v2 harness uses -> the ring slots we score are the
+# SAME shape the live deploy produces).
+from scripts.replay_chat_to_graduation import (  # noqa: E402
+    _encode_best_effort,
+    _iso,
+    _pair_turns,
+    build_episode,
+    load_transcript_threads,
+)
+
+DEFAULT_BACKBONE_PATH = "data/pod_runs/phase2a_full/checkpoints/backbone/backbone_final.pt"
+DEFAULT_RELEVANCE_HEAD = "data/training/strm_relevance/best.pt"
+# Only needed when ``--salience permissive`` (arming the trigger requires all
+# three heads + thresholds, matching ``_salience_armed`` in the orchestrator).
+DEFAULT_RECOVERABILITY_HEAD = "data/training/strm_recoverability/best.pt"
+DEFAULT_LATENT_DYNAMICS_HEAD = "data/training/strm_latent_dynamics/best.pt"
+DEFAULT_THRESHOLDS = "data/training/strm_salience/thresholds.json"
+DEFAULT_TRANSCRIPTS = (
+    "docs/The_Ponder_Engine_Chat.json",
+    "docs/The _Ponder_Engine_Coding_Chat.json",
+)
+
+
+class _StubModeA:
+    """No LLM round-trip. The probe measures r_i, not synthesis."""
+
+    def _complete(self, messages, tools=None, tool_choice=None):
+        return ("[probe-stub-response]", None)
+
+
+def _permissive_thresholds() -> SalienceThresholds:
+    """Every SCORED anchor is salient (the AND passes for any non-None scores).
+    Only used when ``--salience permissive`` (so salience-fired pin-tagged
+    episodes join the ring alongside the prompt-driven ones)."""
+    return SalienceThresholds(
+        theta=1e18, phi=-1e18, surprise_cap=1e18,
+        theta_percentile=0.0, phi_percentile=100.0, surprise_cap_percentile=100.0,
+        basis="permissive-upper-bound", n_recoverability=0, n_relevance=0, n_latent_dynamics=0,
+    )
+
+
+def _resolve_thresholds(salience: str) -> Optional[SalienceThresholds]:
+    """Permissive -> the upper-bound sidecar (every scored anchor fires). Real
+    -> the shipped thresholds.json. Off -> None (salience not armed)."""
+    if salience == "permissive":
+        return _permissive_thresholds()
+    if salience == "real":
+        return load_salience_thresholds(DEFAULT_THRESHOLDS)
+    return None
+
+
+def _cosine(a, b) -> float:
+    """Cosine of two 1-d tensors (bge embeddings)."""
+    a = a.to(torch.float32).reshape(-1)
+    b = b.to(torch.float32).reshape(-1)
+    na = a.norm().item() or 1.0
+    nb = b.norm().item() or 1.0
+    return float(torch.dot(a, b).item() / (na * nb))
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return float("nan")
+    s = sorted(values)
+    k = (len(s) - 1) * q
+    lo = math.floor(k)
+    hi = math.ceil(k)
+    if lo == hi:
+        return s[lo]
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def _capture_turn(orch: PonderOrchestrator, user_text: str) -> dict:
+    """Score the current WM ring against this turn's query. Returns one record:
+    ``{user_text, slots: [{source_id, text, r_i, cos}]}`` where ``cos`` is the
+    bge cosine between the slot text and THIS turn's user_text (the probe/filler
+    label signal). Only text-bearing slots are scored (``score_ring_slots``
+    returns None for the rest -> filtered out)."""
+    prompt_emb = orch.working_memory.embed([user_text])[0]
+    slots = orch.working_memory.ring_buffer()
+    slots, r_is = score_ring_slots(
+        orch.working_memory, orch.relevance_head, orch.embedder, prompt_emb, slots=slots)
+    # Embed each scored slot's text once for the cosine probe/filler label.
+    out_slots = []
+    for s, r in zip(slots, r_is):
+        if r is None or not s.text:
+            continue
+        slot_emb = orch.working_memory.embed([s.text])[0]
+        out_slots.append({
+            "source_id": str(s.source_id) if s.source_id is not None else None,
+            "text": s.text,
+            "r_i": r,
+            "cos": _cosine(prompt_emb, slot_emb),
+        })
+    return {"user_text": user_text, "slots": out_slots}
+
+
+def replay_and_capture(
+    *, transcripts: list[str], backbone_path: str, rel_head_path: str,
+    ring_capacity: int, max_turns: int, device: str, salience: str,
+    user_id: str, rec_head_path: str, ld_head_path: str,
+) -> tuple[list[dict], dict]:
+    """Replay every transcript turn through the orchestrator and capture per-
+    turn per-slot r_i on the real recalled ring slots. Returns (turn_records,
+    run_stats)."""
+    tmpdir = tempfile.mkdtemp(prefix="pondr_probe4a_")
+    turn_records: list[dict] = []
+    store = None
+    try:
+        db_path = str(Path(tmpdir) / "db")
+        from src.memory.store import HippocampalStore  # noqa: E402
+        store = HippocampalStore(db_path)
+        embedder = build_embedder("on-demand")
+        backbone = load_backbone(str(backbone_path), BackboneConfig(), device=device)
+        relevance_head = load_relevance_head(str(rel_head_path), device=device)
+        # Salience arming needs all three heads + thresholds (``_salience_armed``
+        # in the orchestrator). OFF (the default) measures the head alone on the
+        # prompt-driven recalled slots; permissive/real arm the trigger so
+        # salience-fired pin-tagged episodes join the ring (the comparison
+        # variant). The relevance head is loaded in ALL cases (r_i is what we
+        # measure); only ``strm_salience`` + the other two heads + thresholds
+        # differ.
+        strm_salience = salience != "off"
+        recoverability_head = None
+        latent_dynamics_head = None
+        if strm_salience:
+            recoverability_head = load_recoverability_head(str(rec_head_path),
+                                                           device=device)
+            latent_dynamics_head = load_latent_dynamics_head(str(ld_head_path),
+                                                              device=device)
+        thresholds = _resolve_thresholds(salience)
+        planner = BonsaiQueryPlanner(endpoint=None)  # None -> rule-based fallback
+        retriever = HippocampalRetriever(
+            store, planner=planner, auto_load_index=True,
+            retrieval_gate=None, embedder=embedder,
+        )
+        cfg = Phase2cConfig()
+        cfg.session.state_dir = str(Path(tmpdir) / "sessions")
+        orch = PonderOrchestrator(
+            store=store, retriever=retriever, backbone=backbone, embedder=embedder,
+            mode_a=_StubModeA(), config=cfg, user_id=user_id, encoder=None,
+            relevance_head=relevance_head, ring_capacity=ring_capacity,
+            recoverability_head=recoverability_head,
+            latent_dynamics_head=latent_dynamics_head,
+            strm_salience=strm_salience, salience_thresholds=thresholds,
+        )
+
+        total_queries = 0
+        total_encoded = 0
+        total_skipped = 0
+        epoch_base = 0.0
+        for tpath in transcripts:
+            session_id, turns = load_transcript_threads(tpath)
+            pairs = _pair_turns(turns)
+            if max_turns > 0:
+                pairs = pairs[:max_turns]
+            print(f"[replay] {tpath} session={session_id} -> {len(pairs)} user turns",
+                  flush=True)
+            if not pairs:
+                continue
+            orch.user_id = session_id
+            orch.working_memory.reset()
+            history: list[dict] = []
+            # Seed: encode turn 0 so query 1 has memory to recall.
+            u0, a0 = pairs[0]
+            ep0 = build_episode(
+                f"{session_id}__ep0000", u0, a0, timestamp=_iso(epoch_base, 0),
+                user_id=user_id, session_id=session_id, embedder=embedder)
+            if _encode_best_effort(store, ep0, session_id, 0):
+                total_encoded += 1
+            else:
+                total_skipped += 1
+            history.append({"role": "user", "content": u0})
+            history.append({"role": "assistant", "content": a0})
+            for i in range(1, len(pairs)):
+                u, a = pairs[i]
+                try:
+                    orch.query(u, conversation_history=list(history),
+                                auto_persist=False, signal="routine")
+                except Exception as e:  # noqa: BLE001 - one bad turn must not kill the run
+                    print(f"  [query-fail] session={session_id} turn={i}: {e}",
+                          file=sys.stderr)
+                # Score the ring NOW (after the query step + recalled-episode
+                # injects populate text-bearing slots). prompt_emb is re-derived
+                # from the user text (deterministic -- same embed call query()
+                # uses internally).
+                rec = _capture_turn(orch, u)
+                rec["session_id"] = session_id
+                rec["turn_index"] = i
+                turn_records.append(rec)
+                ep = build_episode(
+                    f"{session_id}__ep{i:04d}", u, a,
+                    timestamp=_iso(epoch_base, i), user_id=user_id,
+                    session_id=session_id, embedder=embedder)
+                if _encode_best_effort(store, ep, session_id, i):
+                    total_encoded += 1
+                else:
+                    total_skipped += 1
+                history.append({"role": "user", "content": u})
+                history.append({"role": "assistant", "content": a})
+                total_queries += 1
+                if (i + 1) % 20 == 0:
+                    print(f"  replayed {i + 1}/{len(pairs)} turns "
+                          f"(encoded={total_encoded} skipped={total_skipped})",
+                          flush=True)
+            epoch_base += 1e6
+        run_stats = {
+            "n_turns": total_queries, "n_encoded": total_encoded,
+            "n_skipped": total_skipped, "ring_capacity": ring_capacity,
+            "salience": salience, "device": device,
+        }
+        return turn_records, run_stats
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _analyze(turn_records: list[dict]) -> dict:
+    """Compute (1) the r_i distribution across all scored (slot, turn) pairs
+    and (2) the per-source selectivity gap (probe r_i minus mean filler r_i)."""
+    # (1) distribution across every scored slot occurrence.
+    all_r = [s["r_i"] for rec in turn_records for s in rec["slots"]]
+    dist = {
+        "n_scored": len(all_r),
+        "min": min(all_r) if all_r else None,
+        "p10": _percentile(all_r, 0.10),
+        "p50": _percentile(all_r, 0.50),
+        "p90": _percentile(all_r, 0.90),
+        "max": max(all_r) if all_r else None,
+        "mean": statistics.fmean(all_r) if all_r else None,
+        "stdev": statistics.pstdev(all_r) if len(all_r) >= 2 else 0.0,
+        "frac_ge_0p99": (sum(1 for r in all_r if r >= 0.99) / len(all_r)) if all_r else 0.0,
+    }
+    # (2) per-source selectivity. Group scored occurrences by source_id; for
+    # each source seen on >= 3 turns, the probe turn = max-cos turn, fillers =
+    # the remaining turns; gap = probe_r - mean(filler_r). Report the min +
+    # median gap (the gate is min gap >= 0.2, matching Probe 3).
+    by_source: dict[str, list[dict]] = {}
+    for rec in turn_records:
+        for s in rec["slots"]:
+            sid = s["source_id"]
+            if sid is None:
+                continue
+            by_source.setdefault(sid, []).append({
+                "turn_index": rec["turn_index"], "r_i": s["r_i"], "cos": s["cos"],
+            })
+    gaps: list[float] = []
+    per_source_examples: list[dict] = []
+    for sid, occs in by_source.items():
+        if len(occs) < 3:
+            continue
+        occs_sorted = sorted(occs, key=lambda o: o["cos"], reverse=True)
+        probe = occs_sorted[0]
+        fillers = occs_sorted[1:]
+        mean_filler = statistics.fmean(o["r_i"] for o in fillers)
+        gap = probe["r_i"] - mean_filler
+        gaps.append(gap)
+        if len(per_source_examples) < 12:
+            per_source_examples.append({
+                "source_id": sid, "n_turns": len(occs),
+                "probe_cos": probe["cos"], "probe_r_i": probe["r_i"],
+                "mean_filler_r_i": mean_filler, "gap": gap,
+            })
+    selectivity = {
+        "n_sources_total": len(by_source),
+        "n_sources_eligible": len(gaps),
+        "min_gap": min(gaps) if gaps else None,
+        "median_gap": statistics.median(gaps) if gaps else None,
+        "mean_gap": statistics.fmean(gaps) if gaps else None,
+        "n_gap_ge_0p2": sum(1 for g in gaps if g >= 0.2),
+        "gate_min_gap_ge_0p2": (min(gaps) >= 0.2) if gaps else False,
+        "examples": per_source_examples,
+    }
+    return {"distribution": dist, "selectivity": selectivity}
+
+
+def _main() -> int:
+    p = argparse.ArgumentParser(
+        description="STRM Probe 4a: 2a relevance-head selectivity on REAL serve data (no LLM)")
+    p.add_argument("--transcripts", nargs="+", default=list(DEFAULT_TRANSCRIPTS))
+    p.add_argument("--backbone", default=DEFAULT_BACKBONE_PATH)
+    p.add_argument("--relevance-head", default=DEFAULT_RELEVANCE_HEAD)
+    p.add_argument("--recoverability-head", default=DEFAULT_RECOVERABILITY_HEAD,
+                    help="2b head (only needed when --salience != off)")
+    p.add_argument("--latent-dynamics-head", default=DEFAULT_LATENT_DYNAMICS_HEAD,
+                    help="2c head (only needed when --salience != off)")
+    p.add_argument("--ring-capacity", type=int, default=16)
+    p.add_argument("--max-turns", type=int, default=0, help="cap user turns per session (0=all)")
+    p.add_argument("--device", default="auto", help="backbone+head device: auto|cpu|cuda")
+    p.add_argument("--salience", choices=("off", "permissive", "real"), default="off",
+                   help="off=measure the head alone on prompt-driven slots; "
+                        "permissive=arm with upper-bound thresholds; "
+                        "real=arm with the shipped thresholds.json")
+    p.add_argument("--user-id", default="pondr")
+    p.add_argument("--out", default="", help="write the JSON report to this path")
+    args = p.parse_args()
+
+    if not Path(args.backbone).exists():
+        print(f"ERROR: backbone not found at {args.backbone}", file=sys.stderr)
+        return 1
+    if not Path(args.relevance_head).exists():
+        print(f"ERROR: relevance-head checkpoint not found at {args.relevance_head}",
+              file=sys.stderr)
+        return 1
+    if args.salience != "off":
+        for label, hp in (("recoverability-head", args.recoverability_head),
+                          ("latent-dynamics-head", args.latent_dynamics_head)):
+            if not Path(hp).exists():
+                print(f"ERROR: {label} not found at {hp} (required when --salience != off)",
+                      file=sys.stderr)
+                return 1
+        if args.salience == "real" and not Path(DEFAULT_THRESHOLDS).exists():
+            print(f"ERROR: thresholds not found at {DEFAULT_THRESHOLDS} "
+                  f"(required for --salience real)", file=sys.stderr)
+            return 1
+    for t in args.transcripts:
+        if not Path(t).exists():
+            print(f"ERROR: transcript not found at {t}", file=sys.stderr)
+            return 1
+
+    turn_records, run_stats = replay_and_capture(
+        transcripts=args.transcripts, backbone_path=args.backbone,
+        rel_head_path=args.relevance_head, ring_capacity=args.ring_capacity,
+        max_turns=args.max_turns, device=args.device, salience=args.salience,
+        user_id=args.user_id, rec_head_path=args.recoverability_head,
+        ld_head_path=args.latent_dynamics_head)
+    analysis = _analyze(turn_records)
+    report = {"run": run_stats, **analysis, "n_turn_records": len(turn_records)}
+
+    print("=" * 68)
+    print(f"STRM Probe 4a -- 2a relevance-head selectivity on REAL serve data")
+    print(f"  transcripts={args.transcripts} ring={run_stats['ring_capacity']} "
+          f"salience={run_stats['salience']} turns={run_stats['n_turns']} "
+          f"(encoded={run_stats['n_encoded']} skipped={run_stats['n_skipped']})")
+    print("-" * 68)
+    d = report["distribution"]
+    print(f"  r_i DISTRIBUTION on real recalled slots ({d['n_scored']} scored):")
+    print(f"    min={d['min']:.4f}  p10={d['p10']:.4f}  p50={d['p50']:.4f}  "
+          f"p90={d['p90']:.4f}  max={d['max']:.4f}")
+    print(f"    mean={d['mean']:.4f}  stdev={d['stdev']:.4f}  frac>=0.99={d['frac_ge_0p99']:.2%}")
+    print(f"    (Probe 3 synthetic saturation: r_i ~ 0.9998, stdev ~ 0 -> near-constant)")
+    s = report["selectivity"]
+    print(f"  SELECTIVITY GAP (probe r_i - mean filler r_i, per recalled episode):")
+    print(f"    sources total={s['n_sources_total']}  eligible(>=3 turns)={s['n_sources_eligible']}")
+    if s["min_gap"] is not None:
+        print(f"    min gap={s['min_gap']:+.4f}  median={s['median_gap']:+.4f}  "
+              f"mean={s['mean_gap']:+.4f}  n>=0.2={s['n_gap_ge_0p2']}")
+        print(f"    gate (min gap >= 0.2): {'PASS' if s['gate_min_gap_ge_0p2'] else 'FAIL'}")
+    else:
+        print("    (no source seen on >=3 turns -- run longer / raise --ring-capacity)")
+    print("-" * 68)
+    print("  per-source examples (probe turn = max bge-cosine turn vs this slot):")
+    for ex in s["examples"]:
+        print(f"    {ex['source_id'][:28]:<28} n={ex['n_turns']:>2} "
+              f"cos={ex['probe_cos']:.3f} probe_r={ex['probe_r_i']:.4f} "
+              f"filler_r={ex['mean_filler_r_i']:.4f} gap={ex['gap']:+.4f}")
+    print("=" * 68)
+    print("VERDICT: healthy dist (stdev>0, p10<<p90) + min gap>=0.2 => head discriminates")
+    print("         on real serve data => synthetic Probe 3 NO-GO was OOD; move to Probe 4b.")
+    print("         saturated dist (stdev~0, frac>=0.99~100%) => head broken on serve;")
+    print("         train on serve-distribution data, not ERAG.")
+
+    if args.out:
+        Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"report -> {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
