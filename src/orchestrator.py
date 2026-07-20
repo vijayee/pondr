@@ -712,14 +712,22 @@ class PonderOrchestrator:
             idx_text = [(i, s.text) for i, s in enumerate(slots)
                         if s.text is not None and str(s.text).strip()]
             if idx_text:
+                # The relevance head may live on a different device than the
+                # slot readouts (CUDA backbone) vs the bge embedder (CPU) vs the
+                # query embedding (CPU). Move every operand to the HEAD's device
+                # before the fused predict -- a mixed-device addmm crashes the
+                # whole logger (and thus the turn). ``.to`` on an already-right-
+                # device tensor is a no-op, so this is free when they already
+                # agree.
+                head_dev = next(self.relevance_head.parameters()).device
                 doc_embs = self.working_memory.embed([t for _, t in idx_text])  # [K',384] each [1,384]
                 ys = torch.cat(
                     [slots[i].y.to(torch.float32).squeeze(0).reshape(1, -1)
-                     for i, _ in idx_text], dim=0)                # [K', 256]
+                     for i, _ in idx_text], dim=0).to(head_dev)   # [K', 256]
                 ds = torch.cat(
                     [e.to(torch.float32).squeeze(0).reshape(1, -1)
-                     for e in doc_embs], dim=0)                    # [K', 384]
-                q = prompt_emb.to(torch.float32).squeeze(0).reshape(1, -1)  # [1, 384]
+                     for e in doc_embs], dim=0).to(head_dev)       # [K', 384]
+                q = prompt_emb.to(torch.float32).squeeze(0).reshape(1, -1).to(head_dev)  # [1, 384]
                 with torch.no_grad():
                     r = self.relevance_head.predict(ys, ds, q)    # [K', 1]
                 for j, (i, _) in enumerate(idx_text):
