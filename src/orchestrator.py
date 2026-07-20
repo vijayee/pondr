@@ -57,6 +57,7 @@ from .subconscious.state_serializer import (
     deserialize, serialize, snapshot_from_instance,
 )
 from .subconscious.recoverability_head import pool_state_tensors
+from .subconscious.relevance_score import score_ring_slots
 from .subconscious.working_memory import WorkingMemory, WorkingMemoryState
 from .tools import (
     LOOP_TOOLS, SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
@@ -707,31 +708,14 @@ class PonderOrchestrator:
         # text (bge-small, 384-d -- the SAME vector the 2a generator built its
         # doc vectors from) and score against the query embedding. Slots with
         # no text (e.g. the raw query step, None-provenance recalls) get null.
-        r_is: list[Optional[float]] = [None] * len(slots)
-        if self.relevance_head is not None and self.embedder is not None:
-            idx_text = [(i, s.text) for i, s in enumerate(slots)
-                        if s.text is not None and str(s.text).strip()]
-            if idx_text:
-                # The relevance head may live on a different device than the
-                # slot readouts (CUDA backbone) vs the bge embedder (CPU) vs the
-                # query embedding (CPU). Move every operand to the HEAD's device
-                # before the fused predict -- a mixed-device addmm crashes the
-                # whole logger (and thus the turn). ``.to`` on an already-right-
-                # device tensor is a no-op, so this is free when they already
-                # agree.
-                head_dev = next(self.relevance_head.parameters()).device
-                doc_embs = self.working_memory.embed([t for _, t in idx_text])  # [K',384] each [1,384]
-                ys = torch.cat(
-                    [slots[i].y.to(torch.float32).squeeze(0).reshape(1, -1)
-                     for i, _ in idx_text], dim=0).to(head_dev)   # [K', 256]
-                ds = torch.cat(
-                    [e.to(torch.float32).squeeze(0).reshape(1, -1)
-                     for e in doc_embs], dim=0).to(head_dev)       # [K', 384]
-                q = prompt_emb.to(torch.float32).squeeze(0).reshape(1, -1).to(head_dev)  # [1, 384]
-                with torch.no_grad():
-                    r = self.relevance_head.predict(ys, ds, q)    # [K', 1]
-                for j, (i, _) in enumerate(idx_text):
-                    r_is[i] = float(r[j].item())
+        # The loop is factored into ``relevance_score.score_ring_slots`` (shared
+        # with the Phase 3 context-builder path); this call is byte-identical to
+        # the pre-Phase-3 inline loop -- same embed, same device moves, same
+        # ``predict`` -> ``float(r[j].item())`` assignment into ``r_is``.
+        _slots, r_is = score_ring_slots(
+            self.working_memory, self.relevance_head, self.embedder,
+            prompt_emb, slots=slots,
+        )
 
         # Append one JSONL line per slot (oldest-first, the ring's order).
         self._REPLAY_PATH.parent.mkdir(parents=True, exist_ok=True)
