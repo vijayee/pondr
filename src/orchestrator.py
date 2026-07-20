@@ -794,6 +794,14 @@ class PonderOrchestrator:
                     "r_i": r_is[slot_index],
                     "llm_signal": signal,
                     "later_needed": None,
+                    # Phase 4 Step 3: whether this slot was re-injected with the
+                    # pin tag (a salience-fired recall). Non-breaking extra key --
+                    # ``generate_graduation_labels.py`` shallow-copies and is
+                    # key-agnostic; ``graduation_training.py`` ignores extra keys.
+                    # Lets a future retention surrogate ask whether pinned slots
+                    # stay relevant (high r_i) over K steps. Always False until
+                    # Step 5 wires the salience re-inject.
+                    "pinned": bool(slot.pinned),
                 }
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 

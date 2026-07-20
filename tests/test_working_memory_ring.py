@@ -235,3 +235,110 @@ def test_state_tensors_distinct_from_snapshot():
     for a, b in zip(live, snap.state_tensors):
         assert torch.equal(a, b)  # equal values
         assert a is not b  # distinct objects (snapshot cloned)
+
+
+# ── Phase 4 Step 3: pin tag (token-type embedding on injected u_{t+1}) ──
+
+def test_ring_slot_pinned_default_false():
+    """RingSlot.pinned defaults to False (checkpoint-safe 4th field; the ring is
+    not serialized so adding a field is backward-compatible)."""
+    slot = RingSlot(torch.zeros(1, 256), "ep-1", "text")
+    assert slot.pinned is False
+    # and explicitly True round-trips
+    slot_p = RingSlot(torch.zeros(1, 256), "ep-1", "text", pinned=True)
+    assert slot_p.pinned is True
+
+
+def test_inject_carries_pin():
+    """pin=True marks the resulting ring slot pinned=True (mirrors
+    test_inject_carries_provenance). The pin flag is per-slot bookkeeping for
+    the replay JSONL / a future retention surrogate; the pin ITSELF is the
+    input-side embedding (PinTag), not this flag."""
+    wm = _wm(ring_capacity=3)
+    wm.update(_rand_emb(seed=1), source_id="query", text="the query")
+    wm.inject(_rand_emb(seed=2), source_id="ep-42", text="recalled 42", pin=True)
+    slots = wm.ring_buffer()
+    assert len(slots) == 2
+    assert slots[0].pinned is False  # the query step is never pinned
+    assert slots[1].pinned is True   # the salience-fired recall is pinned
+
+
+def test_pin_adds_embedding_to_input():
+    """pin=True adds the pin vector to the input BEFORE the SSM step. The
+    pin=True output is EXACTLY what you get by manually adding the pin vector
+    to the input and stepping with pin=False (no double-add, no other side
+    effect). This pins the semantic: the pin is an ADD on u_{t+1}, d_model
+    stays 384 (a concat would break W_A's Linear(384 -> 16))."""
+    bb = JGSBackbone(BackboneConfig())
+    torch.manual_seed(321)
+    wm_pin = WorkingMemory(bb, ring_capacity=4)       # owns a default-init PinTag
+    torch.manual_seed(321)
+    wm_manual = WorkingMemory(bb, ring_capacity=4)    # same init, same pin vector
+    # the two WMs share the SAME pin vector (deterministic default init)
+    assert torch.equal(wm_pin._pin_tag.pin, wm_manual._pin_tag.pin)
+    pin_vec = wm_pin._pin_tag.pin.detach()
+    emb = _rand_emb(seed=7)
+    # pin=True path vs manually adding the pin to the input (pin=False, no add)
+    out_pin, _, _ = wm_pin.step(emb, source_id="a", text="a", pin=True)
+    out_manual, _, _ = wm_manual.step(emb + pin_vec, source_id="a", text="a", pin=False)
+    assert torch.allclose(out_pin, out_manual, atol=1e-6)
+    # and pin=True measurably changes the output vs pin=False on the same input
+    torch.manual_seed(321)
+    wm_nopin = WorkingMemory(bb, ring_capacity=4)
+    out_nopin, _, _ = wm_nopin.step(emb, source_id="a", text="a", pin=False)
+    assert not torch.allclose(out_pin, out_nopin, atol=1e-6)
+
+
+def test_k0_pin_is_noop():
+    """Ring OFF + pin=True is byte-identical to pin=False (the pin is gated on
+    the ring: no salience fires without it, so pin is a no-op at K=0). Mirrors
+    test_k0_state_identical_to_k_positive_state -- the pin must never perturb
+    the SSM when the ring is off."""
+    bb = JGSBackbone(BackboneConfig())
+    torch.manual_seed(999)
+    wm_off_pin = WorkingMemory(bb, ring_capacity=0)
+    torch.manual_seed(999)
+    wm_off_nopin = WorkingMemory(bb, ring_capacity=0)
+    for s in range(5):
+        emb = _rand_emb(seed=s)
+        wm_off_pin.update(emb, source_id=f"q{s}", text=f"t{s}", pin=True)
+        wm_off_nopin.update(emb, source_id=f"q{s}", text=f"t{s}", pin=False)
+    assert wm_off_pin.state is not None and wm_off_nopin.state is not None
+    for a, b in zip(wm_off_pin.state, wm_off_nopin.state):
+        assert torch.equal(a, b), "pin=True perturbed the SSM state at K=0"
+    # and the ring is empty either way (K=0), so no pinned slot is recorded
+    assert wm_off_pin.ring_buffer() == []
+    assert wm_off_nopin.ring_buffer() == []
+
+
+def test_pin_tag_default_init_is_nonzero_and_deterministic():
+    """The default-init PinTag is a faithful non-stub: non-zero (so pin=True is
+    not a silent no-op) and deterministic across constructions (fixed generator,
+    no Date.now/random). v1 ships this; a retention surrogate can fit it later."""
+    from src.subconscious.pin_tag import PinTag, D_MODEL
+    t1 = PinTag()
+    t2 = PinTag()
+    assert t1.pin.shape == (D_MODEL,)
+    assert float(t1.pin.detach().abs().max()) > 0.0  # non-zero
+    assert torch.equal(t1.pin, t2.pin)  # deterministic
+    # forward adds the pin to the input (broadcasts over the batch dim)
+    emb = _rand_emb(seed=11)
+    out = t1(emb)
+    assert torch.allclose(out, emb + t1.pin)
+
+
+def test_pin_tag_loader_roundtrip(tmp_path):
+    """load_pin_tag recovers a saved PinTag (the loader is wired now so a future
+    retention surrogate's checkpoint loads without new plumbing). v1 has no
+    trained checkpoint, so this writes a default-init one and round-trips it."""
+    import torch as _torch
+    from src.subconscious.pin_tag import PinTag, load_pin_tag, D_MODEL
+    tag = PinTag()
+    # the checkpoint shape load_pin_tag expects: {"pin": state_dict, "d_model": ...}
+    ckpt = {"pin": tag.state_dict(), "d_model": D_MODEL}
+    path = tmp_path / "pin.pt"
+    _torch.save(ckpt, path)
+    loaded = load_pin_tag(str(path), device="cpu")
+    assert isinstance(loaded, PinTag)
+    assert not loaded.training
+    assert torch.equal(loaded.pin, tag.pin)  # round-trip preserves the vector

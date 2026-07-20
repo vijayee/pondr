@@ -40,6 +40,7 @@ from torch import Tensor
 
 from .configs import INSTANCE_CONFIGS, InstanceConfig
 from .instance import JGSInstance
+from .pin_tag import PinTag
 from .routing import Embedder
 from .state_serializer import JGSSnapshot
 
@@ -63,11 +64,21 @@ class RingSlot:
 
     The slot vector dim is config-driven (``output_dim``), NOT a hardcoded 384:
     the buffer is dimension-agnostic and stores whatever the step emits.
+
+    ``pinned`` (Phase 4 Step 3) marks a slot whose input was a salience-fired
+    recall re-injected with the pin tag (``pin=True``). It is per-slot
+    bookkeeping ONLY — the pin itself is an input-side token-type embedding
+    (``PinTag``), not this flag; we never name a slot flag ``u_t`` (that is the
+    SSM input vector). Default ``False``; carried into the replay JSONL so a
+    retention surrogate can ask whether pinned slots stay relevant over K steps.
+    The ring is in-memory only (NOT in ``snapshot()``/checkpoints), so adding a
+    field is checkpoint-backward-compatible.
     """
 
     y: Tensor
     source_id: Optional[str]
     text: Optional[str]
+    pinned: bool = False
 
 
 class WorkingMemory(JGSInstance):
@@ -86,6 +97,7 @@ class WorkingMemory(JGSInstance):
         embedder: Optional[Embedder] = None,
         decay_alpha: float = 1.0,
         ring_capacity: Optional[int] = None,
+        pin_tag: Optional[PinTag] = None,
     ) -> None:
         cfg = config or INSTANCE_CONFIGS["working_memory"]
         super().__init__(backbone, cfg)
@@ -103,6 +115,15 @@ class WorkingMemory(JGSInstance):
         # byte-identical. K>0 retains the last K slots (FIFO).
         self._ring_capacity = int(ring_capacity) if ring_capacity is not None else int(cfg.ring_capacity)
         self._ring: deque[RingSlot] = deque(maxlen=self._ring_capacity)
+        # Phase 4 Step 3: the pin tag. Owned here so a pinned injection
+        # (``pin=True``) can add the token-type embedding to ``u_{t+1}`` before
+        # the SSM step. Default-initialized (deterministic non-zero) when no
+        # trained checkpoint is supplied — a faithful non-stub, NOT a zero
+        # vector (see ``pin_tag.py``). Loaded from a checkpoint when wired via
+        # ``build_ponder``. The off-path (``pin=False``, the default everywhere
+        # except the salience re-inject) never reads this, so it is
+        # byte-identical to pre-Step-3.
+        self._pin_tag = pin_tag if pin_tag is not None else PinTag()
 
     # ── state evolution ──
 
@@ -113,6 +134,7 @@ class WorkingMemory(JGSInstance):
         source_id: Optional[str] = None,
         text: Optional[str] = None,
         retrieved_sources: Optional[list[tuple[Optional[str], Optional[str]]]] = None,
+        pin: bool = False,
     ) -> WorkingMemoryState:
         """Step the SSM with the query embedding, then inject each retrieved
         episode embedding as a step. State evolves in place; NOT reset.
@@ -129,12 +151,21 @@ class WorkingMemory(JGSInstance):
                 tuples, one per ``retrieved_embeddings`` entry, carrying each
                 recalled episode's provenance into its ring slot. ``None`` (the
                 default) means injected recalls carry ``None`` provenance.
+            pin: Phase 4 Step 3 — when ``True`` AND the ring is ON, add the pin
+                tag (a token-type embedding) to each stepped input before the
+                SSM step so ``W_A`` retains the episode over the next K steps,
+                and mark the resulting ring slots ``pinned=True``. Default
+                ``False`` (the prompt-driven path) is byte-identical to
+                pre-Step-3. The salience re-inject (Step 5) is the only caller
+                that sets ``pin=True``. Ignored when the ring is OFF (no salience
+                fires without the ring, so pin is a no-op there — pinned by
+                ``test_k0_pin_is_noop``).
 
         Returns:
             A detached ``WorkingMemoryState`` snapshot (clones; caller-independent
             of the live state).
         """
-        self.step(input_embedding, source_id=source_id, text=text)
+        self.step(input_embedding, source_id=source_id, text=text, pin=pin)
         self._input_count += 1
         if retrieved_embeddings:
             if retrieved_sources is not None and len(retrieved_sources) != len(retrieved_embeddings):
@@ -146,18 +177,21 @@ class WorkingMemory(JGSInstance):
             srcs = retrieved_sources if retrieved_sources is not None else [None] * len(retrieved_embeddings)
             for emb, src in zip(retrieved_embeddings, srcs):
                 sid, txt = src if isinstance(src, tuple) else (None, None)
-                self.inject(emb, source_id=sid, text=txt)
+                self.inject(emb, source_id=sid, text=txt, pin=pin)
         return self.snapshot()
 
-    def inject(self, embedding: Tensor, source_id: Optional[str] = None, text: Optional[str] = None) -> None:
+    def inject(self, embedding: Tensor, source_id: Optional[str] = None, text: Optional[str] = None, pin: bool = False) -> None:
         """One SSM step with ``embedding`` without incrementing ``input_count``.
 
         Used to absorb retrieved episodes (and, in the chunker, secondary chunks)
         into the recurrent state as gist. Does not reset; mutates ``self.state``.
         ``source_id`` / ``text`` carry the recalled episode's provenance into the
         ring buffer (when ``ring_capacity > 0``); ignored when the ring is OFF.
+        ``pin`` (Phase 4 Step 3) adds the pin tag to the input before the SSM
+        step and marks the slot ``pinned=True``; see ``update`` for the full
+        semantics. Default ``False`` is byte-identical to pre-Step-3.
         """
-        self.step(embedding, source_id=source_id, text=text)
+        self.step(embedding, source_id=source_id, text=text, pin=pin)
 
     def _apply_decay(self) -> None:
         """Post-step forget factor on the recurrent state.
@@ -174,7 +208,7 @@ class WorkingMemory(JGSInstance):
         if self.decay_alpha != 1.0 and self.state is not None:
             self.state = [self.decay_alpha * s for s in self.state]
 
-    def step(self, input_embedding: Tensor, context=None, source_id=None, text=None):  # type: ignore[override]
+    def step(self, input_embedding: Tensor, context=None, source_id=None, text=None, pin: bool = False):  # type: ignore[override]
         """Wrap ``JGSInstance.step`` to apply ``decay_alpha`` and record the ring.
 
         The SSM step already mixes the new input into the state; ``decay_alpha``
@@ -184,14 +218,25 @@ class WorkingMemory(JGSInstance):
         is strictly post-step and post-decay; it never touches the state
         computation, so the K=0 path is byte-identical to Phase 2c.
 
+        Phase 4 Step 3: when ``pin=True`` AND the ring is ON, the pin tag (a
+        token-type embedding owned by ``self._pin_tag``) is ADDED to
+        ``input_embedding`` BEFORE ``super().step``. ``d_model`` stays 384 (an
+        ADD, not a concat — a concat would break ``W_A``'s ``Linear(384 -> 16)``).
+        The pin is gated on the ring so K=0 + ``pin=True`` stays byte-identical
+        (no salience fires without the ring; pinned by ``test_k0_pin_is_noop``).
+        The slot is recorded with ``pinned=pin`` so the replay JSONL can flag
+        pin-tagged recalls for a retention surrogate.
+
         Returns the same ``(output, predicted, gate decision)`` triple as the base
         instance (the triple is unchanged; the ring records ``output`` only).
         """
+        if pin and self._ring_capacity > 0:
+            input_embedding = self._pin_tag(input_embedding)
         result = super().step(input_embedding, context)
         self._apply_decay()
         if self._ring_capacity > 0:
             output, _predicted, _decision = result
-            self._ring.append(RingSlot(output.detach().clone(), source_id, text))
+            self._ring.append(RingSlot(output.detach().clone(), source_id, text, pinned=pin))
         return result
 
     # ── snapshot / restore / reset ──
