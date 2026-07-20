@@ -63,6 +63,7 @@ def build_ponder(
     mode_a: Optional[ModeAGenerator] = None,
     config_override: Optional[Phase2cConfig] = None,
     relevance_head_path: Optional[str] = None,
+    graduation_proxy: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -94,6 +95,13 @@ def build_ponder(
             orchestrator (it scores each WM ring slot's relevance to the query;
             Phase 3's context-builder consumes ``r_i``). ``None`` (default) ->
             no relevance head at serve (byte-identical to pre-2a).
+        graduation_proxy: when True, attach the STRM Phase 2d v1 graduation
+            proxy (``GraduationProxyV1`` -- the parameter-free ``integral(r_i
+            dt)`` heuristic baseline the v2 head must beat). No checkpoint, no
+            training -- the proxy reads the 2a ``r_i`` stream. Default False
+            (byte-identical to pre-2d). Full graduation -> LTM promotion is
+            Phase 4; this round only makes the proxy attachable + the flag
+            plumbed.
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -161,6 +169,15 @@ def build_ponder(
         from .subconscious.relevance_head import load_relevance_head
         relevance_head = load_relevance_head(relevance_head_path, device=device)
 
+    # STRM Phase 2d v1 graduation proxy (optional, parameter-free). Attached
+    # only when graduation_proxy is True (default off). No checkpoint -- the
+    # proxy is the integral(r_i dt) heuristic the v2 head must beat. Full
+    # graduation -> LTM promotion is Phase 4; this round only attaches it.
+    graduation_proxy_head = None
+    if graduation_proxy:
+        from .subconscious.graduation_head import GraduationProxyV1
+        graduation_proxy_head = GraduationProxyV1()
+
     orch = PonderOrchestrator(
         store=store,
         retriever=retriever,
@@ -171,6 +188,7 @@ def build_ponder(
         user_id=user_id,
         encoder=encoder,
         relevance_head=relevance_head,
+        graduation_proxy=graduation_proxy_head,
     )
     return orch
 

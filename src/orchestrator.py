@@ -165,6 +165,7 @@ class PonderOrchestrator:
         user_id: Optional[str] = None,
         encoder: Optional[HippocampalEncoder] = None,
         relevance_head=None,
+        graduation_proxy=None,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -177,6 +178,12 @@ class PonderOrchestrator:
         # slot-selection bias. ``None`` (default, flag off / no checkpoint) ->
         # no relevance scoring at serve (byte-identical to pre-2a).
         self.relevance_head = relevance_head
+        # STRM Phase 2d v1 graduation proxy (optional, DI like the encoder).
+        # When wired it scores each WM ring slot's graduation (the
+        # parameter-free ``integral(r_i dt)`` heuristic the v2 head must beat);
+        # Phase 4's LTM-promotion path consumes the decision. ``None`` (default,
+        # flag off) -> no graduation scoring at serve (byte-identical to pre-2d).
+        self.graduation_proxy = graduation_proxy
         # Live-encode (2026-07-14): persist each exchange as an episode. The
         # encoder is injected (DI pattern, like retriever/mode_a/embedder) -- a
         # caller that wants live-encode constructs a ``HippocampalEncoder`` and

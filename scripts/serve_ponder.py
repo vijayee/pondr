@@ -42,6 +42,10 @@ Flags:
                           feedback.jsonl tap (data/training/strm_relevance/).
                           DEFAULT OFF; the tap is side-effect-only and the
                           labels only matter once a 2a head is in training.
+    --strm-graduation-proxy  attach the STRM Phase 2d v1 graduation proxy (the
+                          parameter-free integral(r_i dt) heuristic the v2 head
+                          must beat). No checkpoint. DEFAULT OFF (byte-identical
+                          to pre-2d). Full graduation -> LTM promotion is Phase 4.
     --strm-graduation-logging append per-turn ring-slot state to the STRM 2d
                           replay.jsonl tap (data/training/strm_graduation/) so
                           the v2 graduation labels accumulate. DEFAULT OFF.
@@ -138,6 +142,11 @@ def main() -> int:
                    help="append the raw per-unit rating to the STRM 2a feedback.jsonl "
                         "tap. DEFAULT OFF (side-effect-only; labels only matter once a "
                         "2a head is in training).")
+    p.add_argument("--strm-graduation-proxy", action="store_true",
+                   default=False,
+                   help="attach the STRM Phase 2d v1 graduation proxy (the "
+                        "parameter-free integral(r_i dt) heuristic the v2 head must "
+                        "beat). No checkpoint. DEFAULT OFF (byte-identical to pre-2d).")
     p.add_argument("--strm-graduation-logging", action=argparse.BooleanOptionalAction,
                    default=False,
                    help="append per-turn ring-slot state to the STRM 2d replay.jsonl "
@@ -183,6 +192,7 @@ def main() -> int:
           f"bonsai_isolation={args.bonsai_isolation}", file=sys.stderr)
     print(f"[load] strm_relevance_head={relevance_head_path or '(off)'} "
           f"strm_relevance_logging={args.strm_relevance_logging} "
+          f"strm_graduation_proxy={args.strm_graduation_proxy} "
           f"strm_graduation_logging={args.strm_graduation_logging}", file=sys.stderr)
 
     orch = build_ponder(
@@ -197,6 +207,7 @@ def main() -> int:
         live_encode=not args.no_live_encode,
         user_id=args.user_id,
         relevance_head_path=relevance_head_path,
+        graduation_proxy=args.strm_graduation_proxy,
     )
 
     try:
