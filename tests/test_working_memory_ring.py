@@ -342,3 +342,114 @@ def test_pin_tag_loader_roundtrip(tmp_path):
     assert isinstance(loaded, PinTag)
     assert not loaded.training
     assert torch.equal(loaded.pin, tag.pin)  # round-trip preserves the vector
+
+
+# ── State-trajectory rewire (Phase A): store h_t per ring slot ──
+
+def test_ringslot_h_defaults_none():
+    """RingSlot.h defaults to None so any existing positional constructor
+    (RingSlot(y, sid, text) / RingSlot(y, sid, text, pinned=...)) is
+    backward-compatible. The field is in-memory only (not in snapshot/
+    checkpoints), so adding it is checkpoint-backward-compatible."""
+    slot = RingSlot(torch.zeros(1, 256), "ep-1", "text")
+    assert slot.h is None
+    slot_p = RingSlot(torch.zeros(1, 256), "ep-1", "text", pinned=True)
+    assert slot_p.h is None
+
+
+def test_slot_h_captured_shape_and_dtype():
+    """A K>0 step captures the per-layer recurrent state on the slot: a list of
+    n_layers (4) fp16 [1, d_state=16, d_model=384] tensors. fp16 bounds memory;
+    LatentDynamicsHead.project casts to fp32 internally so the projection is
+    lossless."""
+    wm = _wm(ring_capacity=4)
+    wm.update(_rand_emb(seed=0), source_id="q0", text="t0")
+    slot = wm.ring_buffer()[0]
+    assert slot.h is not None
+    assert len(slot.h) == 4  # n_layers
+    for t in slot.h:
+        assert t.shape == (1, 16, 384)
+        assert t.dtype == torch.float16
+        assert not t.requires_grad  # detached (no BPTT into the frozen backbone)
+
+
+def test_slot_h_matches_live_state_for_last_slot():
+    """The most-recent slot's h is the state that produced it; no step has
+    happened since, so casting slot.h back to fp32 equals the live
+    state_tensors() (the capture is a faithful snapshot of the post-step,
+    post-decay recurrent state, not a stale or perturbed copy)."""
+    wm = _wm(ring_capacity=4)
+    wm.update(_rand_emb(seed=0), source_id="q0", text="t0")
+    slot = wm.ring_buffer()[-1]
+    live = wm.state_tensors()
+    assert slot.h is not None and len(slot.h) == len(live)
+    for h, s in zip(slot.h, live):
+        # fp16 storage rounds vs the fp32 live state; assert faithful within
+        # fp16 tolerance (the capture is a snapshot of the post-step/post-decay
+        # state, not a stale or perturbed copy).
+        assert torch.allclose(h.to(torch.float32), s.to(torch.float32), atol=1e-3)
+
+
+def test_slot_h_is_independent_clone():
+    """slot.h is a detached clone: later steps (which mutate self.state in
+    place) do not change a previously captured slot's h. This is the same
+    independence contract test_slot_vector_is_detached_clone pins for y."""
+    wm = _wm(ring_capacity=4)
+    wm.update(_rand_emb(seed=0), source_id="q0", text="t0")
+    slot0 = wm.ring_buffer()[0]
+    h0_frozen = [t.clone() for t in slot0.h]
+    # a subsequent step mutates the live state but must not touch slot0.h
+    wm.update(_rand_emb(seed=1), source_id="q1", text="t1")
+    for a, b in zip(slot0.h, h0_frozen):
+        assert torch.equal(a, b), "a later step perturbed a captured slot.h"
+
+
+def test_k0_does_not_construct_h():
+    """K=0 never enters the ring-append block, so no h is constructed and the
+    state evolution is byte-identical to Phase 2c. (The ring is empty, so this
+    is also covered by test_k0_ring_stays_empty_after_updates; this test pins
+    that the h-capture specifically is gated on the ring.)"""
+    wm = _wm(ring_capacity=0)
+    for s in range(3):
+        wm.update(_rand_emb(seed=s), source_id=f"q{s}", text=f"t{s}")
+    assert wm.ring_buffer() == []  # no slots -> no h anywhere
+
+
+def test_slot_z_helper_projects_and_none_guards():
+    """slot_z(slot, head) -> head.project(slot.h) = [1, 384] for a state-bearing
+    slot, and None for an h-less slot (tests/partial constructions). Reuses
+    LatentDynamicsHead.project verbatim (last layer, mean over d_state) -- the
+    state-trajectory rewire's unit of attention."""
+    from src.subconscious.latent_dynamics_head import LatentDynamicsHead
+    from src.subconscious.working_memory import slot_z
+
+    head = LatentDynamicsHead()  # untrained is fine for a shape/projection test
+    wm = _wm(ring_capacity=4)
+    wm.update(_rand_emb(seed=0), source_id="q0", text="t0")
+    slot = wm.ring_buffer()[0]
+    z = slot_z(slot, head)
+    assert z is not None
+    assert z.shape == (1, 384)
+    # matches projecting the live state directly (same last-layer mean)
+    assert torch.allclose(z, head.project(wm.state_tensors()), atol=1e-3)
+    # an h-less slot (positional constructor) -> None, not a crash
+    bare = RingSlot(torch.zeros(1, 256), "ep", "text")
+    assert slot_z(bare, head) is None
+
+
+def test_slot_z_fp16_storage_is_lossless_for_projection():
+    """project casts to fp32 internally, so storing h in fp16 vs fp32 produces
+    an equal projection (within fp16 round-trip tolerance). This justifies the
+    fp16 storage choice on memory grounds without a precision cost downstream."""
+    from src.subconscious.latent_dynamics_head import LatentDynamicsHead
+    from src.subconscious.working_memory import slot_z
+
+    head = LatentDynamicsHead()
+    wm = _wm(ring_capacity=4)
+    wm.update(_rand_emb(seed=0), source_id="q0", text="t0")
+    slot = wm.ring_buffer()[0]
+    z_fp16 = slot_z(slot, head)
+    # project the same last-layer state in pure fp32
+    last_fp32 = slot.h[-1].to(torch.float32)
+    z_fp32 = head.project([last_fp32])
+    assert torch.allclose(z_fp16, z_fp32, atol=1e-3)

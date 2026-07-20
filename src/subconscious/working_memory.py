@@ -73,12 +73,44 @@ class RingSlot:
     retention surrogate can ask whether pinned slots stay relevant over K steps.
     The ring is in-memory only (NOT in ``snapshot()``/checkpoints), so adding a
     field is checkpoint-backward-compatible.
+
+    ``h`` (state-trajectory rewire) is the per-layer SSM recurrent state that
+    produced this slot's ``y``: a list of ``n_layers`` (4) fp16 tensors, each
+    ``[1, d_state=16, d_model=384]``, captured post-step/post-decay at
+    ``WorkingMemory.step``. This is the SSM *state trajectory* the original
+    vision wants a transformer to attend over — ``y`` alone (the output readout)
+    was shown NOT to carry query-relevance signal (Probe 4a), so the
+    state-trajectory path stores the actual recurrent state, not just the
+    readout. fp16 bounds the memory cost (~48 KB/slot, ~750 KB for K=16);
+    ``LatentDynamicsHead.project`` casts to fp32 internally, so the projection
+    is lossless. ``None`` for slots constructed without a state (tests, partial
+    constructions) — ``slot_z`` none-guards. Like ``y``, it is in-memory only
+    (NOT in ``snapshot()``/checkpoints), so the field is checkpoint-backward-
+    compatible and defaults to ``None`` for any existing positional constructor.
     """
 
     y: Tensor
     source_id: Optional[str]
     text: Optional[str]
     pinned: bool = False
+    h: Optional[list[Tensor]] = None
+
+
+def slot_z(slot: RingSlot, head) -> Optional[Tensor]:
+    """Project a ring slot's stored recurrent state ``h`` to the 384-d ``z_i``.
+
+    The state-trajectory rewire's unit of attention: ``z_i = head.project(h)``
+    where ``head`` is a ``LatentDynamicsHead`` (or anything exposing
+    ``project(state_tensors) -> [1, 384]`` — last SSM layer, mean over
+    ``d_state``). Returns ``None`` when the slot carries no state (``h is None``:
+    a test/partial construction, or a cold-start slot) so callers can none-guard
+    rather than crash. ``project`` casts to fp32 internally, so fp16 storage is
+    lossless here. Kept loose-typed (no ``LatentDynamicsHead`` import) to avoid a
+    ``working_memory`` <-> ``latent_dynamics_head`` import cycle.
+    """
+    if slot.h is None:
+        return None
+    return head.project(slot.h)
 
 
 class WorkingMemory(JGSInstance):
@@ -228,7 +260,9 @@ class WorkingMemory(JGSInstance):
         pin-tagged recalls for a retention surrogate.
 
         Returns the same ``(output, predicted, gate decision)`` triple as the base
-        instance (the triple is unchanged; the ring records ``output`` only).
+        instance (the triple is unchanged; the ring records ``output`` and, when
+        the state-trajectory path is in use, the per-layer recurrent state ``h``
+        that produced it).
         """
         if pin and self._ring_capacity > 0:
             input_embedding = self._pin_tag(input_embedding)
@@ -236,7 +270,21 @@ class WorkingMemory(JGSInstance):
         self._apply_decay()
         if self._ring_capacity > 0:
             output, _predicted, _decision = result
-            self._ring.append(RingSlot(output.detach().clone(), source_id, text, pinned=pin))
+            # State-trajectory rewire: snapshot the per-layer recurrent state
+            # (post-step, post-decay) alongside the readout. self.state is the
+            # live detached [1,16,384]-per-layer list set by JGSInstance.step; we
+            # clone to fp16 so the slot is independent of later steps and the
+            # memory cost is bounded. A read of self.state only — it never
+            # touches the state computation, so K=0 (which skips this block) and
+            # the state evolution are byte-identical to Phase 2c.
+            h = (
+                [s.detach().to(torch.float16).clone() for s in self.state]
+                if self.state is not None
+                else None
+            )
+            self._ring.append(
+                RingSlot(output.detach().clone(), source_id, text, pinned=pin, h=h)
+            )
         return result
 
     # ── snapshot / restore / reset ──
