@@ -43,6 +43,40 @@ ANCHOR_DIM = 384
 INPUT_DIM = STATE_DIM_POOLED + ANCHOR_DIM
 
 
+def pool_state_tensors(state_tensors: list[Tensor]) -> Tensor:
+    """Map live per-layer WM state -> the 1536-d pooled rep (0a-validated).
+
+    ``state_tensors`` is ``WorkingMemory.state_tensors()``: a list of 4 per-layer
+    tensors of shape ``[1, d_state=16, d_model=384]`` (or ``[16, 384]`` when the
+    batch dim is squeezed). We mean over the d_state axis per layer and
+    concatenate the 4 layers -> ``[1, 1536]``. Shared by the recoverability head
+    (``P``) and the STRM 2d v2 graduation head (which reads the same pooled rep),
+    so the two heads see the identical state feature -- extracted here rather
+    than duplicated in each head.
+    """
+    if not state_tensors:
+        raise ValueError("pool_state_tensors called with no state tensors")
+    if len(state_tensors) != 4:
+        raise ValueError(
+            f"pool_state_tensors: expected 4 per-layer state tensors, got "
+            f"{len(state_tensors)}"
+        )
+    per_layer = []
+    for st in state_tensors:
+        s = st.to(torch.float32)            # [1, 16, 384] or [16, 384]
+        if s.dim() == 3:
+            per_layer.append(s.mean(dim=1))        # [1, 384]
+        elif s.dim() == 2:
+            per_layer.append(s.mean(dim=0).unsqueeze(0))  # [1, 384]
+        else:
+            raise ValueError(
+                f"pool_state_tensors: per-layer state has unsupported ndim="
+                f"{s.dim()} (expected 2 [d_state,d_model] or 3 "
+                f"[batch,d_state,d_model])"
+            )
+    return torch.cat(per_layer, dim=1)     # [1, STATE_DIM_POOLED]
+
+
 class RecoverabilityHead(nn.Module):
     """Ridge ``e_hat(i,t) = P([state_t ; u_i])`` over the pooled WM state.
 
@@ -70,38 +104,11 @@ class RecoverabilityHead(nn.Module):
     def project_state(self, state_tensors: list[Tensor]) -> Tensor:
         """Map the live per-layer WM state -> the pooled vector P reads.
 
-        ``state_tensors`` is ``WorkingMemory.state_tensors()``: a list of 4
-        per-layer tensors of shape ``[1, d_state=16, d_model=384]`` (or
-        ``[16, 384]`` when the batch dim is squeezed). We mean over the
-        d_state axis per layer and concatenate the 4 layers -> ``[1, 1536]``.
-        This is the 0a-validated "pooled" representation; P was fit on it.
-
-        Returns a 2-D ``[1, state_dim_pooled]`` tensor.
+        Thin wrapper over the module-level ``pool_state_tensors`` (shared with
+        the 2d v2 graduation head so both heads see the identical 1536-d state
+        feature). Returns a 2-D ``[1, state_dim_pooled]`` tensor.
         """
-        if not state_tensors:
-            raise ValueError(
-                "RecoverabilityHead.project_state called with no state tensors"
-            )
-        if len(state_tensors) != 4:
-            raise ValueError(
-                f"RecoverabilityHead.project_state: expected 4 per-layer state "
-                f"tensors, got {len(state_tensors)}"
-            )
-        # Mean over d_state per layer -> [1, 384] each, then cat -> [1, 1536].
-        per_layer = []
-        for st in state_tensors:
-            s = st.to(torch.float32)            # [1, 16, 384] or [16, 384]
-            if s.dim() == 3:
-                per_layer.append(s.mean(dim=1))        # [1, 384]
-            elif s.dim() == 2:
-                per_layer.append(s.mean(dim=0).unsqueeze(0))  # [1, 384]
-            else:
-                raise ValueError(
-                    f"RecoverabilityHead.project_state: per-layer state has "
-                    f"unsupported ndim={s.dim()} (expected 2 [d_state,d_model] "
-                    f"or 3 [batch,d_state,d_model])"
-                )
-        return torch.cat(per_layer, dim=1)     # [1, state_dim_pooled]
+        return pool_state_tensors(state_tensors)
 
     # ── prediction ──
 

@@ -64,6 +64,7 @@ def build_ponder(
     config_override: Optional[Phase2cConfig] = None,
     relevance_head_path: Optional[str] = None,
     graduation_proxy: bool = False,
+    ring_capacity: int = 0,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -102,6 +103,12 @@ def build_ponder(
             (byte-identical to pre-2d). Full graduation -> LTM promotion is
             Phase 4; this round only makes the proxy attachable + the flag
             plumbed.
+        ring_capacity: WM ring buffer capacity K (default 0 = OFF, byte-
+            identical to Phase 2c). The STRM 2a relevance head + the 2d
+            graduation replay logger need the ring ON to populate per-slot
+            state; pass K>0 (e.g. 16) to turn it on at serve. Provenance
+            (episode_id + summary) is threaded into each recalled-episode
+            inject so the ring slots carry ``source_id``/``text``.
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -189,6 +196,7 @@ def build_ponder(
         encoder=encoder,
         relevance_head=relevance_head,
         graduation_proxy=graduation_proxy_head,
+        ring_capacity=ring_capacity,
     )
     return orch
 

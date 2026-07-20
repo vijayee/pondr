@@ -49,6 +49,12 @@ Flags:
     --strm-graduation-logging append per-turn ring-slot state to the STRM 2d
                           replay.jsonl tap (data/training/strm_graduation/) so
                           the v2 graduation labels accumulate. DEFAULT OFF.
+    --strm-ring-capacity N  WM ring buffer capacity K (default 0 = OFF). The
+                          STRM relevance head + graduation replay logger need
+                          the ring ON to populate per-slot state; pass K>0
+                          (e.g. 16) when running --strm-relevance-head or
+                          --strm-graduation-logging, or those heads/loggers see
+                          an empty ring and produce nothing.
 
 Pre-warm the Bonsai server first (PTX-JIT cold-start ~18s/shape; see memory
 ``hippo-bonsai-local-server``). Live-encode (default on) loads GLiNER; the
@@ -151,6 +157,11 @@ def main() -> int:
                    default=False,
                    help="append per-turn ring-slot state to the STRM 2d replay.jsonl "
                         "tap so the v2 graduation labels accumulate. DEFAULT OFF.")
+    p.add_argument("--strm-ring-capacity", type=int, default=0,
+                   help="WM ring buffer capacity K (default 0 = OFF). The STRM "
+                        "relevance head + graduation replay logger need the ring "
+                        "ON to populate per-slot state; pass K>0 (e.g. 16) when "
+                        "running --strm-relevance-head or --strm-graduation-logging.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -165,6 +176,14 @@ def main() -> int:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
               "--async-distill too (or pass --no-bonsai-isolation).", file=sys.stderr)
+    if (args.strm_relevance_head or args.strm_relevance_logging
+            or args.strm_graduation_logging) and args.strm_ring_capacity <= 0:
+        print("WARNING: --strm-relevance-head / --strm-relevance-logging / "
+              "--strm-graduation-logging need the WM ring ON to populate per-slot "
+              "state, but --strm-ring-capacity is 0 (ring OFF). Pass "
+              "--strm-ring-capacity 16 (or similar), or the relevance head scores "
+              "an empty ring and the replay logger writes nothing.",
+              file=sys.stderr)
 
     backbone_path = Path(args.backbone)
     if not backbone_path.exists():
@@ -193,7 +212,8 @@ def main() -> int:
     print(f"[load] strm_relevance_head={relevance_head_path or '(off)'} "
           f"strm_relevance_logging={args.strm_relevance_logging} "
           f"strm_graduation_proxy={args.strm_graduation_proxy} "
-          f"strm_graduation_logging={args.strm_graduation_logging}", file=sys.stderr)
+          f"strm_graduation_logging={args.strm_graduation_logging} "
+          f"strm_ring_capacity={args.strm_ring_capacity}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -208,6 +228,7 @@ def main() -> int:
         user_id=args.user_id,
         relevance_head_path=relevance_head_path,
         graduation_proxy=args.strm_graduation_proxy,
+        ring_capacity=args.strm_ring_capacity,
     )
 
     try:

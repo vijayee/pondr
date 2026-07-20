@@ -39,6 +39,9 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+import torch
+from torch import Tensor
+
 from .config import Phase2cConfig, config as _runtime_config
 from .generation.mode_a import ModeAGenerator
 from .retrieval.chunked_context import ChunkedContextFormatter
@@ -53,6 +56,7 @@ from .subconscious.ssm_chunker import SSMChunker
 from .subconscious.state_serializer import (
     deserialize, serialize, snapshot_from_instance,
 )
+from .subconscious.recoverability_head import pool_state_tensors
 from .subconscious.working_memory import WorkingMemory, WorkingMemoryState
 from .tools import (
     LOOP_TOOLS, SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
@@ -166,6 +170,7 @@ class PonderOrchestrator:
         encoder: Optional[HippocampalEncoder] = None,
         relevance_head=None,
         graduation_proxy=None,
+        ring_capacity: Optional[int] = None,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -212,11 +217,24 @@ class PonderOrchestrator:
         # query() and cleared on every return path so the record_feedback tool
         # path can thread it into feedback.jsonl. None outside a query.
         self._current_query: Optional[str] = None
+        # STRM 2d replay-logger turn counter: a per-orchestrator monotonic id so
+        # the v2 graduation label generator can order turns within a session
+        # (the WM ring's FIFO eviction makes "compressed out then re-recalled"
+        # a turn-gap question). Incremented once per query when
+        # ``strm_graduation_logging`` is on; untouched (stays 0) when off, so
+        # the flag-off path is byte-identical (the logger never runs).
+        self._graduation_turn_counter: int = 0
 
         # The cross-query Working Memory (persistent state). embedder injected so
-        # WM can embed episodes/queries on demand.
+        # WM can embed episodes/queries on demand. ``ring_capacity`` overrides
+        # the instance config's ring_capacity (default None -> config, which is 0
+        # = ring OFF, byte-identical to Phase 2c). The STRM 2a/2d serve-time
+        # read-out heads (relevance scoring, graduation replay logging) need the
+        # ring ON; a serve flag threads a K>0 here so the ring populates. K=0
+        # (the default) keeps the ring off and the shipped path byte-identical.
         self.working_memory = WorkingMemory(
-            backbone, embedder=embedder, decay_alpha=config.working_memory.decay_alpha
+            backbone, embedder=embedder, decay_alpha=config.working_memory.decay_alpha,
+            ring_capacity=ring_capacity,
         )
         self.ssm_chunker = SSMChunker(backbone, embedder, config)
         self.presentation_gate = PresentationGate(config, embedder)
@@ -338,11 +356,33 @@ class PonderOrchestrator:
         if episodes and self.embedder is not None:
             summaries = [e.get("summary", "") or e.get("text", "") for e in episodes]
             embs = self.working_memory.embed(summaries)
-            for emb in embs:
-                self.working_memory.inject(emb)
+            # Thread provenance (episode_id + summary) into each inject so the
+            # WM ring slots carry ``source_id``/``text`` when the ring is ON --
+            # the STRM 2a relevance head scores per slot and the 2d replay logger
+            # + label generator match on ``source_id`` (a slot is "later needed"
+            # if its source_id re-appears after a ring gap). When the ring is OFF
+            # (the default) provenance is ignored, so this is byte-identical to
+            # the pre-2d path.
+            for emb, ep in zip(embs, episodes):
+                self.working_memory.inject(
+                    emb, source_id=ep.get("episode_id"),
+                    text=ep.get("summary", "") or ep.get("text", ""),
+                )
             self.working_memory.set_metadata(
                 "active_domains", sorted({d for e in episodes for d in e.get("topics", [])})[:5]
             )
+
+        # STRM 2d replay logger (Step 5): when ``strm_graduation_logging`` is
+        # on, snapshot the WM ring slots for THIS turn to replay.jsonl so the
+        # v2 graduation labels can accumulate (one record per ring slot per
+        # turn; later_needed is filled later by the label generator). The ring
+        # is now fully populated (the query step + the recalled-episode
+        # injects). Best-effort: a logger failure never breaks the query.
+        if getattr(_runtime_config, "strm_graduation_logging", False):
+            try:
+                self._write_graduation_replay(prompt_emb, signal)
+            except Exception as e:  # noqa: BLE001 - logging is best-effort
+                print(f"[graduation-replay-fail] {e}", file=sys.stderr)
 
         # 5. Presentation Gate axis (a): chunking strategy.
         presentation_plan = self.presentation_gate.plan(
@@ -610,6 +650,99 @@ class PonderOrchestrator:
                 result["persisted_episode_id"] = episode.id
         except Exception as e:  # noqa: BLE001 - never lose the response
             print(f"[persist-fail] {e}", file=sys.stderr)
+
+    # ── STRM 2d: replay logger (v2 graduation training substrate) ──
+
+    _REPLAY_PATH = Path("data/training/strm_graduation/replay.jsonl")
+
+    def _write_graduation_replay(self, prompt_emb: Tensor, signal: str) -> None:
+        """Append one replay.jsonl record per WM ring slot for THIS turn.
+
+        Gated by ``strm_graduation_logging`` (the caller checks the flag; this
+        method does the I/O). Each record captures the inputs the v2
+        graduation head + its label generator need:
+
+          * ``state_t_pooled`` (1536) -- the 0a-validated pooled WM state
+            (shared with RecoverabilityHead), the v2 head's first feature.
+          * ``slot_y_t`` (256) -- the slot's recurrent readout, the v2 head's
+            second feature.
+          * ``r_i`` (float or null) -- the 2a relevance head's per-slot score
+            for THIS turn (re-embedded from the slot's text against the query;
+            null when no relevance head is loaded or the slot has no text).
+            The v1 ``integral(r_i dt)`` proxy is scored later from a slot's
+            ``r_i`` stream, so the v2-beat-v1 gate has both on the same slots.
+          * ``llm_signal`` -- the turn's affective signal (the v2 head's third
+            feature; the ``forgetting.LLM_SIGNAL_MODIFIERS`` vocabulary).
+          * ``source_id`` / ``text`` -- provenance the label generator matches
+            on (a slot is ``later_needed`` if its ``source_id`` re-appears in a
+            later turn AFTER a ring gap -- "compressed out then re-recalled").
+          * ``turn_id`` / ``session_id`` / ``slot_index`` -- ordering keys.
+          * ``later_needed`` -- null now; the label generator fills it.
+
+        The append is best-effort (the caller wraps it in a try) and writes
+        one JSONL line per slot. Tensors are moved to CPU + ``.tolist()`` for
+        JSON. The query step itself is in the ring (its ``source_id``/``text``
+        are None for the raw prompt) -- kept, so the log mirrors the WM content
+        exactly; the label generator ignores None-``source_id`` slots.
+        """
+        slots = self.working_memory.ring_buffer()
+        if not slots:
+            return
+        self._graduation_turn_counter += 1
+        turn_id = self._graduation_turn_counter
+        encoder = self._get_encoder()
+        session_id = (
+            encoder.session_id
+            if encoder is not None and getattr(encoder, "session_id", None)
+            else self.user_id
+        ) or "default"
+
+        # Pool the live WM state once for this turn (the v2 head's first
+        # feature). state_tensors() is the live, on-device per-layer state;
+        # pool_state_tensors means over d_state per layer -> [1, 1536].
+        state_pooled = pool_state_tensors(self.working_memory.state_tensors())
+        state_list = state_pooled.squeeze(0).to(torch.float32).tolist()
+
+        # r_i: only when a 2a relevance head is loaded. Re-embed each slot's
+        # text (bge-small, 384-d -- the SAME vector the 2a generator built its
+        # doc vectors from) and score against the query embedding. Slots with
+        # no text (e.g. the raw query step, None-provenance recalls) get null.
+        r_is: list[Optional[float]] = [None] * len(slots)
+        if self.relevance_head is not None and self.embedder is not None:
+            idx_text = [(i, s.text) for i, s in enumerate(slots)
+                        if s.text is not None and str(s.text).strip()]
+            if idx_text:
+                doc_embs = self.working_memory.embed([t for _, t in idx_text])  # [K',384] each [1,384]
+                ys = torch.cat(
+                    [slots[i].y.to(torch.float32).squeeze(0).reshape(1, -1)
+                     for i, _ in idx_text], dim=0)                # [K', 256]
+                ds = torch.cat(
+                    [e.to(torch.float32).squeeze(0).reshape(1, -1)
+                     for e in doc_embs], dim=0)                    # [K', 384]
+                q = prompt_emb.to(torch.float32).squeeze(0).reshape(1, -1)  # [1, 384]
+                with torch.no_grad():
+                    r = self.relevance_head.predict(ys, ds, q)    # [K', 1]
+                for j, (i, _) in enumerate(idx_text):
+                    r_is[i] = float(r[j].item())
+
+        # Append one JSONL line per slot (oldest-first, the ring's order).
+        self._REPLAY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._REPLAY_PATH, "a", encoding="utf-8") as f:
+            for slot_index, slot in enumerate(slots):
+                y_list = slot.y.to(torch.float32).squeeze(0).tolist()
+                rec = {
+                    "turn_id": turn_id,
+                    "session_id": session_id,
+                    "slot_index": slot_index,
+                    "source_id": slot.source_id,
+                    "text": slot.text,
+                    "slot_y_t": y_list,
+                    "state_t_pooled": state_list,
+                    "r_i": r_is[slot_index],
+                    "llm_signal": signal,
+                    "later_needed": None,
+                }
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     # ── Phase 2c+: feedback salience + consumer tool surface ──
 

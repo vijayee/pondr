@@ -1,4 +1,4 @@
-"""STRM Phase 2d graduation-head tests (v1 proxy + v2 head shell).
+"""STRM Phase 2d graduation-head tests (v1 proxy + v2 head + trainer + labeler).
 
 CPU-only, no backbone, no embedder, no WaveDB, no replay data. The v1 proxy is
 parameter-free (its math is exact, not learned), so the tests assert the
@@ -6,14 +6,23 @@ parameter-free (its math is exact, not learned), so the tests assert the
 classifier whose TRAINING RUN is deferred (Step 5 ships the trainer + replay
 labels); here we validate the module's predict shape/range, the
 ``llm_signal`` one-hot encoding (reusing the ``forgetting.LLM_SIGNAL_MODIFIERS``
-vocabulary), the broadcast/bad-dim guards, and the checkpoint round-trip --
-the same surface the 2b/2c/2a head tests cover for their heads.
+vocabulary), the broadcast/bad-dim guards, the checkpoint round-trip, the AUC
+gate + v1-score helpers, the replay-label generator (re-appearance after a
+ring gap), and that the v2 trainer clears the synthetic gate (v2 beats the v1
+r_i proxy when slot_y carries the signal and r_i does not) -- the same surface
+the 2b/2c/2a head tests cover for their heads.
 """
 
 from __future__ import annotations
 
+import json
+import sys
+from pathlib import Path
+
 import pytest
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.subconscious.graduation_head import (
     DEFAULT_GRADUATION_THRESHOLD,
@@ -26,7 +35,25 @@ from src.subconscious.graduation_head import (
     encode_llm_signal,
     load_graduation_head,
 )
+from src.subconscious.recoverability_head import STATE_DIM_POOLED as _REC_STATE_DIM
+from src.subconscious.training.graduation_training import (
+    GraduationTrainingConfig,
+    _auc,
+    fit_graduation,
+    load_replay_labeled,
+    v1_scores_per_record,
+)
 from src.memory.forgetting import LLM_SIGNAL_MODIFIERS
+from scripts.generate_graduation_labels import label_later_needed, load_replay
+from src.config import Phase2cConfig, config as _config
+
+# Orchestrator harness stubs (shared with tests/test_orchestrator.py -- the
+# replay-logger integration test mirrors that suite's offline harness).
+from tests.test_orchestrator import _StubEmbedder, _StubPlanner, _StubModeA, _ep
+
+
+# sanity: the v2 head reuses the recoverability head's pooled-state dim
+assert STATE_DIM_POOLED == _REC_STATE_DIM == 4 * 384
 
 
 # ── v1 proxy: integral(r_i dt) math ──
@@ -220,3 +247,317 @@ def test_graduation_head_v2_dim_mismatch_raises(tmp_path):
     torch.save(ckpt2, p2)
     with pytest.raises(RuntimeError, match="size mismatch"):
         load_graduation_head(str(p2), device="cpu")
+
+
+# ── AUC helper (rank-based, tie-aware) ──
+
+def test_auc_known_value_perfect_separation():
+    # two positives score above two negatives -> AUC 1.0
+    assert _auc([0.1, 0.4, 0.35, 0.8], [0, 0, 1, 1]) == pytest.approx(0.75)
+    assert _auc([0.1, 0.2, 0.9, 0.95], [0, 0, 1, 1]) == pytest.approx(1.0)
+    # inverted -> AUC 0.0
+    assert _auc([0.9, 0.95, 0.1, 0.2], [0, 0, 1, 1]) == pytest.approx(0.0)
+
+
+def test_auc_all_ties_is_chance():
+    # all scores tied -> average ranks -> AUC 0.5 (chance), no crash
+    assert _auc([0.5, 0.5, 0.5], [0, 1, 1]) == pytest.approx(0.5)
+    assert _auc([0.5, 0.5], [0, 1]) == pytest.approx(0.5)
+
+
+def test_auc_single_class_is_chance():
+    # one class empty -> 0.5 (the gate then fails on the chance floor, not a
+    # crash). Both directions.
+    assert _auc([0.1, 0.2, 0.3], [0, 0, 0]) == 0.5
+    assert _auc([0.1, 0.2, 0.3], [1, 1, 1]) == 0.5
+
+
+# ── v1 scores: cumulative sum(r_i dt) per (session, source_id) by turn ──
+
+def _rec(turn_id, session_id, source_id, r_i, label=None,
+         slot0=0.0, signal="routine"):
+    """Build a minimal replay record (the orchestrator's replay.jsonl shape).
+
+    ``later_needed`` defaults to ``None`` -- the replay logger writes null and
+    the label generator fills it; tests pass an explicit bool only when they
+    need a labeled record (the v2 trainer / the loader drop test).
+    """
+    return {
+        "turn_id": turn_id, "session_id": session_id, "source_id": source_id,
+        "slot_index": 0, "text": f"text-{source_id}" if source_id else None,
+        "slot_y_t": [slot0] + [0.0] * (SLOT_DIM - 1),
+        "state_t_pooled": [0.0] * STATE_DIM_POOLED,
+        "r_i": r_i, "llm_signal": signal, "later_needed": label,
+    }
+
+
+def test_v1_scores_cumulative_per_source_by_turn():
+    recs = [
+        _rec(1, "s1", "x", 0.5),     # x@1: cum 0.5
+        _rec(3, "s1", "x", 0.3),     # x@3: cum 0.8
+        _rec(2, "s1", "y", 0.9),     # y@2: cum 0.9
+        _rec(1, "s2", "z", 1.0),     # s2/z@1: cum 1.0 (different session)
+    ]
+    scores = v1_scores_per_record(recs, dt=1.0)
+    assert scores == pytest.approx([0.5, 0.8, 0.9, 1.0])
+    # dt scales the integral uniformly
+    scores2 = v1_scores_per_record(recs, dt=2.0)
+    assert scores2 == pytest.approx([1.0, 1.6, 1.8, 2.0])
+
+
+def test_v1_scores_null_r_i_contributes_zero_but_carries_cumulative():
+    # a null r_i at a turn adds 0.0 but does not reset the cumulative sum.
+    recs = [
+        _rec(1, "s1", "x", 0.4),     # cum 0.4
+        _rec(2, "s1", "x", None),    # cum 0.4 (null -> +0.0)
+        _rec(3, "s1", "x", 0.6),     # cum 1.0
+    ]
+    assert v1_scores_per_record(recs, dt=1.0) == pytest.approx([0.4, 0.4, 1.0])
+
+
+def test_v1_scores_none_source_id_records_stay_zero():
+    # the raw query step (source_id=None) cannot be grouped -> v1 score 0.0.
+    recs = [
+        _rec(1, "s1", None, 0.9),
+        _rec(2, "s1", "x", 0.5),
+    ]
+    assert v1_scores_per_record(recs, dt=1.0) == pytest.approx([0.0, 0.5])
+
+
+# ── label generator: re-appearance after a ring gap ──
+
+def test_label_later_needed_re_appearance_after_gap():
+    # session s1, present turns 1..5.
+    # A: appears at 1,2 then absent at 3, re-appears at 4 -> A@1,A@2 later_needed
+    # B: appears at 1,2,3 consecutively (no gap) -> all False
+    # C: appears at 1 and 5, absent at 2,3,4 -> C@1 later_needed
+    recs = []
+    for t in [1, 2, 4]:
+        recs.append(_rec(t, "s1", "A", 0.5, label=True, slot0=0.0))
+    for t in [1, 2, 3]:
+        recs.append(_rec(t, "s1", "B", 0.5, label=True, slot0=0.0))
+    for t in [1, 5]:
+        recs.append(_rec(t, "s1", "C", 0.5, label=True, slot0=0.0))
+    # A None-source_id slot (the raw query step) -- must stay null (unmatchable).
+    recs.append(_rec(1, "s1", None, 0.5, label=True, slot0=0.0))
+
+    labeled = label_later_needed(recs)
+    # build a (turn, source_id) -> later_needed map (None source -> null)
+    by_key = {(r["turn_id"], r["source_id"]): r["later_needed"] for r in labeled}
+    # A@1 and A@2: re-appears at 4 with turn 3 absent -> True
+    assert by_key[(1, "A")] is True
+    assert by_key[(2, "A")] is True
+    # A@4: no later appearance -> False
+    assert by_key[(4, "A")] is False
+    # B@1,B@2,B@3: consecutive presence, no gap -> False
+    assert by_key[(1, "B")] is False
+    assert by_key[(2, "B")] is False
+    assert by_key[(3, "B")] is False
+    # C@1: re-appears at 5 with 2,3,4 absent -> True. C@5: no later -> False.
+    assert by_key[(1, "C")] is True
+    assert by_key[(5, "C")] is False
+    # None-source slot -> later_needed null (trainer drops it)
+    assert by_key[(1, None)] is None
+
+
+def test_label_later_needed_does_not_mutate_input():
+    # the replay log records carry ``later_needed: null`` (the logger's shape);
+    # the labeler returns a NEW list of shallow copies with the field filled,
+    # leaving the originals' null untouched.
+    recs = [_rec(1, "s1", "x", 0.5), _rec(3, "s1", "x", 0.5)]
+    assert recs[0]["later_needed"] is None
+    labeled = label_later_needed(recs)
+    # originals untouched (a NEW shallow copy per record)
+    assert recs[0]["later_needed"] is None
+    assert recs[1]["later_needed"] is None
+    # x appears at turns 1 and 3 only (no turn 2 in the session) -> no gap ->
+    # both False (consecutive-ish presence is not a re-recall after eviction).
+    assert labeled[0]["later_needed"] is False
+    assert labeled[1]["later_needed"] is False
+
+
+def test_load_replay_drops_malformed_lines(tmp_path):
+    p = tmp_path / "replay.jsonl"
+    p.write_text(
+        json.dumps({"turn_id": 1, "session_id": "s1", "source_id": "x"}) + "\n"
+        + "not json\n"
+        + json.dumps({"turn_id": 2}) + "\n"            # missing session_id
+        + json.dumps({"turn_id": 3, "session_id": "s2", "source_id": "y"}) + "\n",
+        encoding="utf-8",
+    )
+    recs = load_replay(str(p))
+    assert len(recs) == 2
+    assert recs[0]["turn_id"] == 1
+    assert recs[1]["session_id"] == "s2"
+
+
+# ── v2 trainer clears the synthetic gate (v2 beats v1, chance floor) ──
+
+def test_fit_graduation_v2_beats_v1_on_synthetic_gate(tmp_path):
+    # Two sessions, 10 records each (5 positive / 5 negative). The label is
+    # perfectly separated by slot_y_t[0] (+3.0 positive, -3.0 negative) -> the
+    # v2 MLP learns it -> v2_auc ~ 1.0. r_i is a CONSTANT 0.5 with one record
+    # per (session, source_id), so each v1 score = 0.5 (a single r_i in the
+    # cumulative) -> all v1 scores tied -> v1_auc = 0.5 (chance). state + signal
+    # are all-zeros (uninformative). The gate: v2 beats v1 AND clears the
+    # chance floor -> go=True, best_v2_auc > best_v1_auc.
+    records: list[dict] = []
+    for sess in ("s1", "s2"):
+        for i in range(5):
+            records.append(_rec(
+                turn_id=i * 2, session_id=sess, source_id=f"{sess}-neg-{i}",
+                r_i=0.5, label=False, slot0=-3.0))
+            records.append(_rec(
+                turn_id=i * 2 + 1, session_id=sess, source_id=f"{sess}-pos-{i}",
+                r_i=0.5, label=True, slot0=+3.0))
+    cfg = GraduationTrainingConfig(
+        epochs=30, learning_rate=3e-3, val_fraction=0.5, min_val_n=8,
+        gate_auc_min=0.5, checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    result = fit_graduation(records, cfg)
+    assert result["go"] is True
+    assert result["best_v2_auc"] > result["best_v1_auc"]
+    assert result["best_v2_auc"] >= 0.95          # clean separation
+    assert result["best_v1_auc"] == pytest.approx(0.5)   # constant r_i -> chance
+    # the checkpoint was written + round-trips through the loader.
+    best = tmp_path / "ckpt" / "best.pt"
+    assert best.exists()
+    loaded = load_graduation_head(str(best), device="cpu")
+    # the loaded head separates the two classes on a fresh batch
+    pos = torch.tensor([[+3.0] + [0.0] * (SLOT_DIM - 1)], dtype=torch.float32)
+    neg = torch.tensor([[-3.0] + [0.0] * (SLOT_DIM - 1)], dtype=torch.float32)
+    st = torch.zeros(1, STATE_DIM_POOLED)
+    sig = torch.zeros(1, LLM_SIGNAL_DIM)
+    with torch.no_grad():
+        p_pos = loaded.predict(st, pos, sig).item()
+        p_neg = loaded.predict(st, neg, sig).item()
+    assert p_pos > p_neg
+
+
+def test_fit_graduation_empty_records_raises():
+    with pytest.raises(RuntimeError, match="no records"):
+        fit_graduation([])
+
+
+def test_load_replay_labeled_drops_null_and_missing(tmp_path):
+    p = tmp_path / "labeled.jsonl"
+    p.write_text(
+        json.dumps(_rec(1, "s1", "x", 0.5, label=True)) + "\n"          # keep
+        + json.dumps(_rec(2, "s1", "y", 0.5, label=False)) + "\n"      # keep
+        + json.dumps(_rec(3, "s1", None, 0.5, label=None)) + "\n"      # null label -> drop
+        + json.dumps({"turn_id": 4, "session_id": "s1", "source_id": "z"}) + "\n"  # missing fields -> drop
+        + "garbage\n",
+        encoding="utf-8",
+    )
+    recs = load_replay_labeled(str(p))
+    # only the two records with a bool label AND all feature fields survive.
+    assert len(recs) == 2
+    assert all(isinstance(r["later_needed"], bool) for r in recs)
+
+
+# ── replay-logger integration: orchestrator writes replay.jsonl (ring ON) ──
+
+def test_orchestrator_writes_graduation_replay_when_logging_on(tmp_path):
+    """With the ring ON + strm_graduation_logging on, query() appends one
+    replay.jsonl record per WM ring slot per turn. The records carry the v2
+    head's three feature fields (state_t_pooled, slot_y_t, llm_signal) + the
+    label-generator match keys (turn_id, session_id, source_id, text) +
+    later_needed: null (filled later by the label generator)."""
+    from src.orchestrator import PonderOrchestrator
+    from src.memory.store import HippocampalStore
+    from src.retrieval.retriever import HippocampalRetriever
+    from src.subconscious.backbone import JGSBackbone
+    from src.subconscious.configs import BackboneConfig
+
+    # Build a tiny orchestrator with the ring ON (ring_capacity=8) on a tmp
+    # store with one retrievable episode. Mirror tests/test_orchestrator.py's
+    # stub harness (no Bonsai, no GLiNER).
+    store = HippocampalStore(str(tmp_path / "db"))
+    ep = _ep("ep_001", entities=["Alice"], summary="Alice said use Postgres")
+    store.encode_episode(ep)
+    plan = {"entities": ["Alice"], "entity_mode": "union"}
+    retriever = HippocampalRetriever(store, planner=_StubPlanner(plan),
+                                    embedder=_StubEmbedder())
+    backbone = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    cfg.session.state_dir = str(tmp_path / "sessions")
+    replay_path = tmp_path / "replay.jsonl"
+    # Redirect the class-level replay path so the test never touches the real
+    # data dir.
+    saved_path = PonderOrchestrator._REPLAY_PATH
+    PonderOrchestrator._REPLAY_PATH = replay_path
+    saved_flag = _config.strm_graduation_logging
+    _config.strm_graduation_logging = True
+    try:
+        orch = PonderOrchestrator(
+            store=store, retriever=retriever, backbone=backbone,
+            embedder=_StubEmbedder(), mode_a=_StubModeA(reply="R"),
+            config=cfg, user_id="victor", ring_capacity=8,
+        )
+        res = orch.query("What did Alice say?")
+        assert res["supported"] is True
+    finally:
+        PonderOrchestrator._REPLAY_PATH = saved_path
+        _config.strm_graduation_logging = saved_flag
+    store.close()
+
+    assert replay_path.exists(), "replay logger wrote nothing (ring off?)"
+    import json as _json
+    lines = [l for l in replay_path.read_text(encoding="utf-8").splitlines() if l]
+    assert lines, "replay.jsonl is empty"
+    recs = [_json.loads(l) for l in lines]
+    # one record per ring slot for this turn
+    assert len(recs) >= 1
+    for r in recs:
+        # the three v2-head feature fields are present + right shape
+        assert len(r["slot_y_t"]) == SLOT_DIM
+        assert len(r["state_t_pooled"]) == STATE_DIM_POOLED
+        assert "r_i" in r                       # null (no relevance head loaded)
+        assert r["r_i"] is None
+        assert "llm_signal" in r
+        # label-generator match keys
+        assert r["turn_id"] == 1
+        assert r["session_id"] == "victor"      # no encoder -> user_id
+        assert r["later_needed"] is None        # filled later by the labeler
+    # the recalled episode's source_id is threaded into a ring slot
+    source_ids = {r["source_id"] for r in recs}
+    assert "ep_001" in source_ids
+    # the raw query step carries a None source_id (the labeler drops it)
+    assert None in source_ids
+
+
+def test_orchestrator_no_replay_when_logging_off(tmp_path):
+    """strm_graduation_logging off (the default) -> no replay.jsonl written,
+    byte-identical to the pre-2d path. Guards the flag-off invariant."""
+    from src.orchestrator import PonderOrchestrator
+    from src.memory.store import HippocampalStore
+    from src.retrieval.retriever import HippocampalRetriever
+    from src.subconscious.backbone import JGSBackbone
+    from src.subconscious.configs import BackboneConfig
+
+    store = HippocampalStore(str(tmp_path / "db"))
+    ep = _ep("ep_001", entities=["Alice"], summary="Alice said use Postgres")
+    store.encode_episode(ep)
+    plan = {"entities": ["Alice"], "entity_mode": "union"}
+    retriever = HippocampalRetriever(store, planner=_StubPlanner(plan),
+                                    embedder=_StubEmbedder())
+    backbone = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    cfg.session.state_dir = str(tmp_path / "sessions")
+    replay_path = tmp_path / "replay.jsonl"
+    saved_path = PonderOrchestrator._REPLAY_PATH
+    PonderOrchestrator._REPLAY_PATH = replay_path
+    saved_flag = _config.strm_graduation_logging
+    _config.strm_graduation_logging = False
+    try:
+        orch = PonderOrchestrator(
+            store=store, retriever=retriever, backbone=backbone,
+            embedder=_StubEmbedder(), mode_a=_StubModeA(reply="R"),
+            config=cfg, user_id="victor", ring_capacity=8,
+        )
+        orch.query("What did Alice say?")
+    finally:
+        PonderOrchestrator._REPLAY_PATH = saved_path
+        _config.strm_graduation_logging = saved_flag
+    store.close()
+    assert not replay_path.exists()
