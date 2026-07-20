@@ -73,7 +73,10 @@ from src.retrieval.query_planner import BonsaiQueryPlanner  # noqa: E402
 from src.retrieval.retriever import HippocampalRetriever  # noqa: E402
 from src.subconscious.configs import BackboneConfig  # noqa: E402
 from src.subconscious.context_builder import load_context_builder  # noqa: E402
-from src.subconscious.latent_dynamics_head import load_latent_dynamics_head  # noqa: E402
+from src.subconscious.latent_dynamics_head import (  # noqa: E402
+    LatentDynamicsHead,
+    load_latent_dynamics_head,
+)
 from src.subconscious.recoverability_head import load_recoverability_head  # noqa: E402
 from src.subconscious.relevance_head import load_relevance_head  # noqa: E402
 from src.subconscious.salience import (  # noqa: E402
@@ -81,6 +84,7 @@ from src.subconscious.salience import (  # noqa: E402
     load_salience_thresholds,
 )
 from src.subconscious.training.routing_training import build_embedder, load_backbone  # noqa: E402
+from src.subconscious.z_relevance_head import load_z_relevance_head  # noqa: E402
 
 # Reuse the committed transcript-replay helpers verbatim (the same loader +
 # episode builder the 2d v2 harness uses -> the ring slots we score are the
@@ -107,6 +111,12 @@ DEFAULT_CONTEXT_BUILDER = "data/training/strm_context_builder/best.pt"
 # three heads + thresholds, matching ``_salience_armed`` in the orchestrator).
 DEFAULT_RECOVERABILITY_HEAD = "data/training/strm_recoverability/best.pt"
 DEFAULT_LATENT_DYNAMICS_HEAD = "data/training/strm_latent_dynamics/best.pt"
+# The Phase B ``h_t`` probe head (a ZRelevanceHead trained on slots_z). Loaded
+# when present so the probe ALSO scores each ring slot with the z_i head -- the
+# serve half of GATE 1: does the projected SSM state z_i = project(slot.h) carry
+# query-relevance signal the 2a y_t readout did NOT? Optional: absent -> the
+# r_i / s_i run is byte-identical to the prior behavior.
+DEFAULT_Z_RELEVANCE_HEAD = "data/training/strm_z_relevance/best.pt"
 DEFAULT_THRESHOLDS = "data/training/strm_salience/thresholds.json"
 DEFAULT_TRANSCRIPTS = (
     "docs/The_Ponder_Engine_Chat.json",
@@ -164,24 +174,28 @@ def _percentile(values: list[float], q: float) -> float:
 
 
 def _capture_turn(orch: PonderOrchestrator, user_text: str,
-                  context_builder=None) -> dict:
+                  context_builder=None, z_head=None, ld_head=None) -> dict:
     """Score the current WM ring against this turn's query. Returns one record:
-    ``{user_text, slots: [{source_id, text, r_i, logit, s_i, s_i_pure, cos}]}``
-    where ``cos`` is the bge cosine between the slot text and THIS turn's
-    user_text (the probe/filler label signal); ``logit`` is the pre-sigmoid 2a
-    relevance logit (the decisive signal under ``--ablate-yt`` when the sigmoid
-    is saturated); and ``s_i`` / ``s_i_pure`` are the ContextBuilder's
-    transformer scores (as-shipped with the 2a r_i bias, and pure with that bias
-    zeroed -- the DeepSeek-Hole-1 test), present only when a builder is passed.
-    Only text-bearing slots are scored."""
+    ``{user_text, slots: [{source_id, text, r_i, logit, s_i, s_i_pure, z_r,
+    z_logit, cos}]}`` where ``cos`` is the bge cosine between the slot text and
+    THIS turn's user_text (the probe/filler label signal); ``logit`` is the
+    pre-sigmoid 2a relevance logit (the decisive signal under ``--ablate-yt``
+    when the sigmoid is saturated); ``s_i`` / ``s_i_pure`` are the
+    ContextBuilder's transformer scores (as-shipped with the 2a r_i bias, and
+    pure with that bias zeroed -- the DeepSeek-Hole-1 test), present only when a
+    builder is passed; and ``z_r`` / ``z_logit`` are the Phase B z_i-head's
+    sigmoid + pre-sigmoid score (``z_i = project(slot.h)``, the ``h_t`` analog of
+    the 2a ``y_t`` test -- the serve half of GATE 1), present only when a z_head
+    is passed. Only text-bearing slots are scored."""
     prompt_emb = orch.working_memory.embed([user_text])[0]
     slots = orch.working_memory.ring_buffer()
-    slots, r_is, logits, s_is, s_is_pure = _score_ring_with_logits(
+    (slots, r_is, logits, s_is, s_is_pure, z_logits, z_rs) = _score_ring_with_logits(
         orch.working_memory, orch.relevance_head, orch.embedder, prompt_emb,
-        slots, context_builder=context_builder)
+        slots, context_builder=context_builder, z_head=z_head, ld_head=ld_head)
     # Embed each scored slot's text once for the cosine probe/filler label.
     out_slots = []
-    for s, r, lg, si, sip in zip(slots, r_is, logits, s_is, s_is_pure):
+    for s, r, lg, si, sip, zlg, zr in zip(slots, r_is, logits, s_is, s_is_pure,
+                                          z_logits, z_rs):
         if r is None or not s.text:
             continue
         slot_emb = orch.working_memory.embed([s.text])[0]
@@ -196,12 +210,17 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
             rec["s_i"] = si
         if sip is not None:
             rec["s_i_pure"] = sip
+        if zlg is not None:
+            rec["z_logit"] = zlg
+        if zr is not None:
+            rec["z_r"] = zr
         out_slots.append(rec)
     return {"user_text": user_text, "slots": out_slots}
 
 
 def _score_ring_with_logits(working_memory, relevance_head, embedder,
-                            prompt_emb, slots, context_builder=None):
+                            prompt_emb, slots, context_builder=None,
+                            z_head=None, ld_head=None):
     """Mirror ``relevance_score._score`` but return the pre-sigmoid LOGIT too
     (so the ablation can measure the bilinear gap that the saturated sigmoid
     hides), and -- when a ContextBuilder is supplied -- the transformer's per-
@@ -219,20 +238,33 @@ def _score_ring_with_logits(working_memory, relevance_head, embedder,
         ``s_i_pure`` gap == the cross-slot attention gap == the test of whether
         ``y_t`` carries enough signal for the transformer to locate relevance.)
 
-    Returns ``(slots, r_is, logits, s_is, s_is_pure)`` length-``len(slots)`` with
-    ``None`` at unscored positions (matching ``score_ring_slots``); the two
-    transformer lists stay ``[None]*n`` when no builder is passed."""
+    AND -- when a ``z_head`` (ZRelevanceHead) is supplied (with ``ld_head`` for
+    ``project(slot.h)``) -- the Phase B z_i-head's per-slot ``z_logit`` +
+    ``z_r``: ``z_i = ld_head.project(slot.h)`` (last layer, mean over d_state,
+    384-d), scored ``bilinear(proj_z(z_i), proj_q(query))``. This is the ``h_t``
+    analog of the 2a ``y_t`` test -- the serve half of GATE 1: does the projected
+    SSM recurrent state carry query-relevance signal the ``y_t`` readout did NOT?
+    ``ld_head.project`` is parameter-free, so an untrained ``LatentDynamicsHead``
+    here matches the generator's ``slots_z`` exactly (train/serve z_i identity).
+
+    Returns ``(slots, r_is, logits, s_is, s_is_pure, z_logits, z_rs)``, each
+    length-``len(slots)`` with ``None`` at unscored positions (matching
+    ``score_ring_slots``); the transformer lists stay ``[None]*n`` when no
+    builder is passed, and the z lists stay ``[None]*n`` when no z_head is
+    passed (or a scored slot lacks ``slot.h``)."""
     n = len(slots)
     r_is: list = [None] * n
     logits: list = [None] * n
     s_is: list = [None] * n
     s_is_pure: list = [None] * n
+    z_logits: list = [None] * n
+    z_rs: list = [None] * n
     if relevance_head is None or embedder is None:
-        return slots, r_is, logits, s_is, s_is_pure
+        return slots, r_is, logits, s_is, s_is_pure, z_logits, z_rs
     idx_text = [(i, s.text) for i, s in enumerate(slots)
                 if s.text is not None and str(s.text).strip()]
     if not idx_text:
-        return slots, r_is, logits, s_is, s_is_pure
+        return slots, r_is, logits, s_is, s_is_pure, z_logits, z_rs
     head_dev = next(relevance_head.parameters()).device
     doc_emb_tensors = working_memory.embed([t for _, t in idx_text])
     ys = torch.cat([slots[i].y.to(torch.float32).squeeze(0).reshape(1, -1)
@@ -249,13 +281,48 @@ def _score_ring_with_logits(working_memory, relevance_head, embedder,
             s = context_builder.logits(ys, ds, q, r_flat)              # [K']
             # pure transformer score: r bias zeroed -> (q . h)*scale + bias only.
             s_pure = context_builder.logits(ys, ds, q, torch.zeros_like(r_flat))
+        # Phase B: z_i = project(slot.h) scored by the z_head. slot.h is present
+        # for every ring slot when ring_capacity>0 (Phase A captures it); a None
+        # here would mean Phase A regressed -> that slot is z-unscored (None).
+        if z_head is not None and ld_head is not None:
+            z_rows = []
+            z_mask: list[bool] = []
+            for i, _ in idx_text:
+                h = getattr(slots[i], "h", None)
+                if h is None:
+                    z_rows.append(None)
+                    z_mask.append(False)
+                else:
+                    z_i = ld_head.project(h).squeeze(0).to(torch.float32)  # [384]
+                    z_rows.append(z_i)
+                    z_mask.append(True)
+            if any(z_mask):
+                z_stack = torch.stack([z for z in z_rows if z is not None]).to(head_dev)
+                # z_head.logits IGNORES slot_y (``del slot_y`` -- the pure-z_i
+                # test), so pass a zero dummy of the right shape rather than a
+                # slice of ``ys`` (which would misalign with z_stack when some
+                # slots lack h -- harmless today since slot_y is unused, but the
+                # dummy makes the "ignored" intent explicit and avoids a latent
+                # mis-wire if a future head ever reads slot_y).
+                slot_y_dummy = torch.zeros(z_stack.shape[0], z_head.slot_dim,
+                                           device=head_dev, dtype=torch.float32)
+                z_lg = z_head.logits(slot_y_dummy, z_stack, q)             # [Kz, 1]
+                z_r = torch.sigmoid(z_lg)                                  # [Kz, 1]
+                k = 0
+                for j, ok in enumerate(z_mask):
+                    if not ok:
+                        continue
+                    zi = idx_text[j][0]
+                    z_logits[zi] = float(z_lg[k].item())
+                    z_rs[zi] = float(z_r[k].item())
+                    k += 1
     for j, (i, _) in enumerate(idx_text):
         logits[i] = float(lg[j].item())
         r_is[i] = float(r[j].item())
         if context_builder is not None:
             s_is[i] = float(s[j].item())
             s_is_pure[i] = float(s_pure[j].item())
-    return slots, r_is, logits, s_is, s_is_pure
+    return slots, r_is, logits, s_is, s_is_pure, z_logits, z_rs
 
 
 def _ablate_yt_sidepath(head) -> None:
@@ -279,11 +346,13 @@ def replay_and_capture(
     ring_capacity: int, max_turns: int, device: str, salience: str,
     user_id: str, rec_head_path: str, ld_head_path: str, ablate_yt: bool,
     context_builder_path: Optional[str] = None,
+    z_relevance_head_path: Optional[str] = None,
 ) -> tuple[list[dict], dict]:
     """Replay every transcript turn through the orchestrator and capture per-
     turn per-slot r_i (and, when a ContextBuilder checkpoint is supplied, the
-    transformer's s_i / s_i_pure) on the real recalled ring slots. Returns
-    (turn_records, run_stats)."""
+    transformer's s_i / s_i_pure; when a z_relevance_head checkpoint is
+    supplied, the z_i-head's z_r / z_logit) on the real recalled ring slots.
+    Returns (turn_records, run_stats)."""
     tmpdir = tempfile.mkdtemp(prefix="pondr_probe4a_")
     turn_records: list[dict] = []
     store = None
@@ -311,6 +380,22 @@ def replay_and_capture(
         elif context_builder_path:
             print(f"[probe] ContextBuilder checkpoint not found at "
                   f"{context_builder_path} -- r_i-only run.", file=sys.stderr)
+        # The Phase B z_i head (ZRelevanceHead) is OPTIONAL -- load it when a
+        # checkpoint path is supplied and present so the probe also captures the
+        # z_i-head's z_r / z_logit (the serve half of GATE 1). The project step
+        # uses an UNTRAINED LatentDynamicsHead (project is parameter-free) so
+        # serve z_i EXACTLY matches the generator's slots_z the head was trained
+        # on. Absent path -> z capture skipped (byte-identical to prior runs).
+        z_head = None
+        ld_head_for_z: Optional[LatentDynamicsHead] = None
+        if z_relevance_head_path and Path(z_relevance_head_path).exists():
+            z_head = load_z_relevance_head(str(z_relevance_head_path), device=device)
+            ld_head_for_z = LatentDynamicsHead()  # untrained; project is parameter-free
+            print(f"[probe] ZRelevanceHead loaded: {z_relevance_head_path} "
+                  f"(capturing z_r + z_logit alongside r_i)", flush=True)
+        elif z_relevance_head_path:
+            print(f"[probe] ZRelevanceHead checkpoint not found at "
+                  f"{z_relevance_head_path} -- z capture skipped.", file=sys.stderr)
         # Salience arming needs all three heads + thresholds (``_salience_armed``
         # in the orchestrator). OFF (the default) measures the head alone on the
         # prompt-driven recalled slots; permissive/real arm the trigger so
@@ -382,7 +467,8 @@ def replay_and_capture(
                 # injects populate text-bearing slots). prompt_emb is re-derived
                 # from the user text (deterministic -- same embed call query()
                 # uses internally).
-                rec = _capture_turn(orch, u, context_builder=context_builder)
+                rec = _capture_turn(orch, u, context_builder=context_builder,
+                                    z_head=z_head, ld_head=ld_head_for_z)
                 rec["session_id"] = session_id
                 rec["turn_index"] = i
                 turn_records.append(rec)
@@ -407,6 +493,7 @@ def replay_and_capture(
             "n_skipped": total_skipped, "ring_capacity": ring_capacity,
             "salience": salience, "device": device,
             "context_builder": context_builder is not None,
+            "z_relevance_head": z_head is not None,
         }
         return turn_records, run_stats
     finally:
@@ -437,6 +524,10 @@ def _analyze(turn_records: list[dict]) -> dict:
              if s.get("s_i") is not None]
     all_sp = [s["s_i_pure"] for rec in turn_records for s in rec["slots"]
               if s.get("s_i_pure") is not None]
+    all_zr = [s["z_r"] for rec in turn_records for s in rec["slots"]
+              if s.get("z_r") is not None]
+    all_zlg = [s["z_logit"] for rec in turn_records for s in rec["slots"]
+               if s.get("z_logit") is not None]
 
     def _dist(vals: list[float]) -> dict:
         return {
@@ -468,6 +559,14 @@ def _analyze(turn_records: list[dict]) -> dict:
         "logit_stdev": statistics.pstdev(all_lg) if len(all_lg) >= 2 else 0.0,
         "s_i": _dist(all_s),
         "s_i_pure": _dist(all_sp),
+        # Phase B: the z_i-head's sigmoid (z_r) + pre-sigmoid (z_logit). z_r is
+        # the GATE 1 metric (serve selectivity gap median >= 0.2, the 2a r_i
+        # scale); z_logit (unbounded) uses the >= 2.0 logit gate like the 2a
+        # logit / s_i. frac_ge_0p99 on z_r mirrors the 2a saturation signature.
+        "z_r": {**_dist(all_zr),
+                "frac_ge_0p99": (sum(1 for r in all_zr if r >= 0.99) / len(all_zr))
+                                if all_zr else 0.0},
+        "z_logit": _dist(all_zlg),
     }
     # (2) per-source selectivity for r_i, logit, s_i, s_i_pure. Group scored
     # occurrences by source_id; for each source seen on >= 3 turns, the probe
@@ -485,12 +584,15 @@ def _analyze(turn_records: list[dict]) -> dict:
                 "turn_index": rec["turn_index"], "r_i": s["r_i"],
                 "logit": s.get("logit"), "cos": s["cos"],
                 "s_i": s.get("s_i"), "s_i_pure": s.get("s_i_pure"),
+                "z_r": s.get("z_r"), "z_logit": s.get("z_logit"),
             })
 
     r_gaps: list[float] = []
     lg_gaps: list[float] = []
     s_gaps: list[float] = []
     sp_gaps: list[float] = []
+    zr_gaps: list[float] = []
+    zlg_gaps: list[float] = []
     per_source_examples: list[dict] = []
     for sid, occs in by_source.items():
         if len(occs) < 3:
@@ -513,6 +615,17 @@ def _analyze(turn_records: list[dict]) -> dict:
         if probe["s_i_pure"] is not None and all(o["s_i_pure"] is not None for o in fillers):
             sp_gap = probe["s_i_pure"] - statistics.fmean(o["s_i_pure"] for o in fillers)
             sp_gaps.append(sp_gap)
+        # Phase B GATE 1: the z_i-head's selectivity gap (probe z minus mean
+        # filler z). z_r uses the 0.2 sigmoid gap gate (the 2a r_i scale, the
+        # GATE 1 metric); z_logit uses the 2.0 unbounded-logit gate.
+        zr_gap = None
+        if probe["z_r"] is not None and all(o["z_r"] is not None for o in fillers):
+            zr_gap = probe["z_r"] - statistics.fmean(o["z_r"] for o in fillers)
+            zr_gaps.append(zr_gap)
+        zlg_gap = None
+        if probe["z_logit"] is not None and all(o["z_logit"] is not None for o in fillers):
+            zlg_gap = probe["z_logit"] - statistics.fmean(o["z_logit"] for o in fillers)
+            zlg_gaps.append(zlg_gap)
         if len(per_source_examples) < 12:
             per_source_examples.append({
                 "source_id": sid, "n_turns": len(occs),
@@ -521,6 +634,8 @@ def _analyze(turn_records: list[dict]) -> dict:
                 "probe_logit": probe["logit"], "logit_gap": lg_gap,
                 "probe_s_i": probe["s_i"], "s_gap": s_gap,
                 "probe_s_i_pure": probe["s_i_pure"], "s_pure_gap": sp_gap,
+                "probe_z_r": probe["z_r"], "z_r_gap": zr_gap,
+                "probe_z_logit": probe["z_logit"], "z_logit_gap": zlg_gap,
             })
 
     def _gap_stats(gaps: list[float], thr: float):
@@ -548,6 +663,10 @@ def _analyze(turn_records: list[dict]) -> dict:
         "gate_median_logit_gap_ge_2": (statistics.median(lg_gaps) >= 2.0) if lg_gaps else False,
         "s_i": _gap_stats(s_gaps, 2.0),
         "s_i_pure": _gap_stats(sp_gaps, 2.0),
+        # Phase B GATE 1: z_r gap (sigmoid scale, thr 0.2 -- the primary gate)
+        # + z_logit gap (unbounded, thr 2.0 -- the ablation-scale view).
+        "z_r": _gap_stats(zr_gaps, 0.2),
+        "z_logit": _gap_stats(zlg_gaps, 2.0),
         "examples": per_source_examples,
     }
     return {"distribution": dist, "selectivity": selectivity}
@@ -577,6 +696,12 @@ def _main() -> int:
                    help="ContextBuilder checkpoint to ALSO capture the "
                         "transformer's s_i / s_i_pure (the DeepSeek-Hole-1 test). "
                         "Default = the shipped Phase 3 builder; pass '' to skip.")
+    p.add_argument("--z-relevance-head", default=DEFAULT_Z_RELEVANCE_HEAD,
+                   help="ZRelevanceHead checkpoint (Phase B h_t probe) to ALSO "
+                        "capture the z_i-head's z_r / z_logit (the serve half of "
+                        "GATE 1: does z_i = project(slot.h) carry query-relevance "
+                        "signal y_t did NOT). Default = the trained z-head; pass "
+                        "'' to skip.")
     p.add_argument("--user-id", default="pondr")
     p.add_argument("--out", default="", help="write the JSON report to this path")
     args = p.parse_args()
@@ -610,7 +735,8 @@ def _main() -> int:
         max_turns=args.max_turns, device=args.device, salience=args.salience,
         user_id=args.user_id, rec_head_path=args.recoverability_head,
         ld_head_path=args.latent_dynamics_head, ablate_yt=args.ablate_yt,
-        context_builder_path=args.context_builder or None)
+        context_builder_path=args.context_builder or None,
+        z_relevance_head_path=args.z_relevance_head or None)
     analysis = _analyze(turn_records)
     report = {"run": run_stats, **analysis, "n_turn_records": len(turn_records)}
 
@@ -662,6 +788,33 @@ def _main() -> int:
 
     _print_transformer("s_i      (as-shipped, 2a r_i bias)", "s_i", "s_i")
     _print_transformer("s_i_pure (r bias zeroed -- Hole 1)", "s_i_pure", "s_i_pure")
+
+    # Phase B GATE 1: the z_i-head's selectivity. z_r is the primary gate metric
+    # (sigmoid scale, median gap >= 0.2 in >= 3/4 runs vs 2a's ~0); z_logit is
+    # the unbounded ablation-scale view (median >= 2.0).
+    zd = d.get("z_r")
+    zs = s.get("z_r")
+    zld = d.get("z_logit")
+    zls = s.get("z_logit")
+    if zd and zs and zs["n_eligible"] > 0:
+        print(f"  z_r   (Phase B h_t probe, GATE 1) distribution ({zd['n']} scored):")
+        print(f"    min={zd['min']:.4f}  p10={zd['p10']:.4f}  p50={zd['p50']:.4f}  "
+              f"p90={zd['p90']:.4f}  max={zd['max']:.4f}  "
+              f"stdev={zd['stdev']:.4f}  frac>=0.99={zd['frac_ge_0p99']:.2%}")
+        print(f"    z_r   gap: min={zs['min']:+.4f} median={zs['median']:+.4f} "
+              f"mean={zs['mean']:+.4f}  n>=0.2={zs['n_ge_thr']}/{zs['n_eligible']}  "
+              f"gate(median>=0.2): {'PASS' if zs['gate_median_ge_thr'] else 'FAIL'}")
+        if zld and zls and zls["n_eligible"] > 0:
+            print(f"  z_logit (pre-sigmoid) distribution ({zld['n']} scored):")
+            print(f"    min={zld['min']:+.3f}  p10={zld['p10']:+.3f}  "
+                  f"p50={zld['p50']:+.3f}  p90={zld['p90']:+.3f}  max={zld['max']:+.3f}  "
+                  f"stdev={zld['stdev']:.3f}")
+            print(f"    z_logit gap: min={zls['min']:+.3f} median={zls['median']:+.3f} "
+                  f"mean={zls['mean']:+.3f}  n>=2.0={zls['n_ge_thr']}/{zls['n_eligible']}  "
+                  f"gate(median>=2.0): {'PASS' if zls['gate_median_ge_thr'] else 'FAIL'}")
+    else:
+        print("  z_r (Phase B h_t probe): (not captured -- no ZRelevanceHead loaded "
+              "or no source seen on >=3 turns)")
     print("-" * 72)
     print("  per-source examples:")
     for ex in s["examples"]:
@@ -669,9 +822,11 @@ def _main() -> int:
         lg_s = f"{lg:+.3f}" if lg is not None else "  n/a"
         sp = ex.get("s_pure_gap")
         sp_s = f"{sp:+.3f}" if sp is not None else "  n/a"
+        zr = ex.get("z_r_gap")
+        zr_s = f"{zr:+.4f}" if zr is not None else "  n/a"
         print(f"    {ex['source_id'][:24]:<24} n={ex['n_turns']:>2} "
               f"cos={ex['probe_cos']:.3f} r_gap={ex['r_gap']:+.4f} "
-              f"lg_gap={lg_s} s_pure_gap={sp_s}")
+              f"lg_gap={lg_s} s_pure_gap={sp_s} z_r_gap={zr_s}")
     print("=" * 72)
     print("VERDICT (ablate-yt): a healthy LOGIT gap (median >= 2.0) => the bilinear")
     print("  term discriminates on real serve data and yt_sidepath was the culprit;")
@@ -686,6 +841,15 @@ def _main() -> int:
     print("  locator role is viable (then address labels/cost/two-pass in the retrain).")
     print("  A ~0 s_i_pure gap => y_t carries insufficient signal for the transformer")
     print("  to locate relevance -> must store actual SSM states, not just y_t readouts.")
+    print("VERDICT (z_r -- Phase B GATE 1, the h_t test): a healthy z_r gap "
+          "(median >= 0.2)")
+    print("  => the projected SSM state z_i carries serve-relevance signal the y_t")
+    print("  readout did NOT -> the state-trajectory-transformer premise SURVIVES;")
+    print("  proceed to the transformer rewire (Phases C-F). A ~0 z_r gap (like 2a's")
+    print("  r_i ~0) => h_t does NOT carry the signal either -> STOP, do not build the")
+    print("  transformer; the vision's state-locator is dead on h_t too (likely a")
+    print("  backbone problem -- routing-trained, not relevance-trained -- not a")
+    print("  readout problem). Run >= 4 times; GATE 1 = median >= 0.2 in >= 3/4 runs.")
 
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")

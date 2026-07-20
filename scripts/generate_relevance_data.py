@@ -22,7 +22,8 @@ Algorithm (one slot per doc):
      ``y_t`` [K, 256] with provenance ``source_id`` = doc_id.
   4. Embed the query (bge-small, 384-d, same path as ``orchestrator.py:266``).
   5. Emit one record per query: ``{query_id, question, category, query_emb[384],
-     slots_y[K,256], source_ids[K], labels[K] (1 if doc_id in expected_doc_ids)}``.
+     slots_y[K,256], slots_doc_emb[K,384], slots_z[K,384] (Phase B: projected SSM
+     state per slot), source_ids[K], labels[K] (1 if doc_id in expected_doc_ids)}``.
 
 Output ``data/training/strm_relevance/traces.pt`` (gitignored, regenerable) +
 a ``questions_meta.jsonl`` provenance sidecar. The trainer
@@ -55,6 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.ingestion.chunker import HierarchicalChunker  # noqa: E402
 from src.ingestion.parsers import MarkdownParser  # noqa: E402
 from src.subconscious.configs import BackboneConfig  # noqa: E402
+from src.subconscious.latent_dynamics_head import LatentDynamicsHead  # noqa: E402
 from src.subconscious.training.routing_training import (  # noqa: E402
     _resolve_device,
     build_embedder,
@@ -267,6 +269,15 @@ def build_records(
     doc_cache: dict[str, torch.Tensor] = {}
     n_pos = n_neg = 0
 
+    # Untrained is fine: LatentDynamicsHead.project is PARAMETER-FREE (last
+    # layer, mean over d_state -> [1, 384]); the trained ``linear`` is only used
+    # by predict/surprise, not project. Using the same parameter-free project
+    # here AND in the serve probe (probe_strm_selectivity_real.py) guarantees
+    # train/serve ``z_i`` match -- the z_i head is trained on EXACTLY the z_i
+    # the probe scores it on. Phase A captures slot.h for every ring slot, so
+    # every slot is projectable.
+    ld_head = LatentDynamicsHead()
+
     def doc_vec(doc_id: str) -> torch.Tensor | None:
         if doc_id in doc_cache:
             return doc_cache[doc_id]
@@ -299,6 +310,24 @@ def build_records(
         slots_y = torch.stack([s.y.detach().to("cpu").to(torch.float32)
                                for s in ring]).squeeze(1)   # [K, 256]
         source_ids = [str(s.source_id) for s in ring]
+        # The projected SSM recurrent state per slot -- Phase A stores slot.h
+        # (the post-step, post-decay per-layer recurrent state, fp16), and
+        # ``z_i = LatentDynamicsHead.project(slot.h)`` (last layer, mean over
+        # d_state -> [1, 384]) is the state-trajectory rewire's unit of
+        # attention. The Phase B ``h_t`` probe trains a ZRelevanceHead on this
+        # field (``slot_signal_field="slots_z"``) to test whether ``z_i``
+        # carries query-relevance signal the 2a ``y_t`` readout did NOT -- the
+        # cheap GATE 1 before any transformer build. Ring ON (max_k>=1) -> every
+        # slot has h; a None here would mean Phase A regressed (hard error).
+        if any(s.h is None for s in ring):
+            raise RuntimeError(
+                "build_records: a ring slot has h=None (Phase A should capture h "
+                "for every slot when ring_capacity>0). Regenerate the backbone?"
+            )
+        slots_z = torch.stack([
+            ld_head.project(s.h).squeeze(0).detach().to("cpu").to(torch.float32)
+            for s in ring
+        ])                                                 # [K, 384]
         # The RAW bge doc embedding per slot -- the step INPUT to wm.step, in the
         # SAME order as the ring (== cand_vecs order). The 2a head reads this
         # alongside y_t: a probe (scripts/_scratch/_probe_relevance_bge_baseline)
@@ -329,6 +358,7 @@ def build_records(
             "query_emb": query_emb,            # [384]
             "slots_y": slots_y,                # [K, 256]  (WM recurrent readout)
             "slots_doc_emb": slots_doc_emb,    # [K, 384]  (raw bge doc identity)
+            "slots_z": slots_z,                # [K, 384]  (projected SSM state, Phase B)
             "source_ids": source_ids,          # [K]
             "labels": labels,                  # [K]
         })

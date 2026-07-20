@@ -39,9 +39,9 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
-from ..relevance_head import DOC_DIM, PROJ_DIM, QUERY_DIM, SLOT_DIM, RelevanceHead
+from ..relevance_head import RelevanceHead
 from .doc_kind_training import _wilson_ci95
 
 
@@ -91,20 +91,29 @@ class RelevanceTrainingConfig:
     device: str = "cpu"   # the trainer is a small MLP fitter; CPU is fine
     checkpoint_dir: str = "data/training/strm_relevance"
 
+    # Which per-slot tensor field is the head's slot signal. Default
+    # ``slots_doc_emb`` (the 2a bge doc embedding) -> byte-identical to the
+    # pre-2026-07 trainer. The Phase B ``h_t`` probe swaps this to ``slots_z``
+    # (per-slot ``z_i = LatentDynamicsHead.project(slot.h)``) and passes a
+    # ``ZRelevanceHead`` to ``fit_relevance`` -- the SAME trainer, only the
+    # slot-signal field + head change (see ``z_relevance_head``).
+    slot_signal_field: str = "slots_doc_emb"
+
 
 # ── data ──
 
-def load_relevance_traces(path: str) -> list[dict]:
+def load_relevance_traces(path: str, slot_signal_field: str = "slots_doc_emb") -> list[dict]:
     """Load the 2a relevance traces from the Step 1 generator's ``traces.pt``.
 
     Each record is ``{query_id, question, category, expected_doc_ids,
-    query_emb[384], slots_y[K,256], slots_doc_emb[K,384], source_ids[K],
-    labels[K]}``. Drops records with no slots or no labels (a record with zero
-    gold would have an all-zero label vector and an undefined top-3 recall --
-    the generator already filters these, but a defensive drop keeps the trainer
-    honest). Requires ``slots_doc_emb`` (the raw bge doc embedding the head
-    fuses alongside ``y_t`` -- without it the head has no relevance signal; see
-    ``relevance_head``'s docstring); a stale trace file without it is rejected
+    query_emb[384], slots_y[K,256], slots_doc_emb[K,384], slots_z[K,384]
+    (Phase B, optional), source_ids[K], labels[K]}``. Drops records with no
+    slots or no labels (a record with zero gold would have an all-zero label
+    vector and an undefined top-3 recall -- the generator already filters these,
+    but a defensive drop keeps the trainer honest). Requires the configured
+    ``slot_signal_field`` (default ``slots_doc_emb`` -- the raw bge doc embedding
+    the 2a head fuses alongside ``y_t``; for the Phase B ``h_t`` probe pass
+    ``slot_signal_field="slots_z"``); a stale trace file without it is rejected
     with a "regenerate" pointer.
     """
     records = torch.load(path, map_location="cpu", weights_only=False)
@@ -117,17 +126,21 @@ def load_relevance_traces(path: str) -> list[dict]:
         slots = r.get("slots_y")
         labels = r.get("labels")
         qemb = r.get("query_emb")
-        doc_emb = r.get("slots_doc_emb")
+        doc_emb = r.get(slot_signal_field)
         if not isinstance(slots, Tensor) or not isinstance(labels, Tensor):
             continue
         if not isinstance(qemb, Tensor):
             continue
         if not isinstance(doc_emb, Tensor):
-            raise RuntimeError(
-                f"relevance trace at {path} lacks slots_doc_emb (the raw bge doc "
-                f"embedding the head fuses with y_t). Regenerate with "
-                f"scripts/generate_relevance_data.py --retrace."
-            )
+            if slot_signal_field == "slots_doc_emb":
+                field_hint = ("lacks slots_doc_emb (the raw bge doc embedding the "
+                              "2a head fuses with y_t). Regenerate with "
+                              "scripts/generate_relevance_data.py --retrace.")
+            else:
+                field_hint = (f"lacks {slot_signal_field} (the head's slot signal). "
+                              f"Regenerate with scripts/generate_relevance_data.py "
+                              f"--retrace (Phase B emits slots_z when the ring is ON).")
+            raise RuntimeError(f"relevance trace at {path} {field_hint}")
         if slots.shape[0] == 0 or labels.shape[0] == 0:
             continue
         if int(labels.sum().item()) == 0:
@@ -171,6 +184,7 @@ def _score_slots(head: RelevanceHead, slots_y: Tensor, slots_doc_emb: Tensor,
 def evaluate_relevance(
     head: RelevanceHead,
     val: list[dict],
+    slot_signal_field: str = "slots_doc_emb",
 ) -> dict:
     """Per-query top-3 recall scorecard for the RelevanceHead.
 
@@ -180,6 +194,11 @@ def evaluate_relevance(
     (the per-query Bernoulli for the Wilson CI). Returns the mean top-3 recall,
     the hit rate, the Wilson 95% CI on the hit rate, and the mean ``r_i`` over
     positive slots (a tiebreaker -- prefer heads that score positives high).
+
+    ``slot_signal_field`` selects which per-slot tensor feeds the head (default
+    ``slots_doc_emb`` for 2a; ``slots_z`` for the Phase B ``h_t`` probe). The
+    head's ``logits(slots_y, slot_signal, query)`` call is unchanged -- a
+    ``ZRelevanceHead`` ignores ``slots_y`` by design.
     """
     head.eval()
     n = len(val)
@@ -191,7 +210,7 @@ def evaluate_relevance(
     r_pos: list[float] = []
     for rec in val:
         slots = rec["slots_y"]
-        doc_emb = rec["slots_doc_emb"]
+        doc_emb = rec[slot_signal_field]
         labels = rec["labels"]
         qemb = rec["query_emb"]
         r = _score_slots(head, slots, doc_emb, qemb)              # [K]
@@ -244,21 +263,30 @@ def fit_relevance(
     traces: list[dict],
     config: Optional[RelevanceTrainingConfig] = None,
     progress_cb=None,
+    head: Optional[nn.Module] = None,
 ) -> dict:
     """Train the RelevanceHead supervised on the ERAG-Bench traces.
 
-    Constructs a fresh ``RelevanceHead``, splits queries 80/20 (no slot
-    leakage), trains with per-slot BCE (pos_weight capped), evaluates per-query
-    top-3 recall + Wilson CI each epoch, and writes ``best.pt`` (gate-selected)
-    + ``final.pt`` (last epoch) + ``train_log.json``. Returns the best-epoch
-    scorecard + the GO/NO-GO decision. No backbone, no embedder -- the traces
-    carry the precomputed ``slots_y`` + ``query_emb``.
+    Constructs a fresh ``RelevanceHead`` (or reuses the passed ``head`` -- the
+    Phase B ``h_t`` probe passes a ``ZRelevanceHead`` so the SAME trainer fits
+    the ``z_i``-input variant with only the slot-signal field swapped), splits
+    queries 80/20 (no slot leakage), trains with per-slot BCE (pos_weight
+    capped), evaluates per-query top-3 recall + Wilson CI each epoch, and writes
+    ``best.pt`` (gate-selected) + ``final.pt`` (last epoch) + ``train_log.json``.
+    Returns the best-epoch scorecard + the GO/NO-GO decision. No backbone, no
+    embedder -- the traces carry the precomputed ``slots_y`` + ``query_emb`` +
+    the slot-signal tensor (``slots_doc_emb`` for 2a, ``slots_z`` for the probe).
+
+    The checkpoint dims (``slot_dim``/``doc_dim``/``query_dim``/``proj_dim``)
+    are read from the head instance so a ``ZRelevanceHead`` (``doc_dim == z_dim``)
+    saves its own shape; the default ``RelevanceHead`` exposes the same attrs
+    with the same module-constant values, so the 2a path is byte-identical.
     """
     cfg = config or RelevanceTrainingConfig()
     dev = torch.device(cfg.device)
     torch.manual_seed(cfg.seed)
 
-    head = RelevanceHead().to(dev)
+    head = head.to(dev) if head is not None else RelevanceHead().to(dev)
     optimizer = torch.optim.AdamW(
         head.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
     )
@@ -296,6 +324,14 @@ def fit_relevance(
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     accum = max(1, cfg.accum_steps)
+    # Read the checkpoint dims from the head instance (RelevanceHead and
+    # ZRelevanceHead both expose slot_dim/doc_dim/query_dim/proj_dim). For the
+    # default RelevanceHead these equal the module constants -> byte-identical
+    # checkpoint; a ZRelevanceHead saves its own z_dim under ``doc_dim``.
+    ck_slot_dim = int(getattr(head, "slot_dim"))
+    ck_doc_dim = int(getattr(head, "doc_dim"))
+    ck_query_dim = int(getattr(head, "query_dim"))
+    ck_proj_dim = int(getattr(head, "proj_dim"))
 
     for epoch in range(cfg.epochs):
         head.train()
@@ -307,7 +343,7 @@ def fit_relevance(
         for k, qi in enumerate(order):
             rec = train[qi]
             slots = rec["slots_y"].to(dev).to(torch.float32)        # [K, 256]
-            doc_emb = rec["slots_doc_emb"].to(dev).to(torch.float32)  # [K, 384]
+            doc_emb = rec[cfg.slot_signal_field].to(dev).to(torch.float32)  # [K, 384]
             qemb = rec["query_emb"].to(dev).to(torch.float32)       # [384]
             labels = rec["labels"].to(dev).to(torch.float32)        # [K]
             logits = head.logits(slots, doc_emb, qemb).squeeze(-1)  # [K]
@@ -325,7 +361,7 @@ def fit_relevance(
             optimizer.zero_grad()
 
         train_loss = total_loss / max(n_steps, 1)
-        pc = evaluate_relevance(head, val)
+        pc = evaluate_relevance(head, val, slot_signal_field=cfg.slot_signal_field)
         go = (pc["mean_top3_recall"] >= cfg.gate_top3
               and pc["hit_ci95"][0] > cfg.gate_wilson_low)
         log.append({"epoch": epoch, "train_loss": round(train_loss, 6),
@@ -351,9 +387,9 @@ def fit_relevance(
             best_score = score
             best_pc = pc
             best_epoch = epoch
-            torch.save({"head": head.state_dict(), "slot_dim": SLOT_DIM,
-                        "doc_dim": DOC_DIM, "query_dim": QUERY_DIM,
-                        "proj_dim": PROJ_DIM,
+            torch.save({"head": head.state_dict(), "slot_dim": ck_slot_dim,
+                        "doc_dim": ck_doc_dim, "query_dim": ck_query_dim,
+                        "proj_dim": ck_proj_dim,
                         "top3_recall": pc["mean_top3_recall"],
                         "hit_rate": pc["hit_rate"],
                         "hit_ci95": pc["hit_ci95"],
@@ -362,9 +398,9 @@ def fit_relevance(
 
     # final.pt = the LAST epoch (mirrors doc_kind: best.pt is gate-selected,
     # final.pt is the last epoch for inspection).
-    torch.save({"head": head.state_dict(), "slot_dim": SLOT_DIM,
-                "doc_dim": DOC_DIM, "query_dim": QUERY_DIM,
-                "proj_dim": PROJ_DIM,
+    torch.save({"head": head.state_dict(), "slot_dim": ck_slot_dim,
+                "doc_dim": ck_doc_dim, "query_dim": ck_query_dim,
+                "proj_dim": ck_proj_dim,
                 "top3_recall": pc["mean_top3_recall"], "hit_rate": pc["hit_rate"],
                 "hit_ci95": pc["hit_ci95"], "go": go, "epoch": cfg.epochs - 1},
                ckpt_dir / "final.pt")
