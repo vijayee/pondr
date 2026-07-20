@@ -50,7 +50,7 @@ WorkingMemoryState = JGSSnapshot
 
 @dataclass(frozen=True, eq=False)
 class RingSlot:
-    """One entry in the JST ring buffer: a step output plus its provenance.
+    """One entry in the STRM ring buffer: a step output plus its provenance.
 
     ``y`` is the step output vector (``[1, output_dim]`` — for the working_memory
     instance, ``output_dim=256``), detached+cloned so the slot is independent of
@@ -96,7 +96,7 @@ class WorkingMemory(JGSInstance):
         self.decay_alpha = float(decay_alpha)
         self._input_count = 0
         self._metadata: dict[str, object] = {}
-        # JST ring buffer of recent step outputs with provenance. Capacity is
+        # STRM ring buffer of recent step outputs with provenance. Capacity is
         # config-driven (``InstanceConfig.ring_capacity``); the ``ring_capacity``
         # kwarg overrides the config for tests. 0 = OFF: no buffer is allocated
         # and step() does no extra work, so the shipped Phase 2c path is
@@ -245,7 +245,7 @@ class WorkingMemory(JGSInstance):
         self._metadata = {}
         self._ring.clear()
 
-    # ── JST read-out: ring buffer + live state ──
+    # ── STRM read-out: ring buffer + live state ──
 
     @property
     def ring_capacity(self) -> int:

@@ -1,22 +1,23 @@
-# JST — Implementation & Training Plan
+# STRM — Implementation & Training Plan
 
-**Companion to `docs/JST-architecture-proposal.md`. v0.1 (draft for review).**
+**Companion to `docs/STRM-architecture-proposal.md`. v0.2 (draft for review).**
 
 This is a phased build plan, not a spec. Every phase has a concrete deliverable,
 the file it touches, the convention it reuses, and a stop condition. Two phases
-(0a, 0b) are **go/no-go gates** — everything downstream is conditional on them.
+(0a, 0b) are **go/no-go gates** — both PASSED 2026-07-19 (0a AUC 0.810; 0b GO,
+ship LINEAR), and Phase 1 shipped (be77e35), so Phases 2-6 are now the live work.
 
 ## How to read this
 
-- **Reuse, don't reinvent.** JST heads copy existing trainers. The mapping
+- **Reuse, don't reinvent.** STRM heads copy existing trainers. The mapping
   (verified against the tree):
 
-  | JST piece | Copy this file | Notes |
+  | STRM piece | Copy this file | Notes |
   |---|---|---|
   | Relevance head (supervised classifier) | `src/subconscious/training/doc_kind_training.py` + `src/subconscious/doc_kind_head.py` | CE on frozen backbone, class-weighted, `_gate_score`-style best.pt |
   | Recoverability head (supervised, classifier or regression) | `doc_kind_training.py` (classifier); no regression template exists — borrow dataclass + CLI shell, swap CE for MSE | labels come from the Phase 0a probe decoder |
   | Graduation head (supervised) | same as Recoverability | labels from replay (the long pole) |
-  | Latent-dynamics head (self-supervised JEPA) | `src/subconscious/training/pretrain.py` + `jepa_loss.py` | reuse `_update_ema` (`pretrain.py:148-151`), deepcopy+frozen target (`pretrain.py:182-184`), `jepa_loss.step_loss` |
+  | Latent-dynamics head (linear, not JEPA) | `doc_kind_training.py` shell + a `Linear` head (or closed-form ridge) | v1 ships `ẑ_{t+1}=Az_t+b` per the 0b probe (linear beat EMA JEPA on surprise-AUC, frozen backbone can't collapse). No EMA/stop-grad/anti-collapse in v1; JEPA reserved for a future generative rollout |
   | Context-builder Transformer | net-new arch (no Transformer in `src/subconscious/`) | register like `INSTANCE_CONFIGS["doc_kind"]` (`configs.py:96-100`) |
 
 - **Conventions to follow (checklist):**
@@ -34,7 +35,7 @@ the file it touches, the convention it reuses, and a stop condition. Two phases
     `_gate_score` lives in `train_log.json`, NOT the checkpoint.
   - Backbone loaded ONCE and shared — `load_backbone(path, BackboneConfig(),
     device)`; re-freeze belt-and-suspenders in the trainer.
-  - JST head trainers use fp32 (the head-trainer convention;
+  - STRM head trainers use fp32 (the head-trainer convention;
     `_resolve_dtype` warns on a non-fp32 request, `routing_training.py:58-69` —
     backbone pretrain is the separate bf16 path, `configs.py:156`, not relevant
     here); `device="auto"`; `lr=3e-4`, `weight_decay=0.01`, `epochs=20` as
@@ -45,7 +46,7 @@ the file it touches, the convention it reuses, and a stop condition. Two phases
     `_gate_score` lexicographic tuple. (No t-dist CI anywhere in the tree — use
     Wilson.)
   - Serve: a head is on by default when its checkpoint exists, à la
-    `--doc-kind-ensemble` defaulting on (`ingest_document.py:191-196`). JST's
+    `--doc-kind-ensemble` defaulting on (`ingest_document.py:191-196`). STRM's
     context-builder plugs into `build_ponder` (`runtime.py:51-157`) and the
     orchestrator seam at `orchestrator.py:323` (`PresentationGate.plan`).
 
@@ -55,7 +56,20 @@ the file it touches, the convention it reuses, and a stop condition. Two phases
 
 ---
 
-## Phase 0a — Recoverability probe (GO / NO-GO GATE 1)
+## Phase 0a — Recoverability probe (GO / NO-GO GATE 1) — ✅ DONE 2026-07-19, GO
+
+**Result:** probe `P(state_t, u_i)` AUC val = **0.810** (gate 0.75), beats the free
+`k`-baseline (0.732). Decay curve grows monotonically with `k` (val `e` 0.188 →
+0.464 at `k=1→8`). State carries lag-independent "which anchor was forgotten"
+info, not just older=more-forgotten. **Decision: GO** — the recoverability head
+(Phase 2b) is viable; its labels are decoder `D`'s `e(i,t)` (free, no Oracle).
+Probe used **ridge regression** (closed-form), not an MLP — an MLP decoder
+overfit train (2M params / 334 pairs) and collapsed the train-error variance so
+the probe trained on an uninformative target (train AUC 0.50); ridge fixed it
+(train AUC 0.866). State rep = per-`d_state`-channel mean per layer (1536-dim
+"pooled"); the full 4096-dim state was too slow on this LAPACK. Probe script
+(`scripts/_probe_recoverability.py`) is probe-only / not committed; traces under
+`data/probe/` are gitignored.
 
 **Question:** is SSM forgetting predictable enough that a probe can estimate
 recoverability from `state_t`? If no, the salience mechanism is not viable and
@@ -84,7 +98,7 @@ ingested episode store). No Oracle calls.
   (Phase 2b) is viable and its labels are now generated.
 - AUC poor AND discretization suspected → try a Mamba2 backend swap (Mamba2, not
   Mamba3 — `mamba3-cuda` build fails here, `step()` is `NotImplementedError`).
-- AUC poor with no obvious fix → STOP; simplify JST to fixed-interval refresh,
+- AUC poor with no obvious fix → STOP; simplify STRM to fixed-interval refresh,
   drop salience + recoverability + graduation heads.
 
 **De-wonk note:** the decoder `D` and probe `P` are probe-only artifacts; they are
@@ -94,13 +108,40 @@ number + the generated label set) is what survives into Phase 2b.
 
 ---
 
-## Phase 0b — Latent-dynamics gate (GO / NO-GO GATE 2, two steps)
+## Phase 0b — Latent-dynamics gate (GO / NO-GO GATE 2, two steps) — ✅ DONE 2026-07-19, GO (ship LINEAR)
 
-**Question (two parts):** (i) does the WM recurrent state `z_t` have *learnable
-transition dynamics at all*, and (ii) if so, can a properly-instrumented EMA
-predictor avoid collapse on it? If (i) is no, drop the latent-dynamics head
-before paying for any EMA machinery. If (ii) is no, drop it; the three supervised
-heads still stand.
+**Result (step 1 — linear baseline):** linear `z_{t+1}=Az_t+b` (ridge) R² =
+**0.297** over constant-mean (gate 0.15) — dynamics ARE learnable. **GOTCHA
+caught by de-wonk:** at the 1536-dim "pooled" state the linear fit was
+underdetermined (N=957 transitions < D=1537; ridge shrinks to the mean) and
+gave R²=-0.088 (false NO-GO). At the 384-dim "last layer, mean over `d_state`"
+rep (N > D, what the JEPA predictor operates on) linear R²=0.297 (GO). The probe
+gained a `--state-rep` flag so the comparison is fair.
+
+**Result (step 2 — EMA JEPA vs linear surprise):** the EMA JEPA predictor `g`
+trained with `jepa_contrastive_loss` (cosine + logsumexp negatives + 0.1·MSE)
+scored surprise-AUC = **0.565** in its *native cosine distance* — *underperforms*
+the linear predictor's L2-residual surprise-AUC = **0.7625** (gate 0.70). Latent
+variance stayed bounded (no collapse). Measuring `g`'s surprise in L2 (a
+cross-objective mistake, since `g` is cosine-trained) was an early
+de-wonk catch — the meaningful comparison is `g`-cosine vs linear-L2, and linear
+still wins.
+
+**Decision: GO, ship the latent-dynamics head LINEAR.** A closed-form linear map
+clears the surprise gate and beats the JEPA predictor; the backbone is frozen so
+collapse cannot occur, and the JEPA EMA/stop-grad/anti-collapse machinery solves
+a non-problem in v1 (see proposal §6.2 for the four reasons). Phase 2c ships
+`ẑ_{t+1}=Az_t+b`, not JEPA. JEPA is reserved for a future generative rollout
+(predict `k>1` for imagination) — a different feature, past v1.
+
+---
+
+**Question (two parts, for reference):** (i) does the WM recurrent state `z_t`
+have *learnable transition dynamics at all*, and (ii) if so, can a
+properly-instrumented EMA predictor avoid collapse on it? If (i) is no, drop the
+latent-dynamics head before paying for any EMA machinery. If (ii) is no, drop it;
+the three supervised heads still stand. *(Both answered GO above; step 2's
+"avoid collapse" question is moot once the linear baseline already beats JEPA.)*
 
 **Step 1 — linear baseline (cheap, run first).** On the Phase 0a traces, fit a
 linear `z_{t+1} ≈ Az_t + b` (least squares) and compare one-step prediction MSE
@@ -118,7 +159,7 @@ machinery** — this is not net-new:
   batch-negatives logsumexp is the anti-collapse term.
 
 **Deliverables (step 2):**
-1. `scripts/probe_latent_dynamics.py` — on the Phase 0a traces, train a predictor
+1. `scripts/_probe_latent_dynamics.py` — on the Phase 0a traces, train a predictor
    `g(z_t) → ẑ_{t+1}` with the EMA target + stop-grad + the `jepa_loss` collapse
    penalty. `k=1` (per proposal §7).
 2. Metrics: prediction MSE, latent variance/covariance over training (collapse
@@ -134,11 +175,21 @@ machinery** — this is not net-new:
   supervised heads do not depend on it.
 
 **De-wonk note:** `A`, `g` are probe-only; not shipped. Probe scripts not
-committed.
+committed. (Step 2 is retained in the plan as the de-risk record; its outcome —
+JEPA loses to linear — is what makes Phase 2c a linear head.)
 
 ---
 
-## Phase 1 — Ring buffer + state read-out plumbing (no heads yet)
+## Phase 1 — Ring buffer + state read-out plumbing (no heads yet) — ✅ DONE 2026-07-19 (be77e35)
+
+**Shipped:** `WorkingMemory` ring buffer of `(y_t, source_id, text)` provenance
+slots + `state_tensors()` live read-out + `ring_buffer()` accessor. 14 new tests
+in `tests/test_working_memory_ring.py`. `K=0` default verified byte-identical to
+Phase 2c (state evolution bit-identical `K=0` vs `K>0`, ring is observation-only
+post-step/post-decay). **Key correction vs this plan's draft:** the slot vector
+is the step *output* `[1, output_dim=256]` for `working_memory`, NOT a hardcoded
+`384` — the buffer is dimension-agnostic, stores whatever `step` emits.
+`InstanceConfig.ring_capacity` added; `retrieved_sources` length-mismatch guard.
 
 **Goal:** expose `y_t` history and `state_t` from `WorkingMemory` so heads can
 read them, without changing any shipped behavior.
@@ -186,8 +237,8 @@ compounded boost multiplier and **does not persist the raw rating**
 (`store.py:707-749`). Add a raw-rating JSONL tap: in
 `store.record_feedback` (or just before the boost write), append
 `{unit_id, rating, query, slot_index, timestamp}` to
-`data/training/jst_relevance/feedback.jsonl` when a flag
-`jst_relevance_logging` is on (default off). Until enough real labels accumulate,
+`data/training/strm_relevance/feedback.jsonl` when a flag
+`strm_relevance_logging` is on (default off). Until enough real labels accumulate,
 generate synthetic pairs à la `scripts/generate_jepa_training_data.py` (query →
 relevant slots) using the existing `OracleClient` (`src/training/oracle_labeling.py`)
 and `prompts.py` if needed.
@@ -196,7 +247,7 @@ and `prompts.py` if needed.
 1. `src/subconscious/relevance_head.py` — `RelevanceHead(JGSInstance)` modeled on
   `DocKindHead` (`doc_kind_head.py:51-209`): one `nn.Sequential` head over the
    pooled ring-buffer slot, sigmoid output per slot. Register in
-   `INSTANCE_CONFIGS["jst_relevance"]` (copy the `doc_kind` entry).
+   `INSTANCE_CONFIGS["strm_relevance"]` (copy the `doc_kind` entry).
 2. `src/subconscious/training/relevance_training.py` — copy
    `doc_kind_training.py`; swap the 5-class CE for per-slot BCE; keep
    `_gate_score`-style best.pt selection (define a relevance gate: e.g. top-3
@@ -206,7 +257,7 @@ and `prompts.py` if needed.
    val; Wilson CI on the small real-label slice.
 
 **Stop condition / gate:** relevance gate passes on the val set (top-3 recall ≥
-~0.6 as a starting bar — calibrate). Ship behind `--jst-relevance-head PATH`,
+~0.6 as a starting bar — calibrate). Ship behind `--strm-relevance-head PATH`,
 default off.
 
 ### 2b — Recoverability head (supervised; classifier or regression)
@@ -227,33 +278,48 @@ binarize at θ for classifier, or use raw for regression). No new labeling.
 4. Eval: AUC (matching the Phase 0a metric, on a held-out trace split) + Wilson CI.
 
 **Stop condition / gate:** held-out AUC ≥ the Phase 0a bar. Ship behind
-`--jst-recoverability-head PATH`, default off.
+`--strm-recoverability-head PATH`, default off.
 
-### 2c — Latent-dynamics head (self-supervised JEPA — the hard one)
+### 2c — Latent-dynamics head (LINEAR in v1 — the cheap one, per Phase 0b)
 
-**Only proceed if Phase 0b passed.** Reuses `pretrain.py`'s EMA + stop-grad +
-`jepa_loss` collapse penalty. Net-new: the target is the WM recurrent state
-`z_t` (a per-layer `[1, 16, 384]` list), not an embedding; and it runs on a
-per-instance head, not the shared backbone.
+**Phase 0b passed and decided the shape:** ship the linear predictor
+`ẑ_{t+1} = A z_t + b`, NOT JEPA. The 0b probe showed linear surprise-AUC (L2
+residual) = 0.7625 beats the EMA JEPA predictor's cosine surprise-AUC 0.565, and
+the frozen backbone means collapse cannot occur — so the EMA / stop-grad /
+anti-collapse machinery is not built in v1 (see proposal §6.2 for the four
+reasons). This is now the *cheapest* of the four heads, not the hard one.
+
+**State rep (from 0b):** use the **last-layer, mean-over-`d_state`** projection
+`z_t ∈ [384]` (N > D, the rep on which linear R²=0.297 was measured). The 1536-dim
+"pooled" rep was underdetermined (N < D) — do not use it for the linear head.
 
 **Deliverables:**
-1. `src/subconscious/latent_dynamics_head.py` — predictor `g(z_t) → ẑ_{t+1}`;
-   EMA target encoder via `_update_ema`; stop-grad via frozen deepcopy
-   (`pretrain.py:182-184`).
-2. `src/subconscious/training/latent_dynamics_training.py` — copy `pretrain.py`'s
-   loop structure (`pretrain.py:194-243`): online under autocast, target under
-   `torch.no_grad()`, EMA each step, `jepa_loss.step_loss` for the anti-collapse
-   term. Add a VICReg-style variance/covariance regularizer if Phase 0b needed it.
+1. `src/subconscious/latent_dynamics_head.py` — a `Linear(state_dim,
+   state_dim)` predictor `g(z_t) → ẑ_{t+1}` (plus bias). Models on `DocKindHead`'s
+   shell, not on `pretrain.py`. No EMA, no stop-grad, no negatives.
+2. `src/subconscious/training/latent_dynamics_training.py` — copy
+   `doc_kind_training.py`; swap the head + loss for `F.mse_loss(g(z_t), z_{t+1})`
+   on `(z_t, z_{t+1})` consecutive-step pairs from the Phase 0a traces (free,
+   self-supervised labels — the next state IS the label). Standard ridge-style
+   MSE; closed-form ridge is also acceptable for v1 (the probe already used it).
+   Keep `_gate_score`-style best.pt selection.
 3. `scripts/train_latent_dynamics_head.py`.
-4. Eval: prediction MSE + latent-variance-over-epochs (collapse watch) +
-   surprise-AUC on held-out anomalous steps.
+4. Eval: prediction MSE (vs the 0b linear R²=0.297 / MSE 0.00017 baseline) +
+   surprise-AUC on held-out mismatched next-states (vs the 0b linear
+   surprise-AUC 0.7625). No collapse watch needed (linear cannot collapse).
 
-**Stop condition / gate:** no collapse over training + surprise-AUC > chance.
-Ship behind `--jst-latent-dynamics-head PATH`, default off.
+**Stop condition / gate:** surprise-AUC ≥ the 0b bar (≥ 0.70) on held-out
+transitions; prediction MSE ≤ the 0b linear baseline. Ship behind
+`--strm-latent-dynamics-head PATH`, default off.
 
-**De-wonk note:** this is the one head where skimping on JEPA machinery fails.
-Do NOT train it as plain MSE — it will collapse to the mean. The EMA target and
-the `jepa_loss` negatives are both required; if either is removed, re-run Phase 0b.
+**De-wonk note:** do NOT drag EMA / stop-grad / `jepa_loss` negatives into this
+head in v1 — the 0b probe measured that they make it *worse* on the surprise
+signal, and the frozen backbone means there is nothing to collapse. The honest
+upgrade path if R²=0.30 binds is a light **MSE-trained MLP** (non-linear, same L2
+objective) — NOT JEPA. JEPA only re-enters for a future generative rollout
+(predict `k>1` for imagination), a separate feature past v1; if that is ever
+built, this is the head it reuses, and *then* the EMA/anti-collapse machinery
+earns its place.
 
 ### 2d — Graduation (v1 proxy first, v2 replay head — the long pole)
 
@@ -264,7 +330,7 @@ circular dependency for free: "would have been needed later" is approximated by
 "was relevant for a long time," which needs no replay and no downstream pipeline.
 - Deliverable: a small module computing `∫ r_i dt` per slot from the relevance
   head's `r_i` stream; threshold → graduate. No training, no checkpoint.
-- Ship behind `--jst-graduation-proxy`, default off. This is the heuristic
+- Ship behind `--strm-graduation-proxy`, default off. This is the heuristic
   baseline the v2 head has to beat.
 
 **v2 — replay-supervised head (the long pole).** Replay logged streams, mark
@@ -289,7 +355,7 @@ heads train.
    **must beat the v1 proxy** to be worth shipping.
 
 **Stop condition / gate (v2):** v2 graduation gate passes AND v2 beats v1 proxy
-on the held-out replay eval. Ship v2 behind `--jst-graduation-head PATH`, default
+on the held-out replay eval. Ship v2 behind `--strm-graduation-head PATH`, default
 off, keeping v1 as fallback. Feeds the existing consolidator (`consolidate.py`)
 as prioritized input — the consolidator's LTM-internal logic is unchanged.
 
@@ -326,7 +392,7 @@ read-back for training exists today** — Phase 3 builds the trainer that consum
    just `y_t` (Phase 1 must store this). Without it the selector can't map back to
    text. This is a Phase 1 / Phase 3 contract; do not let Phase 1 ship a
    vector-only buffer that Phase 3 then can't use.
-3. Config: `INSTANCE_CONFIGS["jst_context_builder"]`.
+3. Config: `INSTANCE_CONFIGS["strm_context_builder"]`.
 4. `src/subconscious/training/context_builder_training.py` — train on context
    quality: does the block let a downstream consumer answer correctly? Reuse the
    Phase 3c / ERAG-Bench eval labels. Consume the `PresentationGate` override
@@ -334,7 +400,7 @@ read-back for training exists today** — Phase 3 builds the trainer that consum
 5. `scripts/train_context_builder.py`.
 6. Wiring: `build_ponder` (`runtime.py:51-157`) loads the builder when its
    checkpoint exists; the orchestrator at `orchestrator.py:323` calls the builder
-   instead of `presentation_gate.plan` when `--jst-context-builder` is on,
+   instead of `presentation_gate.plan` when `--strm-context-builder` is on,
    falling back to the heuristic otherwise.
 
 **Stop condition / gate:** on the ERAG-Bench / Phase 3c factual-accuracy eval, the
@@ -375,7 +441,7 @@ pre-emptive `search_memory`), instead of only externally by the prompt.
    interaction-design deliverable (a new signal type in the consumer contract),
    not just a threshold.
 
-**Stop condition / gate:** end-to-end — on a long-horizon eval, JST+recall
+**Stop condition / gate:** end-to-end — on a long-horizon eval, STRM+recall
 answers more factual questions correctly than fixed-interval refresh at equal
 recall budget/latency. This is the **ship-deciding experiment** for the whole
 primitive.
@@ -397,7 +463,7 @@ is warm and recalls are cheap reads; define the freshness watermark `Δ`.
    the parsers do something sensible on event-stream input (open question from
    proposal §7; resolve here).
 2. Thread 2 loop: continuous, eventually-consistent ingestion + the existing
-   consolidation dream pass (`consolidate.py`) + receiving JST's graduation
+   consolidation dream pass (`consolidate.py`) + receiving STRM's graduation
    writes and surprise events.
 3. Freshness watermark: expose Thread 2's lag `Δ` so Phase 4 can read it.
 
@@ -441,8 +507,11 @@ entirely. Do not joint-train for its own sake.
 - Relevance, Recoverability, Graduation: supervised (CE or MSE), class-weighted,
   with a `_gate_score`-style lexicographic best.pt selection and a bool-dict ship
   gate. Copy `doc_kind_training.py`.
-- Latent-dynamics: JEPA — `‖g(z_t) − sg(EMA(z_{t+1}))‖` + `jepa_loss` collapse
-  penalty (+ VICReg variance/covariance if Phase 0b needed it). Copy `pretrain.py`.
+- Latent-dynamics: **linear MSE** — `‖A z_t + b − z_{t+1}‖²` (ridge / closed-form
+  or a `Linear` head trained with `F.mse_loss`). Copy `doc_kind_training.py`'s
+  shell, NOT `pretrain.py`. JEPA / EMA / anti-collapse is NOT used in v1 (the 0b
+  probe showed linear beats JEPA on surprise-AUC and the frozen backbone can't
+  collapse); reserved for a future generative rollout.
 - Context-builder: context-quality loss (downstream answer correctness under a
   token budget).
 
@@ -451,14 +520,14 @@ entirely. Do not joint-train for its own sake.
   per-class recall) — copy `doc_kind_training.py:217-306`.
 - Ship gates as `all(checks.values())` bool dicts; checkpoint selection via
   `_gate_score` tuples.
-- The whole-primitive ship-deciding eval (Phase 4): JST+recall vs fixed-interval
+- The whole-primitive ship-deciding eval (Phase 4): STRM+recall vs fixed-interval
   RAG at equal budget/latency on long-horizon factual accuracy.
 
 **Checkpoint / serve (reuse):**
 - `best.pt` + `final.pt` + `train_log.json` per head, under
-  `data/training/jst_<head>/`.
+  `data/training/strm_<head>/`.
 - `build_ponder` loads each head when its checkpoint exists; CLI flags
-  `--jst-*` default OFF, flipping ON à la `--doc-kind-ensemble` once a head's
+  `--strm-*` default OFF, flipping ON à la `--doc-kind-ensemble` once a head's
   gate passes.
 - No HF upload from the trainers (matches existing convention; the private HF
   backup is a separate manual step if wanted).
@@ -469,36 +538,44 @@ entirely. Do not joint-train for its own sake.
 
 | Gate | Phase | Decision |
 |---|---|---|
-| Recoverability probe AUC | 0a | Go → build salience; No → fixed-interval fallback, drop salience/recoverability/graduation |
-| Linear dynamics beats mean | 0b step 1 | Go → run EMA check; No → drop surprise head now (no EMA work) |
-| Latent-dynamics EMA collapse | 0b step 2 | Go → build surprise head; No → drop it (3 supervised heads stand) |
+| Recoverability probe AUC | 0a | ✅ GO (AUC 0.810, beats k-baseline 0.732) — build salience; recoverability head labels free from decoder `e(i,t)` |
+| Linear dynamics beats mean | 0b step 1 | ✅ GO (R²=0.297 at 384-dim "last" rep; 1536-dim was a false NO-GO from N<D — de-wonk caught) |
+| Linear surprise-AUC vs EMA JEPA | 0b step 2 | ✅ GO — linear L2-residual surprise-AUC 0.7625 beats EMA JEPA cosine 0.565; no collapse. **Ship LINEAR (not JEPA); EMA/anti-collapse machinery deferred to a future generative rollout.** |
 | Relevance gate | 2a | Ship relevance head |
 | Recoverability gate | 2b | Ship recoverability head |
-| Latent-dynamics surprise-AUC | 2c | Ship latent-dynamics head |
+| Latent-dynamics surprise-AUC (linear) | 2c | Ship latent-dynamics head (linear map) |
 | Graduation v1 proxy ships (no gate) | 2d v1 | Ship the heuristic `∫r·dt` proxy |
 | Graduation v2 beats v1 | 2d v2 | Ship the learned head; else keep v1 |
-| Context-builder ≥ heuristic | 3 | Flip `--jst-context-builder` default on |
-| JST+recall vs fixed-interval RAG | 4 | Ship the primitive (the real decision) |
+| Context-builder ≥ heuristic | 3 | Flip `--strm-context-builder` default on |
+| STRM+recall vs fixed-interval RAG | 4 | Ship the primitive (the real decision) |
 | Stage B beats Stage A | 6 | Joint-train; else stay frozen |
 
 ---
 
 ## What this plan is not
 
-- Not a commitment to build all six phases. Phases 0a/0b can kill the lower half.
-- Not a spec for a new training framework. It copies `doc_kind_training.py` and
-  `pretrain.py`; the only net-new arch is the context-builder Transformer.
+- Not a commitment to build all six phases. Phases 0a/0b can kill the lower half
+  (they ran 2026-07-19 — both GO, see above).
+- Not a spec for a new training framework. It copies `doc_kind_training.py` for
+  every head (including the latent-dynamics head, which is linear in v1 —
+  `pretrain.py` is no longer a template now that JEPA is deferred); the only
+  net-new arch is the context-builder Transformer.
 - Not a redesign of Ponder's LTM machinery. Consolidation, anomaly, forgetting,
-  retrieval are reused as-is; JST only adds the STM-side read-out and the wiring.
+  retrieval are reused as-is; STRM only adds the STM-side read-out and the wiring.
 - Not a reason to touch the shipped orchestrator's default path. Everything ships
   behind a flag; the heuristic `PresentationGate` stays as fallback.
 
 ---
 
-## First move
+## First move (done 2026-07-19)
 
-Phase 0a (recoverability probe) and Phase 0b (latent-dynamics collapse check)
-together — they share the same logged `state_t` traces, so the trace-logging
-script is built once and both probes run on it. Both are probe-only (no shipped
-code, no committed probe scripts), both need no retraining, and both produce the
-go/no-go numbers that decide whether the rest of this plan is worth executing.
+Phase 0a (recoverability probe) and Phase 0b (latent-dynamics gate) ran together
+— they share the same logged `state_t` traces, so the trace-logging script was
+built once and both probes ran on it. Both are probe-only (no shipped code, no
+committed probe scripts), both needed no retraining, and both produced the
+go/no-go numbers: **0a GO (AUC 0.810), 0b GO (ship LINEAR, surprise-AUC 0.7625).**
+Phase 1 (ring buffer + read-out) shipped (be77e35). **Next move: Phase 2** — the
+four heads. Cheapest first: the recoverability head (labels free from 0a) and
+the latent-dynamics head (now linear — a closed-form ridge fit, no training
+loop), then relevance (needs the `record_feedback` raw-rating tap), then
+graduation v1 proxy.

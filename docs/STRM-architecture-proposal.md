@@ -1,21 +1,48 @@
-# JST — JEPA / SSM / Transformer Short-Term Memory Primitive
+# STRM — Short-Term Read-Only Memory Primitive
 
-**Architecture proposal — v0.2 (draft for review, not a shipped design)**
+**Architecture proposal — v0.3 (draft for review, not a shipped design)**
 
-Status: one core assumption is **unverified** (that SSM forgetting is predictable
-enough for a learned probe to read off the hidden state). §6.1 names the
-experiment that resolves it, and everything downstream is conditional on the
-result. This doc is written so that if the probe fails, the parts that still
-stand are clearly separable from the parts that don't.
+STRM = **S**hort-**T**erm **R**ead-**O**nly **M**emory. The name states the core
+finding: the `WorkingMemory` recurrent state is **write-only relative to LTM**
+(verified across `src/` — nothing outside `working_memory.py` reads it), and the
+STRM heads are the **read-only** read-out of that state (they read `state_t` /
+`y_t`; they never write the state). Two different "only"s on two interfaces.
+The old acronym (JEPA/SSM/Transformer) is retired in favor of STRM now that the
+latent-dynamics head dropped JEPA for a linear predictor (v0.3, below).
 
-**What changed in v0.2:** the JEPA layer is expanded from two heads to four, to
-cover the full set of JEPA behaviors from the source conversation (relevance,
+**Status: de-risked 2026-07-19.** The one core assumption the whole design rested
+on — that SSM forgetting is predictable enough for a learned probe to read off
+the hidden state — is now verified by the §6.1 / §9 probes. Both gates PASSED.
+The result that changes the design: the **latent-dynamics head ships LINEAR, not
+JEPA** (see §6.2). This doc is still written so the parts that stand if a later
+gate fails are separable from the parts that don't.
+
+**What changed in v0.3 (2026-07-19): probe results + the linear-not-JEPA pivot.**
+- **0a recoverability — GO.** Probe `P(state_t, u_i)` AUC val = 0.810 (gate 0.75),
+  beats the free `k`-baseline (0.732). State carries lag-independent "which anchor
+  was forgotten" info, not just older=more-forgotten; the decay curve grows
+  monotonically with `k`. The recoverability head is viable; its labels are
+  decoder `D`'s reconstruction error `e(i,t)` (free, no Oracle).
+- **0b latent-dynamics — GO, ship LINEAR.** Linear `z_{t+1}=Az_t+b` R²=0.297 over
+  constant-mean (gate 0.15); linear surprise-AUC (L2 residual) = 0.7625 (gate
+  0.70). An EMA JEPA predictor `g` trained with the contrastive anti-collapse
+  loss scored surprise-AUC = 0.565 (cosine, its native distance) — *underperforms*
+  the closed-form linear baseline. Latent variance stayed bounded (no collapse).
+  Because the backbone is frozen, collapse cannot occur, so the JEPA EMA /
+  stop-grad / anti-collapse machinery solves a problem that does not exist in v1.
+  The latent-dynamics head ships as `z_{t+1}=Az_t+b`; the upgrade path if its R²
+  ceiling binds is a light **MSE-trained MLP**, not JEPA. JEPA only earns its
+  place for a future *generative* rollout (predict `k>1` steps ahead for
+  imagination), which is a different feature than the surprise signal — past v1.
+
+**What changed in v0.2:** the head layer is expanded from two heads to four, to
+cover the full set of behaviors from the source conversation (relevance,
 forgetting-prediction, latent-dynamics/world-model, STM→LTM graduation), and a
 new §3 maps each behavior to **what Ponder already ships** vs. what is genuinely
 net-new. The headline of that mapping: Ponder has rich LTM-side memory machinery
 (forgetting, anomaly, consolidation, presentation, retrieval) — but **none of it
 reads the `WorkingMemory` recurrent state**. The SSM state is write-only relative
-to LTM. JST's contribution is the STM-side, state-conditioned analogs that close
+to LTM. STRM's contribution is the STM-side, state-conditioned analogs that close
 that gap, plus the wiring between the two sides.
 
 ---
@@ -29,18 +56,18 @@ that gap, plus the wiring between the two sides.
   accuracy has been compressed out — so a recall can be issued against LTM.
 - **Out of scope (covered elsewhere):** long-term memory itself (Ponder's
   ingestion + episodic store + GNN consolidation + contradiction/citation
-  machinery). The consumer (LLM/agent) that reads the context block. JST produces
+  machinery). The consumer (LLM/agent) that reads the context block. STRM produces
   a bounded context block, graduation decisions, and recall pointers; it does not
   store episodes or reason.
 
-JST is **not greenfield**. The SSM substrate already ships as `WorkingMemory`
+STRM is **not greenfield**. The SSM substrate already ships as `WorkingMemory`
 (`src/subconscious/working_memory.py`, Phase 2c): a `JGSInstance` whose recurrent
 state persists across queries, with `inject()` for absorbing retrieved episodes
 and `decay_alpha` for a post-step forget factor. State is 4 per-layer tensors
-`[1, d_state=16, d_model=384]`, detached per step (no BPTT). JST extends
+`[1, d_state=16, d_model=384]`, detached per step (no BPTT). STRM extends
 `WorkingMemory` with what it currently lacks — and the central finding of this
 proposal is that **`WorkingMemory`'s state is currently never read by anything
-outside its own module** (verified across `src/`; see §3). Everything JST adds is
+outside its own module** (verified across `src/`; see §3). Everything STRM adds is
 a read-out of that state.
 
 ---
@@ -62,7 +89,7 @@ component that
    commits to an answer.
 
 "Seamless" means: the consumer never manages memory layout, eviction, refresh
-timing, or what to consolidate. It hands JST activity and importance signals and
+timing, or what to consolidate. It hands STRM activity and importance signals and
 receives a context block plus, occasionally, a recall request and a graduation
 hint.
 
@@ -70,18 +97,18 @@ hint.
 
 ## 2. Problems it solves
 
-| Problem | What goes wrong today | JST's answer |
+| Problem | What goes wrong today | STRM's answer |
 |---|---|---|
-| **Unbounded stream vs. fixed window** | Activity streams grow without limit; the consumer's window is fixed. Naive truncation drops the wrong things; Ponder's `PresentationGate` picks a chunking strategy by keyword heuristics, not by state content. | A learned context-builder emits a **fixed-budget** block; JEPA relevance decides what fills the budget. This is the "deferred learned gate" `PresentationGate` reserves replay buffers for (`presentation_gate.py:13-21`). |
+| **Unbounded stream vs. fixed window** | Activity streams grow without limit; the consumer's window is fixed. Naive truncation drops the wrong things; Ponder's `PresentationGate` picks a chunking strategy by keyword heuristics, not by state content. | A learned context-builder emits a **fixed-budget** block; the relevance head decides what fills the budget. This is the "deferred learned gate" `PresentationGate` reserves replay buffers for (`presentation_gate.py:13-21`). |
 | **Opaque STM forgetting** | `WorkingMemory` forgets via SSM dynamics + a scalar `decay_alpha`, but nothing can tell *what* it has forgotten or *when* a needed fact has been compressed out. Ponder's forgetting machinery is LTM-side only. | A **recoverability head** estimates, per anchor, whether the fact is still in the state — the STM-side analog of Ponder's LTM salience/prune heads. |
-| **No STM-side surprise signal** | Ponder's `AnomalyHead` (`heads.py:205-273`) is a 9-label *classifier* over GAT node embeddings detecting structural corruption in LTM. It is not a next-state predictor and is not SSM-conditioned. There is no "the STM just did something unpredicted" signal. | A **latent-dynamics head** predicts `z_{t+k}` from `z_t`; prediction error is STM-side surprise — the genuinely JEPA-shaped piece, and the STM sibling of the LTM anomaly head. |
+| **No STM-side surprise signal** | Ponder's `AnomalyHead` (`heads.py:205-273`) is a 9-label *classifier* over GAT node embeddings detecting structural corruption in LTM. It is not a next-state predictor and is not SSM-conditioned. There is no "the STM just did something unpredicted" signal. | A **latent-dynamics head** predicts `z_{t+k}` from `z_t`; prediction error is STM-side surprise — the genuinely predictive piece (a next-state predictor, not a label classifier), and the STM sibling of the LTM anomaly head. Ships **linear** in v1 per the §6.2 / 0b probe; JEPA is reserved for a future generative rollout. |
 | **No STM→LTM graduation** | Ponder's consolidator (`consolidate.py`) operates **entirely within the LTM graph** (DiffPool abstraction, salience-prune, supersede). There is no gate that decides what the STM writes out to LTM before it is lost; Thread-2 ingestion is undiscriminating. | A **graduation head** scores state contents for LTM-write priority — the "remembering" decision, the inverse of the recoverability flag. |
 | **Wasteful / latency-coupled refresh** | Retrieval is always externally triggered by a user prompt (`retrieval_gate.py:126-146` embeds the *prompt*, not the state). Fixed-interval refresh fetches on a clock whether or not anything was lost. | Refresh is **self-triggered** by the salience signal; LTM is kept warm by a parallel continuous-ingestion thread so a recall is a cheap read. |
 | **Reactive-only factual guards** | Existing contradiction/citation guards (Phase 3c, Bonsai decider, doc-kind snapshot guard) catch errors *after* the fact. | Salience is a **proactive** "about to be wrong" signal — the sibling of the reactive guards, earlier in the loop. |
 
 ---
 
-## 3. What Ponder already ships vs. what JST adds
+## 3. What Ponder already ships vs. what STRM adds
 
 This is the heart of the user's question. Verified across `src/` (excluding
 training and tests): **nothing outside `working_memory.py` reads the
@@ -91,11 +118,11 @@ orchestrator set itself, not derived from the state) and (b) `wm_episode_ids`, a
 set of episode ids used only to re-order consolidation scoring centers
 (`consolidate.py:163`). The SSM state is **write-only relative to LTM**.
 
-| JEPA behavior (Copilot) | Ponder already has (LTM-side) | Does it read WM state? | JST adds (STM-side) |
+| Behavior (from source conversation) | Ponder already has (LTM-side) | Does it read WM state? | STRM adds (STM-side) |
 |---|---|---|---|
 | **Relevance scoring** | `SalienceHead` (GNN, over episode subgraphs); kind-aware rerank (Phase 2c) | No — graph embeddings only | Relevance head over the `y_t` ring buffer, query-conditioned |
 | **Forgetting prediction** | `SalienceHead`-gated prune (`consolidate.py:617-644`); utility decay (`forgetting.py`); `supersede_assertion` tombstone, Bonsai-gated (`store.py:1076-1105`) | No | Recoverability head reading `state_t` directly |
-| **Latent dynamics / world model** (predict `z_{t+k}`) | *Nothing.* `AnomalyHead` is a classifier, not a predictor. (`DecomposedGate` does pool a `predicted_future` (`gate.py:113-116`) — but that is the gate's own internal state, not a WM read-out.) | No | **Latent-dynamics head** — predict `z_{t+k}` from `z_t`; prediction error = STM surprise. Genuinely new and genuinely JEPA-shaped. |
+| **Latent dynamics / world model** (predict `z_{t+k}`) | *Nothing.* `AnomalyHead` is a classifier, not a predictor. (`DecomposedGate` does pool a `predicted_future` (`gate.py:113-116`) — but that is the gate's own internal state, not a WM read-out.) | No | **Latent-dynamics head** — predict `z_{t+k}` from `z_t`; prediction error = STM surprise. Genuinely new. Ships **linear** (`z_{t+1}=Az_t+b`) in v1 per the 0b probe — a closed-form map already clears the surprise gate and beats an EMA JEPA predictor; the frozen backbone means collapse cannot occur. JEPA's EMA/stop-grad/anti-collapse machinery is deferred to a future generative rollout (§6.2). |
 | **Graduation (STM→LTM write gate)** | LTM-internal abstraction only (DiffPool clusters → `M:` nodes, `semantic_memory.py:63-109`); no STM→LTM promotion path exists | No | **Graduation head** — score state contents for LTM-write priority before compression loses them |
 | **Predictability / surprise** | `AnomalyHead` (9 structural-corruption labels, classifier over GAT node emb, `heads.py:205-273`) | No — graph side | STM surprise from the latent-dynamics head's prediction error; interlocks with the LTM anomaly head (§5.4) |
 | **Consumer importance tags** | **Already shipped as `llm_signal`** (`important/routine/satisfied/frustration/correction`, `forgetting.py:58-64`) modulating retrieval boost | n/a (caller-supplied) | Route `llm_signal` into the STM too (graduation + relevance bias). **Do not rebuild this — reuse it.** |
@@ -103,7 +130,7 @@ set of episode ids used only to re-order consolidation scoring centers
 | **Retrieval gating** | `RetrievalGate` + `BonsaiQueryPlanner`; query = **prompt embedding**, never state; externally triggered only (`retrieval_gate.py:126-146`) | No | State-conditioned retrieval query + **self-triggered** recall on salience |
 
 **Bottom line:** Ponder has the LTM side of every one of these behaviors, driven
-by trained GNN heads and Bonsai. JST does not duplicate any of it. JST adds the
+by trained GNN heads and Bonsai. STRM does not duplicate any of it. STRM adds the
 **STM-side, state-conditioned analogs** (which are absent precisely because the
 WM state is write-only today) and the **wiring** that lets the two sides talk:
 STM surprise feeds into the anomaly pipeline; STM graduation feeds the
@@ -137,12 +164,12 @@ Why it fits:
   right backend. (Swap candidate if the probe fails: Mamba2, not Mamba3 — mature
   kernels, working step path.)
 - **Already persists state across queries** and **already absorbs recalled
-  episodes** via `inject()`. The re-injection mechanism JST needs is shipped.
+  episodes** via `inject()`. The re-injection mechanism STRM needs is shipped.
 
-### 4.2 JEPA — four diagnostic/predictive heads (new)
+### 4.2 Four diagnostic/predictive heads (new)
 
-JEPA's job in JST is **flagging, predicting, and gating** — not orchestrating. It
-emits signals that other components act on. Four heads, with deliberately
+The heads' job in STRM is **flagging, predicting, and gating** — not orchestrating.
+They emit signals that other components act on. Four heads, with deliberately
 different read access:
 
 - **Relevance head** — reads slot content `y_t` + the current query → per-slot
@@ -156,12 +183,19 @@ different read access:
   (`forget(t) = D(g(z_{t+k}), z_t)`), trained self-supervised (§6.2).
 - **Latent-dynamics head** — predicts `ẑ_{t+k}` from `z_t` (a learned transition
   / world model over the memory state). Prediction error
-  `‖ẑ_{t+k} − z_{t+k}‖` is the **STM-side surprise** signal. This is the
-  genuinely JEPA piece (predict a future latent, not a label) and the one
-  behavior Ponder has no analog for on the STM side. It needs the real JEPA
-  machinery — EMA target encoder, stop-gradient, an anti-collapse term — because
-  it is a true self-supervised next-state predictor, not a supervised classifier
-  (§6.2).
+  `‖ẑ_{t+k} − z_{t+k}‖` is the **STM-side surprise** signal. This is the one
+  behavior Ponder has no analog for on the STM side. **It ships LINEAR in v1**
+  (`ẑ_{t+1} = A z_t + b`, fit closed-form): the 0b probe showed a linear map
+  already clears the surprise gate (surprise-AUC 0.7625) and *beats* an EMA JEPA
+  predictor (cosine surprise-AUC 0.565). Because the backbone is frozen, the
+  latent `z_t` is a fixed, non-collapsing input — there is no encoder being
+  trained that could collapse, so the JEPA anti-collapse machinery (EMA target
+  encoder, stop-grad, contrastive negatives) solves a problem that cannot occur
+  here and is deferred. The honest upgrade path if linear's R² ceiling binds is a
+  light **MSE-trained MLP** (non-linear, same L2 objective the surprise signal
+  wants); JEPA only earns its place for a future *generative* rollout predicting
+  `k>1` steps ahead for imagination, which is a different feature than the
+  surprise signal and past v1 (§6.2).
 - **Graduation head** — reads `state_t` + the slot's content + an
   `llm_signal`-derived importance input → a score for "write this to LTM before
   it is compressed out." This is the "remembering" decision. It feeds the
@@ -177,14 +211,14 @@ state; the thing that *assembles context* reads the published outputs.
 ### 4.3 Context-builder Transformer (new)
 
 Role: turn the ring buffer of recent `y_t` into a bounded context block, using
-JEPA relevance as an attention bias. This is the learned `PresentationGate`
+the relevance head's scores as an attention bias. This is the learned `PresentationGate`
 that `presentation_gate.py:13-21` explicitly defers and reserves replay buffers
-for — JST consumes those buffers as training signal.
+for — STRM consumes those buffers as training signal.
 
 ```
 M ∈ [1, K, 384]            # ring buffer of recent step outputs y_t
 q_raw ∈ [1, 384]           # query, from current input/task
-r ∈ [1, K]                 # JEPA per-slot relevance (from the relevance head)
+r ∈ [1, K]                 # per-slot relevance (from the relevance head)
 q     = q_raw @ W_q        # [1, d_head]   (project query into attention space)
 K_mat = M @ W_k            # [1, K, d_head]
 V     = M @ W_v            # [1, K, d_head]
@@ -258,7 +292,7 @@ visible to the builder. They answer different questions.
 
 ### 4.5 LTM pointer, graduation, and re-injection (partly exists)
 
-Three things leave JST for Ponder:
+Three things leave STRM for Ponder:
 
 - **Recall pointer** (on salience) → Ponder services it from warm LTM. The
   returned episode is encoded and **re-injected as the next `u_{t+1}`** via
@@ -280,24 +314,24 @@ is unchanged) so the input-dependent `W_A` gate tends to retain it over the next
 ### 4.6 Two-thread architecture (wiring, partly exists)
 
 - **Thread 1 — STM (hot, low-latency):** `WorkingMemory` + ring buffer + four
-  JEPA heads + context-builder. Runs per activity event. Latency budget: ms.
+  STRM heads + context-builder. Runs per activity event. Latency budget: ms.
 - **Thread 2 — Ponder continuous ingestion (async, eventually consistent):** the
   existing doc-ingestion pipeline (TEXT+MD/PDF/Code/DOCX/Web/email parsers,
   salience, doc-kind, Bonsai, 3c citation/contradiction) pointed at the **live
   activity feed**. Always running; populates/updates LTM in the background. Also
-  receives JST's graduation writes and surprise events.
+  receives STRM's graduation writes and surprise events.
 
-Why two threads: it **decouples STM latency from consolidation latency**. JST
+Why two threads: it **decouples STM latency from consolidation latency**. STRM
 never blocks on Bonsai/GLiNER/extraction (the ingestion bottleneck your notes put
 at ~24s/conv). When salience fires, LTM is already warm; the recall is a cheap
 read. The two threads are **parallel consumers of one activity stream**; they
 share the input tap, not state. Keep the SSM state and Ponder's graph deliberately
-un-entangled — JST communicates with Ponder via the three message types above,
+un-entangled — STRM communicates with Ponder via the three message types above,
 not by sharing tensors.
 
 ### 4.7 Delivery path & tool interlock (verified)
 
-How context reaches the consumer today, so JST's outputs land in the right place:
+How context reaches the consumer today, so STRM's outputs land in the right place:
 
 - **Prompt assembly is primary.** The LLM always receives a pre-assembled
   context block in its user prompt — `Context from past conversations:\n{context}
@@ -313,13 +347,13 @@ How context reaches the consumer today, so JST's outputs land in the right place
   compressed gist by id (`tools.py:73-91`), `search_memory` re-retrieves
   mid-generation with a refined query (`tools.py:92-118`), and `record_feedback`
   has the LLM rate each cited unit 1-5 *after* answering (`tools.py:44-72`).
-- **JST salience is the internal, pre-emptive version of the external tools.**
+- **STRM salience is the internal, pre-emptive version of the external tools.**
   `search_memory` is the LLM noticing "I'm missing something" and re-retrieving;
-  JST's salience signal fires that same recall *before* the LLM has to notice —
+  STRM's salience signal fires that same recall *before* the LLM has to notice —
   the recall is re-injected into STM (`WorkingMemory.inject`) and shows up in the
   next prompt-assembly, so the LLM never sees the gap. `expand` is the LLM
-  pulling detail on a gist it was shown; JST's relevance head decides which gists
-  to show uncompressed in the first place. JST does not remove the tools — it
+  pulling detail on a gist it was shown; STRM's relevance head decides which gists
+  to show uncompressed in the first place. STRM does not remove the tools — it
   reduces how often the LLM needs them.
 - **`record_feedback` could label the relevance head — but the raw ratings
   aren't logged today.** The 1-5 per-unit judgments are reduced to a compounded
@@ -352,7 +386,7 @@ Per activity event (one step):
    step (lower confidence in the recoverability estimate).
 5. **Append** `y_t` to the ring buffer; pop the oldest. Buffer stays
    `[1, K, 384]`.
-6. **JEPA heads:**
+6. **STRM heads:**
    - relevance head → `r ∈ [1, K]`;
    - recoverability head → per-anchor recoverability from `state_t`;
    - graduation head → per-slot LTM-write priority (high-priority slots queued
@@ -405,34 +439,51 @@ that a probe can estimate recoverability from `state_t`.** Test it on the
    error without doing the recovery.
 4. Measure probe AUC.
 
-Decision: decent AUC → the salience mechanism is viable, build JST. Poor AUC *and*
+Decision: decent AUC → the salience mechanism is viable, build STRM. Poor AUC *and*
 discretization is the suspected cause → consider a Mamba2 swap. Poor AUC with no
 obvious fix → simplify to fixed-interval refresh and stop. The probe also answers
 "do we need Mamba" for free: it tests whether `ReferenceSSM`'s selectivity
 suffices in practice.
 
-### 6.2 The four heads, and which are real JEPA
+### 6.2 The four heads (none are JEPA in v1)
 
 - **Recoverability head** — supervised on the §6.1 labels (you generate them from
-  your own SSM). *Not* self-supervised JEPA; a supervised probe with generated
-  labels. Simpler and likely better than a collapse-prone self-supervised
-  objective for this specific job. The "JEPA" framing applies because the labels
-  come from a reconstruction-error world model, but the head itself is a
-  supervised regressor.
-- **Latent-dynamics head** — this **is** real JEPA and needs the full machinery:
-  an EMA target encoder for `z_{t+k}` (stop-gradient on the target), the
-  predictor `g(z_t) → ẑ_{t+k}`, and an anti-collapse term (a variance/covariance
-  regularizer or a contrastive negative) so the predictor cannot trivially
-  collapse the latent. Objective: minimize `‖g(z_t) − sg(EMA(z_{t+k}))‖` + collapse
-  penalty. This is the one head where skimping on JEPA machinery will fail — a
-  naive MSE predictor collapses to the mean. Do not under-build this one.
-  **Gate ordering (de-risk cheap first):** before training the full JEPA
-  predictor, test whether the SSM latent has *learnable transition dynamics at
-  all* — fit a linear `z_{t+1} ≈ Az_t + b` on the logged traces and check it beats
-  a constant-mean baseline. If a linear map can't beat mean, the latent has no
-  learnable dynamics and no amount of nonlinear JEPA machinery rescues it — stop
-  here. Only if linear beats mean does the EMA/stop-grad/anti-collapse work earn
-  its complexity. (This is Phase 0b in the implementation plan.)
+  your own SSM). A supervised probe with generated labels, not a self-supervised
+  objective. Simpler and likely better than a collapse-prone self-supervised
+  objective for this specific job. The labels come from a reconstruction-error
+  world model (decoder `D`'s `e(i,t)`), but the head itself is a supervised
+  regressor.
+- **Latent-dynamics head** — ships **linear** in v1, not JEPA. This is the
+  outcome of the 0b probe, not an a priori choice. The probe ran the de-risk
+  ordering the original v0.2 spec called for (linear baseline first, then EMA
+  JEPA only if linear beat mean) and got a decisive result: linear
+  `z_{t+1}=Az_t+b` R²=0.297 (beats mean, gate 0.15) AND its L2-residual
+  surprise-AUC = 0.7625 (gate 0.70), while the EMA JEPA predictor `g` trained
+  with `jepa_contrastive_loss` (cosine + logsumexp negatives + 0.1·MSE) scored
+  surprise-AUC = 0.565 in its native cosine distance — *below* the linear
+  baseline. Four reasons JEPA loses here: (1) the surprise signal is naturally an
+  L2 residual (magnitude of the miss), but the JEPA contrastive loss optimizes
+  cosine direction (scale-invariant) — a predictor can have low cosine loss and
+  poor magnitude calibration, which is exactly what `g` showed (its L2 MSE was
+  83× worse than linear); (2) the logsumexp negatives push the prediction *away*
+  from the other batch targets, but consecutive `z_{t+1}` states are similar, so
+  the anti-collapse term fights the prediction objective; (3) the backbone is
+  frozen, so there is no encoder that could collapse — the entire reason JEPA
+  exists (collapse-resistant self-supervision) does not apply; (4) JEPA needs an
+  EMA target encoder, stop-grad, temperature, negative count, and a training loop,
+  vs. a closed-form one-shot ridge fit with no hyperparameters. So v1 ships the
+  linear map: `min ‖A z_t + b − z_{t+1}‖²` (ridge, closed-form). The honest
+  upgrade path if R²=0.30 becomes limiting is a light **MSE-trained MLP** —
+  non-linear dynamics under the same L2 objective the surprise signal wants; the
+  probe's `g` did poorly *because it was JEPA-trained*, not because MLPs are bad.
+  **JEPA is reserved for a future generative rollout** (predict `k>1` steps
+  ahead for imagination/rollout), where a learned latent dynamics model is the
+  point and the collapse-resistant objective earns its place — that is a
+  different feature than the v1 surprise signal and past v1.
+  **Gate ordering (already run):** linear baseline first (Phase 0b step 1) — if it
+  had not beaten mean, the latent-dynamics head would be dropped before any
+  predictor work. It beat mean, so step 2 (EMA JEPA) ran and lost to linear. The
+  v1 head is the linear map; EMA/stop-grad/anti-collapse is not built.
 - **Relevance head** — supervised on query-anchor pairs. The `record_feedback`
   tool (`tools.py:44-72`) has the LLM rate each cited unit 1-5, but today those
   ratings are reduced to a compounded boost multiplier (`store.record_feedback`,
@@ -473,12 +524,16 @@ bottleneck.
 
 ### 6.5 Honest training caveats
 
-- **"JEPA" is not one thing.** Two of the four heads are supervised probes
-  (recoverability, relevance, graduation) that happen to use JEPA-derived labels
-  or framing; one (latent-dynamics) is real self-supervised JEPA and needs the
-  full anti-collapse machinery. Treat them differently. Do not drag EMA
-  target encoders into the supervised heads, and do not skip the EMA/stop-grad
-  on the dynamics head.
+- **None of the v1 heads are JEPA.** Three of the four heads (relevance,
+  recoverability, graduation) are supervised probes that happen to use
+  reconstruction-error-derived labels or framing; the fourth (latent-dynamics) is
+  a **linear** next-state predictor per the 0b probe. The original v0.2 framing
+  called the dynamics head "real JEPA" needing EMA/stop-grad/anti-collapse; the
+  probe retired that — a closed-form linear map beats the JEPA predictor on the
+  surprise signal, and the frozen backbone means collapse cannot occur. Do not
+  drag EMA target encoders into any of the four heads in v1. JEPA only re-enters
+  if a future generative rollout (predict `k>1` for imagination) is built — a
+  separate feature, past v1.
 - **The dependency half of salience is the hard part.** Recoverability is
   well-defined and labelable. "Needed for factual accuracy" is query-dependent
   and harder. Start with the weaker proxy
@@ -524,7 +579,7 @@ bottleneck.
 
 ---
 
-## 8. What JST is not
+## 8. What STRM is not
 
 - Not a reasoning engine. It builds context and emits signals; the consumer
   reasons.
@@ -532,29 +587,33 @@ bottleneck.
   is a bounded block at a chosen budget, not a 384-float bottleneck. (The
   one-vector framing from the source conversation is explicitly rejected — it is
   information-bottlenecked and loses precision recall.)
-- Not long-term memory. Ponder owns LTM; JST points at it and graduates into it.
+- Not long-term memory. Ponder owns LTM; STRM points at it and graduates into it.
 - Not a replacement for the reactive contradiction/citation guards or the LTM
   anomaly/salience/consolidation heads. It is their STM-side sibling and feeds
   them.
 - Not greenfield. The SSM substrate (`WorkingMemory`), re-injection (`inject()`),
   the persistence/snapshot contract, the `llm_signal` importance channel, and the
-  entire LTM consolidation/anomaly/forgetting/retrieval stack already ship. JST
+  entire LTM consolidation/anomaly/forgetting/retrieval stack already ship. STRM
   adds the read-out of the WM state (ring buffer + four heads + context-builder)
   and the wiring that lets that read-out drive the existing LTM machinery.
 
 ---
 
-## 9. First move
+## 9. First move (done 2026-07-19)
 
-Run the §6.1 recoverability probe on the trained `WorkingMemory` backbone. It is
-a few days of work on infrastructure that already exists, it requires no
-retraining, and its AUC decides whether the rest of this proposal is worth
-building. In parallel, on the same logged `state_t` traces, run the two-step
-dynamics de-risk: **(i) a linear `z_{t+1} ≈ Az_t + b` vs a constant-mean
-baseline** — if linear can't beat mean, the latent has no learnable dynamics and
-the surprise head is dropped before any EMA machinery is built; **(ii) only if (i)
-passes**, the EMA/stop-grad/anti-collapse predictor — its collapse behavior is
-the second go/no-go. If a properly-instrumented EMA predictor cannot avoid
-collapse on the SSM latent, the surprise signal is not usable and the design
-shrinks back to the three supervised heads. Everything else is downstream of
-those numbers.
+The §6.1 recoverability probe and the §6.2 dynamics de-risk ran on the trained
+`WorkingMemory` backbone — no retraining, on infrastructure that already exists.
+Both gates PASSED:
+
+- **0a recoverability — GO.** Probe AUC val = 0.810 (gate 0.75), beats the free
+  `k`-baseline (0.732). The recoverability head is viable; its labels are
+  decoder `D`'s reconstruction error `e(i,t)`.
+- **0b latent-dynamics — GO, ship LINEAR.** Linear `z_{t+1}=Az_t+b` R²=0.297 over
+  constant-mean; linear surprise-AUC (L2 residual) = 0.7625 (gate 0.70), beating
+  the EMA JEPA predictor (cosine surprise-AUC 0.565). The latent-dynamics head
+  ships as the linear map; JEPA is deferred to a future generative rollout.
+
+Everything else is downstream of those numbers, and both said GO. Next move is
+Phase 2 — the four heads, starting with the recoverability head (cheapest: labels
+are already free from 0a) and the latent-dynamics head (now linear, the cheapest
+of the four — a closed-form ridge fit, no training loop).

@@ -32,7 +32,7 @@ vector_index_vectors.json
 # Phase 1d Oracle-generated training data (regenerable via scripts/generate_*_training_data.py)
 data/training/
 
-# JST probe artifacts (throwaway traces/probe outputs; scripts/_probe_*.py are
+# STRM probe artifacts (throwaway traces/probe outputs; scripts/_probe_*.py are
 # probe-only and never committed per commit-at-will)
 data/probe/
 .oracle_cache.json

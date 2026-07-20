@@ -1,4 +1,4 @@
-"""Phase 1 (JST) tests: the provenance-carrying ring buffer + state read-out.
+"""Phase 1 (STRM) tests: the provenance-carrying ring buffer + state read-out.
 
 All CPU-runnable against ``ReferenceSSM`` + deterministic embeddings (no
 ``sentence_transformers``, no Ollama, no WaveDB). Two contracts:
