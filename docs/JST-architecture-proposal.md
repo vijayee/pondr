@@ -190,18 +190,42 @@ K_mat = M @ W_k            # [1, K, d_head]
 V     = M @ W_v            # [1, K, d_head]
 logits = (q @ K_matᵀ)/√d + λ·r          # [1, K]
 attn   = softmax(logits, -1)            # [1, K]
-ctx    = attn.unsqueeze(1) @ V          # [1, 1, d_head] → [1, d_head]
-                                #   → projected to the output budget C
+ctx    = attn.unsqueeze(1) @ V          # [1, d_head] — INTERNAL training surrogate
+                                #   (see below: serve path is discrete top-m, not ctx)
 ```
 
-"Pick the relevant slice" = the slots with high `attn` weight. **Hard top-m**
-variant: keep the top-m of `(q·K + λr)`, mask the rest to `-inf` before softmax —
-the literal discrete "pick a slice." Start soft (differentiable, easy to train);
-add hard selection if discrete recall is wanted. Small model: it attends over `K`
-vectors (~dozens to low hundreds), not tokens — a 20-200M-parameter router, not a
-language model. It does **not** touch `state_t` directly; it reads `y_t` through
-the SSM's trained `W_C`. (Upgrade path if `W_C`'s read-out doesn't preserve what
-the builder needs: add a `proj(state_t)` head trained jointly — see §7.)
+**The output is discrete, not the continuous `ctx` vector.** This is the
+resolution of the obvious question the equation raises: the math produces a
+continuous `[1, d_head]` vector, but the seam consumes and produces **text** and
+the consumer is a text LLM (it cannot eat a raw 384-dim vector without a whole
+soft-prompt research layer). So the context-builder is a **learned
+selector/reranker**, not a vector compressor: `attn` produces selection weights
+over ring-buffer slots; the selected slots map back to their **source episode
+text** (the ring buffer carries provenance — slot → source `episode_id` / event —
+not just `y_t`); the consumer-facing output is the bounded **text** of the
+selected episodes, same shape as `PresentationGate`'s primary/compressed split.
+The continuous `ctx = attn @ V` is the *internal* selection signal used during
+training (differentiable surrogate for the discrete pick); at serve time it is
+discarded and the discrete selection is what ships.
+
+Three consequences made explicit:
+
+- **The ring buffer carries provenance.** Each slot is `(y_t, source_id, text)`,
+  not just `y_t`. Without provenance the selector cannot map back to text.
+- **Hard top-m is the primary serve path, not an optional variant.** Soft
+  attention trains the selector; hard top-m (keep top-m of `q·K + λr`, mask the
+  rest to `-inf`) is what produces the discrete selection the consumer needs.
+  "Start soft, add hard" is a training schedule, not a serve-time choice.
+- **Continuous soft-prompt output is out of scope for v1.** Feeding `ctx` as a
+  soft prompt / prefix to a consumer that accepts continuous inputs is a
+  different consumer interface and a separate research direction; the seam here
+  is text-in/text-out, so v1 is discrete selection only.
+
+Small model: it attends over `K` vectors (~dozens to low hundreds), not tokens —
+a 20-200M-parameter router, not a language model. It does **not** touch `state_t`
+directly; it reads `y_t` through the SSM's trained `W_C`. (Upgrade path if
+`W_C`'s read-out doesn't preserve what the builder needs: add a `proj(state_t)`
+head trained jointly — see §7.)
 
 **Where it plugs in (the seam, verified):** today the context the LLM receives is
 **prompt-assembled, not a tool call**. The chain is `PresentationGate.plan`
@@ -221,13 +245,16 @@ string (replace `format_for_llm`); start at the first.
 
 ### 4.4 Ring buffer (new)
 
-A temporal window `M ∈ [1, K, 384]` of the last `K` step outputs, append/pop per
-step. **`K` is not `d_state`.** `d_state = 16` is the SSM's channel depth at one
-instant — how many parallel memory tracks the state holds *right now*, already
-collapsed to 384 by `W_C` when producing `y_t`; it does not appear in the buffer.
-`K` is the temporal lookback — how many recent timesteps the Transformer can
-reach. Independent knob. Crank `d_state` → richer per-moment compression; crank
-`K` → deeper history visible to the builder. They answer different questions.
+A temporal window of the last `K` step outputs. Each slot is a triple
+`(y_t ∈ [1, 384], source_id, text)` — the vector plus **provenance** back to the
+event/episode that produced it (required so the context-builder can map a
+selected slot back to text; see §4.3). Append/pop per step. **`K` is not
+`d_state`.** `d_state = 16` is the SSM's channel depth at one instant — how many
+parallel memory tracks the state holds *right now*, already collapsed to 384 by
+`W_C` when producing `y_t`; it does not appear in the buffer. `K` is the temporal
+lookback — how many recent timesteps the Transformer can reach. Independent knob.
+Crank `d_state` → richer per-moment compression; crank `K` → deeper history
+visible to the builder. They answer different questions.
 
 ### 4.5 LTM pointer, graduation, and re-injection (partly exists)
 
@@ -348,11 +375,15 @@ save/load path, unchanged.
 
 **Freshness watermark (Thread 2 lag):** if Thread 2 lags by `Δ`, a fact younger
 than `Δ` that gets compressed out of STM is unrecallable — it is neither in STM
-nor yet in LTM. The salience signal must carry a freshness check: suppress the
-LTM pointer (or emit "unknown — not in STM, not yet in LTM") for anchors known to
-be younger than the watermark. Otherwise silent false-negative recalls. With
-async-distill + the GLiNER GPU path, `Δ` should be manageable; define it
-explicitly rather than pretending it is zero.
+nor yet in LTM. The salience signal must carry a freshness check, and the check
+must **tell the consumer, not silently drop the pointer.** Suppressing the
+pointer alone is a silent false negative: the consumer assumes the fact does not
+exist, which is worse than admitting uncertainty. So for anchors younger than the
+watermark, emit a typed **stale-uncertain** signal to the consumer ("I may know
+this but have not finished ingesting it") alongside the suppressed pointer — the
+consumer can then choose to wait, re-ask, or proceed with a stated gap, rather
+than being lied to by omission. With async-distill + the GLiNER GPU path, `Δ`
+should be manageable; define it explicitly rather than pretending it is zero.
 
 ---
 
@@ -395,6 +426,13 @@ suffices in practice.
   collapse the latent. Objective: minimize `‖g(z_t) − sg(EMA(z_{t+k}))‖` + collapse
   penalty. This is the one head where skimping on JEPA machinery will fail — a
   naive MSE predictor collapses to the mean. Do not under-build this one.
+  **Gate ordering (de-risk cheap first):** before training the full JEPA
+  predictor, test whether the SSM latent has *learnable transition dynamics at
+  all* — fit a linear `z_{t+1} ≈ Az_t + b` on the logged traces and check it beats
+  a constant-mean baseline. If a linear map can't beat mean, the latent has no
+  learnable dynamics and no amount of nonlinear JEPA machinery rescues it — stop
+  here. Only if linear beats mean does the EMA/stop-grad/anti-collapse work earn
+  its complexity. (This is Phase 0b in the implementation plan.)
 - **Relevance head** — supervised on query-anchor pairs. The `record_feedback`
   tool (`tools.py:44-72`) has the LLM rate each cited unit 1-5, but today those
   ratings are reduced to a compounded boost multiplier (`store.record_feedback`,
@@ -403,12 +441,20 @@ suffices in practice.
   raw-rating JSONL tap (write `{unit_id, rating, query, slot}` *before* the
   reduction) before this head can train on real labels; until then, fall back to
   synthetic labels à la `scripts/generate_jepa_training_data.py`.
-- **Graduation head** — supervised on "would this fact have been useful later?"
-  labels, derivable from replay: replay a stream, mark which compressed-out facts
-  were later needed (i.e., would have triggered a salience recall), train the
-  head to predict that from `(state_t, content, llm_signal)`. Reuses the
-  `PresentationGate` replay buffers (`outcome_buffer`, `override_buffer`) as a
-  label source.
+- **Graduation head** — two stages, v1 cheap then v2 accurate. **v1 proxy:**
+  graduation score = the slot's integrated relevance over its lifetime in the
+  buffer (`∫ r_i dt` — a fact that stayed relevant for many steps is probably
+  worth keeping). This breaks the circular dependency for free: "would have been
+  needed later" is approximated by "was relevant for a long time," which needs no
+  replay and no downstream pipeline. Ship v1 as the heuristic baseline.
+  **v2 replay:** supervise on "would this fact have been useful later?" labels
+  from replaying logged streams and marking which compressed-out facts later
+  triggered a salience recall or a consumer `search_memory`/`expand`. This is the
+  true credit-assignment signal but depends on the whole downstream pipeline
+  (relevance → context-builder → consumer behavior), so the labels are noisy and
+  slow — the long pole. Reuses the `PresentationGate` replay buffers
+  (`outcome_buffer`, `override_buffer`) as a seed source. Train v2 only once the
+  pipeline exists and v1 is shipping.
 
 ### 6.3 Context-builder Transformer
 
@@ -438,9 +484,11 @@ bottleneck.
   and harder. Start with the weaker proxy
   `salience = recoverability_drop on recently-high-relevance slots`, validate,
   then upgrade to true dependency modeling.
-- **Graduation labels are the long pole.** They require replay over long streams
-  to know what *would have been* needed later. Budget for this; it is the
-  "remembering" feature's real cost.
+- **Graduation labels are the long pole — so ship the v1 proxy first.** v2
+  replay labels require replay over long streams to know what *would have been*
+  needed later, and depend on the whole downstream pipeline (circular). The v1
+  proxy (integrated relevance over slot lifetime) breaks the circle and ships
+  without replay. Do not block the "remembering" feature on the long pole.
 - **Multi-objective balancing.** Stage B has at least four losses (the four
   heads) + context quality. Expect tuning, not a clean single-objective train.
 - **Thresholds exist.** `θ`, `φ`, `C`, `K`, `Δ`, the surprise gate, and the
@@ -501,9 +549,12 @@ bottleneck.
 Run the §6.1 recoverability probe on the trained `WorkingMemory` backbone. It is
 a few days of work on infrastructure that already exists, it requires no
 retraining, and its AUC decides whether the rest of this proposal is worth
-building. In parallel, prototype the latent-dynamics head on the same logged
-trajectories (it needs the same `state_t` traces) — its collapse behavior is the
-second go/no-go: if a properly-instrumented EMA predictor cannot avoid collapse
-on the SSM latent, the surprise signal is not usable and the design shrinks back
-to the three supervised heads. Everything else is downstream of those two
-numbers.
+building. In parallel, on the same logged `state_t` traces, run the two-step
+dynamics de-risk: **(i) a linear `z_{t+1} ≈ Az_t + b` vs a constant-mean
+baseline** — if linear can't beat mean, the latent has no learnable dynamics and
+the surprise head is dropped before any EMA machinery is built; **(ii) only if (i)
+passes**, the EMA/stop-grad/anti-collapse predictor — its collapse behavior is
+the second go/no-go. If a properly-instrumented EMA predictor cannot avoid
+collapse on the SSM latent, the surprise signal is not usable and the design
+shrinks back to the three supervised heads. Everything else is downstream of
+those numbers.

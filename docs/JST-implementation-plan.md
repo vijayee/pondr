@@ -94,19 +94,30 @@ number + the generated label set) is what survives into Phase 2b.
 
 ---
 
-## Phase 0b — Latent-dynamics collapse check (GO / NO-GO GATE 2)
+## Phase 0b — Latent-dynamics gate (GO / NO-GO GATE 2, two steps)
 
-**Question:** can a properly-instrumented EMA predictor avoid collapse on the WM
-recurrent state `z_t`? If no, the surprise signal is unusable and the
-latent-dynamics head is dropped (the three supervised heads still stand).
+**Question (two parts):** (i) does the WM recurrent state `z_t` have *learnable
+transition dynamics at all*, and (ii) if so, can a properly-instrumented EMA
+predictor avoid collapse on it? If (i) is no, drop the latent-dynamics head
+before paying for any EMA machinery. If (ii) is no, drop it; the three supervised
+heads still stand.
 
-**Reuses existing JEPA machinery** — this is not net-new:
+**Step 1 — linear baseline (cheap, run first).** On the Phase 0a traces, fit a
+linear `z_{t+1} ≈ Az_t + b` (least squares) and compare one-step prediction MSE
+to a constant-mean baseline (`ẑ_{t+1} = mean(z)`). **Gate:** linear must beat
+mean by a clear margin. If a linear map can't beat mean, the latent has no
+learnable dynamics — no nonlinear JEPA predictor rescues it, so DROP the
+latent-dynamics head here and skip step 2. This is the cheapest possible test of
+the deeper risk and it runs in minutes on logged traces.
+
+**Step 2 — EMA collapse check (only if step 1 passes). Reuses existing JEPA
+machinery** — this is not net-new:
 - `_update_ema(target, online, decay)` (`pretrain.py:148-151`).
 - Target = `copy.deepcopy(backbone)` with `requires_grad_(False)` (`pretrain.py:182-184`).
 - `jepa_loss.step_loss` / `jepa_contrastive_loss` (`jepa_loss.py:24-63`) — the
   batch-negatives logsumexp is the anti-collapse term.
 
-**Deliverables:**
+**Deliverables (step 2):**
 1. `scripts/probe_latent_dynamics.py` — on the Phase 0a traces, train a predictor
    `g(z_t) → ẑ_{t+1}` with the EMA target + stop-grad + the `jepa_loss` collapse
    penalty. `k=1` (per proposal §7).
@@ -114,7 +125,7 @@ latent-dynamics head is dropped (the three supervised heads still stand).
    detector — variance → 0 means collapse), and a "surprise" head AUC on
    held-out anomalous steps (if reconstructable).
 
-**Stop condition / gate:**
+**Stop condition / gate (step 2):**
 - Latent variance stays bounded AND surprise-AUC > chance → GO; the
   latent-dynamics head (Phase 2c) is viable.
 - Collapses despite the anti-collapse term → either (a) strengthen the penalty
@@ -122,7 +133,8 @@ latent-dynamics head is dropped (the three supervised heads still stand).
   regularizer) and retry once, or (b) DROP the latent-dynamics head. The three
   supervised heads do not depend on it.
 
-**De-wonk note:** `g` is probe-only; not shipped. Probe script not committed.
+**De-wonk note:** `A`, `g` are probe-only; not shipped. Probe scripts not
+committed.
 
 ---
 
@@ -133,15 +145,20 @@ read them, without changing any shipped behavior.
 
 **Deliverables:**
 1. Extend `WorkingMemory` (`src/subconscious/working_memory.py`) with a ring
-   buffer `self.ring: deque` of recent step outputs `y_t` (capacity `K`,
-   configurable, default OFF / `K=0` so shipped behavior is byte-identical). Add
-   `ring_buffer()` read-only accessor and a `state_tensors()` accessor returning
-   the live per-layer `[1, 16, 384]` state (distinct from `snapshot()`, which
-   detaches+clones for serialization — the heads need a live, on-device view).
+   buffer `self.ring: deque` of recent step outputs, where each slot is a triple
+   `(y_t, source_id, text)` — the vector **plus provenance** back to the event/
+   episode that produced it (required by the Phase 3 context-builder to map a
+   selected slot back to text; shipping a vector-only buffer now would force a
+   Phase 3 redesign). Capacity `K` configurable, default OFF / `K=0` so shipped
+   behavior is byte-identical. Add `ring_buffer()` read-only accessor and a
+   `state_tensors()` accessor returning the live per-layer `[1, 16, 384]` state
+   (distinct from `snapshot()`, which detaches+clones for serialization — the heads
+   need a live, on-device view).
 2. Config: add `ring_capacity` to the `working_memory` entry in `INSTANCE_CONFIGS`
    (`configs.py`), default 0.
 3. Tests (`tests/test_working_memory_ring.py`): with `K=0`, existing WM tests
-   pass unchanged; with `K>0`, the buffer holds the last `K` `y_t` and pops FIFO.
+   pass unchanged; with `K>0`, the buffer holds the last `K` slots (with
+   provenance) and pops FIFO.
 
 **Stop condition:** all existing WM tests green; ring tests green; `K=0` path
 byte-identical to today (verified by re-running the Phase 2c suite).
@@ -238,16 +255,28 @@ Ship behind `--jst-latent-dynamics-head PATH`, default off.
 Do NOT train it as plain MSE — it will collapse to the mean. The EMA target and
 the `jepa_loss` negatives are both required; if either is removed, re-run Phase 0b.
 
-### 2d — Graduation head (supervised — the long pole)
+### 2d — Graduation (v1 proxy first, v2 replay head — the long pole)
 
-**Labels:** replay-based. Replay a stream, mark which compressed-out facts were
-later needed (i.e., would have triggered a salience recall or a consumer
-`search_memory`/`expand`), train the head to predict that from
-`(state_t, slot_content, llm_signal)`. This needs long-horizon replays, so it is
-the slowest label to gather. Start the replay logger in Phase 2a so labels are
-accumulating while the other heads train.
+**v1 — relevance-lifetime proxy (ship first, no replay).** Graduation score = the
+slot's integrated relevance over its lifetime in the buffer (`∫ r_i dt`). A fact
+that stayed relevant for many steps is probably worth keeping. This breaks the
+circular dependency for free: "would have been needed later" is approximated by
+"was relevant for a long time," which needs no replay and no downstream pipeline.
+- Deliverable: a small module computing `∫ r_i dt` per slot from the relevance
+  head's `r_i` stream; threshold → graduate. No training, no checkpoint.
+- Ship behind `--jst-graduation-proxy`, default off. This is the heuristic
+  baseline the v2 head has to beat.
 
-**Deliverables:**
+**v2 — replay-supervised head (the long pole).** Replay logged streams, mark
+which compressed-out facts were later needed (i.e., would have triggered a
+salience recall or a consumer `search_memory`/`expand`), train the head to
+predict that from `(state_t, slot_content, llm_signal)`. This is the true
+credit-assignment signal but depends on the whole downstream pipeline
+(relevance → context-builder → consumer behavior), so the labels are noisy and
+slow. Start the replay logger in Phase 2a so labels accumulate while the other
+heads train.
+
+**Deliverables (v2):**
 1. `src/subconscious/graduation_head.py` — reads `state_t` + slot content + the
    `llm_signal`-derived importance input (`forgetting.py:58-64` already defines
    the signal vocabulary — reuse it, do not invent a new one).
@@ -256,17 +285,16 @@ accumulating while the other heads train.
 3. `scripts/train_graduation_head.py`.
 4. A replay-label generator `scripts/generate_graduation_labels.py` consuming the
    replay log.
-5. Eval: "would-have-been-needed" recall on held-out replays + Wilson CI.
+5. Eval: "would-have-been-needed" recall on held-out replays + Wilson CI;
+   **must beat the v1 proxy** to be worth shipping.
 
-**Stop condition / gate:** graduation gate passes. Ship behind
-`--jst-graduation-head PATH`, default off. Feeds the existing consolidator
-(`consolidate.py`) as prioritized input — the consolidator's LTM-internal logic
-is unchanged.
+**Stop condition / gate (v2):** v2 graduation gate passes AND v2 beats v1 proxy
+on the held-out replay eval. Ship v2 behind `--jst-graduation-head PATH`, default
+off, keeping v1 as fallback. Feeds the existing consolidator (`consolidate.py`)
+as prioritized input — the consolidator's LTM-internal logic is unchanged.
 
-**De-wonk note:** graduation labels are the long pole; do not block the other
-heads on this. If labels are too sparse to train a good head, ship the
-graduation feature as a heuristic (high-relevance + low-recoverability + high
-`llm_signal` → graduate) and defer the learned head.
+**De-wonk note:** do not block the "remembering" feature on the long pole — v1
+ships it. If v2 labels are too sparse to beat v1, keep v1 and defer v2.
 
 ---
 
@@ -284,17 +312,27 @@ read-back for training exists today** — Phase 3 builds the trainer that consum
 `serialize_buffers()` (`presentation_gate.py:368-380`).
 
 **Deliverables:**
-1. `src/subconscious/context_builder.py` — the Transformer router (attention over
-   the `K` ring-buffer slots with the relevance head's `r` as bias, per proposal
-   §4.3). Emits a `PresentationPlan`-like object (smallest seam: keep
-   `SSMChunker.chunk` at `orchestrator.py:336` and `format_for_llm` working).
-2. Config: `INSTANCE_CONFIGS["jst_context_builder"]`.
-3. `src/subconscious/training/context_builder_training.py` — train on context
+1. `src/subconscious/context_builder.py` — the Transformer **selector/reranker**
+   (attention over the `K` ring-buffer slots with the relevance head's `r` as
+   bias, per proposal §4.3). **The consumer-facing output is discrete selected
+   text, not the continuous `ctx` vector** — `attn` produces selection weights;
+   hard top-m picks the slots; each slot's provenance (`source_id`) maps back to
+   source episode text; the output is the bounded text of the selected episodes,
+   same shape as `PresentationGate`'s primary/compressed split. Soft attention is
+   the training-time differentiable surrogate; hard top-m is the serve path.
+   Emits a `PresentationPlan`-like object (smallest seam: keep `SSMChunker.chunk`
+   at `orchestrator.py:336` and `format_for_llm` working).
+2. **Ring buffer carries provenance** — each slot is `(y_t, source_id, text)`, not
+   just `y_t` (Phase 1 must store this). Without it the selector can't map back to
+   text. This is a Phase 1 / Phase 3 contract; do not let Phase 1 ship a
+   vector-only buffer that Phase 3 then can't use.
+3. Config: `INSTANCE_CONFIGS["jst_context_builder"]`.
+4. `src/subconscious/training/context_builder_training.py` — train on context
    quality: does the block let a downstream consumer answer correctly? Reuse the
    Phase 3c / ERAG-Bench eval labels. Consume the `PresentationGate` override
    buffer (caller overrode the heuristic) as seed supervision.
-4. `scripts/train_context_builder.py`.
-5. Wiring: `build_ponder` (`runtime.py:51-157`) loads the builder when its
+5. `scripts/train_context_builder.py`.
+6. Wiring: `build_ponder` (`runtime.py:51-157`) loads the builder when its
    checkpoint exists; the orchestrator at `orchestrator.py:323` calls the builder
    instead of `presentation_gate.plan` when `--jst-context-builder` is on,
    falling back to the heuristic otherwise.
@@ -329,8 +367,13 @@ pre-emptive `search_memory`), instead of only externally by the prompt.
    **pin tag** (a learned token-type embedding added to `u_{t+1}`, same dim as
    the input so `d_model` is unchanged, per proposal §4.5) so `W_A` retains it
    over the next `K` steps.
-4. Freshness watermark `Δ` (proposal §5): suppress the pointer for anchors
-   younger than Thread 2's lag.
+4. Freshness watermark `Δ` (proposal §5): for anchors younger than Thread 2's
+   lag, **do not silently suppress the pointer** — emit a typed **stale-uncertain**
+   signal to the consumer ("I may know this but have not finished ingesting it")
+   alongside the suppressed pointer, so the consumer can wait / re-ask / proceed
+   with a stated gap rather than being lied to by omission. This is an
+   interaction-design deliverable (a new signal type in the consumer contract),
+   not just a threshold.
 
 **Stop condition / gate:** end-to-end — on a long-horizon eval, JST+recall
 answers more factual questions correctly than fixed-interval refresh at equal
@@ -427,11 +470,13 @@ entirely. Do not joint-train for its own sake.
 | Gate | Phase | Decision |
 |---|---|---|
 | Recoverability probe AUC | 0a | Go → build salience; No → fixed-interval fallback, drop salience/recoverability/graduation |
-| Latent-dynamics collapse | 0b | Go → build surprise head; No → drop it (3 supervised heads stand) |
+| Linear dynamics beats mean | 0b step 1 | Go → run EMA check; No → drop surprise head now (no EMA work) |
+| Latent-dynamics EMA collapse | 0b step 2 | Go → build surprise head; No → drop it (3 supervised heads stand) |
 | Relevance gate | 2a | Ship relevance head |
 | Recoverability gate | 2b | Ship recoverability head |
 | Latent-dynamics surprise-AUC | 2c | Ship latent-dynamics head |
-| Graduation gate | 2d | Ship graduation head (or heuristic fallback) |
+| Graduation v1 proxy ships (no gate) | 2d v1 | Ship the heuristic `∫r·dt` proxy |
+| Graduation v2 beats v1 | 2d v2 | Ship the learned head; else keep v1 |
 | Context-builder ≥ heuristic | 3 | Flip `--jst-context-builder` default on |
 | JST+recall vs fixed-interval RAG | 4 | Ship the primitive (the real decision) |
 | Stage B beats Stage A | 6 | Joint-train; else stay frozen |
