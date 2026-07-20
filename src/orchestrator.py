@@ -178,6 +178,8 @@ class PonderOrchestrator:
         latent_dynamics_head=None,
         ring_capacity: Optional[int] = None,
         context_builder=None,
+        strm_salience: bool = False,
+        salience_thresholds=None,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -227,6 +229,19 @@ class PonderOrchestrator:
         # crashes. ``None`` (default, flag off) -> heuristic PresentationGate
         # (byte-identical to pre-3).
         self.context_builder = context_builder
+        # STRM Phase 4 salience trigger (Step 4). When ``strm_salience`` is ON
+        # AND all three read-out heads (2a relevance, 2b recoverability, 2c
+        # latent-dynamics) are wired AND the ring is ON AND thresholds are
+        # loaded, the pre-retrieval hook (``_run_salience_hook``) scores every
+        # ring slot for salience and stashes the anchors here for Step 5
+        # (state-conditioned retrieval + pin-tagged re-inject) and Step 6
+        # (freshness watermark + stale-uncertain signal). ``strm_salience=False``
+        # (the default) -> the hook never runs -> ``_salience_anchors`` stays
+        # None -> byte-identical to pre-Step-4. Best-effort: any failure in the
+        # hook is swallowed (anchors stay None, the turn proceeds unchanged).
+        self.strm_salience = bool(strm_salience)
+        self.salience_thresholds = salience_thresholds
+        self._salience_anchors = None
         # Live-encode (2026-07-14): persist each exchange as an episode. The
         # encoder is injected (DI pattern, like retriever/mode_a/embedder) -- a
         # caller that wants live-encode constructs a ``HippocampalEncoder`` and
@@ -295,6 +310,62 @@ class PonderOrchestrator:
             # buffers (EXPAND-frequency signal) so they survive restarts.
             self.load_outcomes(user_id)
 
+    # ── STRM Phase 4 Step 4: salience trigger ──
+
+    def _salience_armed(self) -> bool:
+        """True iff the salience trigger has everything it needs to run: the
+        ``--strm-salience`` flag is on, all three read-out heads (2a relevance,
+        2b recoverability, 2c latent-dynamics) are wired, the thresholds sidecar
+        is loaded, and the ring is ON (salience reads ring slots). A missing
+        piece disarms the trigger -- the salience AND needs all three scores, so
+        a missing head means no anchor can be salient. Flag-off (the default)
+        disarms here so the query() seam skips the state capture + hook entirely
+        (byte-identical to pre-Step-4)."""
+        return (
+            self.strm_salience
+            and self.relevance_head is not None
+            and self.recoverability_head is not None
+            and self.latent_dynamics_head is not None
+            and self.salience_thresholds is not None
+            and self.working_memory.ring_capacity > 0
+        )
+
+    def _run_salience_hook(self, prompt_emb, prev_state_tensors) -> None:
+        """Score the WM ring for salience (state-conditioned, pre-retrieval).
+
+        Computes ``SalienceAnchor`` per ring slot and stashes them on
+        ``self._salience_anchors`` for Step 5 (state-conditioned retrieval +
+        pin-tagged re-inject) and Step 6 (freshness watermark + stale-uncertain
+        signal). Does NOT fire retrieval or change the result dict this step ->
+        flag-off (when the hook never runs) is byte-identical. Best-effort: any
+        failure is swallowed (``_salience_anchors`` stays ``None``, the turn
+        proceeds unchanged) -- a proactive-recall heuristic must never crash the
+        turn. Caller (``query``) only invokes this when ``_salience_armed``.
+        """
+        try:
+            ring_slots = self.working_memory.ring_buffer()
+            if not ring_slots:
+                self._salience_anchors = None
+                return
+            state_tensors = self.working_memory.state_tensors()
+            from src.subconscious.salience import compute_salience
+            self._salience_anchors = compute_salience(
+                ring_slots=ring_slots,
+                state_tensors=state_tensors,
+                prev_state_tensors=prev_state_tensors,
+                working_memory=self.working_memory,
+                relevance_head=self.relevance_head,
+                recoverability_head=self.recoverability_head,
+                latent_dynamics_head=self.latent_dynamics_head,
+                embedder=self.embedder,
+                query_emb=prompt_emb,
+                thresholds=self.salience_thresholds,
+            )
+        except Exception:
+            # A proactive-recall heuristic must never crash the turn. Swallow,
+            # leave no anchors, and the rest of query() proceeds unchanged.
+            self._salience_anchors = None
+
     # ── main entry ──
 
     def query(
@@ -342,11 +413,29 @@ class PonderOrchestrator:
         # early-return at the route gate below + the happy-path tail) so it never
         # leaks into the next query -- if a new return path is added, clear there.
         self._current_query = user_prompt
+        # STRM Phase 4 Step 4: salience trigger. If armed, capture the pre-step
+        # WM state (the 2c surprise term needs surprise(z_t, z_{t+1}) -> both
+        # states) BEFORE the query step mutates it. Flag-off (the default) skips
+        # the capture + the hook entirely -> byte-identical to pre-Step-4. Reset
+        # the per-turn anchor stash so a skipped/failed turn never leaks the
+        # previous turn's anchors.
+        salience_armed = self._salience_armed()
+        if not salience_armed:
+            self._salience_anchors = None
+        prev_state_tensors = None
+        if salience_armed and self.working_memory.state is not None:
+            prev_state_tensors = [t.clone() for t in self.working_memory.state_tensors()]
         # 1. embed prompt; update WM (state persists across queries).
         prompt_emb = self.working_memory.embed([user_prompt])[0]
         self.working_memory.update(prompt_emb)
         self.working_memory.set_metadata("last_query_type", self._classify_query(user_prompt))
         wm_snapshot = self.working_memory.snapshot()
+        # STRM Phase 4 Step 4: score the ring for salience (state-conditioned,
+        # pre-retrieval). Stashes anchors for Step 5/6; does NOT fire retrieval
+        # or change the result dict this step -> flag-off byte-identical.
+        # Best-effort: any failure leaves _salience_anchors None (no-op).
+        if salience_armed:
+            self._run_salience_hook(prompt_emb, prev_state_tensors)
 
         # 2. compress the prompt for planning (text ≤ bonsai_max_input). Done
         #    BEFORE routing/retrieval so Bonsai (the planner) never sees >2000

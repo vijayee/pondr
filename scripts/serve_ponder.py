@@ -193,6 +193,25 @@ def main() -> int:
                         "(completes the full serve-wiring of all STRM read-out "
                         "heads). Phase 4's LTM-promotion path consumes the "
                         "decision. DEFAULT OFF (byte-identical to pre-Phase-4).")
+    p.add_argument("--strm-salience", action="store_true",
+                   help="STRM Phase 4: arm the state-conditioned salience "
+                        "trigger. When armed, the orchestrator scores every WM "
+                        "ring slot for salience (recoverability < theta AND "
+                        "relevance > phi AND surprise < surprise_cap) BEFORE "
+                        "retrieval and stashes the anchors for the Step 5 "
+                        "state-conditioned re-inject. Requires --strm-relevance-"
+                        "head + --strm-recoverability-head + --strm-latent-"
+                        "dynamics-head + --strm-salience-thresholds + "
+                        "--strm-ring-capacity > 0; otherwise disarms (no-op, "
+                        "byte-identical). DEFAULT OFF. Flipping the default on "
+                        "waits for the deferred Step 7 long-horizon eval.")
+    p.add_argument("--strm-salience-thresholds", default=None,
+                   help="STRM Phase 4: the salience thresholds sidecar "
+                        "(thresholds.json from scripts/"
+                        "compute_salience_thresholds.py -- the theta/phi/"
+                        "surprise_cap percentiles on the 2b/2a/2c val "
+                        "distributions). Required when --strm-salience is set; "
+                        "without it the trigger disarms (byte-identical).")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -244,6 +263,28 @@ def main() -> int:
                   "relevance head is set. The orchestrator will fall back to "
                   "the heuristic PresentationGate. Pass --strm-relevance-head "
                   "PATH.", file=sys.stderr)
+    # STRM Phase 4 salience trigger: the salience AND needs all three read-out
+    # heads + the thresholds sidecar + the ring ON. Warn on any missing piece;
+    # the orchestrator's _salience_armed also disarms, so this is a warning
+    # (byte-identical to flag-off), not a hard error (matches the 2a/3 flag style).
+    if args.strm_salience:
+        missing = []
+        if not args.strm_relevance_head:
+            missing.append("--strm-relevance-head")
+        if not args.strm_recoverability_head:
+            missing.append("--strm-recoverability-head")
+        if not args.strm_latent_dynamics_head:
+            missing.append("--strm-latent-dynamics-head")
+        if not args.strm_salience_thresholds:
+            missing.append("--strm-salience-thresholds")
+        if args.strm_ring_capacity <= 0:
+            missing.append("--strm-ring-capacity > 0")
+        if missing:
+            print("WARNING: --strm-salience disarmed (missing: "
+                  + ", ".join(missing) + "). The salience AND needs all three "
+                  "read-out heads + the thresholds sidecar + the ring ON. The "
+                  "trigger stays off this run (byte-identical to flag-off).",
+                  file=sys.stderr)
 
     backbone_path = Path(args.backbone)
     if not backbone_path.exists():
@@ -293,6 +334,14 @@ def main() -> int:
                   f"{graduation_head_path}", file=sys.stderr)
             return 1
         graduation_head_path = str(graduation_head_path)
+    salience_thresholds_path = None
+    if args.strm_salience_thresholds:
+        salience_thresholds_path = Path(args.strm_salience_thresholds)
+        if not salience_thresholds_path.exists():
+            print(f"ERROR: STRM salience thresholds sidecar not found at "
+                  f"{salience_thresholds_path}", file=sys.stderr)
+            return 1
+        salience_thresholds_path = str(salience_thresholds_path)
 
     print(f"[load] backbone={backbone_path}", file=sys.stderr)
     print(f"[load] gate={gate_path}", file=sys.stderr)
@@ -309,7 +358,10 @@ def main() -> int:
           f"strm_context_builder={context_builder_path or '(off)'} "
           f"strm_recoverability_head={recoverability_head_path or '(off)'} "
           f"strm_latent_dynamics_head={latent_dynamics_head_path or '(off)'} "
-          f"strm_graduation_head={graduation_head_path or '(off)'}", file=sys.stderr)
+          f"strm_graduation_head={graduation_head_path or '(off)'} "
+          f"strm_salience={args.strm_salience} "
+          f"strm_salience_thresholds={salience_thresholds_path or '(off)'}",
+          file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -329,6 +381,8 @@ def main() -> int:
         latent_dynamics_head_path=latent_dynamics_head_path,
         ring_capacity=args.strm_ring_capacity,
         context_builder_path=context_builder_path,
+        strm_salience=args.strm_salience,
+        salience_thresholds_path=salience_thresholds_path,
     )
 
     try:

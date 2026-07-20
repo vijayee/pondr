@@ -69,6 +69,8 @@ def build_ponder(
     latent_dynamics_head_path: Optional[str] = None,
     ring_capacity: int = 0,
     context_builder_path: Optional[str] = None,
+    strm_salience: bool = False,
+    salience_thresholds_path: Optional[str] = None,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -272,6 +274,17 @@ def build_ponder(
         latent_dynamics_head = load_latent_dynamics_head(
             latent_dynamics_head_path, device=device)
 
+    # STRM Phase 4 salience thresholds (optional sidecar). The three gate
+    # thresholds (theta/phi/surprise_cap) are percentiles on the 2b/2a/2c val
+    # distributions, written by ``scripts/compute_salience_thresholds.py``.
+    # Loaded only when a path is given; ``strm_salience`` is OFF by default and
+    # the orchestrator's ``_salience_armed`` further requires all three heads +
+    # the ring ON, so a missing sidecar disarms the trigger (byte-identical).
+    salience_thresholds = None
+    if salience_thresholds_path:
+        from .subconscious.salience import load_salience_thresholds
+        salience_thresholds = load_salience_thresholds(salience_thresholds_path)
+
     orch = PonderOrchestrator(
         store=store,
         retriever=retriever,
@@ -288,6 +301,8 @@ def build_ponder(
         latent_dynamics_head=latent_dynamics_head,
         ring_capacity=ring_capacity,
         context_builder=context_builder,
+        strm_salience=strm_salience,
+        salience_thresholds=salience_thresholds,
     )
     return orch
 
