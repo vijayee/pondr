@@ -294,10 +294,12 @@ How context reaches the consumer today, so JST's outputs land in the right place
   pulling detail on a gist it was shown; JST's relevance head decides which gists
   to show uncompressed in the first place. JST does not remove the tools — it
   reduces how often the LLM needs them.
-- **`record_feedback` is a free label source for the relevance head.** The 1-5
-  per-unit ratings the LLM already emits are exactly the query-anchor relevance
-  labels §6.2 needs. No new labeling pipeline for that head — mine the existing
-  feedback log.
+- **`record_feedback` could label the relevance head — but the raw ratings
+  aren't logged today.** The 1-5 per-unit judgments are reduced to a compounded
+  boost multiplier at `content/unit_boost/{unit_id}` (`store.py:707-749`); only
+  the multiplier survives, not the rating. Phase 2a adds a raw-rating JSONL tap
+  before the reduction so the relevance head can train on real labels; until
+  then, synthetic labels.
 
 `prompt_compress._wm_preamble` / `compress_prompt_for_planning`
 (`prompt_compress.py:97-174`) is a *separate, earlier* compression for the
@@ -393,10 +395,14 @@ suffices in practice.
   collapse the latent. Objective: minimize `‖g(z_t) − sg(EMA(z_{t+k}))‖` + collapse
   penalty. This is the one head where skimping on JEPA machinery will fail — a
   naive MSE predictor collapses to the mean. Do not under-build this one.
-- **Relevance head** — supervised on query-anchor pairs. Labels are already
-  being generated: the `record_feedback` tool (`tools.py:44-72`) has the LLM
-  rate each cited context unit 1-5 after answering, and that log is mined for
-  per-slot relevance labels. No new labeling pipeline for this head.
+- **Relevance head** — supervised on query-anchor pairs. The `record_feedback`
+  tool (`tools.py:44-72`) has the LLM rate each cited unit 1-5, but today those
+  ratings are reduced to a compounded boost multiplier (`store.record_feedback`,
+  `store.py:707-749`) and the **raw 1-5 judgments are not persisted** — only the
+  multiplier at `content/unit_boost/{unit_id}` survives. So Phase 2a must add a
+  raw-rating JSONL tap (write `{unit_id, rating, query, slot}` *before* the
+  reduction) before this head can train on real labels; until then, fall back to
+  synthetic labels à la `scripts/generate_jepa_training_data.py`.
 - **Graduation head** — supervised on "would this fact have been useful later?"
   labels, derivable from replay: replay a stream, mark which compressed-out facts
   were later needed (i.e., would have triggered a salience recall), train the
