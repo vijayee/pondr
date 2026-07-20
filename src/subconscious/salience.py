@@ -129,6 +129,25 @@ class SalienceAnchor:
     surprise_i: Optional[float]     # per-turn transition surprise; high = suppress
     age: int                        # ring-position proxy (0 = newest); refined in Step 6
     salient: bool
+    # The 384-d bge doc vector (re-embedded slot text) used as the 2b anchor AND
+    # the Step 5 retrieval query (state-conditioned: this anchor only fires
+    # because the state flagged it as being-forgotten). None for unscoreable
+    # slots (no text) -- and those are never salient, so a salient anchor always
+    # carries one. NOT the turn-level z_t projection: project(state_tensors) is
+    # one vector per turn, so per-anchor retrievals on it would be identical
+    # (dedup would collapse them and the budget cap would be theater). The
+    # anchor's own doc vector gives per-anchor diversity (different forgotten
+    # anchors recall different LTM episodes) -- the deferred Step 7 eval decides
+    # whether this state-conditioned query shape beats fixed-interval RAG.
+    doc_emb: Optional[Tensor] = None
+
+
+# Step 5 budget cap: at most this many salience-fired retrievals per turn (the
+# proactive-recall budget). A proactive recall should fire rarely -- the salience
+# AND is already selective, and this caps the worst-case per-turn retrieval
+# blast. The deferred Step 7 eval measures the actual per-turn count (surfaced
+# in the result dict) to tune this against fixed-interval RAG at equal budget.
+SALIENCE_RETRIEVAL_BUDGET = 3
 
 
 def _decide_salience(
@@ -243,6 +262,7 @@ def compute_salience(
             surprise_i=surprise_i,
             age=age,
             salient=salient,
+            doc_emb=doc_embs[i],
         ))
     return anchors
 

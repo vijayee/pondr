@@ -84,6 +84,21 @@ class WavedbVectorStore:
         # match VectorSearch's contract + the retriever's reverse=True sort.
         return [(r.id_str, 1.0 - float(r.distance)) for r in results]
 
+    def search_by_vector(self, vec: list[float], k: int = 5) -> list[tuple[str, float]]:
+        """Nearest episodes to a PRE-COMPUTED ``vec`` (no re-embed), best first.
+
+        STRM Phase 4 Step 5: the salience trigger fires retrieval with a
+        state-conditioned query (the anchor's 384-d doc vector), not a text
+        prompt, so the embed step is skipped. Same distance->similarity
+        conversion + empty-when-no-layer contract as ``search``.
+        """
+        vl = getattr(self.store, "vector_layer", None)
+        if vl is None:
+            return []
+        vec = [float(x) for x in vec]
+        results = vl.search_sync(vec, k)
+        return [(r.id_str, 1.0 - float(r.distance)) for r in results]
+
     # ── API-parity no-ops (the index is maintained live by the store) ──
 
     def build_index(self) -> int:

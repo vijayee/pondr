@@ -176,6 +176,58 @@ class HippocampalRetriever:
         """
         return self.traversal.retrieve(query_plan, signal=signal)
 
+    def retrieve_by_embedding(
+        self,
+        query_emb,
+        signal: str = "routine",
+        limit: Optional[int] = None,
+    ) -> list[dict]:
+        """Vector search with a PRE-COMPUTED query embedding (no text re-embed).
+
+        STRM Phase 4 Step 5: the salience trigger fires state-conditioned
+        retrieval -- the query is the salient anchor's 384-d doc vector (the
+        episode the WM state flagged as being-forgotten), NOT the prompt text.
+        Reuses the same vector index the ``use_semantic`` fallback uses, hydrates
+        hits into episode dicts in the same shape as ``retrieve`` (with the same
+        0.5 score discount so prompt-driven graph matches rank higher), and
+        applies the per-unit feedback boost. ``[]`` when no vector index is
+        configured (no-op -- byte-identical to a no-salience turn).
+
+        Args:
+            query_emb: ``[384]`` / ``[1,384]`` tensor or list[float] -- the
+                state-conditioned query (a bge-space 384-d vector).
+            signal: the caller's affective/task signal, threaded to the
+                retrieval-boost hook (same as ``retrieve``).
+            limit: max hits (defaults to ``config.default_retrieval_limit``).
+        """
+        if self.vector_search is None:
+            return []
+        # Tensor -> flat list[float] (the C/Python search backends take a 1-D
+        # list). Accept [384] or [1,384] (the anchor doc_emb is [1,384]) by
+        # flattening to 1-D first.
+        if hasattr(query_emb, "detach"):
+            import torch  # local: only needed for the tensor->list conversion
+            v = query_emb.detach().cpu().to(torch.float32).reshape(-1)
+            vec = [float(x) for x in v.tolist()]
+        else:
+            try:
+                vec = [float(x) for x in query_emb]
+            except (TypeError, ValueError):
+                return []
+        if not vec:
+            return []
+        k = limit if limit is not None else config.default_retrieval_limit
+        hits = self.vector_search.search_by_vector(vec, k=k)
+        out: list[dict] = []
+        for eid, sim in hits:
+            ep = self.traversal._hydrate(eid)
+            ep["score"] = sim * 0.5  # discount so graph matches rank higher
+            out.append(ep)
+        # Same boost path as the semantic fallback so no scored result bypasses
+        # the per-unit feedback boost.
+        self.traversal._apply_unit_boost(out)
+        return out
+
     # ── Phase 2b: subconscious routing ──
 
     def retrieve_with_routing(

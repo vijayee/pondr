@@ -224,6 +224,23 @@ class VectorSearch:
         if not self._ids:
             return []
         qvec = _l2_normalize(self._embed([query])[0])
+        return self._search_normalized(qvec, k)
+
+    def search_by_vector(self, vec: list[float], k: int = 5) -> list[tuple[str, float]]:
+        """Nearest episodes to a PRE-COMPUTED ``vec`` (no re-embed), best first.
+
+        STRM Phase 4 Step 5: the salience trigger fires retrieval with a
+        state-conditioned query (the anchor's 384-d doc vector), not a text
+        prompt. ``vec`` is L2-normalized here (the index stores normalized
+        vectors so cosine = inner product). Empty when no index is loaded.
+        """
+        if not self._ids:
+            return []
+        qvec = _l2_normalize([float(x) for x in vec])
+        return self._search_normalized(qvec, k)
+
+    def _search_normalized(self, qvec: list[float], k: int) -> list[tuple[str, float]]:
+        """Shared nearest-neighbor core for ``search`` / ``search_by_vector``."""
         if self._faiss_index is not None:
             import faiss  # type: ignore
             import numpy as np  # type: ignore

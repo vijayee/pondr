@@ -242,6 +242,13 @@ class PonderOrchestrator:
         self.strm_salience = bool(strm_salience)
         self.salience_thresholds = salience_thresholds
         self._salience_anchors = None
+        # Step 5: episodes the salience trigger proactively recalled from LTM
+        # (state-conditioned, pin-tagged re-inject). Reset to None each turn;
+        # merged into the prompt-driven ``episodes`` (salience first, dedup by
+        # episode_id) and injected with ``pin=True`` so W_A retains them. None
+        # when the trigger is off / disarmed / failed -> no merge -> byte-
+        # identical to pre-Step-5.
+        self._salience_fired_episodes: Optional[list] = None
         # Live-encode (2026-07-14): persist each exchange as an episode. The
         # encoder is injected (DI pattern, like retriever/mode_a/embedder) -- a
         # caller that wants live-encode constructs a ``HippocampalEncoder`` and
@@ -330,25 +337,38 @@ class PonderOrchestrator:
             and self.working_memory.ring_capacity > 0
         )
 
-    def _run_salience_hook(self, prompt_emb, prev_state_tensors) -> None:
-        """Score the WM ring for salience (state-conditioned, pre-retrieval).
+    def _run_salience_hook(self, prompt_emb, prev_state_tensors, signal: str) -> None:
+        """Score the WM ring for salience + fire state-conditioned retrieval.
 
-        Computes ``SalienceAnchor`` per ring slot and stashes them on
-        ``self._salience_anchors`` for Step 5 (state-conditioned retrieval +
-        pin-tagged re-inject) and Step 6 (freshness watermark + stale-uncertain
-        signal). Does NOT fire retrieval or change the result dict this step ->
-        flag-off (when the hook never runs) is byte-identical. Best-effort: any
-        failure is swallowed (``_salience_anchors`` stays ``None``, the turn
-        proceeds unchanged) -- a proactive-recall heuristic must never crash the
-        turn. Caller (``query``) only invokes this when ``_salience_armed``.
+        Step 4: compute ``SalienceAnchor`` per ring slot and stash on
+        ``self._salience_anchors`` (for Step 6's freshness watermark).
+        Step 5: for each SALIENT anchor (budget-capped), fire
+        ``retrieve_by_embedding`` with the anchor's 384-d doc vector as the
+        state-conditioned query (the episode the WM state flagged as being-
+        forgotten), dedup by ``episode_id``, and stash the merged list on
+        ``self._salience_fired_episodes`` -- the caller merges it into the
+        prompt-driven ``episodes`` (salience first) and injects with
+        ``pin=True`` so ``W_A`` retains the proactive recall.
+
+        Flag-off (when the hook never runs) is byte-identical: no anchors, no
+        fired episodes, no merge. Best-effort: any failure is swallowed
+        (``_salience_anchors`` AND ``_salience_fired_episodes`` stay ``None``,
+        the turn proceeds unchanged) -- a proactive-recall heuristic must never
+        crash the turn. Caller (``query``) only invokes this when
+        ``_salience_armed``.
         """
         try:
             ring_slots = self.working_memory.ring_buffer()
             if not ring_slots:
                 self._salience_anchors = None
+                self._salience_fired_episodes = None
                 return
             state_tensors = self.working_memory.state_tensors()
-            from src.subconscious.salience import compute_salience
+            from src.subconscious.salience import (
+                compute_salience,
+                salient_anchors,
+                SALIENCE_RETRIEVAL_BUDGET,
+            )
             self._salience_anchors = compute_salience(
                 ring_slots=ring_slots,
                 state_tensors=state_tensors,
@@ -361,10 +381,31 @@ class PonderOrchestrator:
                 query_emb=prompt_emb,
                 thresholds=self.salience_thresholds,
             )
+            # Step 5: fire state-conditioned retrieval per salient anchor.
+            fired: list[dict] = []
+            seen_ids: set = set()
+            for anchor in salient_anchors(self._salience_anchors)[:SALIENCE_RETRIEVAL_BUDGET]:
+                if anchor.doc_emb is None or self.retriever is None:
+                    continue
+                try:
+                    hits = self.retriever.retrieve_by_embedding(
+                        anchor.doc_emb, signal=signal,
+                    )
+                except Exception:  # noqa: BLE001 - per-anchor best-effort
+                    continue
+                for ep in hits:
+                    eid = ep.get("episode_id")
+                    if eid is None or eid in seen_ids:
+                        continue
+                    seen_ids.add(eid)
+                    fired.append(ep)
+            self._salience_fired_episodes = fired
         except Exception:
             # A proactive-recall heuristic must never crash the turn. Swallow,
-            # leave no anchors, and the rest of query() proceeds unchanged.
+            # leave no anchors + no fired episodes, and the rest of query()
+            # proceeds unchanged.
             self._salience_anchors = None
+            self._salience_fired_episodes = None
 
     # ── main entry ──
 
@@ -413,15 +454,16 @@ class PonderOrchestrator:
         # early-return at the route gate below + the happy-path tail) so it never
         # leaks into the next query -- if a new return path is added, clear there.
         self._current_query = user_prompt
-        # STRM Phase 4 Step 4: salience trigger. If armed, capture the pre-step
+        # STRM Phase 4 Step 4/5: salience trigger. If armed, capture the pre-step
         # WM state (the 2c surprise term needs surprise(z_t, z_{t+1}) -> both
         # states) BEFORE the query step mutates it. Flag-off (the default) skips
         # the capture + the hook entirely -> byte-identical to pre-Step-4. Reset
-        # the per-turn anchor stash so a skipped/failed turn never leaks the
-        # previous turn's anchors.
+        # the per-turn stashes so a skipped/failed turn never leaks the previous
+        # turn's anchors / fired episodes.
         salience_armed = self._salience_armed()
         if not salience_armed:
             self._salience_anchors = None
+            self._salience_fired_episodes = None
         prev_state_tensors = None
         if salience_armed and self.working_memory.state is not None:
             prev_state_tensors = [t.clone() for t in self.working_memory.state_tensors()]
@@ -430,12 +472,14 @@ class PonderOrchestrator:
         self.working_memory.update(prompt_emb)
         self.working_memory.set_metadata("last_query_type", self._classify_query(user_prompt))
         wm_snapshot = self.working_memory.snapshot()
-        # STRM Phase 4 Step 4: score the ring for salience (state-conditioned,
-        # pre-retrieval). Stashes anchors for Step 5/6; does NOT fire retrieval
-        # or change the result dict this step -> flag-off byte-identical.
-        # Best-effort: any failure leaves _salience_anchors None (no-op).
+        # STRM Phase 4 Step 4/5: score the ring for salience (state-conditioned,
+        # pre-retrieval) AND fire state-conditioned retrieval per salient anchor
+        # (budget-capped, dedup by episode_id). Stashes anchors (Step 6) + fired
+        # episodes (merged into the prompt-driven set below, pin-tagged re-
+        # inject). Best-effort: any failure leaves both stashes None (no-op) ->
+        # flag-off byte-identical.
         if salience_armed:
-            self._run_salience_hook(prompt_emb, prev_state_tensors)
+            self._run_salience_hook(prompt_emb, prev_state_tensors, signal)
 
         # 2. compress the prompt for planning (text ≤ bonsai_max_input). Done
         #    BEFORE routing/retrieval so Bonsai (the planner) never sees >2000
@@ -472,12 +516,34 @@ class PonderOrchestrator:
                     "working_memory_state": self.working_memory.snapshot(),
                     "presentation_plan": None, "end_state_plan": None,
                     "supported": False,
+                    # Armed-only (see the happy-path augmentation): the
+                    # salience hook ran before this route gate, so report its
+                    # retrieval count even on the unsupported-route early return
+                    # for a consistent budget contract. Absent when off.
+                    **({"salience_retrieval_count": len(self._salience_fired_episodes or [])}
+                       if salience_armed else {}),
                 }
             episodes = routing_result.get("results", [])
         else:
             episodes = self.retriever.retrieve(
                 plan_prompt, conversation_history=conversation_history, signal=signal,
             )
+
+        # STRM Phase 4 Step 5: merge salience-fired episodes (state-conditioned
+        # proactive recall) into the prompt-driven set. Salience first, dedup by
+        # episode_id -- a salience-fired episode already in the prompt-driven set
+        # is kept in its salience position (and pin-tagged on inject); the
+        # prompt-driven duplicate is dropped so the same episode is not injected
+        # twice. Flag-off / disarmed / failed -> ``_salience_fired_episodes`` is
+        # None -> ``salience_fired_ids`` stays empty -> no merge -> byte-
+        # identical to pre-Step-5.
+        salience_fired_ids: set = set()
+        if self._salience_fired_episodes:
+            fired = [ep for ep in self._salience_fired_episodes
+                     if ep.get("episode_id") is not None]
+            salience_fired_ids = {ep["episode_id"] for ep in fired}
+            episodes = fired + [ep for ep in episodes
+                                if ep.get("episode_id") not in salience_fired_ids]
 
         # 4. inject each retrieved episode into WM as a gist step.
         if episodes and self.embedder is not None:
@@ -490,10 +556,18 @@ class PonderOrchestrator:
             # if its source_id re-appears after a ring gap). When the ring is OFF
             # (the default) provenance is ignored, so this is byte-identical to
             # the pre-2d path.
+            # STRM Phase 4 Step 5: salience-fired episodes (state-conditioned
+            # proactive recall) inject with ``pin=True`` so W_A retains them
+            # over the next K steps; prompt-driven episodes inject with
+            # ``pin=False`` (unchanged). ``salience_fired_ids`` is empty when the
+            # trigger is off / disarmed / failed -> every inject pin=False ->
+            # byte-identical to pre-Step-5. Pin is itself gated on ring_capacity
+            # > 0 (Step 3), which holds whenever salience is armed.
             for emb, ep in zip(embs, episodes):
                 self.working_memory.inject(
                     emb, source_id=ep.get("episode_id"),
                     text=ep.get("summary", "") or ep.get("text", ""),
+                    pin=(ep.get("episode_id") in salience_fired_ids),
                 )
             self.working_memory.set_metadata(
                 "active_domains", sorted({d for e in episodes for d in e.get("topics", [])})[:5]
@@ -658,6 +732,13 @@ class PonderOrchestrator:
         result["presentation_plan"] = presentation_plan
         result["end_state_plan"] = end_state_plan
         result["supported"] = result.get("supported", True)
+        # STRM Phase 4 Step 5: surface the per-turn salience-fired retrieval
+        # count so the deferred Step 7 eval can measure the proactive-recall
+        # budget against fixed-interval RAG at equal budget WITHOUT re-
+        # instrumenting. Armed-only -> the key is ABSENT when the flag is off
+        # (byte-identical result dict to pre-Step-5).
+        if salience_armed:
+            result["salience_retrieval_count"] = len(self._salience_fired_episodes or [])
 
         # Phase 3a Task 7: auto-record the presentation outcome with the
         # MEASURED expand_count (the durable salience signal from 2c §15).
