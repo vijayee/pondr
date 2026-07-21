@@ -173,8 +173,65 @@ def _percentile(values: list[float], q: float) -> float:
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
+def _build_serve_trace(slots, emit_idx, out_slots, query_emb, user_text,
+                       ld_head) -> Optional[dict]:
+    """Build ONE ``fit_relevance``-format trace record from the scored ring slots
+    of a single serve turn -- for retraining the z-head on SERVE-distribution
+    data (task #38: the z-head trained on ERAG candidate traces failed the SERVE
+    gate ([[pondr-strm-task33-gate-train-go-serve-fail]]) because the train/serve
+    z_i distribution differs; this emits the serve distribution so the retrained
+    head sees the SAME persistent-state z_i + recalled-episode slots the SERVE
+    gate scores).
+
+    For each text-bearing slot ``i`` in ``emit_idx`` (the slots that made it into
+    ``out_slots``): ``slots_z[i] = ld_head.project(slots[i].h).squeeze(0)`` [384]
+    -- the z_i the ZRelevanceHead is trained on. ``ld_head.project`` is
+    parameter-free, so an UNTRAINED ``LatentDynamicsHead`` here matches the
+    generator's ``slots_z`` and the trainer's ``z_from_states`` exactly (the
+    same train/serve z_i identity the ``--identity-instance`` flag pins).
+    ``slots_y[i] = slots[i].y`` [256] -- ``ZRelevanceHead`` ignores ``slot_y``
+    but ``fit_relevance`` requires the field. ``query_emb`` = bge(user_text).
+
+    The LABEL is the bge cosine between the slot text and this turn's query --
+    the SAME signal the SERVE gate's probe/filler split uses (the probe turn =
+    max-cos turn per source). The top-1-cos slot is gold (1), the rest negative
+    (0); the continuous cos is also stored under ``cos`` for an optional
+    multi-positive / regression variant. Turns with <3 text-bearing slots are
+    skipped (top-3 recall is degenerate when K<3). Returns None when skipped."""
+    K = len(emit_idx)
+    if K < 3 or ld_head is None:
+        return None
+    # Drop any text-bearing slot whose Phase-A state capture (slot.h) is missing
+    # -- the probe's own z-scoring guards this (``getattr(slots[i], "h", None)``);
+    # a None here would be a Phase A regression, so skip the slot rather than
+    # crash. Keeps slots_z / slots_y / labels / cos / source_ids aligned.
+    kept = [(j, i) for j, i in enumerate(range(K))  # j = out_slots idx, i = emit_idx[j]
+            if getattr(slots[emit_idx[i]], "h", None) is not None]
+    if len(kept) < 3:
+        return None
+    cos_vals = torch.tensor([out_slots[j]["cos"] for j, _ in kept],
+                            dtype=torch.float32)              # [K']
+    labels = torch.zeros(len(kept), dtype=torch.float32)
+    labels[int(cos_vals.argmax().item())] = 1.0               # top-1-cos = gold
+    slots_z = torch.stack([
+        ld_head.project(slots[emit_idx[i]].h).squeeze(0).to(torch.float32)
+        for _, i in kept
+    ])                                                        # [K', 384]
+    slots_y = torch.stack([
+        slots[emit_idx[i]].y.to(torch.float32).squeeze(0).reshape(-1)
+        for _, i in kept
+    ])                                                        # [K', 256]
+    return {
+        "query_emb": query_emb.to(torch.float32).squeeze(0).reshape(-1),  # [384]
+        "slots_y": slots_y, "slots_z": slots_z, "labels": labels,
+        "source_ids": [out_slots[j]["source_id"] for j, _ in kept],
+        "question": user_text, "cos": cos_vals,
+    }
+
+
 def _capture_turn(orch: PonderOrchestrator, user_text: str,
-                  context_builder=None, z_head=None, ld_head=None) -> dict:
+                  context_builder=None, z_head=None, ld_head=None,
+                  emit_trace: bool = False, ld_head_for_emit=None) -> dict:
     """Score the current WM ring against this turn's query. Returns one record:
     ``{user_text, slots: [{source_id, text, r_i, logit, s_i, s_i_pure, z_r,
     z_logit, cos}]}`` where ``cos`` is the bge cosine between the slot text and
@@ -194,8 +251,9 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
         slots, context_builder=context_builder, z_head=z_head, ld_head=ld_head)
     # Embed each scored slot's text once for the cosine probe/filler label.
     out_slots = []
-    for s, r, lg, si, sip, zlg, zr in zip(slots, r_is, logits, s_is, s_is_pure,
-                                          z_logits, z_rs):
+    emit_idx: list[int] = []
+    for i, (s, r, lg, si, sip, zlg, zr) in enumerate(zip(
+            slots, r_is, logits, s_is, s_is_pure, z_logits, z_rs)):
         if r is None or not s.text:
             continue
         slot_emb = orch.working_memory.embed([s.text])[0]
@@ -215,7 +273,17 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
         if zr is not None:
             rec["z_r"] = zr
         out_slots.append(rec)
-    return {"user_text": user_text, "slots": out_slots}
+        emit_idx.append(i)
+    out = {"user_text": user_text, "slots": out_slots}
+    # Task #38: when emitting serve-distribution training traces, attach the
+    # fit_relevance-format record built from this turn's ring. ``_analyze`` does
+    # not read ``_trace``, so the probe's measurement path is unaffected; the
+    # key is present ONLY when ``emit_trace`` is set (default off -> byte-
+    # identical to the prior probe output).
+    if emit_trace:
+        out["_trace"] = _build_serve_trace(slots, emit_idx, out_slots, prompt_emb,
+                                           user_text, ld_head_for_emit)
+    return out
 
 
 def _score_ring_with_logits(working_memory, relevance_head, embedder,
@@ -348,6 +416,7 @@ def replay_and_capture(
     context_builder_path: Optional[str] = None,
     z_relevance_head_path: Optional[str] = None,
     identity_instance: bool = False,
+    emit_traces: Optional[str] = None,
 ) -> tuple[list[dict], dict]:
     """Replay every transcript turn through the orchestrator and capture per-
     turn per-slot r_i (and, when a ContextBuilder checkpoint is supplied, the
@@ -397,6 +466,18 @@ def replay_and_capture(
         elif z_relevance_head_path:
             print(f"[probe] ZRelevanceHead checkpoint not found at "
                   f"{z_relevance_head_path} -- z capture skipped.", file=sys.stderr)
+        # Task #38: an untrained LatentDynamicsHead for EMITTING serve-distribution
+        # training traces (project is parameter-free, so this matches the
+        # generator/trainer z_i exactly). Independent of z_head -- emit uses the
+        # raw z_i, z_head scoring uses z_head.logits. Created only when
+        # emit_traces is set; None otherwise (the probe path is byte-identical).
+        ld_head_for_emit: Optional[LatentDynamicsHead] = None
+        if emit_traces:
+            ld_head_for_emit = LatentDynamicsHead()
+            print(f"[probe] emit-traces ON -> {emit_traces} (capturing per-turn "
+                  f"slots_z + slots_y + top-1-cos labels for z-head retrain)",
+                  flush=True)
+        trace_records: list[dict] = []
         # Salience arming needs all three heads + thresholds (``_salience_armed``
         # in the orchestrator). OFF (the default) measures the head alone on the
         # prompt-driven recalled slots; permissive/real arm the trigger so
@@ -470,7 +551,15 @@ def replay_and_capture(
                 # from the user text (deterministic -- same embed call query()
                 # uses internally).
                 rec = _capture_turn(orch, u, context_builder=context_builder,
-                                    z_head=z_head, ld_head=ld_head_for_z)
+                                    z_head=z_head, ld_head=ld_head_for_z,
+                                    emit_trace=emit_traces is not None,
+                                    ld_head_for_emit=ld_head_for_emit)
+                if emit_traces:
+                    # Pop the trace BEFORE the record enters turn_records so
+                    # _analyze (the measurement path) never sees it.
+                    trace_rec = rec.pop("_trace", None)
+                    if trace_rec is not None:
+                        trace_records.append(trace_rec)
                 rec["session_id"] = session_id
                 rec["turn_index"] = i
                 turn_records.append(rec)
@@ -490,12 +579,20 @@ def replay_and_capture(
                           f"(encoded={total_encoded} skipped={total_skipped})",
                           flush=True)
             epoch_base += 1e6
+        if emit_traces:
+            emit_path = Path(emit_traces)
+            emit_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(trace_records, emit_path)
+            print(f"[probe] wrote {len(trace_records)} serve-distribution trace "
+                  f"records -> {emit_path}", flush=True)
         run_stats = {
             "n_turns": total_queries, "n_encoded": total_encoded,
             "n_skipped": total_skipped, "ring_capacity": ring_capacity,
             "salience": salience, "device": device,
             "context_builder": context_builder is not None,
             "z_relevance_head": z_head is not None,
+            "emit_traces": emit_traces,
+            "n_trace_records": len(trace_records) if emit_traces else None,
         }
         return turn_records, run_stats
     finally:
@@ -714,6 +811,15 @@ def _main() -> int:
                         "under that path (the new from-scratch ckpt) so the SERVE gate "
                         "measures the SAME path the z-head was trained on. Default off "
                         "-> random instance projections (byte-identical to pre-task-#33).")
+    p.add_argument("--emit-traces", default="",
+                   help="Task #38: write a fit_relevance-format trace file "
+                        "(per-turn slots_z + slots_y + top-1-cos labels) for "
+                        "retraining the z-head on SERVE-distribution data. The "
+                        "trace generator IS this probe's exact replay path "
+                        "(persistent WM + recalled-episode ring), so train/serve "
+                        "distributions match by construction. Use with "
+                        "--identity-instance + --backbone <new from-scratch ckpt>. "
+                        "Default '' -> off, byte-identical to the prior probe.")
     args = p.parse_args()
 
     if not Path(args.backbone).exists():
@@ -747,7 +853,8 @@ def _main() -> int:
         ld_head_path=args.latent_dynamics_head, ablate_yt=args.ablate_yt,
         context_builder_path=args.context_builder or None,
         z_relevance_head_path=args.z_relevance_head or None,
-        identity_instance=args.identity_instance)
+        identity_instance=args.identity_instance,
+        emit_traces=args.emit_traces or None)
     analysis = _analyze(turn_records)
     report = {"run": run_stats, **analysis, "n_turn_records": len(turn_records)}
 
