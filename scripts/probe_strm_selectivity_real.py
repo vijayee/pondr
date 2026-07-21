@@ -173,8 +173,8 @@ def _percentile(values: list[float], q: float) -> float:
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
-def _build_serve_trace(slots, emit_idx, out_slots, query_emb, user_text,
-                       ld_head) -> Optional[dict]:
+def _build_serve_trace(slots, emit_idx, out_slots, emit_embs, query_emb,
+                       user_text, ld_head, emit_raw_state: bool = False) -> Optional[dict]:
     """Build ONE ``fit_relevance``-format trace record from the scored ring slots
     of a single serve turn -- for retraining the z-head on SERVE-distribution
     data (task #38: the z-head trained on ERAG candidate traces failed the SERVE
@@ -191,13 +191,20 @@ def _build_serve_trace(slots, emit_idx, out_slots, query_emb, user_text,
     same train/serve z_i identity the ``--identity-instance`` flag pins).
     ``slots_y[i] = slots[i].y`` [256] -- ``ZRelevanceHead`` ignores ``slot_y``
     but ``fit_relevance`` requires the field. ``query_emb`` = bge(user_text).
+    ``slots_doc_emb[i] = emit_embs[j]`` [384] -- the bge of the slot's text (the
+    doc baseline for the across-slot std normalizer + the bge top-3 baseline).
 
     The LABEL is the bge cosine between the slot text and this turn's query --
     the SAME signal the SERVE gate's probe/filler split uses (the probe turn =
     max-cos turn per source). The top-1-cos slot is gold (1), the rest negative
     (0); the continuous cos is also stored under ``cos`` for an optional
     multi-positive / regression variant. Turns with <3 text-bearing slots are
-    skipped (top-3 recall is degenerate when K<3). Returns None when skipped."""
+    skipped (top-3 recall is degenerate when K<3). Returns None when skipped.
+
+    ``emit_raw_state`` (task #39): also store ``slots_h_raw`` [K',4,16,384] fp16
+    -- the raw per-layer SSM state per slot, the material for the Phase-0a-style
+    serve-state representation probe (z_chan_last / z_flat_last / z_flat_all vs
+    the mean-pool z_mean_last). fp16 keeps it small (~78KB/slot-turn)."""
     K = len(emit_idx)
     if K < 3 or ld_head is None:
         return None
@@ -221,17 +228,35 @@ def _build_serve_trace(slots, emit_idx, out_slots, query_emb, user_text,
         slots[emit_idx[i]].y.to(torch.float32).squeeze(0).reshape(-1)
         for _, i in kept
     ])                                                        # [K', 256]
-    return {
+    slots_doc_emb = torch.stack([
+        emit_embs[j].to(torch.float32).squeeze(0).reshape(-1)
+        for j, _ in kept
+    ])                                                        # [K', 384]
+    rec = {
         "query_emb": query_emb.to(torch.float32).squeeze(0).reshape(-1),  # [384]
         "slots_y": slots_y, "slots_z": slots_z, "labels": labels,
         "source_ids": [out_slots[j]["source_id"] for j, _ in kept],
         "question": user_text, "cos": cos_vals,
+        "slots_doc_emb": slots_doc_emb,
     }
+    if emit_raw_state:
+        # Per-slot per-layer state [4,16,384] fp16. slot.h is a list of 4
+        # per-layer tensors; reshape(16,384) handles both [1,16,384] and
+        # [16,384] storage (6144 elements either way).
+        rec["slots_h_raw"] = torch.stack([
+            torch.stack([
+                layer.detach().to("cpu").to(torch.float16).reshape(16, 384)
+                for layer in slots[emit_idx[i]].h
+            ])
+            for _, i in kept
+        ])                                                    # [K',4,16,384] fp16
+    return rec
 
 
 def _capture_turn(orch: PonderOrchestrator, user_text: str,
                   context_builder=None, z_head=None, ld_head=None,
-                  emit_trace: bool = False, ld_head_for_emit=None) -> dict:
+                  emit_trace: bool = False, ld_head_for_emit=None,
+                  emit_raw_state: bool = False) -> dict:
     """Score the current WM ring against this turn's query. Returns one record:
     ``{user_text, slots: [{source_id, text, r_i, logit, s_i, s_i_pure, z_r,
     z_logit, cos}]}`` where ``cos`` is the bge cosine between the slot text and
@@ -252,6 +277,7 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
     # Embed each scored slot's text once for the cosine probe/filler label.
     out_slots = []
     emit_idx: list[int] = []
+    emit_embs: list = []  # slot text bge, aligned with out_slots (task #39 doc baseline)
     for i, (s, r, lg, si, sip, zlg, zr) in enumerate(zip(
             slots, r_is, logits, s_is, s_is_pure, z_logits, z_rs)):
         if r is None or not s.text:
@@ -274,15 +300,20 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
             rec["z_r"] = zr
         out_slots.append(rec)
         emit_idx.append(i)
+        emit_embs.append(slot_emb)
     out = {"user_text": user_text, "slots": out_slots}
     # Task #38: when emitting serve-distribution training traces, attach the
     # fit_relevance-format record built from this turn's ring. ``_analyze`` does
     # not read ``_trace``, so the probe's measurement path is unaffected; the
     # key is present ONLY when ``emit_trace`` is set (default off -> byte-
-    # identical to the prior probe output).
+    # identical to the prior probe output). Task #39: ``emit_raw_state`` also
+    # stores the per-slot per-layer SSM state (``slots_h_raw``) so the offline
+    # serve-state representation probe can compute z_chan_last / z_flat_last /
+    # z_flat_all -- still only when ``emit_trace`` is set.
     if emit_trace:
-        out["_trace"] = _build_serve_trace(slots, emit_idx, out_slots, prompt_emb,
-                                           user_text, ld_head_for_emit)
+        out["_trace"] = _build_serve_trace(slots, emit_idx, out_slots, emit_embs,
+                                           prompt_emb, user_text, ld_head_for_emit,
+                                           emit_raw_state=emit_raw_state)
     return out
 
 
@@ -417,6 +448,7 @@ def replay_and_capture(
     z_relevance_head_path: Optional[str] = None,
     identity_instance: bool = False,
     emit_traces: Optional[str] = None,
+    emit_raw_state: bool = False,
 ) -> tuple[list[dict], dict]:
     """Replay every transcript turn through the orchestrator and capture per-
     turn per-slot r_i (and, when a ContextBuilder checkpoint is supplied, the
@@ -474,8 +506,10 @@ def replay_and_capture(
         ld_head_for_emit: Optional[LatentDynamicsHead] = None
         if emit_traces:
             ld_head_for_emit = LatentDynamicsHead()
+            extra = " + slots_h_raw (per-layer state)" if emit_raw_state else ""
             print(f"[probe] emit-traces ON -> {emit_traces} (capturing per-turn "
-                  f"slots_z + slots_y + top-1-cos labels for z-head retrain)",
+                  f"slots_z + slots_y + top-1-cos labels{extra} for z-head retrain"
+                  f"{' / serve-state probe' if emit_raw_state else ''})",
                   flush=True)
         trace_records: list[dict] = []
         # Salience arming needs all three heads + thresholds (``_salience_armed``
@@ -553,7 +587,8 @@ def replay_and_capture(
                 rec = _capture_turn(orch, u, context_builder=context_builder,
                                     z_head=z_head, ld_head=ld_head_for_z,
                                     emit_trace=emit_traces is not None,
-                                    ld_head_for_emit=ld_head_for_emit)
+                                    ld_head_for_emit=ld_head_for_emit,
+                                    emit_raw_state=emit_raw_state)
                 if emit_traces:
                     # Pop the trace BEFORE the record enters turn_records so
                     # _analyze (the measurement path) never sees it.
@@ -593,6 +628,7 @@ def replay_and_capture(
             "z_relevance_head": z_head is not None,
             "emit_traces": emit_traces,
             "n_trace_records": len(trace_records) if emit_traces else None,
+            "emit_raw_state": emit_raw_state and emit_traces is not None,
         }
         return turn_records, run_stats
     finally:
@@ -820,6 +856,16 @@ def _main() -> int:
                         "distributions match by construction. Use with "
                         "--identity-instance + --backbone <new from-scratch ckpt>. "
                         "Default '' -> off, byte-identical to the prior probe.")
+    p.add_argument("--emit-raw-state", action="store_true",
+                   help="Task #39: with --emit-traces, ALSO store the per-slot "
+                       "per-layer SSM state (slots_h_raw [K,4,16,384] fp16) + the "
+                       "slot text bge (slots_doc_emb) so the offline serve-state "
+                       "representation probe can compute z_mean_last / z_chan_last / "
+                       "z_flat_last / z_flat_all and compare across-slot variance + "
+                       "bge top-3 per representation (the fork diagnostic: mean-pool-"
+                       "kills-signal -> state-trajectory Transformer, vs all-reps-flat "
+                       "-> backbone-on-serve retrain). No effect without --emit-traces. "
+                       "Default off -> byte-identical to --emit-traces alone.")
     args = p.parse_args()
 
     if not Path(args.backbone).exists():
@@ -854,7 +900,8 @@ def _main() -> int:
         context_builder_path=args.context_builder or None,
         z_relevance_head_path=args.z_relevance_head or None,
         identity_instance=args.identity_instance,
-        emit_traces=args.emit_traces or None)
+        emit_traces=args.emit_traces or None,
+        emit_raw_state=args.emit_raw_state)
     analysis = _analyze(turn_records)
     report = {"run": run_stats, **analysis, "n_turn_records": len(turn_records)}
 
