@@ -28,21 +28,44 @@ from .backbone import JGSBackbone
 
 
 class JGSInstance(nn.Module):
-    def __init__(self, backbone: JGSBackbone, config: InstanceConfig):
+    def __init__(self, backbone: JGSBackbone, config: InstanceConfig,
+                 identity_instance: bool = False):
         super().__init__()
         # Store the shared backbone WITHOUT registering it as a submodule.
         object.__setattr__(self, "_backbone", backbone)
         self.config = config
+        # ``identity_instance`` (Phase 1 gate re-run, task #33): drive the shared
+        # SSM with an IDENTITY ``input_proj`` + a ZERO ``state_lora`` delta -- i.e.
+        # the pure-backbone direct-SSM path the from-scratch relevance trainer
+        # (``scripts/train_backbone_relevance.py:step_sequence``) optimizes. The
+        # default gate path uses RANDOM instance projections (``input_proj``=random
+        # LoRALinear, ``state_lora``~0 but nonzero), which confound the measured
+        # ``z_i`` with a random per-instance projection the trainer never saw. This
+        # flag removes that confound so the gate measures the SAME path that was
+        # trained. Default False -> the projections below are constructed exactly
+        # as before (byte-identical). ``output_proj`` + ``gate`` are NOT made
+        # identity: ``output_proj`` must still project 384->``output_dim`` (the
+        # ring's ``y_t`` shape), and neither affects ``z_i`` (``z_i`` is projected
+        # from the recurrent STATE, not the output), so leaving them constructed is
+        # correct and minimal. Stored on the instance so callers can introspect it.
+        self.identity_instance = bool(identity_instance)
 
-        # Instance-owned projections (LoRA on a frozen base).
-        self.input_proj = LoRALinear(
-            nn.Linear(config.input_dim, config.d_model), rank=config.lora_rank
-        )
+        # Instance-owned projections (LoRA on a frozen base). Under
+        # ``identity_instance`` the input projection is the identity (the raw
+        # 384-d doc/query embedding is fed straight into the SSM) and the
+        # state-LoRA delta is the identity (no per-instance modulation of the
+        # recurrent state) -- matching the trainer's direct-SSM forward.
+        if identity_instance:
+            self.input_proj = nn.Identity()
+            self.state_lora = nn.Identity()
+        else:
+            self.input_proj = LoRALinear(
+                nn.Linear(config.input_dim, config.d_model), rank=config.lora_rank
+            )
+            self.state_lora = StateLoRA(config.d_state, config.d_model, rank=config.lora_rank)
         self.output_proj = LoRALinear(
             nn.Linear(config.d_model, config.output_dim), rank=config.lora_rank
         )
-        # Instance-owned modulation of the shared SSM's recurrent state.
-        self.state_lora = StateLoRA(config.d_state, config.d_model, rank=config.lora_rank)
 
         # Instance-owned gate.
         self.gate = DecomposedGate(

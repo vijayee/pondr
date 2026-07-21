@@ -206,6 +206,7 @@ def build_records(
     hard_neg_map: dict[str, list[str]] | None = None,
     emit_raw_state: bool = False,
     raw_state_rep: str = "flat_last",
+    identity_instance: bool = False,
 ) -> tuple[list[dict], dict]:
     """Step the WM ring over each query's candidate docs; emit labeled records.
 
@@ -273,7 +274,16 @@ def build_records(
         plans.append((q, candidate_ids))
         max_k = max(max_k, len(candidate_ids))
 
-    wm = WorkingMemory(backbone, embedder=embedder, ring_capacity=max_k)
+    # ``identity_instance`` (Phase 1 gate re-run, task #33): drive the SSM with
+    # identity input_proj + zero state_lora -- the SAME direct-SSM path the
+    # from-scratch relevance trainer optimizes (``train_backbone_relevance.py``
+    # ``step_sequence``). Default False -> random instance projections (the
+    # original gate path, byte-identical to pre-task-#33). Only the NEW backbone
+    # was trained under identity, so the gate must measure it under identity too
+    # or the slots_z distribution is confounded by a random projection the
+    # backbone never saw.
+    wm = WorkingMemory(backbone, embedder=embedder, ring_capacity=max_k,
+                       identity_instance=identity_instance)
 
     doc_cache: dict[str, torch.Tensor] = {}
     n_pos = n_neg = 0
@@ -446,6 +456,14 @@ def main() -> int:
                         "layer flattened (default, apples-to-apples vs the mean-pool); "
                         "``flat_all`` [24576] = all 4 layers flattened. Only used with "
                         "--emit-raw-state.")
+    p.add_argument("--identity-instance", action="store_true",
+                   help="Phase 1 gate re-run (task #33): drive the SSM with IDENTITY "
+                        "input_proj + ZERO state_lora -- the direct-SSM path the "
+                        "from-scratch relevance trainer (train_backbone_relevance.py) "
+                        "optimizes. Use this when --backbone points at a backbone "
+                        "trained under that path (the new from-scratch ckpt) so the "
+                        "gate measures the SAME path that was trained. Default off -> "
+                        "random instance projections (byte-identical to pre-task-#33).")
     args = p.parse_args()
 
     out_path = Path(args.output)
@@ -514,12 +532,14 @@ def main() -> int:
 
     print(f"Building records (ring ON, neg_per_query={args.neg_per_query}, "
           f"device={dev}, hard_neg={'ON' if hard_neg_map else 'OFF'}, "
-          f"raw_state={'ON(' + args.raw_state_rep + ')' if args.emit_raw_state else 'OFF'}) "
+          f"raw_state={'ON(' + args.raw_state_rep + ')' if args.emit_raw_state else 'OFF'}, "
+          f"identity_instance={'ON' if args.identity_instance else 'OFF'}) "
           f"-> {out_path}", flush=True)
     records, stats = build_records(
         questions, docs_tbl, doc_idx, all_doc_ids, backbone, embedder,
         parser, chunker, args.neg_per_query, dev, args.seed, hard_neg_map,
         emit_raw_state=args.emit_raw_state, raw_state_rep=args.raw_state_rep,
+        identity_instance=args.identity_instance,
     )
     if not records:
         print(f"ERROR: no records built (all candidates failed to load?)",

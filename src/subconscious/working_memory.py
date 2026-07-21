@@ -130,9 +130,10 @@ class WorkingMemory(JGSInstance):
         decay_alpha: float = 1.0,
         ring_capacity: Optional[int] = None,
         pin_tag: Optional[PinTag] = None,
+        identity_instance: bool = False,
     ) -> None:
         cfg = config or INSTANCE_CONFIGS["working_memory"]
-        super().__init__(backbone, cfg)
+        super().__init__(backbone, cfg, identity_instance=identity_instance)
         # Injected embedder (bge-small, 384-dim) — may be None if the caller
         # steps the instance manually with pre-computed embeddings (tests do
         # this). Keeping it optional preserves a torch-only import surface.
