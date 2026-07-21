@@ -469,6 +469,7 @@ def main() -> int:
     log = [{"step": 0, **base}]
     best_top3 = base["mean_top3_recall"]
     best_step = 0
+    best_state = None          # CPU snapshot of the best-val backbone (see save)
 
     # ── training loop ──
     print(f"Training {args.steps} steps (lr {args.lr}, wd {args.weight_decay}, "
@@ -538,6 +539,10 @@ def main() -> int:
             if m["mean_top3_recall"] > best_top3:
                 best_top3 = m["mean_top3_recall"]
                 best_step = step
+                # Snapshot the best-val backbone so the saved checkpoint is the
+                # peak model, not the (possibly regressed/overfit) final step.
+                best_state = {k: v.detach().cpu().clone()
+                              for k, v in backbone.state_dict().items()}
 
     # ── save checkpoint (NEVER overwrite DEFAULT_BACKBONE_PATH) ──
     out_path = Path(args.output)
@@ -546,12 +551,19 @@ def main() -> int:
               f"({DEFAULT_BACKBONE_PATH}) -- binding constraint", file=sys.stderr)
         return 1
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"backbone": backbone.state_dict(), "step": step,
+    # Save the BEST-val backbone (peak top3), not the final step -- the probe
+    # showed late-step regression (overfitting), so the final weights can be
+    # worse than the peak. Falls back to the final state if no improvement over
+    # the step-0 baseline was ever recorded.
+    saved_state = best_state if best_state is not None else backbone.state_dict()
+    saved_step = best_step if best_state is not None else step
+    torch.save({"backbone": saved_state, "step": saved_step,
                 "arch": "fromscratch_reltraj_v1",
                 "config": {"d_model": cfg.d_model, "n_layers": cfg.n_layers,
                            "d_state": cfg.d_state, "pred_dim": cfg.pred_dim,
                            "ssm_backend": cfg.ssm_backend},
                 "best_top3": best_top3, "best_step": best_step,
+                "final_top3": log[-1]["mean_top3_recall"],
                 "lambda_traj": args.lambda_traj, "temperature": args.temperature,
                 "lr": args.lr, "seed": args.seed}, out_path)
     with open(out_path.parent / "train_log.json", "w", encoding="utf-8") as f:
