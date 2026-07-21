@@ -347,6 +347,7 @@ def replay_and_capture(
     user_id: str, rec_head_path: str, ld_head_path: str, ablate_yt: bool,
     context_builder_path: Optional[str] = None,
     z_relevance_head_path: Optional[str] = None,
+    identity_instance: bool = False,
 ) -> tuple[list[dict], dict]:
     """Replay every transcript turn through the orchestrator and capture per-
     turn per-slot r_i (and, when a ContextBuilder checkpoint is supplied, the
@@ -426,6 +427,7 @@ def replay_and_capture(
             recoverability_head=recoverability_head,
             latent_dynamics_head=latent_dynamics_head,
             strm_salience=strm_salience, salience_thresholds=thresholds,
+            identity_instance=identity_instance,
         )
 
         total_queries = 0
@@ -704,6 +706,14 @@ def _main() -> int:
                         "'' to skip.")
     p.add_argument("--user-id", default="pondr")
     p.add_argument("--out", default="", help="write the JSON report to this path")
+    p.add_argument("--identity-instance", action="store_true",
+                   help="Phase 1 gate re-run (task #33): drive the orchestrator's "
+                        "WorkingMemory with identity input_proj + zero state_lora -- "
+                        "the direct-SSM path the from-scratch relevance trainer "
+                        "optimizes. Use when --backbone points at a backbone trained "
+                        "under that path (the new from-scratch ckpt) so the SERVE gate "
+                        "measures the SAME path the z-head was trained on. Default off "
+                        "-> random instance projections (byte-identical to pre-task-#33).")
     args = p.parse_args()
 
     if not Path(args.backbone).exists():
@@ -736,7 +746,8 @@ def _main() -> int:
         user_id=args.user_id, rec_head_path=args.recoverability_head,
         ld_head_path=args.latent_dynamics_head, ablate_yt=args.ablate_yt,
         context_builder_path=args.context_builder or None,
-        z_relevance_head_path=args.z_relevance_head or None)
+        z_relevance_head_path=args.z_relevance_head or None,
+        identity_instance=args.identity_instance)
     analysis = _analyze(turn_records)
     report = {"run": run_stats, **analysis, "n_turn_records": len(turn_records)}
 

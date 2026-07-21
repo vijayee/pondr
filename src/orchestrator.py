@@ -181,6 +181,7 @@ class PonderOrchestrator:
         context_builder=None,
         strm_salience: bool = False,
         salience_thresholds=None,
+        identity_instance: bool = False,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -309,7 +310,7 @@ class PonderOrchestrator:
         # (the default) keeps the ring off and the shipped path byte-identical.
         self.working_memory = WorkingMemory(
             backbone, embedder=embedder, decay_alpha=config.working_memory.decay_alpha,
-            ring_capacity=ring_capacity,
+            ring_capacity=ring_capacity, identity_instance=identity_instance,
         )
         self.ssm_chunker = SSMChunker(backbone, embedder, config)
         self.presentation_gate = PresentationGate(config, embedder)
