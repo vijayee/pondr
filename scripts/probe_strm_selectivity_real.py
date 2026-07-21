@@ -73,6 +73,9 @@ from src.retrieval.query_planner import BonsaiQueryPlanner  # noqa: E402
 from src.retrieval.retriever import HippocampalRetriever  # noqa: E402
 from src.subconscious.configs import BackboneConfig  # noqa: E402
 from src.subconscious.context_builder import load_context_builder  # noqa: E402
+from src.subconscious.cross_slot_transformer import (  # noqa: E402
+    load_cross_slot_transformer,
+)
 from src.subconscious.latent_dynamics_head import (  # noqa: E402
     LatentDynamicsHead,
     load_latent_dynamics_head,
@@ -83,6 +86,7 @@ from src.subconscious.salience import (  # noqa: E402
     SalienceThresholds,
     load_salience_thresholds,
 )
+from src.subconscious.state_readout import load_composite_z_head  # noqa: E402
 from src.subconscious.training.routing_training import build_embedder, load_backbone  # noqa: E402
 from src.subconscious.z_relevance_head import load_z_relevance_head  # noqa: E402
 
@@ -256,7 +260,7 @@ def _build_serve_trace(slots, emit_idx, out_slots, emit_embs, query_emb,
 def _capture_turn(orch: PonderOrchestrator, user_text: str,
                   context_builder=None, z_head=None, ld_head=None,
                   emit_trace: bool = False, ld_head_for_emit=None,
-                  emit_raw_state: bool = False) -> dict:
+                  emit_raw_state: bool = False, z_head_arch="composite") -> dict:
     """Score the current WM ring against this turn's query. Returns one record:
     ``{user_text, slots: [{source_id, text, r_i, logit, s_i, s_i_pure, z_r,
     z_logit, cos}]}`` where ``cos`` is the bge cosine between the slot text and
@@ -273,7 +277,8 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
     slots = orch.working_memory.ring_buffer()
     (slots, r_is, logits, s_is, s_is_pure, z_logits, z_rs) = _score_ring_with_logits(
         orch.working_memory, orch.relevance_head, orch.embedder, prompt_emb,
-        slots, context_builder=context_builder, z_head=z_head, ld_head=ld_head)
+        slots, context_builder=context_builder, z_head=z_head, ld_head=ld_head,
+        z_head_arch=z_head_arch)
     # Embed each scored slot's text once for the cosine probe/filler label.
     out_slots = []
     emit_idx: list[int] = []
@@ -319,7 +324,7 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
 
 def _score_ring_with_logits(working_memory, relevance_head, embedder,
                             prompt_emb, slots, context_builder=None,
-                            z_head=None, ld_head=None):
+                            z_head=None, ld_head=None, z_head_arch="composite"):
     """Mirror ``relevance_score._score`` but return the pre-sigmoid LOGIT too
     (so the ablation can measure the bilinear gap that the saturated sigmoid
     hides), and -- when a ContextBuilder is supplied -- the transformer's per-
@@ -383,7 +388,25 @@ def _score_ring_with_logits(working_memory, relevance_head, embedder,
         # Phase B: z_i = project(slot.h) scored by the z_head. slot.h is present
         # for every ring slot when ring_capacity>0 (Phase A captures it); a None
         # here would mean Phase A regressed -> that slot is z-unscored (None).
-        if z_head is not None and ld_head is not None:
+        # Task #46 (acceptance): ``z_head_arch`` selects the scoring branch.
+        # ``composite`` (default, byte-identical to pre-#46) = the mean-pool
+        # ``ld_head.project(h)`` [384] scored by the bare ZRelevanceHead bilinear
+        # (task #41's ``data/training/strm_z_relevance/best.pt`` format).
+        # ``transformer`` = Head B (CrossSlotTransformerZHead): score the raw
+        # LAST-layer state flattened [6144] (the SAME ``slots_h_raw`` last-layer
+        # representation Head B trained on in probe_head_to_head_onyx), so the
+        # live SERVE gate measures the state-trajectory Transformer the head-to-
+        # head picked. ``composite-raw`` = Head A from the head-to-head
+        # (CompositeZHead mlp128: StateReadout [6144->384] + ZRelevanceHead
+        # bilinear) scored on the SAME raw flat_last [6144] as Head B -- the
+        # apples-to-apples Head A vs Head B comparison on the live ring (Head A
+        # differs from Head B ONLY in scoring: pointwise bilinear vs cross-slot
+        # attention; both read the same raw state). ``ld_head`` is unused in the
+        # transformer / composite-raw branches (they read the raw state, not the
+        # mean-pool projection) but is kept in the signature so the composite
+        # path is unchanged.
+        if z_head is not None and (
+                ld_head is not None or z_head_arch in ("transformer", "composite-raw")):
             z_rows = []
             z_mask: list[bool] = []
             for i, _ in idx_text:
@@ -391,6 +414,12 @@ def _score_ring_with_logits(working_memory, relevance_head, embedder,
                 if h is None:
                     z_rows.append(None)
                     z_mask.append(False)
+                elif z_head_arch in ("transformer", "composite-raw"):
+                    # Last SSM layer [1,16,384] or [16,384] flattened -> [6144]
+                    # (16 d_state x 384 d_model). Matches ``_load_serve_traces``
+                    # last-layer flatten + Head B's ``StateReadout`` input dim.
+                    z_rows.append(h[-1].detach().to(torch.float32).reshape(-1))
+                    z_mask.append(True)
                 else:
                     z_i = ld_head.project(h).squeeze(0).to(torch.float32)  # [384]
                     z_rows.append(z_i)
@@ -449,6 +478,7 @@ def replay_and_capture(
     identity_instance: bool = False,
     emit_traces: Optional[str] = None,
     emit_raw_state: bool = False,
+    z_head_arch: str = "composite",
 ) -> tuple[list[dict], dict]:
     """Replay every transcript turn through the orchestrator and capture per-
     turn per-slot r_i (and, when a ContextBuilder checkpoint is supplied, the
@@ -491,10 +521,38 @@ def replay_and_capture(
         z_head = None
         ld_head_for_z: Optional[LatentDynamicsHead] = None
         if z_relevance_head_path and Path(z_relevance_head_path).exists():
-            z_head = load_z_relevance_head(str(z_relevance_head_path), device=device)
-            ld_head_for_z = LatentDynamicsHead()  # untrained; project is parameter-free
-            print(f"[probe] ZRelevanceHead loaded: {z_relevance_head_path} "
-                  f"(capturing z_r + z_logit alongside r_i)", flush=True)
+            if z_head_arch == "transformer":
+                # Task #46 acceptance: Head B (CrossSlotTransformerZHead) -- the
+                # cross-slot Transformer the head-to-head (task #45) picked. Scores
+                # the raw last-layer state [6144] (NOT the mean-pool projection),
+                # so ld_head_for_z stays None -- the transformer branch of
+                # ``_score_ring_with_logits`` builds h_raw from slot.h directly.
+                z_head = load_cross_slot_transformer(str(z_relevance_head_path),
+                                                     device=device)
+                print(f"[probe] CrossSlotTransformerZHead (Head B) loaded: "
+                      f"{z_relevance_head_path} (capturing z_r + z_logit via "
+                      f"cross-slot attention on the live recalled ring)", flush=True)
+            elif z_head_arch == "composite-raw":
+                # Task #46 acceptance: Head A from the head-to-head
+                # (CompositeZHead mlp128: readout [6144->384] + bilinear), scored
+                # on the SAME raw flat_last [6144] as Head B -- the apples-to-
+                # apples Head A vs Head B comparison on the live ring. Loads via
+                # ``load_composite_z_head`` (NOT ``load_z_relevance_head`` -- the
+                # head-to-head's bilinear checkpoint is a CompositeZHead with
+                # ``readout.*`` + ``z_head.*`` keys + doc_dim=6144, not the bare
+                # ZRelevanceHead task #41's ``strm_z_relevance/best.pt`` is).
+                # ld_head_for_z stays None -- the composite-raw branch feeds the
+                # raw state, not the mean-pool projection.
+                z_head = load_composite_z_head(str(z_relevance_head_path),
+                                               device=device)
+                print(f"[probe] CompositeZHead (Head A, composite-raw) loaded: "
+                      f"{z_relevance_head_path} (capturing z_r + z_logit via "
+                      f"pointwise bilinear on the live recalled ring)", flush=True)
+            else:
+                z_head = load_z_relevance_head(str(z_relevance_head_path), device=device)
+                ld_head_for_z = LatentDynamicsHead()  # untrained; project is parameter-free
+                print(f"[probe] ZRelevanceHead loaded: {z_relevance_head_path} "
+                      f"(capturing z_r + z_logit alongside r_i)", flush=True)
         elif z_relevance_head_path:
             print(f"[probe] ZRelevanceHead checkpoint not found at "
                   f"{z_relevance_head_path} -- z capture skipped.", file=sys.stderr)
@@ -588,7 +646,8 @@ def replay_and_capture(
                                     z_head=z_head, ld_head=ld_head_for_z,
                                     emit_trace=emit_traces is not None,
                                     ld_head_for_emit=ld_head_for_emit,
-                                    emit_raw_state=emit_raw_state)
+                                    emit_raw_state=emit_raw_state,
+                                    z_head_arch=z_head_arch)
                 if emit_traces:
                     # Pop the trace BEFORE the record enters turn_records so
                     # _analyze (the measurement path) never sees it.
@@ -626,6 +685,7 @@ def replay_and_capture(
             "salience": salience, "device": device,
             "context_builder": context_builder is not None,
             "z_relevance_head": z_head is not None,
+            "z_head_arch": z_head_arch,
             "emit_traces": emit_traces,
             "n_trace_records": len(trace_records) if emit_traces else None,
             "emit_raw_state": emit_raw_state and emit_traces is not None,
@@ -837,6 +897,23 @@ def _main() -> int:
                         "GATE 1: does z_i = project(slot.h) carry query-relevance "
                         "signal y_t did NOT). Default = the trained z-head; pass "
                         "'' to skip.")
+    p.add_argument("--z-head-arch",
+                   choices=("composite", "transformer", "composite-raw"),
+                   default="composite",
+                   help="Task #46 acceptance: which arch the --z-relevance-head "
+                        "checkpoint is + how the live z-scoring path scores it. "
+                        "composite (default) = the mean-pool ZRelevanceHead bilinear "
+                        "(byte-identical to pre-#46; task #41's bare-ZRelevanceHead "
+                        "checkpoint format). transformer = Head B "
+                        "(CrossSlotTransformerZHead, task #45 winner): scores the "
+                        "raw last-layer state [6144] via cross-slot attention -- the "
+                        "live SERVE gate the head-to-head pointed at. composite-raw = "
+                        "Head A from the head-to-head (CompositeZHead mlp128: readout "
+                        "[6144->384] + bilinear) scored on the SAME raw flat_last "
+                        "[6144] as Head B -- the apples-to-apples Head A vs Head B "
+                        "comparison on the live ring. Use transformer / composite-raw "
+                        "with --backbone backbone_v2_full.pt --identity-instance so "
+                        "the state space matches the head-to-head training.")
     p.add_argument("--user-id", default="pondr")
     p.add_argument("--out", default="", help="write the JSON report to this path")
     p.add_argument("--identity-instance", action="store_true",
@@ -901,7 +978,8 @@ def _main() -> int:
         z_relevance_head_path=args.z_relevance_head or None,
         identity_instance=args.identity_instance,
         emit_traces=args.emit_traces or None,
-        emit_raw_state=args.emit_raw_state)
+        emit_raw_state=args.emit_raw_state,
+        z_head_arch=args.z_head_arch)
     analysis = _analyze(turn_records)
     report = {"run": run_stats, **analysis, "n_turn_records": len(turn_records)}
 

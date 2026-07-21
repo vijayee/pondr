@@ -44,9 +44,15 @@ conversations, the true "generalizes to new Onyx" test DeepSeek specified.
     state path has been tested 5 ways and saturates; the bge 2a head (0.889
     train) already works.
 
-**Isolation (binding constraint).** Standalone script; Head B is a LOCAL
-nn.Module defined here (zero ``src/`` changes -> every existing head + the 2b
-gate stay byte-identical by construction). Reuses ``contrastive_loss`` +
+**Isolation (binding constraint).** Standalone diagnostic; Head B
+(``CrossSlotTransformerZHead``) lives in ``src/subconscious/cross_slot_transformer.py``
+(promoted there for the task #46 live-SERVE-gate acceptance test so
+``probe_strm_selectivity_real.py --z-head-arch transformer`` can load + score
+with it). The class is byte-identical to the version this probe trained under,
+so the existing ``best.pt`` checkpoints load unchanged. It is imported ONLY
+by this probe + the live probe -- ``build_ponder`` / ``serve_ponder`` /
+``DEFAULT_BACKBONE_PATH`` are never touched, so every existing head + the 2b
+gate stay byte-identical by construction. Reuses ``contrastive_loss`` +
 ``_to_device`` from ``probe_contrastive_zlogit`` (task #44, committed) and
 ``p41._zr_and_logit_gaps`` + ``p41._load_serve_traces`` (task #41). Does NOT
 call ``fit_relevance``. No live wiring, no HF upload (diagnostic; the Onyx
@@ -71,22 +77,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root
 
 import probe_serve_composite_zrgate as p41  # noqa: E402
 import probe_contrastive_zlogit as p44  # noqa: E402
-from src.subconscious.state_readout import (  # noqa: E402
-    DEFAULT_DIM_IN,
-    CompositeZHead,
-    StateReadout,
+from src.subconscious.cross_slot_transformer import (  # noqa: E402
+    CrossSlotTransformerZHead,
 )
+from src.subconscious.state_readout import CompositeZHead  # noqa: E402
 from src.subconscious.training.relevance_training import (  # noqa: E402
     RelevanceTrainingConfig,
     _gate_score,
     _split_queries,
     evaluate_relevance,
-)
-from src.subconscious.z_relevance_head import (  # noqa: E402
-    PROJ_DIM as Z_PROJ_DIM,
-    QUERY_DIM as Z_QUERY_DIM,
-    SLOT_DIM as Z_SLOT_DIM,
-    Z_DIM,
 )
 
 DEFAULT_ONYX = "data/training/strm_relevance/traces_onyx_serve_hraw.pt"
@@ -96,80 +95,12 @@ DEFAULT_CKPT_ROOT = "data/training/strm_state_readout/head_to_head_onyx"
 ZLOGIT_GATE = 2.0
 
 
-# ── Head B: the cross-slot Transformer (local module, zero src/ changes) ──
-
-class CrossSlotTransformerZHead(nn.Module):
-    """Cross-slot attention relevance head -- the DeepSeek option B.
-
-    Same per-slot readout as ``CompositeZHead`` (``StateReadout`` mlp128
-    [dim_in -> 384]), so the ONLY difference from Head A is the SCORING: the
-    bilinear's pointwise ``proj_z(z_i).proj_q(q)`` is replaced by a Transformer
-    encoder that cross-attends the query (prepended as a [CLS] token) against
-    all K slots, then a per-slot logit head reads each slot's encoder output.
-    The attention lets slot k's logit depend on the query AND on every other
-    slot -> a RELATIVE score (sim-to-query attenuated by the candidate pool),
-    the mechanism DeepSeek identified as escaping the pointwise margin bound.
-
-    Single-record interface (matches ``CompositeZHead.logits``): one record's K
-    slots at a time, no batching/padding. ``logits(slot_y, slot_signal, q)``
-    returns ``[K, 1]`` (so ``.squeeze(-1)`` -> ``[K]``, the contract
-    ``p41._zr_per_slot`` + the contrastive loop assume). ``slot_y`` is accepted
-    and ignored (the pure-z_i test, same as the composite). Exposes
-    ``slot_dim``/``query_dim``/``proj_dim``/``doc_dim`` so the contrastive loop's
-    checkpoint-dim reads (modeled on ``_train_contrastive``) are shape-consistent.
-    """
-
-    def __init__(self, dim_in: int = DEFAULT_DIM_IN, hidden: int | None = 128,
-                 d_model: int = Z_DIM, n_heads: int = 4, n_layers: int = 2,
-                 ffn: int = 512, max_pos: int = 64) -> None:
-        super().__init__()
-        self.dim_in = int(dim_in)
-        self.readout = StateReadout(dim_in=self.dim_in, dim_out=d_model, hidden=hidden)
-        self.d_model = int(d_model)
-        self.max_pos = int(max_pos)
-        # Learned positional embedding for the K slot tokens (positions 1..K; the
-        # query [CLS] takes position 0 -- a learned token, not the query emb).
-        self.pos_emb = nn.Parameter(torch.randn(self.max_pos, d_model) * 0.02)
-        # Learned [CLS] query token; the actual query emb is projected + added so
-        # the encoder's query token carries BOTH a learned slot and the live query.
-        self.cls_token = nn.Parameter(torch.randn(1, d_model) * 0.02)
-        self.query_proj = nn.Linear(d_model, d_model)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=ffn,
-            batch_first=True, activation="gelu", norm_first=True)
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-        self.logit_head = nn.Linear(d_model, 1)
-        # Mirror CompositeZHead's checkpoint dims (the contrastive loop reads
-        # these; doc_dim = the readout input dim so a loader can rebuild it).
-        self.slot_dim = Z_SLOT_DIM
-        self.query_dim = Z_QUERY_DIM
-        self.proj_dim = Z_PROJ_DIM
-        self.doc_dim = self.dim_in
-
-    def logits(self, slot_y: torch.Tensor, slot_signal: torch.Tensor,
-               query_emb: torch.Tensor) -> torch.Tensor:
-        """Pre-sigmoid relevance logit per slot -> ``[K, 1]``.
-
-        ``slot_signal`` is the raw flattened state ``[K, dim_in]`` (or
-        ``[dim_in]``); ``slot_y`` accepted + ignored (pure-z_i test).
-        """
-        z = self.readout(slot_signal)                       # [K, d_model]
-        if z.dim() == 1:
-            z = z.unsqueeze(0)
-        K = z.shape[0]
-        assert K < self.max_pos, f"K={K} exceeds max_pos={self.max_pos}"
-        z = z + self.pos_emb[1:K + 1]                        # [K, d_model]
-        q = self.query_proj(query_emb.to(torch.float32))     # [d_model]
-        cls = self.cls_token[0] + q                          # [d_model] (pos 0)
-        seq = torch.cat([cls.unsqueeze(0), z], dim=0).unsqueeze(0)  # [1, 1+K, d]
-        out = self.encoder(seq)                              # [1, 1+K, d_model]
-        slot_out = out[0, 1:, :]                             # [K, d_model]
-        return self.logit_head(slot_out)                     # [K, 1]
-
-    def predict(self, slot_y, slot_signal, query_emb):
-        return torch.sigmoid(self.logits(slot_y, slot_signal, query_emb))
-
-    forward = predict
+# Head B (CrossSlotTransformerZHead) is imported from src/subconscious/ -- the
+# acceptance-test promotion (task #45 follow-up): the probe's local class was
+# lifted verbatim into ``src/subconscious/cross_slot_transformer.py`` so the
+# live SERVE gate (``probe_strm_selectivity_real.py --z-head-arch transformer``)
+# can load + score with it. Same submodule names -> the probe's existing
+# best.pt checkpoints load via ``load_cross_slot_transformer`` unchanged.
 
 
 def _build_head(arch: str, dim_in: int, hidden: int | None) -> nn.Module:
