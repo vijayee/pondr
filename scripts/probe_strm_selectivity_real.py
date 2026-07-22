@@ -67,7 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch  # noqa: E402
 
-from src.config import Phase2cConfig  # noqa: E402
+from src.config import Phase2cConfig, config as _runtime_config  # noqa: E402
 from src.orchestrator import PonderOrchestrator  # noqa: E402
 from src.retrieval.query_planner import BonsaiQueryPlanner  # noqa: E402
 from src.retrieval.retriever import HippocampalRetriever  # noqa: E402
@@ -977,6 +977,17 @@ def _main() -> int:
                         "comparison on the live ring. Use transformer / composite-raw "
                         "with --backbone backbone_v2_full.pt --identity-instance so "
                         "the state space matches the head-to-head training.")
+    p.add_argument("--strm-ring-text", action="store_true",
+                   help="Phase 1a/1e: thread the prompt's text + source_id into "
+                        "the orchestrator's conversation ring slots (sets the "
+                        "runtime singleton ``strm_ring_text`` before replay). "
+                        "OFF (default) = conversation slots have no text -> the "
+                        "scorer's ``text is not None`` filter drops them -> the "
+                        "scored ring is 100% retrieved-doc-episode slots "
+                        "(byte-identical to pre-Phase-1 / task #46). ON = "
+                        "conversation slots survive -> the scored ring is the "
+                        "FULL mixed ring (conv + retrieved), the production "
+                        "distribution Phase 1 trains + tests on.")
     p.add_argument("--user-id", default="pondr")
     p.add_argument("--out", default="", help="write the JSON report to this path")
     p.add_argument("--identity-instance", action="store_true",
@@ -1030,6 +1041,16 @@ def _main() -> int:
         if not Path(t).exists():
             print(f"ERROR: transcript not found at {t}", file=sys.stderr)
             return 1
+
+    # Phase 1a/1e: set the runtime singleton BEFORE replay so the orchestrator
+    # threads text + source_id into conversation ring slots (the singleton is
+    # read at every query()). Default OFF = byte-identical to pre-Phase-1. The
+    # probe is standalone (not build_ponder/serve_ponder); setting the singleton
+    # here does not touch the default serve path.
+    _runtime_config.strm_ring_text = bool(args.strm_ring_text)
+    if args.strm_ring_text:
+        print("  strm_ring_text=True (Phase 1a: conversation slots scoreable)",
+              flush=True)
 
     turn_records, run_stats = replay_and_capture(
         transcripts=args.transcripts, backbone_path=args.backbone,
