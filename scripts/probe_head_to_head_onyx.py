@@ -77,6 +77,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root
 
 import probe_serve_composite_zrgate as p41  # noqa: E402
 import probe_contrastive_zlogit as p44  # noqa: E402
+import probe_strm_selectivity_real as p_sel  # noqa: E402  # Stage 0: doc_kind_map helpers
 from src.subconscious.cross_slot_transformer import (  # noqa: E402
     CrossSlotTransformerZHead,
 )
@@ -229,6 +230,110 @@ def _drop_self_slot(rec: dict, multi_positive_margin: float = 0.0) -> dict | Non
         labels[int(cos.argmax().item())] = 1.0
     out["labels"] = labels
     return out
+
+
+def _gold_source_id(rec: dict) -> str | None:
+    """The source_id of a record's GOLD slot after ``--drop-self-slot`` (single
+    top-1-cos gold: ``labels`` has one 1.0 at the argmax-cos prior slot). Stage 0
+    uses this to test whether the record's retrieval target is a CODE doc."""
+    idx = int(rec["labels"].argmax())
+    sids = rec["source_ids"]
+    if idx >= len(sids):
+        return None
+    return str(sids[idx])
+
+
+def _gold_doc_kind(rec: dict, doc_kind_map: dict[str, str] | None) -> str | None:
+    """'code' / 'text' / None for a record's gold slot (None for a conv gold or
+    when no doc_kind_map). Reuses ``p_sel._doc_kind_for_source`` so the
+    source_id -> doc_id -> kind resolution matches the live probe exactly."""
+    sid = _gold_source_id(rec)
+    if sid is None:
+        return None
+    return p_sel._doc_kind_for_source(sid, doc_kind_map)
+
+
+def _build_doc_kind_map_cached(doc_store: str, onyx_path: str) -> dict[str, str]:
+    """Build {doc_id: 'code'|'text'} from the persisted doc store, cached to JSON
+    next to the traces so a later run with the store moved/missing still works
+    (the doc_id -> kind mapping is stable for a frozen corpus). Stage 0 only."""
+    cache_path = Path(onyx_path).parent / (Path(onyx_path).stem + ".doc_kind_map.json")
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - corrupt cache -> rebuild below
+            pass
+    if not doc_store or not Path(doc_store).exists():
+        raise SystemExit(f"--code-only-gold needs the doc store (or a cached "
+                         f"doc_kind_map); not found: {doc_store!r} and no cache "
+                         f"at {cache_path}")
+    from src.memory.store import HippocampalStore  # noqa: E402
+    store = HippocampalStore(str(doc_store))
+    try:
+        dk = p_sel._build_doc_kind_map(store)
+    finally:
+        # Match probe_strm_selectivity_real.py: the store holds a WaveDB handle;
+        # close it so the build does not leak the DB across the trainer process.
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001 - best-effort close
+            pass
+    cache_path.write_text(json.dumps(dk, indent=2), encoding="utf-8")
+    return dk
+
+
+def _filter_code_gold(records: list[dict],
+                      doc_kind_map: dict[str, str] | None) -> list[dict]:
+    """Stage 0: keep only records whose gold slot is a CODE doc (the code-doc
+    retrieval task). Records whose gold is a conv slot or a text doc are dropped
+    (counted + reported)."""
+    kept, n_conv, n_text, n_none = [], 0, 0, 0
+    for r in records:
+        k = _gold_doc_kind(r, doc_kind_map)
+        if k == "code":
+            kept.append(r)
+        elif k == "text":
+            n_text += 1
+        elif k is None:
+            n_none += 1  # conv gold or unmapped
+    print(f"  --code-only-gold: kept {len(kept)} code-gold records "
+          f"(dropped {n_text} text-gold, {n_none} conv/unmapped) of "
+          f"{len(records)}", flush=True)
+    return kept
+
+
+def _gold_cos_gap(rec: dict) -> float | None:
+    """Baseline well-posedness / h-norm guard for Stage 0 (S0.4): the INPUT bge-
+    embedding cos gap = gold_slot_cos - mean(filler_cos). The gold slot is the
+    argmax-cos prior slot (labels re-derived over prior slots by
+    ``--drop-self-slot``), so this is positive by construction -- the QUESTION is
+    how large. A near-zero median on the code-gold records means the bge
+    embedding itself barely separates the gold code doc from fillers -> the task
+    is ill-posed at the embedding layer (and a z_logit FAIL is not evidence
+    about ``h``). A healthy positive + a z_logit FAIL points at ``h``/readout
+    (Stage 1/2), not the embedding. Guards against a trivial h-norm false
+    positive too: if the head's z_logit gap tracks this cos gap, the readout
+    added nothing over the embedding."""
+    cos = rec.get("cos")
+    labels = rec.get("labels")
+    if cos is None or labels is None:
+        return None
+    cos = cos.to(torch.float32)
+    labels = labels.to(torch.float32)
+    gold = labels > 0
+    if gold.sum() == 0 or (~gold).sum() == 0:
+        return None
+    g = float(cos[gold].mean())
+    f = float(cos[~gold].mean())
+    return g - f
+
+
+def _gold_cos_baseline(records: list[dict]) -> dict:
+    """Median + n of the per-record gold-cos gap over ``records`` (Stage 0)."""
+    gaps = [g for g in (_gold_cos_gap(r) for r in records) if g is not None]
+    if not gaps:
+        return {"median": None, "n": 0}
+    return {"median": float(statistics.median(gaps)), "n": len(gaps)}
 
 
 def _session_split(records: list[dict], val_fraction: float, seed: int,
@@ -658,6 +763,14 @@ def main() -> int:
                         "and into a dedicated live-eval bucket every seed (D0.4a; "
                         "default = the 2 live-transcript sessions). Empty string "
                         "disables -> byte-identical to pre-#47.")
+    p.add_argument("--code-only-gold", action="store_true",
+                   help="Stage 0 diagnostic: filter train/val/live-eval to records "
+                        "whose GOLD slot is a CODE doc (the code-doc retrieval task). "
+                        "Default off = byte-identical. Needs --doc-store (or a cached "
+                        "doc_kind_map next to the traces).")
+    p.add_argument("--doc-store", default=None,
+                   help="Path to the persisted doc store used to build the "
+                        "doc_id -> kind map for --code-only-gold. Default = none.")
     p.add_argument("--out", default=DEFAULT_OUT)
     args = p.parse_args()
 
@@ -703,6 +816,37 @@ def main() -> int:
               + (f" | --multi-positive-margin {args.multi_positive_margin} "
                  "(multi-positive InfoNCE gold)" if args.multi_positive_margin > 0
                  else " | single top-1-cos gold"), flush=True)
+
+    # Stage 0 diagnostic: filter to records whose GOLD slot is a CODE doc. Gold
+    # is the argmax-labels prior slot, so this MUST run AFTER --drop-self-slot
+    # (the self-slot is never a doc) and requires --drop-self-slot. The doc_id ->
+    # kind map is built from the persisted doc store (cached to JSON next to the
+    # traces; the mapping is stable for a frozen corpus). Default off =
+    # byte-identical to the 1f-6 retrain.
+    doc_kind_map = None
+    if args.code_only_gold:
+        if not args.drop_self_slot:
+            print("ERROR: --code-only-gold requires --drop-self-slot (gold is a "
+                  "prior doc slot, never the self-slot).", file=sys.stderr)
+            return 1
+        doc_kind_map = _build_doc_kind_map_cached(args.doc_store, args.onyx)
+        before = len(records)
+        records = _filter_code_gold(records, doc_kind_map)
+        if len(records) < 100:
+            print(f"ERROR: only {len(records)} code-gold records after filter "
+                  f"(need >=100 for a real session-split); aborting.",
+                  file=sys.stderr)
+            return 1
+        if before != len(records):
+            print(f"  --code-only-gold: {before} -> {len(records)} records", flush=True)
+        # S0.4 well-posedness / h-norm guard: is the gold code doc even
+        # distinguishable from fillers by the bge embedding? Near-zero -> the task
+        # is ill-posed at the embedding layer (a z_logit FAIL says nothing about
+        # h); healthy positive + a z_logit FAIL points at h/readout.
+        gcb = _gold_cos_baseline(records)
+        if gcb["median"] is not None:
+            print(f"  --code-only-gold gold-cos gap (gold-filler, bge): median="
+                  f"{gcb['median']:+.4f} over {gcb['n']} records", flush=True)
 
     hidden = {"linear": None, "mlp64": 64, "mlp128": 128}[args.readout]
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
@@ -894,6 +1038,49 @@ def main() -> int:
               "+ heavy regularization (Path C stack).")
     print("=" * 80)
 
+    # ── Stage 0 decision (code-only bilinear diagnostic) ──
+    # When --code-only-gold, the decisive question is: does the bilinear head,
+    # trained ONLY on code-doc-gold records, clear the 2.0 z_logit gate on
+    # HELD-OUT code-doc-gold sessions? PASS = the code query-relevant signal IS
+    # in h and a shared readout is the only compromise -> Stage 1 (per-doc-kind
+    # readout). FAIL = the signal is not in h (the Phase 1 backbone never saw a
+    # code-vs-text signal) -> Stage 2 (backbone retrain). Exception: held-out FAIL
+    # but all-turns ceiling PASS -> overfit, not absent -> Stage 1 with heavier
+    # regularization. The gold-cos baseline (printed above) guards against an
+    # embedding-ill-posed false negative and an h-norm false positive.
+    stage0 = None
+    if args.code_only_gold:
+        a_ho = a_held
+        a_ceiling = _med(per_arch["bilinear"], "allturns", "z_logit")
+        a_pass_s0 = a_pass
+        n_seeds = len(seeds)
+        robust = a_pass_s0 >= 2 and a_pass_s0 * 2 >= n_seeds
+        ceiling_pass = (a_ceiling is not None and a_ceiling >= ZLOGIT_GATE)
+        if robust:
+            verdict = ("PASS -> Stage 1 (per-doc-kind readout): the code query-"
+                       "relevant signal IS in h; the shared readout is the only "
+                       "compromise.")
+        elif ceiling_pass:
+            verdict = ("FAIL held-out but all-turns ceiling PASS -> overfit, not "
+                       "absent -> Stage 1 with heavier regularization (kind-head wd, "
+                       "dropout).")
+        else:
+            verdict = ("FAIL -> Stage 2 (code-aware backbone retrain): the code "
+                       "query-relevant signal is NOT in h (Phase 1 backbone never "
+                       "saw a code-vs-text signal).")
+        stage0 = {"heldout_zlogit_median": a_ho, "allturns_ceiling": a_ceiling,
+                  "pass": a_pass_s0, "n_seeds": n_seeds, "robust": robust,
+                  "ceiling_pass": ceiling_pass, "verdict": verdict,
+                  "gold_cos_baseline": _gold_cos_baseline(records)}
+        print("\n" + "=" * 80)
+        print("STAGE 0 VERDICT (1f-7 code-only bilinear diagnostic)")
+        print("=" * 80)
+        print(f"  bilinear held-out z_logit median={a_ho if a_ho is not None else 'n/a'} "
+              f"({a_pass_s0}/{n_seeds} pass)  all-turns ceiling="
+              f"{a_ceiling if a_ceiling is not None else 'n/a'}")
+        print(f"  -> {verdict}")
+        print("=" * 80)
+
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps({
@@ -902,6 +1089,7 @@ def main() -> int:
             "seeds": seeds, "val_fraction": args.val_fraction,
             "n_records": len(records),
             "live_eval_sessions": sorted(live_eval_ids),
+            "stage0": stage0,
             "bilinear_heldout_zlogit_median": a_held,
             "transformer_heldout_zlogit_median": b_held,
             "bilinear_pass": a_pass, "transformer_pass": b_pass,
