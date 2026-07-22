@@ -273,6 +273,15 @@ def main() -> int:
                         "live gate's ring_capacity=16).")
     p.add_argument("--max-sessions", type=int, default=0,
                    help="cap training sessions emitted (0 = all; dev speed knob).")
+    p.add_argument("--start-session", type=int, default=0,
+                   help="skip sessions with index < this (0-indexed). Generic "
+                        "resumability/chunking knob -- e.g. run a long job as "
+                        "fresh-process chunks and merge the .pt records afterward "
+                        "(each chunk gets a clean WaveDB memory_pool). 0 = start "
+                        "at the first session.")
+    p.add_argument("--end-session", type=int, default=0,
+                   help="stop before sessions with index >= this (0-indexed, "
+                        "exclusive; 0 = all). Companion to --start-session.")
     p.add_argument("--device", default="auto")
     p.add_argument("--keep-question", action="store_true",
                    help="retain the 'question' field (message text) on disk. "
@@ -339,7 +348,7 @@ def main() -> int:
     print(f"  docs in store: {n_docs_in_store} ({n_sections_in_store} sections)",
           flush=True)
 
-    planner = BonsaiQueryPlanner(endpoint=None)  # None -> rule-based fallback
+    planner = BonsaiQueryPlanner(endpoint=None, force_rule_based=True)  # offline: deterministic rule-based plans, no (flapping) server dependency
     retriever = HippocampalRetriever(
         store, planner=planner, auto_load_index=True,
         retrieval_gate=None, embedder=embedder,
@@ -375,6 +384,11 @@ def main() -> int:
     t0 = time.time()
 
     for s_idx, session in enumerate(sessions):
+        if s_idx < args.start_session:
+            continue
+        if args.end_session and s_idx >= args.end_session:
+            print(f"  hit end_session {args.end_session}, stopping", flush=True)
+            break
         if args.max_sessions and n_sessions_kept >= args.max_sessions:
             print(f"  hit max_sessions {args.max_sessions}, stopping", flush=True)
             break

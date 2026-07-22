@@ -756,7 +756,7 @@ def replay_and_capture(
             latent_dynamics_head = load_latent_dynamics_head(str(ld_head_path),
                                                               device=device)
         thresholds = _resolve_thresholds(salience)
-        planner = BonsaiQueryPlanner(endpoint=None)  # None -> rule-based fallback
+        planner = BonsaiQueryPlanner(endpoint=None, force_rule_based=True)  # offline: deterministic rule-based plans, no (flapping) server dependency
         retriever = HippocampalRetriever(
             store, planner=planner, auto_load_index=True,
             retrieval_gate=None, embedder=embedder,

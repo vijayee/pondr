@@ -324,7 +324,7 @@ def main() -> int:
     from src.memory.store import HippocampalStore  # noqa: E402
     db_path = str(Path(tmpdir) / "db")
     store = HippocampalStore(db_path)
-    planner = BonsaiQueryPlanner(endpoint=None)  # None -> rule-based fallback
+    planner = BonsaiQueryPlanner(endpoint=None, force_rule_based=True)  # offline: deterministic rule-based plans, no (flapping) server dependency
     retriever = HippocampalRetriever(
         store, planner=planner, auto_load_index=True,
         retrieval_gate=None, embedder=embedder,

@@ -275,11 +275,24 @@ class BonsaiQueryPlanner:
         endpoint: str | None = None,
         temperature: float | None = None,
         timeout: float = 30.0,
+        force_rule_based: bool = False,
     ) -> None:
         self.model = model or config.bonsai_model
         self.endpoint = (endpoint or config.bonsai_endpoint).rstrip("/")
         self.temperature = temperature if temperature is not None else config.bonsai_temperature
         self.timeout = timeout
+        # When True, ``plan`` skips the Bonsai server entirely and goes straight
+        # to ``plan_rule_based``. Use this for offline trace generation and
+        # acceptance probes that must be deterministic and must NOT depend on an
+        # external LLM server being up (a flapping server both makes traces
+        # non-reproducible AND can hang ``requests.post`` past its timeout when a
+        # large conversation_history payload meets a half-alive endpoint that
+        # accepts the connection but never drains it). Default False preserves
+        # the server-first-then-fallback behavior every production caller relies
+        # on. NOTE: ``endpoint=None`` does NOT disable the server -- it resolves
+        # to ``config.bonsai_endpoint``; pass ``force_rule_based=True`` for a
+        # truly offline planner.
+        self.force_rule_based = force_rule_based
 
     # ── public API ──
 
@@ -294,7 +307,10 @@ class BonsaiQueryPlanner:
         Any server-side failure (connection, non-200, parse) is swallowed and
         the rule-based plan is returned, so retrieval still works offline. Use
         ``plan_via_server`` to surface server errors verbatim (for live tests).
+        With ``force_rule_based=True`` the server is never contacted.
         """
+        if self.force_rule_based:
+            return self.plan_rule_based(prompt, conversation_history)
         try:
             return self.plan_via_server(prompt, conversation_history)
         except RuntimeError:
