@@ -54,8 +54,25 @@ class WavedbVectorStore:
         return self.embedder
 
     def encode(self, texts: list[str]) -> list[list[float]]:
-        """Satisfy the ``Embedder`` protocol (gate-embedder reuse in the retriever)."""
-        return self._get_embedder().encode(texts)
+        """Satisfy the ``Embedder`` protocol (gate-embedder reuse in the retriever).
+
+        Converts numpy float32 arrays (what sentence-transformers / faiss return)
+        to Python floats so callers that JSON-serialize the result (e.g. the
+        ingestion pipeline's ``s.embedding = list(vec)`` -> ``encode_document``
+        hot-key persist) do not hit ``Object of type float32 is not JSON
+        serializable``. Mirrors ``VectorSearch._embed`` (the FAISS sidecar's
+        same conversion) for contract parity -- ``list[list[float]]``, not
+        numpy. Pure-Python stub embedders already return Python floats (the
+        ``hasattr(v, "tolist")`` guard is a no-op for them).
+        """
+        vecs = self._get_embedder().encode(texts)
+        out: list[list[float]] = []
+        for v in vecs:
+            if hasattr(v, "tolist"):
+                out.append([float(x) for x in v.tolist()])
+            else:
+                out.append([float(x) for x in v])
+        return out
 
     def _embed_query(self, query: str) -> list[float]:
         vec = self._get_embedder().encode([query])[0]

@@ -518,19 +518,61 @@ def replay_and_capture(
     emit_traces: Optional[str] = None,
     emit_raw_state: bool = False,
     z_head_arch: str = "composite",
+    doc_store: Optional[str] = None,
 ) -> tuple[list[dict], dict]:
     """Replay every transcript turn through the orchestrator and capture per-
     turn per-slot r_i (and, when a ContextBuilder checkpoint is supplied, the
     transformer's s_i / s_i_pure; when a z_relevance_head checkpoint is
     supplied, the z_i-head's z_r / z_logit) on the real recalled ring slots.
-    Returns (turn_records, run_stats)."""
+    Returns (turn_records, run_stats).
+
+    ``doc_store`` (Phase 1f-4 acceptance test, default None = byte-identical):
+    when set, open the PERSISTED doc corpus store read-only (built by
+    ``build_doc_corpus_store.py``) instead of an ephemeral tempdir store, attach
+    ``DocumentRetriever`` (mirror production ``build_ponder`` which wires it when
+    ``store_has_documents``), and SKIP the conv-pair episode seeding entirely.
+    The retrieved pool is then the pre-ingested REAL docs (type 1) -- the
+    production ring -- instead of the conv-pair episodes the default path
+    encodes from the transcript. Combine with ``--strm-ring-text`` so the ring
+    = live session messages (type 0) + retrieved docs (type 1), the SAME
+    distribution the Phase 1f generator + trainer used (so the head-to-head /
+    1f checkpoint is in-distribution). ``encoder=None`` + ``auto_persist=False``
+    keep the persisted doc store clean (no session episodes written into it)."""
     tmpdir = tempfile.mkdtemp(prefix="pondr_probe4a_")
     turn_records: list[dict] = []
     store = None
+    doc_store_mode = bool(doc_store)
+    n_turns_with_doc = 0  # retrieval_coverage numerator (doc-store mode only)
     try:
-        db_path = str(Path(tmpdir) / "db")
         from src.memory.store import HippocampalStore  # noqa: E402
-        store = HippocampalStore(db_path)
+        if doc_store_mode:
+            # Open the PERSISTED doc corpus store read-only. The store already
+            # contains the ingested docs; the probe does NOT re-ingest and does
+            # NOT seed conv-pair episodes -> the ONLY type-1 slots are docs
+            # (mirror generate_onyx_doc_ring_traces.py). Session state still
+            # lives in tmpdir (off the persisted store) so the probe never
+            # writes session state into the doc corpus.
+            doc_store_path = Path(doc_store)
+            store = HippocampalStore(str(doc_store_path))
+            from src.retrieval.document_retriever import (  # noqa: E402
+                store_has_documents,
+            )
+            if not store_has_documents(store):
+                print(f"ERROR: --doc-store has no document section edges -- "
+                      f"store_has_documents({doc_store}) is False. Re-run "
+                      f"build_doc_corpus_store.py (the probe would surface zero "
+                      f"doc slots -> invalid doc ring).", file=sys.stderr)
+                return [], {"doc_store_mode": True, "n_turns": 0,
+                            "n_encoded": 0, "n_skipped": 0,
+                            "ring_capacity": ring_capacity, "salience": salience,
+                            "device": device, "z_head_arch": z_head_arch,
+                            "retrieval_coverage": None, "n_turns_with_doc": None}
+            print(f"[probe] doc-store ON: opened persisted doc corpus store "
+                  f"{doc_store} (read-only; conv-pair seeding SKIPPED -> "
+                  f"retrieved pool = pre-ingested docs only)", flush=True)
+        else:
+            db_path = str(Path(tmpdir) / "db")
+            store = HippocampalStore(db_path)
         embedder = build_embedder("on-demand")
         backbone = load_backbone(str(backbone_path), BackboneConfig(), device=device)
         relevance_head = load_relevance_head(str(rel_head_path), device=device)
@@ -630,6 +672,16 @@ def replay_and_capture(
             store, planner=planner, auto_load_index=True,
             retrieval_gate=None, embedder=embedder,
         )
+        if doc_store_mode:
+            # Mirror production: attach the document-aware aggregator so multi-
+            # section doc hits surface as ONE slot per doc (build_ponder wires
+            # this when store_has_documents; the 1f generator + trainer both
+            # had it on -> without it the acceptance ring would be OOD, one
+            # slot per section instead of one per doc).
+            from src.retrieval.document_retriever import DocumentRetriever  # noqa: E402
+            retriever.document_retriever = DocumentRetriever(store)
+            print(f"[probe] attached DocumentRetriever (multi-section -> one "
+                  f"slot per doc)", flush=True)
         cfg = Phase2cConfig()
         cfg.session.state_dir = str(Path(tmpdir) / "sessions")
         orch = PonderOrchestrator(
@@ -658,15 +710,21 @@ def replay_and_capture(
             orch.user_id = session_id
             orch.working_memory.reset()
             history: list[dict] = []
-            # Seed: encode turn 0 so query 1 has memory to recall.
+            # Seed turn 0 so the planner has context for query 1 (pronoun /
+            # implicit-reference resolution). In the DEFAULT path (no --doc-
+            # store) turn 0 is ALSO encoded as an episode so the retriever can
+            # recall it; in doc-store mode the retrieved pool is the pre-
+            # ingested docs only (mirror the 1f generator) so the episode
+            # encode is SKIPPED -- history still carries turn 0 for context.
             u0, a0 = pairs[0]
-            ep0 = build_episode(
-                f"{session_id}__ep0000", u0, a0, timestamp=_iso(epoch_base, 0),
-                user_id=user_id, session_id=session_id, embedder=embedder)
-            if _encode_best_effort(store, ep0, session_id, 0):
-                total_encoded += 1
-            else:
-                total_skipped += 1
+            if not doc_store_mode:
+                ep0 = build_episode(
+                    f"{session_id}__ep0000", u0, a0, timestamp=_iso(epoch_base, 0),
+                    user_id=user_id, session_id=session_id, embedder=embedder)
+                if _encode_best_effort(store, ep0, session_id, 0):
+                    total_encoded += 1
+                else:
+                    total_skipped += 1
             history.append({"role": "user", "content": u0})
             history.append({"role": "assistant", "content": a0})
             for i in range(1, len(pairs)):
@@ -696,14 +754,22 @@ def replay_and_capture(
                 rec["session_id"] = session_id
                 rec["turn_index"] = i
                 turn_records.append(rec)
-                ep = build_episode(
-                    f"{session_id}__ep{i:04d}", u, a,
-                    timestamp=_iso(epoch_base, i), user_id=user_id,
-                    session_id=session_id, embedder=embedder)
-                if _encode_best_effort(store, ep, session_id, i):
-                    total_encoded += 1
-                else:
-                    total_skipped += 1
+                # retrieval_coverage (doc-store mode): did this turn's ring
+                # surface >=1 doc slot? A broken retriever -> 0% coverage ->
+                # the acceptance verdict is invalid (no doc slots to rank), not
+                # a real fail. Counted from the captured slots' slot_type.
+                if doc_store_mode and any(
+                        s.get("slot_type") == 1 for s in rec["slots"]):
+                    n_turns_with_doc += 1
+                if not doc_store_mode:
+                    ep = build_episode(
+                        f"{session_id}__ep{i:04d}", u, a,
+                        timestamp=_iso(epoch_base, i), user_id=user_id,
+                        session_id=session_id, embedder=embedder)
+                    if _encode_best_effort(store, ep, session_id, i):
+                        total_encoded += 1
+                    else:
+                        total_skipped += 1
                 history.append({"role": "user", "content": u})
                 history.append({"role": "assistant", "content": a})
                 total_queries += 1
@@ -728,6 +794,14 @@ def replay_and_capture(
             "emit_traces": emit_traces,
             "n_trace_records": len(trace_records) if emit_traces else None,
             "emit_raw_state": emit_raw_state and emit_traces is not None,
+            "doc_store": doc_store,
+            "doc_store_mode": doc_store_mode,
+            # retrieval_coverage: fraction of scored turns whose ring surfaced
+            # >=1 doc slot (doc-store mode only; None in the default path).
+            "retrieval_coverage": (
+                (n_turns_with_doc / total_queries) if doc_store_mode and total_queries else None
+            ),
+            "n_turns_with_doc": n_turns_with_doc if doc_store_mode else None,
         }
         return turn_records, run_stats
     finally:
@@ -989,6 +1063,20 @@ def _main() -> int:
                         "FULL mixed ring (conv + retrieved), the production "
                         "distribution Phase 1 trains + tests on.")
     p.add_argument("--user-id", default="pondr")
+    p.add_argument("--doc-store", default="",
+                   help="Phase 1f-4 acceptance test: open the PERSISTED doc "
+                        "corpus store (built by build_doc_corpus_store.py) "
+                        "read-only instead of an ephemeral tempdir store, "
+                        "attach DocumentRetriever, and SKIP the conv-pair "
+                        "episode seeding -> the retrieved pool is the pre-"
+                        "ingested REAL docs (type 1), the production ring the "
+                        "Phase 1f generator + trainer used. Default '' = OFF "
+                        "= byte-identical to pre-1f (ephemeral store + conv-"
+                        "pair episodes). Use WITH --strm-ring-text so the ring "
+                        "= live messages (type 0) + retrieved docs (type 1), "
+                        "and WITH --identity-instance + --backbone "
+                        "backbone_v2_full.pt so the state space matches the "
+                        "1f training distribution the z-head was trained on.")
     p.add_argument("--out", default="", help="write the JSON report to this path")
     p.add_argument("--identity-instance", action="store_true",
                    help="Phase 1 gate re-run (task #33): drive the orchestrator's "
@@ -1041,6 +1129,25 @@ def _main() -> int:
         if not Path(t).exists():
             print(f"ERROR: transcript not found at {t}", file=sys.stderr)
             return 1
+    # Phase 1f-4: validate the persisted doc store path up front (the
+    # store_has_documents probe runs again inside replay_and_capture, but a
+    # missing path is a clearer error here than a stack trace at store open).
+    if args.doc_store:
+        if not Path(args.doc_store).exists():
+            print(f"ERROR: --doc-store not found at {args.doc_store} "
+                  f"(build it: python scripts/build_doc_corpus_store.py "
+                  f"--store {args.doc_store})", file=sys.stderr)
+            return 1
+        if not args.strm_ring_text:
+            # NOT fatal -- the probe still runs (scores the 100%-doc-slot ring)
+            # but that is a DIFFERENT test than the mixed production ring; warn
+            # loudly so a missing --strm-ring-text does not silently turn the
+            # acceptance test into a doc-only ranking.
+            print(f"WARNING: --doc-store without --strm-ring-text -> "
+                  f"conversation slots have no text -> the scorer drops them "
+                  f"-> the scored ring is 100% doc slots (NOT the mixed "
+                  f"production ring Phase 1f trains on). Did you mean to pass "
+                  f"--strm-ring-text too?", file=sys.stderr)
 
     # Phase 1a/1e: set the runtime singleton BEFORE replay so the orchestrator
     # threads text + source_id into conversation ring slots (the singleton is
@@ -1063,7 +1170,8 @@ def _main() -> int:
         identity_instance=args.identity_instance,
         emit_traces=args.emit_traces or None,
         emit_raw_state=args.emit_raw_state,
-        z_head_arch=args.z_head_arch)
+        z_head_arch=args.z_head_arch,
+        doc_store=args.doc_store or None)
     analysis = _analyze(turn_records)
     report = {"run": run_stats, **analysis, "n_turn_records": len(turn_records)}
 
@@ -1073,6 +1181,13 @@ def _main() -> int:
     print(f"  transcripts={args.transcripts} ring={run_stats['ring_capacity']} "
           f"salience={run_stats['salience']} turns={run_stats['n_turns']} "
           f"(encoded={run_stats['n_encoded']} skipped={run_stats['n_skipped']})")
+    if run_stats.get("doc_store_mode"):
+        cov = run_stats.get("retrieval_coverage")
+        cov_s = f"{cov:.1%}" if cov is not None else "n/a"
+        print(f"  doc-store ON: {run_stats.get('doc_store')}  "
+              f"retrieval_coverage={cov_s} "
+              f"(turns with >=1 doc slot: {run_stats.get('n_turns_with_doc')}/"
+              f"{run_stats['n_turns']}; 0% => invalid doc ring, not a real fail)")
     print("-" * 72)
     d = report["distribution"]
     print(f"  r_i DISTRIBUTION on real recalled slots ({d['n_scored']} scored):")

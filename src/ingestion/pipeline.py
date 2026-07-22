@@ -53,6 +53,7 @@ class UnifiedIngestionPipeline:
         relation_extractor=None,
         embedder=None,
         doc_kind_tagger=None,
+        state_assertions: bool = True,
     ) -> tuple[str, bool]:
         """Ingest (or re-ingest) a source. Returns ``(doc_id, created)``.
 
@@ -99,11 +100,23 @@ class UnifiedIngestionPipeline:
         parsed = self.chunker.chunk(parsed)
 
         # Per-section extraction (entities/topics) -- the retrieval axes that
-        # make sections + the doc findable by entity/topic.
+        # make sections + the doc findable by entity/topic. Wrapped per-section
+        # (mirrors the doc-level Bonsai guard below): GLiNER can raise on a
+        # hostile section (e.g. ``cannot reshape tensor of 0 elements`` when a
+        # section yields no predictions), and without a guard ONE bad section
+        # would drop the WHOLE doc -- a doc with N-1 good sections lost. Degrade
+        # to empty entities/topics for that section; the doc still ingests and
+        # the good sections still carry their edges.
         sec_extractions: list[dict] = []
         if extractor is not None:
             for sec in parsed.sections:
-                ext = extractor.extract(sec.content)
+                try:
+                    ext = extractor.extract(sec.content)
+                except Exception as e:  # noqa: BLE001 - per-section best-effort
+                    import sys
+                    print(f"[gliner-fail] section extraction (degrading to empty): "
+                          f"{e}", file=sys.stderr)
+                    ext = {"entities": [], "topics": []}
                 sec_extractions.append({
                     "entities": list(ext.get("entities", [])),
                     "topics": list(ext.get("topics", [])),
@@ -165,16 +178,29 @@ class UnifiedIngestionPipeline:
         # provenance. Empty for structure-only ingests (no extractor) and
         # docs with no explicit state claims -- the cold-start no-op (D6).
         # Section ids mirror ``Document.from_parse``'s ``{doc_id}_sec_{i:03d}``.
+        #
+        # ``state_assertions=False`` (opt-out, default True = byte-identical)
+        # skips the deterministic normalizer entirely. Workaround for the
+        # WaveDB memory_pool double-free ([[wavedb-memory-pool-doublefree]]):
+        # assertion-dense docs (e.g. a 60-section spec with 200+ ``key:
+        # value`` claims) grow the ``encode_document`` batch_sync large enough
+        # to trigger a C-level double-free; skipping the assertions keeps the
+        # batch at section + has_section + doc-metadata volume and succeeds.
+        # Assertions are SUPPLEMENTARY for retrieval (docs stay findable via
+        # GLiNER entity/topic + the semantic embedder path), so the corpus
+        # build uses this to ingest assertion-dense docs that would otherwise
+        # be skipped. Production ingest leaves the default True.
         state_assertions: list[dict] = []
-        for i, sec in enumerate(parsed.sections):
-            sid = f"{doc_id}_sec_{i:03d}"
-            for a in extract_state_assertions(sec.content, None, None):
-                state_assertions.append({"entity": a["entity"],
-                                         "value": a["value"], "section": sid})
-        for a in extract_state_assertions(self._doc_text(parsed), None, relations):
-            # Doc-level assertions default ``asserted_by`` to the doc id
-            # (set by the store when ``section`` is absent).
-            state_assertions.append({"entity": a["entity"], "value": a["value"]})
+        if state_assertions:
+            for i, sec in enumerate(parsed.sections):
+                sid = f"{doc_id}_sec_{i:03d}"
+                for a in extract_state_assertions(sec.content, None, None):
+                    state_assertions.append({"entity": a["entity"],
+                                             "value": a["value"], "section": sid})
+            for a in extract_state_assertions(self._doc_text(parsed), None, relations):
+                # Doc-level assertions default ``asserted_by`` to the doc id
+                # (set by the store when ``section`` is absent).
+                state_assertions.append({"entity": a["entity"], "value": a["value"]})
         doc.state_assertions = state_assertions
 
         # Phase 3c Sec 7.11 + deferred head: semantic doc-kind tag at ingest.
