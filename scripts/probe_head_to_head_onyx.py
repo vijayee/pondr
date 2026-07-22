@@ -412,6 +412,12 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
     ckpt_path = r["ckpt_final"] if select_ckpt == "final" else r["ckpt_best"]
     r["select_ckpt"] = select_ckpt
     r["ckpt"] = ckpt_path
+    # De-wonk (Phase 1d): the SCORED ckpt's epoch, not best.pt's. ``--select-ckpt
+    # final`` scores final.pt (saved at ``epochs - 1``); ``--select-ckpt best``
+    # scores best.pt (saved at ``best_epoch``). The verdict print + JSON report
+    # the epoch of the ckpt actually scored, so a "best ep 1" line never misleads
+    # when the scored ckpt is the final-epoch one.
+    r["scored_epoch"] = (epochs - 1) if select_ckpt == "final" else r["best_epoch"]
     head = _load_head(arch, str(ckpt_path), r["dim_in"], hidden, device)
     r["head"] = head
     # The decisive eval: z_r + z_logit gaps on HELD-OUT sessions (unseen convs).
@@ -628,7 +634,7 @@ def main() -> int:
                        ("transformer (B)", per_arch["transformer"])):
         for r in rows:
             ho = r["heldout"]
-            print(f"  {arch} s{r['seed']} (best ep {r['best_epoch']}, "
+            print(f"  {arch} s{r['seed']} ({r['select_ckpt']} ep {r['scored_epoch']}, "
                   f"train_top3={r['train_top3']:.3f}): "
                   f"HELD-OUT z_logit={ho['z_logit']['median']:.3f} "
                   f"({'PASS' if ho['z_logit']['median'] and ho['z_logit']['median']>=ZLOGIT_GATE else 'fail'})  "
@@ -722,11 +728,15 @@ def main() -> int:
                          for arch, e in ensemble.items()},
             "per_seed": {
                 "bilinear": [{"seed": r["seed"], "best_epoch": r["best_epoch"],
+                              "select_ckpt": r["select_ckpt"],
+                              "scored_epoch": r["scored_epoch"],
                               "train_top3": r["train_top3"],
                               "heldout": r["heldout"], "allturns": r["allturns"],
                               "live_eval": r["live_eval"]}
                              for r in per_arch["bilinear"]],
                 "transformer": [{"seed": r["seed"], "best_epoch": r["best_epoch"],
+                                 "select_ckpt": r["select_ckpt"],
+                                 "scored_epoch": r["scored_epoch"],
                                  "train_top3": r["train_top3"],
                                  "heldout": r["heldout"], "allturns": r["allturns"],
                                  "live_eval": r["live_eval"]}
