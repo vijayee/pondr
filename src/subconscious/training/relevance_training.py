@@ -169,7 +169,8 @@ def _split_queries(n: int, val_fraction: float, seed: int) -> tuple[list[int], l
 # ── eval ──
 
 def _score_slots(head: RelevanceHead, slots_y: Tensor, slots_doc_emb: Tensor,
-                query_emb: Tensor, slot_types: Tensor | None = None) -> Tensor:
+                query_emb: Tensor, slot_types: Tensor | None = None,
+                slot_doc_kinds: Tensor | None = None) -> Tensor:
     """``r_i`` for each slot -> ``[K]`` (sigmoid of the bilinear logit).
 
     Uses ``head.logits`` (the pre-sigmoid score) + sigmoid so the trainer's
@@ -180,11 +181,20 @@ def _score_slots(head: RelevanceHead, slots_y: Tensor, slots_doc_emb: Tensor,
     otherwise it is dropped so every existing caller (the shipped 2a
     CompositeZHead / ZRelevanceHead have no ``n_slot_types`` attribute) hits
     the byte-identical ``head.logits(slots_y, slots_doc_emb, query_emb)`` path.
+
+    ``slot_doc_kinds`` (Phase 1f-7, the per-doc-kind readout) is forwarded ONLY
+    when the head has ``n_doc_kinds > 0``; otherwise dropped (byte-identical).
+    The two channels are ORTHOGONAL (n_slot_types is conv/retrieved for the
+    transformer; n_doc_kinds is conv/text/code for the bilinear) so a head
+    declares at most one.
     """
     with torch.no_grad():
         if getattr(head, "n_slot_types", 0) > 0 and slot_types is not None:
             r = torch.sigmoid(head.logits(slots_y, slots_doc_emb, query_emb,
                                           slot_types=slot_types)).squeeze(-1)
+        elif getattr(head, "n_doc_kinds", 0) > 0 and slot_doc_kinds is not None:
+            r = torch.sigmoid(head.logits(slots_y, slots_doc_emb, query_emb,
+                                          slot_doc_kinds=slot_doc_kinds)).squeeze(-1)
         else:
             r = torch.sigmoid(head.logits(slots_y, slots_doc_emb,
                                           query_emb)).squeeze(-1)  # [K]
@@ -228,7 +238,11 @@ def evaluate_relevance(
         # eval too. Old traces without the field -> None -> dropped -> byte-
         # identical for every non-slot-type head (shipped 2a / Head A).
         slot_types = rec.get("slot_types")
-        r = _score_slots(head, slots, doc_emb, qemb, slot_types)  # [K]
+        # Phase 1f-7: forward the per-slot doc-kind tensor for the per-doc-kind
+        # readout (n_doc_kinds>0); same None-on-old-traces byte-identical guard.
+        slot_doc_kinds = rec.get("slot_doc_kinds")
+        r = _score_slots(head, slots, doc_emb, qemb, slot_types,
+                         slot_doc_kinds)  # [K]
         gold_idx = (labels > 0).nonzero(as_tuple=True)[0].tolist()
         n_gold = len(gold_idx)
         if n_gold == 0:

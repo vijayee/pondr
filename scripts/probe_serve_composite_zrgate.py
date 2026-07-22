@@ -82,7 +82,8 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))        # sibling scripts
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root
 
 from src.subconscious.state_readout import (  # noqa: E402
     DEFAULT_DIM_IN,
@@ -94,6 +95,7 @@ from src.subconscious.training.relevance_training import (  # noqa: E402
     _split_queries,
     fit_relevance,
 )
+import probe_strm_selectivity_real as p_sel  # noqa: E402  # Stage 1 doc-kind helpers
 
 # The serve traces carry slot.h as fp16 [K,4,16,384]; the composite's StateReadout
 # takes the flattened LAST layer [K, 16*384=6144] (Phase 0b's validated "last" rep
@@ -103,6 +105,32 @@ D_STATE = 16
 D_MODEL = 384
 DEFAULT_TRACES = "data/training/strm_relevance/traces_serve_identity_hraw.pt"
 DEFAULT_OUT = "data/training/strm_relevance/serve_composite_zrgate.json"
+# Phase 1f-7 Stage 1 per-doc-kind readout channel (orthogonal to the
+# transformer's n_slot_types conv/retrieved channel): conv/unmapped -> 0,
+# text-doc -> 1, code-doc -> 2 (matches probe_head_to_head_onyx.py).
+DOC_KIND_CONV = 0
+DOC_KIND_TEXT = 1
+DOC_KIND_CODE = 2
+
+
+def _slot_doc_kinds(rec: dict, doc_kind_map: dict[str, str] | None) -> Tensor:
+    """``[K] long`` doc-kind index per slot (conv=0/text=1/code=2) for the
+    per-doc-kind readout. Built from ``rec["source_ids"]`` + the doc_kind_map
+    (Stage 1 S1.8). All-0 when the map is None (byte-identical: the shared
+    readout is the only head, so routing is a no-op)."""
+    sids = rec["source_ids"]
+    out = torch.zeros(len(sids), dtype=torch.long)
+    if doc_kind_map is None:
+        return out
+    for i, sid in enumerate(sids):
+        k = p_sel._doc_kind_for_source(str(sid), doc_kind_map)
+        if k == "text":
+            out[i] = DOC_KIND_TEXT
+        elif k == "code":
+            out[i] = DOC_KIND_CODE
+        else:
+            out[i] = DOC_KIND_CONV
+    return out
 # Train-on-serve artifacts are DIAGNOSTIC, not ship artifacts -- keep them out of
 # the real Phase 0b state_readout dir; gitignored (data/ is gitignored anyway).
 DEFAULT_CKPT_ROOT = "data/training/strm_state_readout/serve_zrgate"
@@ -156,7 +184,8 @@ def _load_serve_traces(traces_path: str) -> list[dict]:
     return out
 
 
-def _zr_per_slot(composite: CompositeZHead, rec: dict, device) -> tuple[Tensor, Tensor]:
+def _zr_per_slot(composite: CompositeZHead, rec: dict, device,
+                 doc_kind_map: dict[str, str] | None = None) -> tuple[Tensor, Tensor]:
     """``(z_r, z_logit)`` per slot -> ``([K], [K])``.
 
     ``z_r = sigmoid(logit)`` (the SERVE gate metric, 0.2 sigmoid gap gate);
@@ -165,24 +194,42 @@ def _zr_per_slot(composite: CompositeZHead, rec: dict, device) -> tuple[Tensor, 
     sigmoid gap) from a genuine lack of signal (both small) -- the diagnostic
     that decides whether the flat readout fails the z_r gate because the head
     saturates (fixable: margin/temperature) or because z_i carries no margin
-    signal (not fixable by a readout)."""
+    signal (not fixable by a readout).
+
+    Phase 1f-7 Stage 1: a per-doc-kind ``CompositeZHead`` (``n_doc_kinds>0``)
+    requires a ``slot_doc_kinds`` [K] long tensor to route each slot to its
+    per-kind readout head. Prefer the trainer-stamped ``rec["slot_doc_kinds"]``
+    (the trainer stamps it on every record before --drop-self-slot so the slice
+    stays aligned); fall back to building from ``rec["source_ids"]`` +
+    ``doc_kind_map`` (the standalone serve-probe path, whose records are NOT
+    stamped). All-0 when neither is available = byte-identical to n_doc_kinds=0
+    for a head that ignores the kwarg."""
     z_flat = rec["slots_h_raw"].to(device).to(torch.float32)      # [K,6144]
     q = rec["query_emb"].to(device).to(torch.float32)             # [384]
     K = z_flat.shape[0]
     slot_y = torch.zeros(K, int(composite.slot_dim), device=device)
+    n_doc_kinds = int(getattr(composite, "n_doc_kinds", 0))
     with torch.no_grad():
         # Phase 1c: a Phase-1 CrossSlotTransformerZHead (n_slot_types>0)
         # requires ``slot_types`` to exercise its slot-type embedding; Head A
         # (CompositeZHead) + the bare ZRelevanceHead do NOT accept the kwarg,
         # so gate on ``n_slot_types`` (default 0 = byte-identical, no kwarg).
-        if getattr(composite, "n_slot_types", 0) > 0:
+        # Phase 1f-7: the per-doc-kind readout gates on ``n_doc_kinds`` (an
+        # ORTHOGONAL channel -- a head may set either, both, or neither).
+        use_types = getattr(composite, "n_slot_types", 0) > 0
+        use_kinds = n_doc_kinds > 0
+        kwargs = {}
+        if use_types:
             st = rec.get("slot_types")
             if st is None:
                 st = torch.zeros(K, dtype=torch.long)
-            logit = composite.logits(slot_y, z_flat, q,
-                                     slot_types=st.to(device)).squeeze(-1)
-        else:
-            logit = composite.logits(slot_y, z_flat, q).squeeze(-1)    # [K]
+            kwargs["slot_types"] = st.to(device)
+        if use_kinds:
+            dk = rec.get("slot_doc_kinds")
+            if dk is None:
+                dk = _slot_doc_kinds(rec, doc_kind_map)
+            kwargs["slot_doc_kinds"] = dk.to(device).long()
+        logit = composite.logits(slot_y, z_flat, q, **kwargs).squeeze(-1)
         return torch.sigmoid(logit), logit
 
 
@@ -223,15 +270,21 @@ def _selectivity_gap(turns: list[dict], per_slot_fn, gate: float) -> dict:
     }
 
 
-def _zr_and_logit_gaps(composite: CompositeZHead, turns: list[dict], device) -> dict:
+def _zr_and_logit_gaps(composite: CompositeZHead, turns: list[dict], device,
+                      doc_kind_map: dict[str, str] | None = None) -> dict:
     """Both the z_r sigmoid gap (0.2 gate) and the z_logit pre-sigmoid gap
     (2.0 gate, the unbounded-logit analog the live serve probe reports). The
     z_logit gap is the SATURATION diagnostic: a large z_logit gap with a small
     z_r gap means the head produces a real logit margin that the sigmoid
     compresses (fixable); both small means no margin signal (not fixable by a
-    readout)."""
-    def zr_fn(rec): return _zr_per_slot(composite, rec, device)[0]
-    def zlg_fn(rec): return _zr_per_slot(composite, rec, device)[1]
+    readout).
+
+    ``doc_kind_map`` (Phase 1f-7 Stage 1) is forwarded to ``_zr_per_slot`` so a
+    per-doc-kind head whose records lack a stamped ``slot_doc_kinds`` (the
+    standalone serve-probe path) can build it from ``source_ids``. The trainer
+    path passes None -- its records are already stamped."""
+    def zr_fn(rec): return _zr_per_slot(composite, rec, device, doc_kind_map)[0]
+    def zlg_fn(rec): return _zr_per_slot(composite, rec, device, doc_kind_map)[1]
     return {"z_r": _selectivity_gap(turns, zr_fn, 0.2),
             "z_logit": _selectivity_gap(turns, zlg_fn, 2.0)}
 

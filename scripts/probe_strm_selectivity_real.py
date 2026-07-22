@@ -337,7 +337,8 @@ def _doc_kind_for_source(source_id, doc_kind_map) -> str | None:
 def _capture_turn(orch: PonderOrchestrator, user_text: str,
                   context_builder=None, z_head=None, ld_head=None,
                   emit_trace: bool = False, ld_head_for_emit=None,
-                  emit_raw_state: bool = False, z_head_arch="composite") -> dict:
+                  emit_raw_state: bool = False, z_head_arch="composite",
+                  doc_kind_map: dict[str, str] | None = None) -> dict:
     """Score the current WM ring against this turn's query. Returns one record:
     ``{user_text, slots: [{source_id, text, r_i, logit, s_i, s_i_pure, z_r,
     z_logit, cos}]}`` where ``cos`` is the bge cosine between the slot text and
@@ -355,7 +356,7 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
     (slots, r_is, logits, s_is, s_is_pure, z_logits, z_rs) = _score_ring_with_logits(
         orch.working_memory, orch.relevance_head, orch.embedder, prompt_emb,
         slots, context_builder=context_builder, z_head=z_head, ld_head=ld_head,
-        z_head_arch=z_head_arch)
+        z_head_arch=z_head_arch, doc_kind_map=doc_kind_map)
     # Embed each scored slot's text once for the cosine probe/filler label.
     out_slots = []
     emit_idx: list[int] = []
@@ -410,7 +411,8 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
 
 def _score_ring_with_logits(working_memory, relevance_head, embedder,
                             prompt_emb, slots, context_builder=None,
-                            z_head=None, ld_head=None, z_head_arch="composite"):
+                            z_head=None, ld_head=None, z_head_arch="composite",
+                            doc_kind_map: dict[str, str] | None = None):
     """Mirror ``relevance_score._score`` but return the pre-sigmoid LOGIT too
     (so the ablation can measure the bilinear gap that the saturated sigmoid
     hides), and -- when a ContextBuilder is supplied -- the transformer's per-
@@ -531,6 +533,7 @@ def _score_ring_with_logits(working_memory, relevance_head, embedder,
                 # actually has ``n_slot_types > 0`` -- the task #45/46 heads
                 # (``n_slot_types=0``) take the no-kwarg path -> byte-identical.
                 n_slot_types = getattr(z_head, "n_slot_types", 0)
+                n_doc_kinds = int(getattr(z_head, "n_doc_kinds", 0))
                 z_slot_types = None
                 if n_slot_types > 0:
                     z_slot_types = torch.zeros(
@@ -546,9 +549,42 @@ def _score_ring_with_logits(working_memory, relevance_head, embedder,
                             st = 0 if "#" in sid and "__ep" not in sid else 1
                         z_slot_types[k] = int(st)
                         k += 1
-                if n_slot_types > 0:
+                # Phase 1f-7 Stage 1: per-doc-kind readout. Build a parallel
+                # z_slot_doc_kinds [Kz] long INSIDE the scored path from each
+                # scored slot's ``source_id`` + the already-loaded doc_kind_map
+                # (NOT from a post-capture rec["slots"] dict -- RingSlot has no
+                # doc_kind). conv/unmapped -> 0, text-doc -> 1, code-doc -> 2.
+                # Only passed when the head has n_doc_kinds>0; the n_doc_kinds=0
+                # head takes the no-kwarg path -> byte-identical.
+                z_slot_doc_kinds = None
+                if n_doc_kinds > 0:
+                    z_slot_doc_kinds = torch.zeros(
+                        z_stack.shape[0], dtype=torch.long, device=head_dev)
+                    k = 0
+                    for j, ok in enumerate(z_mask):
+                        if not ok:
+                            continue
+                        slot = slots[idx_text[j][0]]
+                        sid = getattr(slot, "source_id", None) or ""
+                        kk = _doc_kind_for_source(sid, doc_kind_map)
+                        if kk == "text":
+                            kv = 1
+                        elif kk == "code":
+                            kv = 2
+                        else:
+                            kv = 0
+                        z_slot_doc_kinds[k] = kv
+                        k += 1
+                if n_slot_types > 0 and n_doc_kinds > 0:
+                    z_lg = z_head.logits(slot_y_dummy, z_stack, q,
+                                         slot_types=z_slot_types,
+                                         slot_doc_kinds=z_slot_doc_kinds)    # [Kz,1]
+                elif n_slot_types > 0:
                     z_lg = z_head.logits(slot_y_dummy, z_stack, q,
                                          slot_types=z_slot_types)    # [Kz, 1]
+                elif n_doc_kinds > 0:
+                    z_lg = z_head.logits(slot_y_dummy, z_stack, q,
+                                         slot_doc_kinds=z_slot_doc_kinds)    # [Kz,1]
                 else:
                     z_lg = z_head.logits(slot_y_dummy, z_stack, q)             # [Kz, 1]
                 z_r = torch.sigmoid(z_lg)                                  # [Kz, 1]
@@ -726,6 +762,19 @@ def replay_and_capture(
         elif z_relevance_head_path:
             print(f"[probe] ZRelevanceHead checkpoint not found at "
                   f"{z_relevance_head_path} -- z capture skipped.", file=sys.stderr)
+        # Phase 1f-7 Stage 1 de-wonk: a per-doc-kind head (n_doc_kinds>0) needs a
+        # doc_kind_map to route slots to their per-kind readout head. Without
+        # --doc-store the map is None -> _doc_kind_for_source returns None for
+        # every slot -> all slots route to kind 0 (conv) -> the text/code heads
+        # are NEVER exercised. That is a SILENT mis-wire (no crash, wrong
+        # numbers), so warn loudly. The live gate always passes --doc-store.
+        if z_head is not None and int(getattr(z_head, "n_doc_kinds", 0)) > 0 \
+                and doc_kind_map is None:
+            print(f"[probe] WARNING: per-doc-kind head (n_doc_kinds="
+                  f"{getattr(z_head, 'n_doc_kinds', 0)}) loaded without "
+                  f"--doc-store -> every slot routes to kind 0 (conv); the "
+                  f"text/code readout heads are NOT exercised. Pass --doc-store "
+                  f"to build the doc_kind_map.", file=sys.stderr)
         # Task #38: an untrained LatentDynamicsHead for EMITTING serve-distribution
         # training traces (project is parameter-free, so this matches the
         # generator/trainer z_i exactly). Independent of z_head -- emit uses the
@@ -833,7 +882,8 @@ def replay_and_capture(
                                     emit_trace=emit_traces is not None,
                                     ld_head_for_emit=ld_head_for_emit,
                                     emit_raw_state=emit_raw_state,
-                                    z_head_arch=z_head_arch)
+                                    z_head_arch=z_head_arch,
+                                    doc_kind_map=doc_kind_map)
                 if emit_traces:
                     # Pop the trace BEFORE the record enters turn_records so
                     # _analyze (the measurement path) never sees it.

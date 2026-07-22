@@ -66,14 +66,41 @@ class StateReadout(nn.Module):
     ``Linear(dim_in, hidden) -> ReLU -> Linear(hidden, dim_out)`` for the
     nonlinear ``g*W_B(doc_bge)`` encoding. ``forward`` casts to fp32 (the raw
     state is fp16 from Phase A's ``slot.h`` capture).
+
+    Phase 1f-7 per-doc-kind readout (``n_doc_kinds > 0``): a SHARED
+    ``body = Linear(dim_in, hidden) -> ReLU`` (learned once on the full mixed
+    ring) feeds ``kind_heads = ModuleList([Linear(hidden, dim_out) for _ in
+    range(n_doc_kinds)])``, routed by a ``doc_kinds: [B] long`` tensor. Each
+    kind gets its own query-direction rotation; the shared body controls
+    overfit on the ~400 code slots. ``n_doc_kinds=0`` (default) builds the
+    ORIGINAL single-shared ``net = Sequential(Linear, ReLU, Linear)`` so the
+    state_dict keys (``net.0.*`` / ``net.2.*``) are byte-identical and old
+    ``best.pt``/``final.pt`` strict-load -- the binding check. The per-kind
+    arch uses a SEPARATE key namespace (``body.0.*`` / ``kind_heads.{k}.*``)
+    so the two never collide.
     """
 
-    def __init__(self, dim_in: int, dim_out: int = Z_DIM, hidden: int | None = None) -> None:
+    def __init__(self, dim_in: int, dim_out: int = Z_DIM, hidden: int | None = None,
+                 n_doc_kinds: int = 0) -> None:
         super().__init__()
         self.dim_in = int(dim_in)
         self.dim_out = int(dim_out)
         self.hidden = int(hidden) if hidden is not None else None
-        if hidden is None:
+        self.n_doc_kinds = int(n_doc_kinds)
+        if self.n_doc_kinds > 0 and hidden is None:
+            # The per-kind arch needs a shared body to feed the per-kind heads;
+            # a pure-linear per-kind readout is degenerate (no shared depth).
+            raise ValueError("n_doc_kinds>0 requires hidden (shared MLP body)")
+        if self.n_doc_kinds > 0:
+            # Shared body 6144 -> hidden (ReLU); per-kind head hidden -> dim_out.
+            self.body = nn.Sequential(
+                nn.Linear(self.dim_in, self.hidden),
+                nn.ReLU(),
+            )
+            self.kind_heads = nn.ModuleList(
+                [nn.Linear(self.hidden, self.dim_out) for _ in range(self.n_doc_kinds)]
+            )
+        elif hidden is None:
             self.net = nn.Linear(self.dim_in, self.dim_out)
         else:
             self.net = nn.Sequential(
@@ -82,30 +109,53 @@ class StateReadout(nn.Module):
                 nn.Linear(self.hidden, self.dim_out),
             )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, doc_kinds: Tensor | None = None) -> Tensor:
         x = x.to(torch.float32)
         if x.dim() == 1:
             x = x.unsqueeze(0)
-        return self.net(x)            # [B, dim_out]
+        if self.n_doc_kinds <= 0:
+            return self.net(x)            # [B, dim_out] (byte-identical path)
+        # Per-doc-kind: shared body, then route each row to its kind head.
+        if doc_kinds is None:
+            raise RuntimeError(
+                "StateReadout(n_doc_kinds>0).forward requires a doc_kinds tensor"
+            )
+        h = self.body(x)                  # [B, hidden] (ReLU)
+        dk = doc_kinds.to(x.device).long()
+        out = x.new_empty(x.shape[0], self.dim_out)
+        for k in range(self.n_doc_kinds):
+            mask = dk == k
+            if mask.any():
+                out[mask] = self.kind_heads[k](h[mask])
+        return out                        # [B, dim_out]
 
     @classmethod
     def from_state_dict(cls, sd: dict, dim_in: int, dim_out: int = Z_DIM) -> "StateReadout":
         """Build a readout and load a raw ``state_dict`` (keys prefixed ``net.``).
 
         Linear-vs-MLP is inferred from the keys: ``net.2.weight`` present -> MLP
-        with ``hidden = sd["net.0.weight"].shape[0]``; else Linear. Strict on
+        with ``hidden = sd["net.0.weight"].shape[0]``; else Linear. The
+        per-doc-kind arch is inferred from ``kind_heads.{k}.weight`` keys
+        (n_doc_kinds = the count of distinct kind_heads.{k}.weight). Strict on
         missing/unexpected keys (a mis-wire is a hard error, not a silent load).
         Accepts either bare ``net.*`` keys (a standalone readout) or
         ``readout.net.*`` keys (a composite's readout slice) -- the
-        ``readout.`` prefix is stripped BEFORE the MLP inference so the
-        ``net.2.weight`` check sees the de-prefixed keys.
+        ``readout.`` prefix is stripped BEFORE the key inference so the
+        ``net.2.weight`` / ``kind_heads.0.weight`` checks see the de-prefixed
+        keys.
         """
         prefix = "readout."
         own = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
+        n_doc_kinds = 0
+        kind_keys = [k for k in own if k.startswith("kind_heads.") and k.endswith(".weight")]
+        if kind_keys:
+            n_doc_kinds = len({k.split(".")[1] for k in kind_keys})
         hidden = None
-        if "net.2.weight" in own:
+        if n_doc_kinds > 0:
+            hidden = int(own["body.0.weight"].shape[0])
+        elif "net.2.weight" in own:
             hidden = int(own["net.0.weight"].shape[0])
-        ro = cls(dim_in=dim_in, dim_out=dim_out, hidden=hidden)
+        ro = cls(dim_in=dim_in, dim_out=dim_out, hidden=hidden, n_doc_kinds=n_doc_kinds)
         missing, unexpected = ro.load_state_dict(own, strict=False)
         if missing or unexpected:
             raise RuntimeError(
@@ -129,10 +179,13 @@ class CompositeZHead(nn.Module):
     can reconstruct the readout.
     """
 
-    def __init__(self, dim_in: int = DEFAULT_DIM_IN, hidden: int | None = None) -> None:
+    def __init__(self, dim_in: int = DEFAULT_DIM_IN, hidden: int | None = None,
+                 n_doc_kinds: int = 0) -> None:
         super().__init__()
         self.dim_in = int(dim_in)
-        self.readout = StateReadout(dim_in=self.dim_in, hidden=hidden)
+        self.n_doc_kinds = int(n_doc_kinds)
+        self.readout = StateReadout(dim_in=self.dim_in, hidden=hidden,
+                                    n_doc_kinds=self.n_doc_kinds)
         self.z_head = ZRelevanceHead()
         # Mirror the z-head's checkpoint dims; doc_dim = the readout input dim
         # (so the loader rebuilds the readout with the right dim_in).
@@ -141,14 +194,23 @@ class CompositeZHead(nn.Module):
         self.proj_dim = self.z_head.proj_dim
         self.doc_dim = self.dim_in
 
-    def logits(self, slot_y: Tensor, slot_signal: Tensor, query_emb: Tensor) -> Tensor:
+    def logits(self, slot_y: Tensor, slot_signal: Tensor, query_emb: Tensor,
+               slot_doc_kinds: Tensor | None = None) -> Tensor:
         """Pre-sigmoid relevance logit -> ``[batch, 1]``.
 
         ``slot_signal`` is the raw flattened state ``[K, dim_in]`` (or
         ``[dim_in]``); ``slot_y`` is accepted and ignored (pure-z_i test).
+        ``slot_doc_kinds`` routes each slot to its per-kind readout head when
+        ``n_doc_kinds>0`` (Phase 1f-7); ignored when ``n_doc_kinds=0``.
         """
-        z_i = self.readout(slot_signal)                 # [K, 384] or [1, 384]
+        z_i = self.readout(slot_signal, doc_kinds=slot_doc_kinds)  # [K, 384] or [1, 384]
         return self.z_head.logits(slot_y, z_i, query_emb)
+
+    def predict(self, slot_y: Tensor, slot_signal: Tensor, query_emb: Tensor,
+                slot_doc_kinds: Tensor | None = None) -> Tensor:
+        return torch.sigmoid(self.logits(slot_y, slot_signal, query_emb, slot_doc_kinds))
+
+    forward = predict
 
     def predict(self, slot_y: Tensor, slot_signal: Tensor, query_emb: Tensor) -> Tensor:
         return torch.sigmoid(self.logits(slot_y, slot_signal, query_emb))
@@ -168,13 +230,22 @@ class CompositeZHead(nn.Module):
         """Build a composite from a raw composite ``state_dict`` and load it.
 
         Keys are ``readout.*`` and ``z_head.*``. The readout's Linear-vs-MLP arch
-        is inferred from ``readout.net.*`` keys. Strict on missing/unexpected.
+        is inferred from ``readout.net.*`` keys; the per-doc-kind arch is
+        inferred from ``readout.kind_heads.{k}.weight`` keys (n_doc_kinds = the
+        count of distinct kinds). Strict on missing/unexpected.
         """
-        # Infer readout hidden-ness from the readout.net keys.
+        # Infer readout hidden-ness + per-doc-kind from the readout keys.
+        n_doc_kinds = 0
+        kind_keys = [k for k in sd
+                    if k.startswith("readout.kind_heads.") and k.endswith(".weight")]
+        if kind_keys:
+            n_doc_kinds = len({k.split(".")[2] for k in kind_keys})
         hidden = None
-        if "readout.net.2.weight" in sd:
+        if n_doc_kinds > 0:
+            hidden = int(sd["readout.body.0.weight"].shape[0])
+        elif "readout.net.2.weight" in sd:
             hidden = int(sd["readout.net.0.weight"].shape[0])
-        head = cls(dim_in=dim_in, hidden=hidden)
+        head = cls(dim_in=dim_in, hidden=hidden, n_doc_kinds=n_doc_kinds)
         # Rebind the z_head dims to the checkpoint's if they differ (defensive).
         head.z_head = ZRelevanceHead.from_state_dict(
             {k[len("z_head."):]: v for k, v in sd.items() if k.startswith("z_head.")},

@@ -120,15 +120,20 @@ DEFAULT_LIVE_EVAL_SESSION_IDS = (
 
 def _build_head(arch: str, dim_in: int, hidden: int | None,
                 n_slot_types: int = 0, learnable_temp: bool = False,
-                dropout: float = 0.0) -> nn.Module:
+                dropout: float = 0.0, n_doc_kinds: int = 0) -> nn.Module:
     """Construct Head A (bilinear composite) or Head B (cross-slot Transformer).
 
     The Phase-1b/1d knobs (``n_slot_types`` slot-type embedding, ``learnable_temp``
     logit temperature, ``dropout`` readout regularization) are Head B ONLY -- Head
     A (``CompositeZHead``) ignores them. Defaults 0/False/0.0 = the task #45 arch
-    (byte-identical; the existing best.pt strict-loads via ``_load_head``)."""
+    (byte-identical; the existing best.pt strict-loads via ``_load_head``).
+
+    Phase 1f-7 Stage 1 ``n_doc_kinds`` (Head A ONLY): the per-doc-kind readout
+    (shared body + per-kind heads). 0 = byte-identical shared readout. Head B
+    (transformer) ignores it (its ``n_slot_types`` conv/retrieved channel is
+    ORTHOGONAL to doc-kind; do NOT repurpose it)."""
     if arch == "bilinear":
-        return CompositeZHead(dim_in=dim_in, hidden=hidden)
+        return CompositeZHead(dim_in=dim_in, hidden=hidden, n_doc_kinds=n_doc_kinds)
     if arch == "transformer":
         return CrossSlotTransformerZHead(dim_in=dim_in, hidden=hidden,
                                          n_slot_types=n_slot_types,
@@ -139,21 +144,24 @@ def _build_head(arch: str, dim_in: int, hidden: int | None,
 
 def _load_head(arch: str, ckpt_path: str, dim_in: int, hidden: int | None,
                device: str, n_slot_types: int = 0, learnable_temp: bool = False,
-               dropout: float = 0.0) -> nn.Module:
+               dropout: float = 0.0, n_doc_kinds: int = 0) -> nn.Module:
     """Reload a trained head from its checkpoint (best.pt or final.pt).
 
     The Phase-1b/1d knobs are read from the checkpoint (a Phase-1 head wrote
     them); a task-#45 checkpoint omits them -> the defaults 0/False/0.0 rebuild
-    the byte-identical arch + strict-load. ``_build_head`` is used for Head A
-    (knobs ignored) + Head B (knobs threaded into the ctor)."""
+    the byte-identical arch + strict-load. ``n_doc_kinds`` (Phase 1f-7) is read
+    from the ckpt (default 0) for Head A; Head B ignores it. ``_build_head`` is
+    used for Head A (bilinear knobs threaded) + Head B (slot-type knobs threaded)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     sd = ckpt["head"] if isinstance(ckpt, dict) and "head" in ckpt else ckpt
     if isinstance(ckpt, dict) and "head" in ckpt:
         n_slot_types = int(ckpt.get("n_slot_types", n_slot_types))
         learnable_temp = bool(ckpt.get("learnable_temp", learnable_temp))
         dropout = float(ckpt.get("dropout", dropout))
+        n_doc_kinds = int(ckpt.get("n_doc_kinds", n_doc_kinds))
     head = _build_head(arch, dim_in, hidden, n_slot_types=n_slot_types,
-                       learnable_temp=learnable_temp, dropout=dropout)
+                       learnable_temp=learnable_temp, dropout=dropout,
+                       n_doc_kinds=n_doc_kinds)
     head.load_state_dict(sd)
     dev = torch.device(device)
     return head.to(dev).eval()
@@ -216,7 +224,8 @@ def _drop_self_slot(rec: dict, multi_positive_margin: float = 0.0) -> dict | Non
     out["source_ids"] = [rec["source_ids"][j] for j in keep]
     out["slot_types"] = rec["slot_types"][keep]
     out["cos"] = rec["cos"][keep]
-    for k in ("slots_h_raw", "slots_y", "slots_z", "slots_doc_emb"):
+    for k in ("slots_h_raw", "slots_y", "slots_z", "slots_doc_emb",
+              "slot_doc_kinds"):
         if k in rec:
             out[k] = rec[k][keep]
     cos = out["cos"].to(torch.float32)
@@ -336,6 +345,35 @@ def _gold_cos_baseline(records: list[dict]) -> dict:
     return {"median": float(statistics.median(gaps)), "n": len(gaps)}
 
 
+# Stage 1 doc-kind indexing for the per-doc-kind readout. Reuses the live
+# probe's source_id -> kind resolution so train/serve align. conv/unmapped -> 0,
+# text-doc -> 1, code-doc -> 2 (the ``n_doc_kinds=3`` channel; the transformer's
+# n_slot_types conv/retrieved channel is ORTHOGONAL -- do NOT conflate them).
+DOC_KIND_CONV = 0
+DOC_KIND_TEXT = 1
+DOC_KIND_CODE = 2
+
+
+def _slot_doc_kinds(rec: dict, doc_kind_map: dict[str, str] | None) -> torch.Tensor:
+    """A ``[K] long`` doc-kind index per slot (conv=0 / text=1 / code=2) for the
+    per-doc-kind readout. Built from ``source_ids`` + the doc_kind_map (Stage 1
+    S1.5). When ``doc_kind_map is None`` returns all-0 (byte-identical: the
+    shared readout is the only head, so routing is a no-op)."""
+    sids = rec["source_ids"]
+    if doc_kind_map is None:
+        return torch.zeros(len(sids), dtype=torch.long)
+    out = torch.zeros(len(sids), dtype=torch.long)
+    for i, sid in enumerate(sids):
+        k = p_sel._doc_kind_for_source(str(sid), doc_kind_map)
+        if k == "text":
+            out[i] = DOC_KIND_TEXT
+        elif k == "code":
+            out[i] = DOC_KIND_CODE
+        else:
+            out[i] = DOC_KIND_CONV
+    return out
+
+
 def _session_split(records: list[dict], val_fraction: float, seed: int,
                     live_eval_sessions: frozenset[str] = frozenset()):
     """Split records by SESSION so held-out turns are ENTIRE unseen
@@ -415,7 +453,8 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                 n_slot_types: int = 0, learnable_temp: bool = False,
                 dropout: float = 0.0, label_smoothing: float = 0.0,
                 cosine_schedule: bool = False,
-                margin_loss: float = 0.0, hard_negative: bool = False) -> dict:
+                margin_loss: float = 0.0, hard_negative: bool = False,
+                n_doc_kinds: int = 0, kind_head_wd: float = 0.0) -> dict:
     """Train one head (bilinear OR transformer) on the train sessions with the
     SAME contrastive InfoNCE loss. Mirrors ``p44._train_contrastive`` but is
     generic over the head arch. Uses ``evaluate_relevance`` on the train-internal
@@ -441,20 +480,37 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
     torch.manual_seed(seed)
     dim_in = int(train[0]["slots_h_raw"].shape[1])
     head = _build_head(arch, dim_in, hidden, n_slot_types=n_slot_types,
-                       learnable_temp=learnable_temp, dropout=dropout).to(dev)
+                       learnable_temp=learnable_temp, dropout=dropout,
+                       n_doc_kinds=n_doc_kinds).to(dev)
     use_slot_types = getattr(head, "n_slot_types", 0) > 0
+    use_doc_kinds = getattr(head, "n_doc_kinds", 0) > 0
     n_params = sum(p.numel() for p in head.parameters())
     arch_name = (f"MLP-{hidden}" if hidden else "Linear") if arch == "bilinear" \
         else f"Transformer({'MLP-'+str(hidden) if hidden else 'Linear'} readout)"
+    if use_doc_kinds:
+        arch_name = f"PerKind-{arch_name}({n_doc_kinds} kinds)"
     loss_tag = (f"MARGIN(m={margin_loss}, hard-neg={hard_negative})"
                 if margin_loss > 0.0 else f"CONTRASTIVE(T={temperature})")
     print(f"\ntraining {arch} seed={seed} {loss_tag} ({arch_name} {dim_in}->384, "
           f"{n_params:,} params, wd={weight_decay}, {epochs} epochs, "
-          f"slot_types={use_slot_types}, dropout={dropout}, "
-          f"label_smoothing={label_smoothing}, cosine={cosine_schedule}) -> "
-          f"{ckpt_dir}", flush=True)
+          f"slot_types={use_slot_types}, doc_kinds={use_doc_kinds}, "
+          f"dropout={dropout}, label_smoothing={label_smoothing}, "
+          f"cosine={cosine_schedule}) -> {ckpt_dir}", flush=True)
 
-    optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
+    # Phase 1f-7: heavier weight decay on the per-kind heads (the ~400 code
+    # slots overfit; kind_head_wd applies ONLY to kind_heads.* params, the
+    # shared body + z_head keep the base weight_decay). Param groups by name
+    # prefix; AdamW applies per-group weight_decay.
+    if use_doc_kinds and kind_head_wd > 0.0:
+        kind_params, base_params = [], []
+        for n, p in head.named_parameters():
+            (kind_params if n.startswith("readout.kind_heads.") else base_params).append(p)
+        optimizer = torch.optim.AdamW(
+            [{"params": base_params, "weight_decay": weight_decay},
+             {"params": kind_params, "weight_decay": kind_head_wd}],
+            lr=lr)
+    else:
+        optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
                  if cosine_schedule else None)
     # Per-epoch TRAIN gate: query-split WITHIN train (mirrors _train_contrastive).
@@ -485,6 +541,7 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                     "query_dim": ck_query_dim, "proj_dim": ck_proj_dim,
                     "hidden": hidden,
                     "n_slot_types": int(getattr(head, "n_slot_types", 0)),
+                    "n_doc_kinds": int(getattr(head, "n_doc_kinds", 0)),
                     "learnable_temp": bool(getattr(head, "learnable_temp", False)),
                     "dropout": float(getattr(head, "dropout", 0.0)),
                     "label_smoothing": float(label_smoothing),
@@ -520,6 +577,18 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                     st = torch.zeros(K, dtype=torch.long)
                 logits = head.logits(slot_y, z_flat, q,
                                      slot_types=st.to(dev).long()).squeeze(-1)
+            elif use_doc_kinds:
+                # Phase 1f-7: per-doc-kind bilinear. ``slot_doc_kinds`` is stamped
+                # on the record in ``main`` (from source_ids + doc_kind_map) and
+                # sliced by ``_drop_self_slot``; absent on old traces -> all-0
+                # (the shared-head path, a no-op for n_doc_kinds=0 but a hard
+                # error for n_doc_kinds>0 -- guarded by the require-doc-store in
+                # main so a per-kind run never sees an unstamped record).
+                dk = rec.get("slot_doc_kinds")
+                if dk is None:
+                    dk = torch.zeros(K, dtype=torch.long)
+                logits = head.logits(slot_y, z_flat, q,
+                                     slot_doc_kinds=dk.to(dev).long()).squeeze(-1)
             else:
                 logits = head.logits(slot_y, z_flat, q).squeeze(-1)   # [K]
             gold = labels > 0
@@ -598,18 +667,28 @@ class _EnsembleHead(nn.Module):
         self.heads = nn.ModuleList(heads)
         h0 = heads[0]
         self.n_slot_types = int(getattr(h0, "n_slot_types", 0))
+        # Phase 1f-7: mirror n_doc_kinds so a per-kind ensemble forwards the
+        # slot_doc_kinds kwarg to its members (the live eval path gates on this
+        # attribute; without it a per-kind ensemble would take the no-kwarg path
+        # and the member heads would raise "requires doc_kinds").
+        self.n_doc_kinds = int(getattr(h0, "n_doc_kinds", 0))
         self.slot_dim = int(getattr(h0, "slot_dim", 0))
         self.query_dim = int(getattr(h0, "query_dim", 0))
         self.doc_dim = int(getattr(h0, "doc_dim", 0))
         self.proj_dim = int(getattr(h0, "proj_dim", 0))
 
-    def logits(self, slot_y, slot_signal, query_emb, slot_types=None):
+    def logits(self, slot_y, slot_signal, query_emb, slot_types=None,
+               slot_doc_kinds=None):
         acc = None
         for h in self.heads:
+            # Forward only the kwargs the member head declares (a mixed ensemble
+            # is not supported -- all members share h0's n_slot_types/n_doc_kinds).
+            kw = {}
             if self.n_slot_types > 0 and slot_types is not None:
-                lg = h.logits(slot_y, slot_signal, query_emb, slot_types=slot_types)
-            else:
-                lg = h.logits(slot_y, slot_signal, query_emb)
+                kw["slot_types"] = slot_types
+            if self.n_doc_kinds > 0 and slot_doc_kinds is not None:
+                kw["slot_doc_kinds"] = slot_doc_kinds
+            lg = h.logits(slot_y, slot_signal, query_emb, **kw)
             acc = lg if acc is None else acc + lg
         assert acc is not None
         return acc / len(self.heads)
@@ -623,7 +702,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
               dropout: float = 0.0, label_smoothing: float = 0.0,
               cosine_schedule: bool = False,
               select_ckpt: str = "best",
-              margin_loss: float = 0.0, hard_negative: bool = False) -> dict:
+              margin_loss: float = 0.0, hard_negative: bool = False,
+              n_doc_kinds: int = 0, kind_head_wd: float = 0.0) -> dict:
     """Train one arch (one seed), eval on held-out sessions + all-turns ceiling
     + (D0.4a) the live-eval bucket (the 2 live-transcript sessions, held OUT of
     train for every seed -> the genuinely-held-out conversation-ring gap).
@@ -642,7 +722,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
                     n_slot_types=n_slot_types, learnable_temp=learnable_temp,
                     dropout=dropout, label_smoothing=label_smoothing,
                     cosine_schedule=cosine_schedule,
-                    margin_loss=margin_loss, hard_negative=hard_negative)
+                    margin_loss=margin_loss, hard_negative=hard_negative,
+                    n_doc_kinds=n_doc_kinds, kind_head_wd=kind_head_wd)
     ckpt_path = r["ckpt_final"] if select_ckpt == "final" else r["ckpt_best"]
     r["select_ckpt"] = select_ckpt
     r["ckpt"] = ckpt_path
@@ -652,7 +733,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
     # the epoch of the ckpt actually scored, so a "best ep 1" line never misleads
     # when the scored ckpt is the final-epoch one.
     r["scored_epoch"] = (epochs - 1) if select_ckpt == "final" else r["best_epoch"]
-    head = _load_head(arch, str(ckpt_path), r["dim_in"], hidden, device)
+    head = _load_head(arch, str(ckpt_path), r["dim_in"], hidden, device,
+                      n_doc_kinds=n_doc_kinds)
     r["head"] = head
     # The decisive eval: z_r + z_logit gaps on HELD-OUT sessions (unseen convs).
     r["heldout"] = p41._zr_and_logit_gaps(head, val, device)
@@ -771,6 +853,18 @@ def main() -> int:
     p.add_argument("--doc-store", default=None,
                    help="Path to the persisted doc store used to build the "
                         "doc_id -> kind map for --code-only-gold. Default = none.")
+    p.add_argument("--n-doc-kinds", type=int, default=0,
+                   help="Phase 1f-7 Stage 1: per-doc-kind readout channel size "
+                        "(0 = byte-identical shared readout = old final.pt "
+                        "strict-loads; 3 = conv/text/code routed by a doc_kinds "
+                        "tensor built from slot.source_id + --doc-store). Orthogonal "
+                        "to --n-slot-types (transformer conv/retrieved path "
+                        "unchanged). Needs --doc-store.")
+    p.add_argument("--kind-head-wd", type=float, default=0.0,
+                   help="Phase 1f-7 Stage 1: separate weight decay on the per-kind "
+                        "readout heads (combats the ~400-code-slot overfit; the "
+                        "shared MLP body keeps --weight-decay). 0.0 = same wd as "
+                        "the base group = byte-identical optimizer split.")
     p.add_argument("--out", default=DEFAULT_OUT)
     args = p.parse_args()
 
@@ -789,6 +883,28 @@ def main() -> int:
     ok = sorted(r["slots_h_raw"].shape[0] for r in records)
     print(f"onyx: {len(records)} turns (K min/med/max={ok[0]}/{ok[len(ok)//2]}/{ok[-1]}), "
           f"dim_in={records[0]['slots_h_raw'].shape[1]}", flush=True)
+
+    # Phase 1f-7 Stage 1: per-doc-kind readout channel. Build the doc_id -> kind
+    # map ONCE (shared with --code-only-gold below) and stamp a per-slot
+    # ``slot_doc_kinds`` [K] long tensor on EVERY record BEFORE --drop-self-slot
+    # so the keep-list slice in _drop_self_slot keeps it aligned with
+    # slots_h_raw / slot_types / source_ids. conv/unmapped -> 0 (DOC_KIND_CONV),
+    # text-doc -> 1 (DOC_KIND_TEXT), code-doc -> 2 (DOC_KIND_CODE). Default off
+    # (n_doc_kinds=0) = byte-identical (no stamped field, shared readout).
+    doc_kind_map = None
+    if args.n_doc_kinds > 0:
+        if not args.doc_store:
+            print("ERROR: --n-doc-kinds > 0 requires --doc-store (the doc_id -> "
+                  "kind map source).", file=sys.stderr)
+            return 1
+        doc_kind_map = _build_doc_kind_map_cached(args.doc_store, args.onyx)
+        n_stamped = 0
+        for rec in records:
+            rec["slot_doc_kinds"] = _slot_doc_kinds(rec, doc_kind_map)
+            n_stamped += 1
+        print(f"  --n-doc-kinds {args.n_doc_kinds}: stamped slot_doc_kinds on "
+              f"{n_stamped} records (conv=0/text=1/code=2; "
+              f"--kind-head-wd {args.kind_head_wd})", flush=True)
 
     # Phase 1d root-cause fix: the mixed-ring generator scores the ring AFTER
     # orch.query adds the current prompt, so the self-slot (cos ~= 1.0) is the
@@ -821,15 +937,16 @@ def main() -> int:
     # is the argmax-labels prior slot, so this MUST run AFTER --drop-self-slot
     # (the self-slot is never a doc) and requires --drop-self-slot. The doc_id ->
     # kind map is built from the persisted doc store (cached to JSON next to the
-    # traces; the mapping is stable for a frozen corpus). Default off =
-    # byte-identical to the 1f-6 retrain.
-    doc_kind_map = None
+    # traces; the mapping is stable for a frozen corpus). Reuses the map built
+    # above for --n-doc-kinds (if any). Default off = byte-identical to the 1f-6
+    # retrain.
     if args.code_only_gold:
         if not args.drop_self_slot:
             print("ERROR: --code-only-gold requires --drop-self-slot (gold is a "
                   "prior doc slot, never the self-slot).", file=sys.stderr)
             return 1
-        doc_kind_map = _build_doc_kind_map_cached(args.doc_store, args.onyx)
+        if doc_kind_map is None:
+            doc_kind_map = _build_doc_kind_map_cached(args.doc_store, args.onyx)
         before = len(records)
         records = _filter_code_gold(records, doc_kind_map)
         if len(records) < 100:
@@ -887,7 +1004,9 @@ def main() -> int:
                 cosine_schedule=args.cosine_schedule,
                 select_ckpt=args.select_ckpt,
                 margin_loss=args.margin_loss,
-                hard_negative=args.hard_negative))
+                hard_negative=args.hard_negative,
+                n_doc_kinds=args.n_doc_kinds,
+                kind_head_wd=args.kind_head_wd))
 
     # ── Phase 1d ensemble (logit-avg of the per-seed selected ckpts) ──
     # The live_eval bucket is the same 2 live-transcript sessions held OUT of
