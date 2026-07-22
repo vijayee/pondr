@@ -288,8 +288,17 @@ def _capture_turn(orch: PonderOrchestrator, user_text: str,
         if r is None or not s.text:
             continue
         slot_emb = orch.working_memory.embed([s.text])[0]
+        # Phase 1e: slot_type for the conv/retrieved gap split (0=conversation,
+        # 1=retrieved). Read from the slot's ``slot_type`` (Phase 1a, set by
+        # ``update``=0 / ``inject``=1) with a ``source_id``-prefix fallback
+        # (``#`` ->0 conv, ``__ep`` ->1 retrieved) so pre-1a rings still split.
+        st = getattr(s, "slot_type", None)
+        if st is None:
+            sid = s.source_id or ""
+            st = 0 if ("#" in sid and "__ep" not in sid) else 1
         rec = {
             "source_id": str(s.source_id) if s.source_id is not None else None,
+            "slot_type": int(st),
             "text": s.text,
             "r_i": r,
             "logit": lg,
@@ -810,6 +819,7 @@ def _analyze(turn_records: list[dict]) -> dict:
                 "logit": s.get("logit"), "cos": s["cos"],
                 "s_i": s.get("s_i"), "s_i_pure": s.get("s_i_pure"),
                 "z_r": s.get("z_r"), "z_logit": s.get("z_logit"),
+                "slot_type": s.get("slot_type"),
             })
 
     r_gaps: list[float] = []
@@ -818,6 +828,14 @@ def _analyze(turn_records: list[dict]) -> dict:
     sp_gaps: list[float] = []
     zr_gaps: list[float] = []
     zlg_gaps: list[float] = []
+    # Phase 1e: z_logit gap split by slot_type (0=conv, 1=retrieved) so the
+    # verdict shows Head B ranking BOTH slot types, not just the full-ring
+    # median. A source_id is consistently one type (``#msg`` conv / ``__ep``
+    # retrieved), so each eligible source's z_logit gap is appended to its
+    # type list. Empty when no slot_type was carried (pre-1a rings) -> the
+    # split reports None, the full-ring ``z_logit`` stat is unchanged.
+    zlg_gaps_conv: list[float] = []
+    zlg_gaps_ret: list[float] = []
     per_source_examples: list[dict] = []
     for sid, occs in by_source.items():
         if len(occs) < 3:
@@ -851,6 +869,13 @@ def _analyze(turn_records: list[dict]) -> dict:
         if probe["z_logit"] is not None and all(o["z_logit"] is not None for o in fillers):
             zlg_gap = probe["z_logit"] - statistics.fmean(o["z_logit"] for o in fillers)
             zlg_gaps.append(zlg_gap)
+            # Phase 1e: route the gap to its slot-type bucket. ``probe["slot_type"]``
+            # is set from the emitted slot record; default None (pre-1a) -> skipped.
+            stype = probe.get("slot_type")
+            if stype == 0:
+                zlg_gaps_conv.append(zlg_gap)
+            elif stype == 1:
+                zlg_gaps_ret.append(zlg_gap)
         if len(per_source_examples) < 12:
             per_source_examples.append({
                 "source_id": sid, "n_turns": len(occs),
@@ -892,6 +917,14 @@ def _analyze(turn_records: list[dict]) -> dict:
         # + z_logit gap (unbounded, thr 2.0 -- the ablation-scale view).
         "z_r": _gap_stats(zr_gaps, 0.2),
         "z_logit": _gap_stats(zlg_gaps, 2.0),
+        # Phase 1e: the conv/retrieved/full z_logit gap split -- the verdict
+        # shows Head B ranking BOTH slot types (conv message slots vs retrieved
+        # doc-episode slots), not just the full-ring median.
+        "z_logit_by_slot_type": {
+            "conv": _gap_stats(zlg_gaps_conv, 2.0),
+            "retrieved": _gap_stats(zlg_gaps_ret, 2.0),
+            "full": _gap_stats(zlg_gaps, 2.0),
+        },
         "examples": per_source_examples,
     }
     return {"distribution": dist, "selectivity": selectivity}
@@ -1085,6 +1118,18 @@ def _main() -> int:
             print(f"    z_logit gap: min={zls['min']:+.3f} median={zls['median']:+.3f} "
                   f"mean={zls['mean']:+.3f}  n>=2.0={zls['n_ge_thr']}/{zls['n_eligible']}  "
                   f"gate(median>=2.0): {'PASS' if zls['gate_median_ge_thr'] else 'FAIL'}")
+            # Phase 1e: conv/retrieved/full z_logit gap split (Head B ranking
+            # BOTH slot types). Printed only when the split has any eligible
+            # sources of that type (pre-1a rings or a type absent -> skipped).
+            zst = s.get("z_logit_by_slot_type") or {}
+            for label, key in (("conv", "conv"), ("retrieved", "retrieved"),
+                              ("full", "full")):
+                seg = zst.get(key) or {}
+                if not seg or seg.get("n_eligible", 0) == 0:
+                    continue
+                print(f"    z_logit gap [{label}]: median={seg['median']:+.3f} "
+                      f"n>=2.0={seg['n_ge_thr']}/{seg['n_eligible']}  "
+                      f"gate: {'PASS' if seg['gate_median_ge_thr'] else 'FAIL'}")
     else:
         print("  z_r (Phase B h_t probe): (not captured -- no ZRelevanceHead loaded "
               "or no source seen on >=3 turns)")
