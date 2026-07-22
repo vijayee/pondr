@@ -453,3 +453,52 @@ def test_slot_z_fp16_storage_is_lossless_for_projection():
     last_fp32 = slot.h[-1].to(torch.float32)
     z_fp32 = head.project([last_fp32])
     assert torch.allclose(z_fp16, z_fp32, atol=1e-3)
+
+
+# ── Phase 1a: slot_type tag (conversation vs retrieved) ──
+
+def test_ringslot_slot_type_defaults_none():
+    """RingSlot.slot_type defaults to None so any existing positional constructor
+    (RingSlot(y, sid, text) / .../ RingSlot(y, sid, text, pinned=..., h=...)) is
+    backward-compatible. In-memory only (not in snapshot/checkpoints)."""
+    assert RingSlot(torch.zeros(1, 256), "ep-1", "text").slot_type is None
+    assert RingSlot(torch.zeros(1, 256), "ep-1", "text", pinned=True).slot_type is None
+    assert RingSlot(torch.zeros(1, 256), "ep-1", "text", h=None).slot_type is None
+    # and explicitly set round-trips
+    assert RingSlot(torch.zeros(1, 256), "ep-1", "text", slot_type=0).slot_type == 0
+
+
+def test_update_tags_query_slot_conversation():
+    """update's query step is tagged slot_type=0 (conversation); inject is tagged
+    slot_type=1 (retrieved). The production ring mixes both, and the cross-slot
+    Transformer's slot-type embedding + the live scorer's per-type gap split
+    condition on this tag."""
+    wm = _wm(ring_capacity=4)
+    wm.update(_rand_emb(seed=1), source_id="sess#msg1", text="the prompt")
+    wm.inject(_rand_emb(seed=2), source_id="sess__ep0001", text="recalled doc")
+    slots = wm.ring_buffer()
+    assert len(slots) == 2
+    assert slots[0].slot_type == 0   # the query step -> conversation
+    assert slots[1].slot_type == 1   # the injected recall -> retrieved
+
+
+def test_slot_type_never_perturbs_state():
+    """slot_type is in-memory metadata ONLY: passing slot_type=0/1/None to step
+    produces byte-identical state evolution AND output (the tag never reaches
+    the SSM). This is the binding-constraint guard for Phase 1a."""
+    bb = JGSBackbone(BackboneConfig())
+    torch.manual_seed(11)
+    wm_a = WorkingMemory(bb, ring_capacity=4)
+    torch.manual_seed(11)
+    wm_b = WorkingMemory(bb, ring_capacity=4)
+    torch.manual_seed(11)
+    wm_c = WorkingMemory(bb, ring_capacity=4)
+    emb = _rand_emb(seed=9)
+    out_a, _, _ = wm_a.step(emb, source_id="s", text="t", slot_type=0)
+    out_b, _, _ = wm_b.step(emb, source_id="s", text="t", slot_type=1)
+    out_c, _, _ = wm_c.step(emb, source_id="s", text="t", slot_type=None)
+    assert torch.allclose(out_a, out_b, atol=1e-6)
+    assert torch.allclose(out_a, out_c, atol=1e-6)
+    for a, b, c in zip(wm_a.state_tensors(), wm_b.state_tensors(), wm_c.state_tensors()):
+        assert torch.equal(a, b)
+        assert torch.equal(a, c)

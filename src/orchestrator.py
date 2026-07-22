@@ -300,6 +300,18 @@ class PonderOrchestrator:
         # ``strm_graduation_logging`` is on; untouched (stays 0) when off, so
         # the flag-off path is byte-identical (the logger never runs).
         self._graduation_turn_counter: int = 0
+        # Phase 1a: prompt-turn counter for the ``strm_ring_text``
+        # conversation-slot provenance (``source_id=f"{session_id}#msg{turn}"``).
+        # Incremented once per ``query`` when ``strm_ring_text`` is ON; untouched
+        # (stays 0) when off, so the flag-off path is byte-identical (no
+        # provenance is passed to ``update``). Monotonic per orchestrator
+        # lifetime (NOT reset on ``load_session`` — matches
+        # ``_graduation_turn_counter``): the ``session_id`` prefix in the
+        # source_id already separates sessions, so a carried counter still
+        # gives correct per-session ids (``sessionA#msg5`` != ``sessionB#msg5``).
+        # The gap metric needs a message's source_id to REPEAT across the later
+        # turns whose rings it appears in — the prefix+turn id does that.
+        self._strm_ring_text_turn_counter: int = 0
 
         # The cross-query Working Memory (persistent state). embedder injected so
         # WM can embed episodes/queries on demand. ``ring_capacity`` overrides
@@ -542,7 +554,28 @@ class PonderOrchestrator:
             prev_state_tensors = [t.clone() for t in self.working_memory.state_tensors()]
         # 1. embed prompt; update WM (state persists across queries).
         prompt_emb = self.working_memory.embed([user_prompt])[0]
-        self.working_memory.update(prompt_emb)
+        # Phase 1a (strm_ring_text): when ON, thread the prompt's text +
+        # ``source_id=f"{session_id}#msg{turn}"`` into ``update`` so the
+        # conversation slot carries provenance + ``slot_type=0`` and survives the
+        # live scorer's ``text is not None`` filter -> the live gate scores the
+        # FULL ring (conversation + retrieved docs), not retrieved-docs only
+        # (task #46/#47 H2 content shift). Flag-OFF: ``update(prompt_emb)`` with
+        # no provenance -> byte-identical to pre-Phase-1a (conversation slots
+        # dropped by the scorer; shipped path unchanged).
+        if getattr(_runtime_config, "strm_ring_text", False):
+            self._strm_ring_text_turn_counter += 1
+            encoder = self._get_encoder()
+            session_id = (
+                encoder.session_id
+                if encoder is not None and getattr(encoder, "session_id", None)
+                else self.user_id
+            ) or "default"
+            self.working_memory.update(
+                prompt_emb, text=user_prompt,
+                source_id=f"{session_id}#msg{self._strm_ring_text_turn_counter}",
+            )
+        else:
+            self.working_memory.update(prompt_emb)
         self.working_memory.set_metadata("last_query_type", self._classify_query(user_prompt))
         wm_snapshot = self.working_memory.snapshot()
         # STRM Phase 4 Step 4/5: score the ring for salience (state-conditioned,

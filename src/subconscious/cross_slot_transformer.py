@@ -30,6 +30,7 @@ imported ONLY by the probe scripts (``probe_strm_selectivity_real.py`` via
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from src.subconscious.state_readout import DEFAULT_DIM_IN, StateReadout
@@ -64,7 +65,8 @@ class CrossSlotTransformerZHead(nn.Module):
 
     def __init__(self, dim_in: int = DEFAULT_DIM_IN, hidden: int | None = 128,
                  d_model: int = Z_DIM, n_heads: int = 4, n_layers: int = 2,
-                 ffn: int = 512, max_pos: int = 64) -> None:
+                 ffn: int = 512, max_pos: int = 64,
+                 n_slot_types: int = 0, learnable_temp: bool = False) -> None:
         super().__init__()
         self.dim_in = int(dim_in)
         self.readout = StateReadout(dim_in=self.dim_in, dim_out=d_model, hidden=hidden)
@@ -82,6 +84,24 @@ class CrossSlotTransformerZHead(nn.Module):
             batch_first=True, activation="gelu", norm_first=True)
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
         self.logit_head = nn.Linear(d_model, 1)
+        # Phase 1b (task #50): a slot-type embedding so the cross-slot attention
+        # can condition on whether a slot is a CONVERSATION message vs a RETRIEVED
+        # doc-episode (the live production ring mixes both; Head B trained on
+        # conversation-only rings -> H2 content-shift). ``n_slot_types=0`` (default)
+        # = NO embedding = byte-identical to the task #45 arch (the existing
+        # best.pt strict-loads). When >0, ``slot_types`` (a [K] long tensor) MUST
+        # be passed to ``logits``; the embedding is summed into ``z``.
+        self.n_slot_types = int(n_slot_types)
+        if self.n_slot_types > 0:
+            self.slot_type_emb = nn.Embedding(self.n_slot_types, d_model)
+        # Phase 1b: a learnable temperature on the logit head, addressing the
+        # s1 -2.508 collapse + the z_r sigmoid compression (poorly-scaled logits).
+        # Score = ``logit_head(slot_out) / softplus(logit_temp)``. ``learnable_temp
+        # =False`` (default) = NO temp param = byte-identical to the task #45 arch.
+        # Init temp so softplus(temp) ~= 1.0 (temp ~= 0.5414) -> a no-op at init.
+        self.learnable_temp = bool(learnable_temp)
+        if self.learnable_temp:
+            self.logit_temp = nn.Parameter(torch.tensor(0.5414))
         # Mirror CompositeZHead's checkpoint dims (the contrastive loop reads
         # these; doc_dim = the readout input dim so a loader can rebuild it).
         self.slot_dim = Z_SLOT_DIM
@@ -90,11 +110,15 @@ class CrossSlotTransformerZHead(nn.Module):
         self.doc_dim = self.dim_in
 
     def logits(self, slot_y: Tensor, slot_signal: Tensor,
-               query_emb: Tensor) -> Tensor:
+               query_emb: Tensor, slot_types: Tensor | None = None) -> Tensor:
         """Pre-sigmoid relevance logit per slot -> ``[K, 1]``.
 
         ``slot_signal`` is the raw flattened state ``[K, dim_in]`` (or
         ``[dim_in]``); ``slot_y`` accepted + ignored (pure-z_i test).
+        ``slot_types`` (Phase 1b) is an optional ``[K]`` long tensor of slot-type
+        ids (0=conversation, 1=retrieved); added as a type embedding into ``z``
+        when ``n_slot_types > 0``. ``None`` -> no type embedding (byte-identical
+        to the task #45 arch; required only if ``n_slot_types > 0``).
         """
         z = self.readout(slot_signal)                       # [K, d_model]
         if z.dim() == 1:
@@ -102,6 +126,11 @@ class CrossSlotTransformerZHead(nn.Module):
         K = z.shape[0]
         assert K < self.max_pos, f"K={K} exceeds max_pos={self.max_pos}"
         z = z + self.pos_emb[1:K + 1]                        # [K, d_model]
+        if self.n_slot_types > 0:
+            assert slot_types is not None, (
+                "n_slot_types>0 requires slot_types [K] passed to logits()")
+            st = slot_types.to(torch.long).reshape(-1).to(z.device)[:K]
+            z = z + self.slot_type_emb(st)                   # [K, d_model]
         # The query arrives as ``[d_model]`` (the head-to-head's
         # ``rec["query_emb"]``) OR ``[1, d_model]`` (the live probe's
         # ``prompt_emb`` batch-of-1). Single-record contract -> flatten to
@@ -112,7 +141,10 @@ class CrossSlotTransformerZHead(nn.Module):
         seq = torch.cat([cls.unsqueeze(0), z], dim=0).unsqueeze(0)  # [1, 1+K, d]
         out = self.encoder(seq)                              # [1, 1+K, d_model]
         slot_out = out[0, 1:, :]                             # [K, d_model]
-        return self.logit_head(slot_out)                     # [K, 1]
+        logit = self.logit_head(slot_out)                    # [K, 1]
+        if self.learnable_temp:
+            logit = logit / F.softplus(self.logit_temp)       # scale-aware logit
+        return logit                                         # [K, 1]
 
     def predict(self, slot_y, slot_signal, query_emb):
         return torch.sigmoid(self.logits(slot_y, slot_signal, query_emb))
@@ -121,16 +153,22 @@ class CrossSlotTransformerZHead(nn.Module):
 
     @classmethod
     def from_state_dict(cls, sd: dict, dim_in: int,
-                        hidden: int | None = None) -> "CrossSlotTransformerZHead":
+                        hidden: int | None = None,
+                        n_slot_types: int = 0,
+                        learnable_temp: bool = False) -> "CrossSlotTransformerZHead":
         """Build a Head B from a raw state_dict and load it (strict).
 
         ``hidden`` is the ``StateReadout`` hidden width (None -> Linear readout).
         The encoder/readout arch is fixed by the ctor defaults (2 layers / 4
-        heads / FFN-512 / max_pos=64) -- the only checkpoint-carried arch knob
-        is ``dim_in`` + ``hidden``. Strict load: a key mismatch is a hard error
-        (a silent partial load would score with random weights).
+        heads / FFN-512 / max_pos=64) -- the checkpoint-carried arch knobs are
+        ``dim_in`` + ``hidden`` + (Phase 1b) ``n_slot_types`` + ``learnable_temp``.
+        Old checkpoints (task #45) carry neither Phase-1b knob -> both default to
+        0/False -> NO new params -> strict load is byte-identical. Strict load: a
+        key mismatch is a hard error (a silent partial load would score with
+        random weights).
         """
-        head = cls(dim_in=dim_in, hidden=hidden)
+        head = cls(dim_in=dim_in, hidden=hidden, n_slot_types=n_slot_types,
+                   learnable_temp=learnable_temp)
         missing, unexpected = head.load_state_dict(sd, strict=False)
         if missing or unexpected:
             raise RuntimeError(
@@ -160,13 +198,19 @@ def load_cross_slot_transformer(
         hidden = ckpt.get("hidden", None)
         if hidden is not None:
             hidden = int(hidden)
+        n_slot_types = int(ckpt.get("n_slot_types", 0))           # Phase 1b
+        learnable_temp = bool(ckpt.get("learnable_temp", False))    # Phase 1b
         sd = ckpt["head"]
     else:
         # Bare state_dict fallback (not produced by the head-to-head; defensive).
         dim_in = DEFAULT_DIM_IN
         hidden = None
+        n_slot_types = 0
+        learnable_temp = False
         sd = ckpt
-    head = CrossSlotTransformerZHead.from_state_dict(sd, dim_in=dim_in, hidden=hidden)
+    head = CrossSlotTransformerZHead.from_state_dict(
+        sd, dim_in=dim_in, hidden=hidden,
+        n_slot_types=n_slot_types, learnable_temp=learnable_temp)
     if device == "auto":
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:

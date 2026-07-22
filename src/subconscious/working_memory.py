@@ -87,6 +87,17 @@ class RingSlot:
     constructions) — ``slot_z`` none-guards. Like ``y``, it is in-memory only
     (NOT in ``snapshot()``/checkpoints), so the field is checkpoint-backward-
     compatible and defaults to ``None`` for any existing positional constructor.
+
+    ``slot_type`` (Phase 1a) tags whether this slot is a CONVERSATION message
+    (``0``, the user's prompt stepped via ``update``) or a RETRIEVED doc-episode
+    (``1``, stepped via ``inject``), so the cross-slot Transformer's slot-type
+    embedding (``CrossSlotTransformerZHead``) and the live scorer's per-type gap
+    split can condition on type — the production ring mixes both, and Head B
+    trained on conversation-only rings is OOD on the mixed live ring (H2). In-
+    memory only (NOT in ``snapshot()``/checkpoints) -> checkpoint-backward-
+    compatible. ``None`` (the default) = unset; old slots + bare constructions
+    keep it, and a scorer that needs the type infers it from ``source_id`` (``#``
+    -> conversation, ``__ep`` -> retrieved) as a zero-storage fallback.
     """
 
     y: Tensor
@@ -94,6 +105,7 @@ class RingSlot:
     text: Optional[str]
     pinned: bool = False
     h: Optional[list[Tensor]] = None
+    slot_type: Optional[int] = None
 
 
 def slot_z(slot: RingSlot, head) -> Optional[Tensor]:
@@ -198,7 +210,8 @@ class WorkingMemory(JGSInstance):
             A detached ``WorkingMemoryState`` snapshot (clones; caller-independent
             of the live state).
         """
-        self.step(input_embedding, source_id=source_id, text=text, pin=pin)
+        self.step(input_embedding, source_id=source_id, text=text, pin=pin,
+                  slot_type=0)  # Phase 1a: the query step is a CONVERSATION slot
         self._input_count += 1
         if retrieved_embeddings:
             if retrieved_sources is not None and len(retrieved_sources) != len(retrieved_embeddings):
@@ -224,7 +237,8 @@ class WorkingMemory(JGSInstance):
         step and marks the slot ``pinned=True``; see ``update`` for the full
         semantics. Default ``False`` is byte-identical to pre-Step-3.
         """
-        self.step(embedding, source_id=source_id, text=text, pin=pin)
+        self.step(embedding, source_id=source_id, text=text, pin=pin,
+                  slot_type=1)  # Phase 1a: an injected episode is a RETRIEVED slot
 
     def _apply_decay(self) -> None:
         """Post-step forget factor on the recurrent state.
@@ -241,7 +255,7 @@ class WorkingMemory(JGSInstance):
         if self.decay_alpha != 1.0 and self.state is not None:
             self.state = [self.decay_alpha * s for s in self.state]
 
-    def step(self, input_embedding: Tensor, context=None, source_id=None, text=None, pin: bool = False):  # type: ignore[override]
+    def step(self, input_embedding: Tensor, context=None, source_id=None, text=None, pin: bool = False, slot_type: Optional[int] = None):  # type: ignore[override]
         """Wrap ``JGSInstance.step`` to apply ``decay_alpha`` and record the ring.
 
         The SSM step already mixes the new input into the state; ``decay_alpha``
@@ -259,6 +273,12 @@ class WorkingMemory(JGSInstance):
         (no salience fires without the ring; pinned by ``test_k0_pin_is_noop``).
         The slot is recorded with ``pinned=pin`` so the replay JSONL can flag
         pin-tagged recalls for a retention surrogate.
+
+        ``slot_type`` (Phase 1a) is the conversation-vs-retrieved tag carried into
+        the ``RingSlot`` (``update`` -> 0, ``inject`` -> 1; ``None`` for bare
+        ``step`` calls). It is in-memory metadata only — it never touches the
+        SSM step, the output, or the state, so the K=0 path AND the recorded-slot
+        values are byte-identical to pre-Phase-1a when it is left ``None``.
 
         Returns the same ``(output, predicted, gate decision)`` triple as the base
         instance (the triple is unchanged; the ring records ``output`` and, when
@@ -284,7 +304,8 @@ class WorkingMemory(JGSInstance):
                 else None
             )
             self._ring.append(
-                RingSlot(output.detach().clone(), source_id, text, pinned=pin, h=h)
+                RingSlot(output.detach().clone(), source_id, text, pinned=pin,
+                         h=h, slot_type=slot_type)
             )
         return result
 

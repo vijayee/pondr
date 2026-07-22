@@ -94,6 +94,20 @@ DEFAULT_CKPT_ROOT = "data/training/strm_state_readout/head_to_head_onyx"
 
 ZLOGIT_GATE = 2.0
 
+# D0.4a (task #47): the 2 live-transcript sessions (docs/*.json replayed by
+# probe_strm_selectivity_real.py) are IN the 53-session Onyx training traces, so
+# the prior head-to-head's held-out number was partly in-sample on them. Force
+# them OUT of train and into a dedicated live-eval bucket for EVERY seed so the
+# conversation-ring z_logit gap on them is genuinely held-out -- the decisive
+# H3 (overfit) vs H2 (content-shift) diagnostic (see the approved plan). The
+# live probe replays these 2 transcripts; their chat_session_ids (full Onyx
+# UUIDs, opaque -- no PII) are confirmed present in traces_onyx_serve_hraw.pt.
+# ``--live-eval-sessions ""`` disables the hold-out -> byte-identical to pre-#47.
+DEFAULT_LIVE_EVAL_SESSION_IDS = (
+    "682afdd9-e8ea-4258-a329-65f67b5d27d5",  # docs/The _Ponder_Engine_Coding_Chat.json
+    "69e17901-9c6c-4375-a6f1-736e95e1d316",  # docs/The_Ponder_Engine_Chat.json
+)
+
 
 # Head B (CrossSlotTransformerZHead) is imported from src/subconscious/ -- the
 # acceptance-test promotion (task #45 follow-up): the probe's local class was
@@ -131,19 +145,35 @@ def _session_of(rec: dict) -> str:
     return str(rec["source_ids"][0]).split("#", 1)[0]
 
 
-def _session_split(records: list[dict], val_fraction: float, seed: int):
+def _session_split(records: list[dict], val_fraction: float, seed: int,
+                    live_eval_sessions: frozenset[str] = frozenset()):
     """Split records by SESSION so held-out turns are ENTIRE unseen
     conversations (the true generalization test; a query-split would leak a
-    session's turns into both halves). Returns (train, val, val_sessions)."""
+    session's turns into both halves). Returns
+    ``(train, val, live_eval, val_sessions, live_eval_sessions)``.
+
+    ``live_eval_sessions`` (D0.4a) are forced OUT of the train pool AND out of
+    the random held-out draw, into a dedicated ``live_eval`` bucket evaluated
+    separately per seed. The random held-out is drawn from the REMAINING
+    sessions, so a live-eval session is never in train (clean held-out) and
+    never double-counted in the random held-out. Empty ``live_eval_sessions``
+    -> ``live_eval`` is empty -> byte-identical to pre-#47 (train/val split over
+    ALL sessions, no separate bucket)."""
     sessions = sorted({_session_of(r) for r in records})
+    # Keep only live-eval ids actually present in the traces (silently drop a
+    # stale id -- e.g. a transcript no longer in the training set).
+    live_eval_sessions = {s for s in live_eval_sessions if s in sessions}
     rng = random.Random(seed)
-    shuffled = sessions[:]
+    pool = [s for s in sessions if s not in live_eval_sessions]
+    shuffled = pool[:]
     rng.shuffle(shuffled)
     n_val = max(1, int(round(len(shuffled) * val_fraction)))
     val_sessions = set(shuffled[:n_val])
-    train = [r for r in records if _session_of(r) not in val_sessions]
+    train = [r for r in records if _session_of(r) not in val_sessions
+             and _session_of(r) not in live_eval_sessions]
     val = [r for r in records if _session_of(r) in val_sessions]
-    return train, val, sorted(val_sessions)
+    live_eval = [r for r in records if _session_of(r) in live_eval_sessions]
+    return train, val, live_eval, sorted(val_sessions), sorted(live_eval_sessions)
 
 
 # ── the contrastive training loop (generic over Head A / Head B) ──
@@ -261,10 +291,13 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
             "train_go": last_go, "ckpt": ckpt_dir / "best.pt"}
 
 
-def _run_arch(arch: str, train: list[dict], val: list[dict], hidden: int | None,
+def _run_arch(arch: str, train: list[dict], val: list[dict],
+              live_eval: list[dict], hidden: int | None,
               temperature: float, weight_decay: float, epochs: int, lr: float,
               accum_steps: int, seed: int, device: str, ckpt_root: Path) -> dict:
-    """Train one arch (one seed), eval on held-out sessions + all-turns ceiling."""
+    """Train one arch (one seed), eval on held-out sessions + all-turns ceiling
+    + (D0.4a) the live-eval bucket (the 2 live-transcript sessions, held OUT of
+    train for every seed -> the genuinely-held-out conversation-ring gap)."""
     ckpt_dir = ckpt_root / f"{arch}_s{seed}"
     if ckpt_dir.exists():
         shutil.rmtree(ckpt_dir)
@@ -275,14 +308,22 @@ def _run_arch(arch: str, train: list[dict], val: list[dict], hidden: int | None,
     r["heldout"] = p41._zr_and_logit_gaps(head, val, device)
     # All-turns ceiling (in-sample upper bound -- if even this fails, no signal).
     r["allturns"] = p41._zr_and_logit_gaps(head, train + val, device)
+    # D0.4a: the live-transcript sessions, held OUT of train this seed -> the
+    # genuinely-held-out conversation-ring z_logit gap (H3 vs H2 diagnostic).
+    r["live_eval"] = (p41._zr_and_logit_gaps(head, live_eval, device)
+                      if live_eval else None)
     r["seed"] = seed
     ho = r["heldout"]
     on = r["allturns"]
+    le = r["live_eval"]
+    le_str = (f"  LIVE-EVAL z_logit={le['z_logit']['median']:.3f} "
+              f"({'PASS' if le['z_logit']['median'] is not None and le['z_logit']['median']>=ZLOGIT_GATE else 'fail'}, "
+              f"n={le['z_logit']['n_eligible']})" if le else "  LIVE-EVAL n/a")
     print(f"  [{arch} s{seed}] HELD-OUT z_logit={ho['z_logit']['median']:.3f} "
           f"(n_ge_2.0={ho['z_logit']['n_ge_gate']}/{ho['z_logit']['n_eligible']}, "
           f"{'PASS' if ho['z_logit']['median'] is not None and ho['z_logit']['median']>=ZLOGIT_GATE else 'fail'})  "
-          f"z_r={ho['z_r']['median']:.4f}  |  ALL-TURNS z_logit={on['z_logit']['median']:.3f}",
-          flush=True)
+          f"z_r={ho['z_r']['median']:.4f}  |  ALL-TURNS z_logit={on['z_logit']['median']:.3f}"
+          f"{le_str}", flush=True)
     return r
 
 
@@ -308,6 +349,11 @@ def main() -> int:
     p.add_argument("--device", default="cpu",
                    help="train+eval device (cuda trains much faster).")
     p.add_argument("--ckpt-root", default=DEFAULT_CKPT_ROOT)
+    p.add_argument("--live-eval-sessions", default=",".join(DEFAULT_LIVE_EVAL_SESSION_IDS),
+                   help="comma-separated Onyx session UUIDs to force OUT of train "
+                        "and into a dedicated live-eval bucket every seed (D0.4a; "
+                        "default = the 2 live-transcript sessions). Empty string "
+                        "disables -> byte-identical to pre-#47.")
     p.add_argument("--out", default=DEFAULT_OUT)
     args = p.parse_args()
 
@@ -330,18 +376,37 @@ def main() -> int:
     hidden = {"linear": None, "mlp64": 64, "mlp128": 128}[args.readout]
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     ckpt_root = Path(args.ckpt_root)
+    live_eval_ids = frozenset(
+        s.strip() for s in args.live_eval_sessions.split(",") if s.strip())
+    if live_eval_ids:
+        present = {_session_of(r) for r in records}
+        missing = [s for s in live_eval_ids if s not in present]
+        if missing:
+            print(f"NOTE: --live-eval-sessions not in traces (dropped): {missing}",
+                  file=sys.stderr)
+        print(f"live-eval hold-out: {sorted(live_eval_ids)} ({len(live_eval_ids)} "
+              f"sessions forced OUT of train every seed -> genuinely held-out)",
+              flush=True)
 
     # Session split is seed-dependent (which sessions are held out varies) --
-    # re-split per seed so each seed sees a fresh generalization test.
+    # re-split per seed so each seed sees a fresh generalization test. The
+    # live-eval sessions are held OUT of train for EVERY seed (D0.4a).
     per_arch = {"bilinear": [], "transformer": []}
     for seed in seeds:
-        train, val, val_sessions = _session_split(records, args.val_fraction, seed)
+        train, val, live_eval, val_sessions, live_sessions = _session_split(
+            records, args.val_fraction, seed, live_eval_ids)
+        # De-wonk: assert the live-eval sessions never leaked into train.
+        train_sessions = {_session_of(r) for r in train}
+        leaked = [s for s in live_sessions if s in train_sessions]
+        assert not leaked, f"live-eval session(s) leaked into train: {leaked}"
         print(f"\n=== seed {seed}: {len(train)} train / {len(val)} held-out turns "
-              f"({len(val_sessions)} unseen sessions) ===", flush=True)
+              f"({len(val_sessions)} unseen sessions) / {len(live_eval)} live-eval "
+              f"turns ({len(live_sessions)} live sessions) ===", flush=True)
         for arch in ("bilinear", "transformer"):
             per_arch[arch].append(_run_arch(
-                arch, train, val, hidden, args.temperature, args.weight_decay,
-                args.epochs, args.lr, args.accum_steps, seed, args.device, ckpt_root))
+                arch, train, val, live_eval, hidden, args.temperature,
+                args.weight_decay, args.epochs, args.lr, args.accum_steps, seed,
+                args.device, ckpt_root))
 
     # ── aggregate + DeepSeek decision rule ──
     def _med(rows, key, sub):
@@ -360,6 +425,25 @@ def main() -> int:
     b_pass = _npass(per_arch["transformer"], "heldout", "z_logit")
     a_robust = a_pass >= 2 and a_pass * 2 >= len(seeds)
     b_robust = b_pass >= 2 and b_pass * 2 >= len(seeds)
+
+    # D0.4a: live-eval (the 2 live-transcript sessions, held OUT of train every
+    # seed) = Head B on its TRAINED distribution (conversation rings), genuinely
+    # held-out. PASS -> live-gate failure is H2 (content shift); FAIL -> H3
+    # (overfit) is dominant/co-dominant. Only meaningful for the live-eval
+    # sessions actually present (empty -> None).
+    def _le_med(rows):
+        vals = [r["live_eval"]["z_logit"]["median"] for r in rows
+                if r["live_eval"] and r["live_eval"]["z_logit"]["median"] is not None]
+        return statistics.median(vals) if vals else None
+
+    def _le_npass(rows):
+        vals = [r["live_eval"]["z_logit"]["median"] for r in rows
+                if r["live_eval"] and r["live_eval"]["z_logit"]["median"] is not None]
+        return sum(1 for m in vals if m is not None and m >= ZLOGIT_GATE)
+
+    b_live = _le_med(per_arch["transformer"])
+    b_live_pass = _le_npass(per_arch["transformer"])
+    b_live_robust = (b_live_pass >= 2 and b_live_pass * 2 >= len(seeds))
 
     print("\n" + "=" * 80)
     print("VERDICT (task #45: Head A bilinear vs Head B cross-slot Transformer)")
@@ -389,6 +473,10 @@ def main() -> int:
           f"-> {a_pass}/{len(seeds)} pass -> {'ROBUST PASS' if a_robust else 'NOT robust'}")
     print(f"  Head B (transformer): held-out z_logit {b_held if b_held is not None else 'n/a'} "
           f"-> {b_pass}/{len(seeds)} pass -> {'ROBUST PASS' if b_robust else 'NOT robust'}")
+    if b_live is not None:
+        print(f"  Head B LIVE-EVAL (held-out live transcripts, conv ring): z_logit "
+              f"{b_live:.3f} -> {b_live_pass}/{len(seeds)} pass -> "
+              f"{'ROBUST PASS' if b_live_robust else 'NOT robust'}")
     print()
     print("  DECISION RULE (DeepSeek):")
     if a_robust:
@@ -419,6 +507,22 @@ def main() -> int:
             print("     Transformer) and saturates on serve. The bge 2a head (0.889")
             print("     train) already works; accept the SSM state does not beat bge")
             print("     for relevance and stop investing in the state-trajectory lever.")
+    print()
+    print("  D0.4a DIAGNOSTIC (task #47): Head B on its TRAINED distribution (the")
+    print(f"  live-transcript conversation rings, held OUT of train every seed):")
+    if b_live is None:
+        print("  -> LIVE-EVAL n/a (no live-eval sessions in traces; pass "
+              "--live-eval-sessions to enable).")
+    elif b_live_robust:
+        print(f"  -> LIVE-EVAL PASS ({b_live_pass}/{len(seeds)}, median {b_live:.3f}). "
+              "Head B generalizes on conversation rings held-out -> the live-gate")
+        print("     failure is H2 (content shift: live ring = retrieved-doc slots, a")
+        print("     different task). Phase 1 = full-ring retrain incl. documents.")
+    else:
+        print(f"  -> LIVE-EVAL FAIL ({b_live_pass}/{len(seeds)}, median {b_live:.3f}). "
+              "Head B does NOT generalize on conversation rings held-out -> H3")
+        print("     (overfit) is dominant/co-dominant. Phase 1 = full-ring retrain "
+              "+ heavy regularization (Path C stack).")
     print("=" * 80)
 
     if args.out:
@@ -428,18 +532,24 @@ def main() -> int:
             "weight_decay": args.weight_decay, "epochs": args.epochs,
             "seeds": seeds, "val_fraction": args.val_fraction,
             "n_records": len(records),
+            "live_eval_sessions": sorted(live_eval_ids),
             "bilinear_heldout_zlogit_median": a_held,
             "transformer_heldout_zlogit_median": b_held,
             "bilinear_pass": a_pass, "transformer_pass": b_pass,
             "bilinear_robust": a_robust, "transformer_robust": b_robust,
+            "transformer_live_eval_zlogit_median": b_live,
+            "transformer_live_eval_pass": b_live_pass,
+            "transformer_live_eval_robust": b_live_robust,
             "per_seed": {
                 "bilinear": [{"seed": r["seed"], "best_epoch": r["best_epoch"],
                               "train_top3": r["train_top3"],
-                              "heldout": r["heldout"], "allturns": r["allturns"]}
+                              "heldout": r["heldout"], "allturns": r["allturns"],
+                              "live_eval": r["live_eval"]}
                              for r in per_arch["bilinear"]],
                 "transformer": [{"seed": r["seed"], "best_epoch": r["best_epoch"],
                                  "train_top3": r["train_top3"],
-                                 "heldout": r["heldout"], "allturns": r["allturns"]}
+                                 "heldout": r["heldout"], "allturns": r["allturns"],
+                                 "live_eval": r["live_eval"]}
                                 for r in per_arch["transformer"]]},
         }, indent=2), encoding="utf-8")
         print(f"\nwrote report -> {args.out}", flush=True)

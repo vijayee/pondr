@@ -226,6 +226,22 @@ class Config:
     # reason (side-effect-only; labels only matter once a v2 training run is
     # gated on them).
     strm_graduation_logging: bool = False
+    # ``strm_ring_text``: STRM Phase 1a (the [[reflective-greeting-beacon]] plan).
+    # The live orchestrator steps the user's prompt into the WM ring WITHOUT
+    # provenance (``update(prompt_emb)`` -> ``source_id``/``text`` are None), so
+    # the live scorer (``probe_strm_selectivity_real.py``) drops conversation
+    # slots via its ``text is not None`` filter -> the live ring scores ONLY
+    # retrieved-doc-episode slots. Head B trained on conversation-message rings
+    # is therefore OOD on the live ring by construction (H2 content shift, task
+    # #46/#47). When ON, the orchestrator passes ``text=user_prompt,
+    # source_id=f"{session_id}#msg{turn}"`` into ``update`` so conversation
+    # slots carry provenance + ``slot_type=0`` and survive the scorer's filter
+    # -> the live gate scores the FULL production ring (conversation + retrieved
+    # docs) and Phase 1e can report the conv/retrieved/full gap split. Default
+    # OFF: the prompt step stays ``update(prompt_emb)`` -> byte-identical to
+    # pre-Phase-1a (no provenance, conversation slots dropped, shipped path
+    # unchanged). Read ONLY at the orchestrator's prompt-step call site.
+    strm_ring_text: bool = False
     # ``strm_salience_freshness_lag``: STRM Phase 4 Step 6 freshness watermark.
     # When the salience trigger fires retrieval for an anchor and gets NOTHING
     # back (the LTM pointer returned no episode), the engine must not silently
