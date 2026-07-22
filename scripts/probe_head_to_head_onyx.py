@@ -166,6 +166,71 @@ def _session_of(rec: dict) -> str:
     return str(rec["source_ids"][0]).split("#", 1)[0]
 
 
+def _self_slot_idx(rec: dict) -> int | None:
+    """Index of the JUST-ADDED current-prompt slot in a mixed-ring record, or
+    None if there is no conversation slot.
+
+    The Phase 1c generator scores the ring AFTER ``orch.query(u)`` adds the
+    prompt via ``working_memory.update`` (``strm_ring_text`` ON), so the
+    current prompt is in the ring with ``source_id = "{session}#msg{counter}"``
+    and trivially matches the query (cos ~= 1.0). The self-slot is the
+    ``#msg`` slot with the HIGHEST numeric suffix (the orchestrator's
+    per-query counter is monotonic, so the largest = the just-added prompt).
+    Found [[pondr-strm-phase1d-self-match-rootcause]]: 100% of mixed-ring
+    records have argmax cos >= 0.999 and 89% have the self-slot AS the argmax
+    gold, so the model is trained to rank the query's own just-typed message
+    highest -- a trivial identity task misaligned with the gate (the self-slot
+    has a unique per-turn source_id -> <3 occurrences -> gate-ineligible).
+    """
+    msg_slots = [(i, str(s)) for i, s in enumerate(rec["source_ids"])
+                 if "#" in str(s) and "__ep" not in str(s)]
+    if not msg_slots:
+        return None
+
+    def _suffix(sid: str) -> int:
+        try:
+            return int(sid.rsplit("#msg", 1)[-1])
+        except ValueError:
+            return -1
+    return max(msg_slots, key=lambda x: _suffix(x[1]))[0]
+
+
+def _drop_self_slot(rec: dict, multi_positive_margin: float = 0.0) -> dict | None:
+    """Return a copy of ``rec`` with the self-slot (current prompt) removed and
+    labels re-derived over the REMAINING slots (the real "most relevant PRIOR
+    message/episode" target, matching task #45's prior-only gold).
+
+    ``multi_positive_margin`` > 0 -> multi-positive InfoNCE gold: every
+    remaining slot within ``max_cos - margin`` is a positive (DeepSeek's fix
+    for near-tied prior-message / retrieved-episode duplicates -- both pulled
+    up, not forced into opposition). ``0.0`` -> single top-1-cos gold.
+    Returns None if fewer than 3 slots remain (the contrastive loss needs >=3
+    to form a meaningful filler pool; dropped + counted, never silently
+    kept)."""
+    si = _self_slot_idx(rec)
+    keep = [j for j in range(len(rec["source_ids"])) if j != si]
+    if len(keep) < 3:
+        return None
+    out = dict(rec)
+    out["source_ids"] = [rec["source_ids"][j] for j in keep]
+    out["slot_types"] = rec["slot_types"][keep]
+    out["cos"] = rec["cos"][keep]
+    for k in ("slots_h_raw", "slots_y", "slots_z", "slots_doc_emb"):
+        if k in rec:
+            out[k] = rec[k][keep]
+    cos = out["cos"].to(torch.float32)
+    labels = torch.zeros(len(keep), dtype=torch.float32)
+    if multi_positive_margin > 0.0:
+        mx = float(cos.max())
+        labels[cos >= mx - multi_positive_margin] = 1.0
+        if float(labels.sum()) == 0.0:  # guard: margin too tight -> top-1
+            labels[int(cos.argmax().item())] = 1.0
+    else:
+        labels[int(cos.argmax().item())] = 1.0
+    out["labels"] = labels
+    return out
+
+
 def _session_split(records: list[dict], val_fraction: float, seed: int,
                     live_eval_sessions: frozenset[str] = frozenset()):
     """Split records by SESSION so held-out turns are ENTIRE unseen
@@ -489,6 +554,21 @@ def main() -> int:
     p.add_argument("--ensemble", action="store_true",
                    help="Phase 1d: also eval a logit-averaging ensemble of the "
                         "per-seed selected ckpts (the jgs-head multi-gate pattern).")
+    p.add_argument("--drop-self-slot", action="store_true",
+                   help="Phase 1d root-cause fix: remove the JUST-ADDED current-"
+                        "prompt slot (cos ~= 1.0, the trivial self-match gold "
+                        "89 pct of records) from every ring and re-derive gold over "
+                        "the remaining PRIOR slots -- the real relevance target. "
+                        "OFF (default) = use stored labels = byte-identical to the "
+                        "collapsed run. The head locates PRIOR memory, not the "
+                        "query itself; the self-slot is gate-ineligible anyway "
+                        "(unique per-turn source_id < 3 occurrences).")
+    p.add_argument("--multi-positive-margin", type=float, default=0.0,
+                   help="Phase 1d: when >0 (with --drop-self-slot or alone), use "
+                        "multi-positive InfoNCE gold -- every slot within "
+                        "max_cos - margin is a positive (DeepSeek's fix for "
+                        "near-tied prior-message / retrieved-episode duplicates). "
+                        "0.0 = single top-1-cos gold = byte-identical.")
     p.add_argument("--live-eval-sessions", default=",".join(DEFAULT_LIVE_EVAL_SESSION_IDS),
                    help="comma-separated Onyx session UUIDs to force OUT of train "
                         "and into a dedicated live-eval bucket every seed (D0.4a; "
@@ -512,6 +592,33 @@ def main() -> int:
     ok = sorted(r["slots_h_raw"].shape[0] for r in records)
     print(f"onyx: {len(records)} turns (K min/med/max={ok[0]}/{ok[len(ok)//2]}/{ok[-1]}), "
           f"dim_in={records[0]['slots_h_raw'].shape[1]}", flush=True)
+
+    # Phase 1d root-cause fix: the mixed-ring generator scores the ring AFTER
+    # orch.query adds the current prompt, so the self-slot (cos ~= 1.0) is the
+    # trivial gold 89% of the time -- misaligned with the gate (which scores
+    # prior messages/episodes). When --drop-self-slot is set, remove the
+    # self-slot from every ring and re-derive gold over the remaining prior
+    # slots (single top-1-cos, or multi-positive within --multi-positive-margin
+    # for near-tied prior-message/episode duplicates). Both flags off ->
+    # byte-identical to the collapsed run (no re-derivation; stored labels used).
+    if args.multi_positive_margin > 0.0 and not args.drop_self_slot:
+        print("NOTE: --multi-positive-margin without --drop-self-slot keeps the "
+              "self-slot (cos 1.0) as a positive -- does not fix the self-match "
+              "root cause; ignoring. Use WITH --drop-self-slot.", file=sys.stderr)
+        args.multi_positive_margin = 0.0
+    if args.drop_self_slot:
+        before = len(records)
+        cleaned = [_drop_self_slot(r, args.multi_positive_margin)
+                   for r in records]
+        n_drop = sum(1 for r in records if _self_slot_idx(r) is not None)
+        records = [r for r in cleaned if r is not None]
+        n_lost = before - len(records)
+        print(f"  --drop-self-slot: removed the self-slot from {n_drop}/{before} "
+              f"records; {n_lost} records dropped (<3 slots remained), "
+              f"{len(records)} kept"
+              + (f" | --multi-positive-margin {args.multi_positive_margin} "
+                 "(multi-positive InfoNCE gold)" if args.multi_positive_margin > 0
+                 else " | single top-1-cos gold"), flush=True)
 
     hidden = {"linear": None, "mlp64": 64, "mlp128": 128}[args.readout]
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
