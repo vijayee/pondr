@@ -264,12 +264,53 @@ def _session_split(records: list[dict], val_fraction: float, seed: int,
 
 # ── the contrastive training loop (generic over Head A / Head B) ──
 
+def margin_ranking_loss(logits: Tensor, gold_mask: Tensor, margin: float,
+                        hard_negative: bool = False) -> Tensor:
+    """Pairwise hinge margin loss that DIRECTLY optimizes the z_logit gate.
+
+    ``L = mean_{g in gold, f in filler} relu(margin - (logit_g - logit_f))``.
+
+    The live gate is the z_logit gap = (top-gold logit) - (mean filler logit); a
+    per-pair hinge of ``margin`` is a TIGHTER surrogate -- if every gold logit
+    exceeds every filler logit by ``margin``, the gate gap is >= ``margin`` by
+    construction. Unlike InfoNCE (which a constant function can satisfy when the
+    softmax target is near-uniform), the hinge is only zero when the gap is
+    realized, so it cannot collapse to a flat logit vector -- the failure mode
+    DeepSeek diagnosed for the transformer ([[pondr-strm-phase1f-deepseek-live-inversion-diagnosis]],
+    ranked experiment #1).
+
+    Bias-invariant for the bilinear composite: its scalar ``bias`` adds the same
+    constant to ``logit_g`` and ``logit_f`` -> cancels in the diff. For the
+    transformer the per-slot logits are attention-produced; the diff is still the
+    optimized quantity regardless.
+
+    ``hard_negative`` (DeepSeek's "hardest negatives from the ring"): instead of
+    all gold x filler pairs, score only the HARDEST filler (max filler logit) per
+    gold -- ``mean_{g} relu(margin - (logit_g - max_filler_logit))``. Focuses the
+    gradient on the most-violated pair per gold (the filler the head is most
+    tempted to rank above the gold) instead of averaging over easy, already-
+    satisfied pairs. 0 if no gold or no filler.
+    """
+    if gold_mask.sum() == 0:
+        return logits.new_zeros(())
+    g = logits[gold_mask]                       # [n_gold]
+    f = logits[~gold_mask]                      # [n_fill]
+    if f.numel() == 0:
+        return logits.new_zeros(())
+    if hard_negative:
+        hardest = f.max()
+        return torch.relu(margin - (g - hardest)).mean()
+    # All gold x filler pairs: [n_gold, n_fill].
+    return torch.relu(margin - (g.unsqueeze(1) - f.unsqueeze(0))).mean()
+
+
 def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | None,
                 temperature: float, epochs: int, lr: float, weight_decay: float,
                 accum_steps: int, seed: int, device: str, ckpt_dir: Path,
                 n_slot_types: int = 0, learnable_temp: bool = False,
                 dropout: float = 0.0, label_smoothing: float = 0.0,
-                cosine_schedule: bool = False) -> dict:
+                cosine_schedule: bool = False,
+                margin_loss: float = 0.0, hard_negative: bool = False) -> dict:
     """Train one head (bilinear OR transformer) on the train sessions with the
     SAME contrastive InfoNCE loss. Mirrors ``p44._train_contrastive`` but is
     generic over the head arch. Uses ``evaluate_relevance`` on the train-internal
@@ -281,7 +322,16 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
     ``n_slot_types``/``learnable_temp``/``dropout`` build a Phase-1 Head B;
     ``label_smoothing`` softens the InfoNCE target (``p44.contrastive_loss``);
     ``cosine_schedule`` anneals the lr. When all are 0/False the loop is
-    byte-identical to pre-#52 (no slot_types kwarg, hard loss, constant lr)."""
+    byte-identical to pre-#52 (no slot_types kwarg, hard loss, constant lr).
+
+    Phase 1f-5 margin-loss knob (default 0.0 = byte-identical, uses
+    ``p44.contrastive_loss``): when ``margin_loss`` > 0 the loop uses
+    ``margin_ranking_loss`` (pairwise hinge, directly optimizes the z_logit gate)
+    INSTEAD of InfoNCE; ``hard_negative`` restricts the hinge to the hardest
+    filler per gold. DeepSeek's ranked experiment #1 for the transformer's live
+    flatness ([[pondr-strm-phase1f-deepseek-live-inversion-diagnosis]]). When
+    active, ``temperature``/``label_smoothing`` are unused by the loss (the head's
+    learnable_temp is still constructed but the margin loss ignores T)."""
     dev = torch.device(device)
     torch.manual_seed(seed)
     dim_in = int(train[0]["slots_h_raw"].shape[1])
@@ -291,9 +341,11 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
     n_params = sum(p.numel() for p in head.parameters())
     arch_name = (f"MLP-{hidden}" if hidden else "Linear") if arch == "bilinear" \
         else f"Transformer({'MLP-'+str(hidden) if hidden else 'Linear'} readout)"
-    print(f"\ntraining {arch} seed={seed} CONTRASTIVE ({arch_name} {dim_in}->384, "
-          f"{n_params:,} params, T={temperature}, wd={weight_decay}, {epochs} "
-          f"epochs, slot_types={use_slot_types}, dropout={dropout}, "
+    loss_tag = (f"MARGIN(m={margin_loss}, hard-neg={hard_negative})"
+                if margin_loss > 0.0 else f"CONTRASTIVE(T={temperature})")
+    print(f"\ntraining {arch} seed={seed} {loss_tag} ({arch_name} {dim_in}->384, "
+          f"{n_params:,} params, wd={weight_decay}, {epochs} epochs, "
+          f"slot_types={use_slot_types}, dropout={dropout}, "
           f"label_smoothing={label_smoothing}, cosine={cosine_schedule}) -> "
           f"{ckpt_dir}", flush=True)
 
@@ -333,7 +385,10 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                     "label_smoothing": float(label_smoothing),
                     "top3_recall": pc["mean_top3_recall"],
                     "hit_rate": pc["hit_rate"], "hit_ci95": pc["hit_ci95"],
-                    "go": go, "epoch": epoch, "loss": "contrast"}, path)
+                    "go": go, "epoch": epoch,
+                    "loss": "margin" if margin_loss > 0.0 else "contrast",
+                    "margin": float(margin_loss),
+                    "hard_negative": bool(hard_negative)}, path)
 
     for epoch in range(epochs):
         head.train()
@@ -363,8 +418,12 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
             else:
                 logits = head.logits(slot_y, z_flat, q).squeeze(-1)   # [K]
             gold = labels > 0
-            loss = p44.contrastive_loss(logits, gold, temperature,
-                                        label_smoothing=label_smoothing) / accum
+            if margin_loss > 0.0:
+                loss = margin_ranking_loss(logits, gold, margin_loss,
+                                           hard_negative=hard_negative) / accum
+            else:
+                loss = p44.contrastive_loss(logits, gold, temperature,
+                                            label_smoothing=label_smoothing) / accum
             loss.backward()
             total_loss += float(loss.item()) * accum
             n_steps += 1
@@ -398,7 +457,10 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
     if last_pc is not None:
         _save_ckpt(ckpt_dir / "final.pt", last_pc, epochs - 1, last_go)
     with open(ckpt_dir / "train_log.json", "w", encoding="utf-8") as f:
-        json.dump({"best_epoch": best_epoch, "arch": arch, "loss": "contrast",
+        json.dump({"best_epoch": best_epoch, "arch": arch,
+                   "loss": "margin" if margin_loss > 0.0 else "contrast",
+                   "margin": float(margin_loss),
+                   "hard_negative": bool(hard_negative),
                    "temperature": temperature, "seed": seed,
                    "n_train": len(train_q), "n_valq": len(valq),
                    "n_heldout": len(val), "n_slot_types": n_slot_types,
@@ -455,7 +517,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
               n_slot_types: int = 0, learnable_temp: bool = False,
               dropout: float = 0.0, label_smoothing: float = 0.0,
               cosine_schedule: bool = False,
-              select_ckpt: str = "best") -> dict:
+              select_ckpt: str = "best",
+              margin_loss: float = 0.0, hard_negative: bool = False) -> dict:
     """Train one arch (one seed), eval on held-out sessions + all-turns ceiling
     + (D0.4a) the live-eval bucket (the 2 live-transcript sessions, held OUT of
     train for every seed -> the genuinely-held-out conversation-ring gap).
@@ -473,7 +536,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
                     weight_decay, accum_steps, seed, device, ckpt_dir,
                     n_slot_types=n_slot_types, learnable_temp=learnable_temp,
                     dropout=dropout, label_smoothing=label_smoothing,
-                    cosine_schedule=cosine_schedule)
+                    cosine_schedule=cosine_schedule,
+                    margin_loss=margin_loss, hard_negative=hard_negative)
     ckpt_path = r["ckpt_final"] if select_ckpt == "final" else r["ckpt_best"]
     r["select_ckpt"] = select_ckpt
     r["ckpt"] = ckpt_path
@@ -569,6 +633,26 @@ def main() -> int:
                         "max_cos - margin is a positive (DeepSeek's fix for "
                         "near-tied prior-message / retrieved-episode duplicates). "
                         "0.0 = single top-1-cos gold = byte-identical.")
+    p.add_argument("--margin-loss", type=float, default=0.0,
+                   help="Phase 1f-5: when >0, replace InfoNCE with a pairwise "
+                        "hinge margin loss that DIRECTLY optimizes the z_logit "
+                        "gate -- mean_{gold,filler} relu(margin - (logit_gold - "
+                        "logit_filler)). DeepSeek's ranked experiment #1 for the "
+                        "transformer's live flatness (a constant function can "
+                        "satisfy InfoNCE under a near-uniform target; the hinge "
+                        "is only zero when the gap is realized, so it cannot "
+                        "collapse to a flat logit vector). 0.0 = InfoNCE = "
+                        "byte-identical. When active, --temperature / "
+                        "--label-smoothing are unused by the loss (the head's "
+                        "learnable_temp is still constructed). DeepSeek suggests "
+                        "margin 2.0-3.0 (gate is 2.0); 2.5 is the default-ish pick.")
+    p.add_argument("--hard-negative", action="store_true",
+                   help="Phase 1f-5: with --margin-loss >0, restrict the hinge to "
+                        "the HARDEST filler (max filler logit) per gold instead of "
+                        "all gold x filler pairs -- focuses the gradient on the "
+                        "most-violated pair (DeepSeek's 'hardest negatives from "
+                        "the ring'). No-op when --margin-loss is 0 (byte-"
+                        "identical).")
     p.add_argument("--live-eval-sessions", default=",".join(DEFAULT_LIVE_EVAL_SESSION_IDS),
                    help="comma-separated Onyx session UUIDs to force OUT of train "
                         "and into a dedicated live-eval bucket every seed (D0.4a; "
@@ -657,7 +741,9 @@ def main() -> int:
                 learnable_temp=args.learnable_temp, dropout=args.dropout,
                 label_smoothing=args.label_smoothing,
                 cosine_schedule=args.cosine_schedule,
-                select_ckpt=args.select_ckpt))
+                select_ckpt=args.select_ckpt,
+                margin_loss=args.margin_loss,
+                hard_negative=args.hard_negative))
 
     # ── Phase 1d ensemble (logit-avg of the per-seed selected ckpts) ──
     # The live_eval bucket is the same 2 live-transcript sessions held OUT of
@@ -830,6 +916,8 @@ def main() -> int:
                         "cosine_schedule": args.cosine_schedule,
                         "select_ckpt": args.select_ckpt,
                         "ensemble": args.ensemble},
+            "phase1f5": {"margin_loss": args.margin_loss,
+                         "hard_negative": args.hard_negative},
             "ensemble": {arch: {"n_members": e["n_members"],
                                 "z_logit_median": e["z_logit_median"]}
                          for arch, e in ensemble.items()},

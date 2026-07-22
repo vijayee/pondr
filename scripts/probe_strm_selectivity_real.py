@@ -257,6 +257,83 @@ def _build_serve_trace(slots, emit_idx, out_slots, emit_embs, query_emb,
     return rec
 
 
+# Phase 1f-5: code-vs-text doc-kind classification for the retrieved-slot
+# z_logit split. The 1f corpus mixes repo .md (prose) + .py (code) through one
+# pipeline; bge (prose-trained) over raw Python source + a prose-trained SSM
+# backbone produce semantically-malformed code-doc slots next to text
+# ([[pondr-strm-phase1f-deepseek-live-inversion-diagnosis]]). Splitting the
+# retrieved gap by doc-kind isolates whether code is the drag on the doc side
+# (text-doc lifts but code-doc stays flat -> code representation is the
+# bottleneck; both flat -> the backbone is). Reuses CodeParser's _LANG_BY_EXT
+# so 'code' matches exactly what the parser treats as source.
+_CODE_EXTS: set[str] = set()
+
+
+def _code_extensions() -> set[str]:
+    global _CODE_EXTS
+    if not _CODE_EXTS:
+        try:
+            from src.ingestion.code_parser import _LANG_BY_EXT  # noqa: E402
+            _CODE_EXTS = {e.lower() for e in _LANG_BY_EXT}
+        except Exception:
+            # Fallback: common Python/web extensions so the split still works
+            # if the code_parser module is renamed/restructured.
+            _CODE_EXTS = {".py", ".js", ".mjs", ".ts", ".tsx", ".jsx",
+                          ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp",
+                          ".cs", ".rb", ".php", ".swift", ".kt", ".scala"}
+    return _CODE_EXTS
+
+
+def _build_doc_kind_map(store) -> dict[str, str]:
+    """Map every ingested doc_id to 'code' or 'text' via the store's
+    ``document_source_path`` + CodeParser's extension set. Used to split the
+    retrieved-slot z_logit gap by doc-kind (Phase 1f-5). Best-effort: a missing
+    source_path skips the doc (it just won't appear in either bucket)."""
+    code_exts = _code_extensions()
+    out: dict[str, str] = {}
+    try:
+        doc_ids = list(store.default_document_ids())
+    except Exception:  # noqa: BLE001 - older stores may lack the API
+        return out
+    for did in doc_ids:
+        try:
+            sp = store.document_source_path(did)
+        except Exception:  # noqa: BLE001 - per-doc best-effort
+            sp = None
+        if not sp:
+            continue
+        ext = Path(sp).suffix.lower()
+        out[did] = "code" if ext in code_exts else "text"
+    return out
+
+
+def _doc_kind_for_source(source_id, doc_kind_map) -> str | None:
+    """Classify a ring slot's source_id as 'code' or 'text' for the doc-kind
+    z_logit split. None for non-doc slots (slot_type 0 conv) or when no
+    doc_kind_map is available (ephemeral / non-doc-store runs -> no split, the
+    retrieved bucket stays undivided = byte-identical to pre-1f-5).
+
+    A retrieved doc slot's source_id is ``doc_NNNNNN`` (DocumentRetriever
+    aggregates sections to one slot per doc) or ``doc_NNNNNN_sec_NNN`` (a bare
+    section slot). The doc_id is the part before ``_sec_``; look it up in
+    ``doc_kind_map``. Defensive extension fallback if the doc_id is not in the
+    map (should not happen for a doc-store run -- the map is built from the
+    same store)."""
+    if not source_id or doc_kind_map is None:
+        return None
+    sid = str(source_id)
+    if not sid.startswith("doc_"):
+        return None
+    doc_id = sid.split("_sec_", 1)[0]
+    kind = doc_kind_map.get(doc_id)
+    if kind is not None:
+        return kind
+    # Not in the map -- should not happen on a doc-store run (the map is built
+    # from the same store's default_document_ids), but default to 'text' so the
+    # gap still lands in a bucket instead of being silently dropped.
+    return "text"
+
+
 def _capture_turn(orch: PonderOrchestrator, user_text: str,
                   context_builder=None, z_head=None, ld_head=None,
                   emit_trace: bool = False, ld_head_for_emit=None,
@@ -543,6 +620,7 @@ def replay_and_capture(
     store = None
     doc_store_mode = bool(doc_store)
     n_turns_with_doc = 0  # retrieval_coverage numerator (doc-store mode only)
+    doc_kind_map: dict[str, str] | None = None  # Phase 1f-5 (doc-store mode only)
     try:
         from src.memory.store import HippocampalStore  # noqa: E402
         if doc_store_mode:
@@ -570,6 +648,17 @@ def replay_and_capture(
             print(f"[probe] doc-store ON: opened persisted doc corpus store "
                   f"{doc_store} (read-only; conv-pair seeding SKIPPED -> "
                   f"retrieved pool = pre-ingested docs only)", flush=True)
+            # Phase 1f-5: build the doc_id -> 'code'|'text' map so the
+            # retrieved-slot z_logit gap can be split by doc-kind (is code the
+            # drag on the doc side?). Best-effort; an empty map -> the split
+            # reports None for both sub-buckets (the retrieved bucket itself
+            # is unchanged).
+            doc_kind_map = _build_doc_kind_map(store)
+            n_code = sum(1 for v in doc_kind_map.values() if v == "code")
+            n_text = sum(1 for v in doc_kind_map.values() if v == "text")
+            print(f"[probe] doc-kind split: {len(doc_kind_map)} docs "
+                  f"({n_code} code / {n_text} text) -> retrieved z_logit "
+                  f"split into retrieved_text / retrieved_code", flush=True)
         else:
             db_path = str(Path(tmpdir) / "db")
             store = HippocampalStore(db_path)
@@ -753,6 +842,14 @@ def replay_and_capture(
                         trace_records.append(trace_rec)
                 rec["session_id"] = session_id
                 rec["turn_index"] = i
+                # Phase 1f-5: stamp each slot's doc_kind ('code'|'text'|None)
+                # so _analyze can split the retrieved z_logit gap by doc-kind.
+                # Only doc slots (slot_type 1) get a non-None kind; conv slots
+                # stay None. No-op when doc_kind_map is None (ephemeral run).
+                if doc_kind_map is not None:
+                    for s in rec["slots"]:
+                        s["doc_kind"] = _doc_kind_for_source(
+                            s.get("source_id"), doc_kind_map)
                 turn_records.append(rec)
                 # retrieval_coverage (doc-store mode): did this turn's ring
                 # surface >=1 doc slot? A broken retriever -> 0% coverage ->
@@ -802,6 +899,16 @@ def replay_and_capture(
                 (n_turns_with_doc / total_queries) if doc_store_mode and total_queries else None
             ),
             "n_turns_with_doc": n_turns_with_doc if doc_store_mode else None,
+            # Phase 1f-5: doc-kind split of the persisted corpus (code vs text
+            # docs). None in the default ephemeral path (no doc_kind_map).
+            "doc_kind_split": (
+                {
+                    "n_docs": len(doc_kind_map),
+                    "n_code": sum(1 for v in doc_kind_map.values() if v == "code"),
+                    "n_text": sum(1 for v in doc_kind_map.values() if v == "text"),
+                }
+                if doc_kind_map is not None else None
+            ),
         }
         return turn_records, run_stats
     finally:
@@ -894,6 +1001,12 @@ def _analyze(turn_records: list[dict]) -> dict:
                 "s_i": s.get("s_i"), "s_i_pure": s.get("s_i_pure"),
                 "z_r": s.get("z_r"), "z_logit": s.get("z_logit"),
                 "slot_type": s.get("slot_type"),
+                # Phase 1f-5: doc_kind ('code'|'text'|None) stamped in
+                # replay_and_capture when a doc_kind_map is built (doc-store
+                # runs only). Lets _analyze split retrieved z_logit by doc-kind
+                # so a code-doc representation drag is visible vs a text-doc
+                # one. None for conv slots / ephemeral (no-doc-store) runs.
+                "doc_kind": s.get("doc_kind"),
             })
 
     r_gaps: list[float] = []
@@ -910,6 +1023,16 @@ def _analyze(turn_records: list[dict]) -> dict:
     # split reports None, the full-ring ``z_logit`` stat is unchanged.
     zlg_gaps_conv: list[float] = []
     zlg_gaps_ret: list[float] = []
+    # Phase 1f-5: further split the retrieved (slot_type 1) z_logit gap by
+    # doc-kind ('text' vs 'code'). Code docs are tree-sitter parsed into
+    # signature/def sections whose prose-trained bge+backbone representations
+    # are semantically malformed next to text docs -- if text-doc gaps lift
+    # toward the gate while code-doc gaps stay flat, the code representation is
+    # the drag and the retrain verdict stays decisive on text; if both stay
+    # flat, the bottleneck is the backbone (not the doc kind). Empty on
+    # ephemeral (no-doc-store) runs where doc_kind is None for every slot.
+    zlg_gaps_ret_text: list[float] = []
+    zlg_gaps_ret_code: list[float] = []
     per_source_examples: list[dict] = []
     for sid, occs in by_source.items():
         if len(occs) < 3:
@@ -950,6 +1073,13 @@ def _analyze(turn_records: list[dict]) -> dict:
                 zlg_gaps_conv.append(zlg_gap)
             elif stype == 1:
                 zlg_gaps_ret.append(zlg_gap)
+                # Phase 1f-5: bucket the retrieved gap by doc-kind so the
+                # text-doc vs code-doc representation drag is visible.
+                dkind = probe.get("doc_kind")
+                if dkind == "text":
+                    zlg_gaps_ret_text.append(zlg_gap)
+                elif dkind == "code":
+                    zlg_gaps_ret_code.append(zlg_gap)
         if len(per_source_examples) < 12:
             per_source_examples.append({
                 "source_id": sid, "n_turns": len(occs),
@@ -997,6 +1127,10 @@ def _analyze(turn_records: list[dict]) -> dict:
         "z_logit_by_slot_type": {
             "conv": _gap_stats(zlg_gaps_conv, 2.0),
             "retrieved": _gap_stats(zlg_gaps_ret, 2.0),
+            # Phase 1f-5: doc-kind split of the retrieved gap. None on
+            # ephemeral runs (no doc_kind_map); populated on --doc-store runs.
+            "retrieved_text": _gap_stats(zlg_gaps_ret_text, 2.0),
+            "retrieved_code": _gap_stats(zlg_gaps_ret_code, 2.0),
             "full": _gap_stats(zlg_gaps, 2.0),
         },
         "examples": per_source_examples,
