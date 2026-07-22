@@ -42,6 +42,15 @@ class RawSection:
     # chunking (so the chunker -- which builds new RawSection objects -- cannot
     # drop it). ``Document.from_parse`` copies it to ``DocumentSection.embedding``.
     embedding: Optional[list[float]] = None
+    # STRM 1f-6: optional LLM-written prose description of a CODE section, used
+    # as the *embedding handle* so code slots can be located by meaning (the raw
+    # source embeds poorly against prose queries). Filled by the pipeline's
+    # ``summarizer`` AFTER chunking; ``Document.from_parse`` copies it to
+    # ``DocumentSection.summary``. ``None`` for text docs / cold-start / a down
+    # summarizer -> the embedder falls back to ``heading + "\n" + content``
+    # (byte-identical to pre-1f-6). The recalled content (``content``/``text``)
+    # is NEVER replaced by this -- it is an embed-side handle only.
+    summary: Optional[str] = None
 
 
 @dataclass

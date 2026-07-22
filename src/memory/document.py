@@ -59,6 +59,14 @@ class DocumentSection:
     chunk IS the semantic-retrieval unit); ``None`` until the embedding
     backfill populates it. ``blob_hash`` is the content-addressed cold-store
     key (``sha256[:16]`` of the body); the store fills it at encode time.
+
+    ``summary`` (STRM 1f-6) is an optional LLM-written prose description of a
+    CODE section used as the *embedding handle* (so the stored ``embedding`` and
+    the STRM inject-time ``y_t`` locate it by meaning, not raw source). It is
+    an embed-side handle ONLY -- the recalled content stays ``content``/``text``.
+    ``None`` for text docs / cold-start / a down summarizer -> byte-identical to
+    pre-1f-6. Persisted under ``{s}/summary`` only when non-empty (conditional,
+    like ``embedding``), so stores built without a summarizer are byte-identical.
     """
 
     id: str
@@ -70,6 +78,7 @@ class DocumentSection:
     topics: list[str] = field(default_factory=list)
     embedding: Optional[list[float]] = None
     blob_hash: Optional[str] = None
+    summary: Optional[str] = None
 
 
 @dataclass
@@ -192,6 +201,7 @@ class Document:
                 entities=list(sec_ents),
                 topics=list(sec_tops),
                 embedding=getattr(raw, "embedding", None),
+                summary=getattr(raw, "summary", None),
             ))
 
         # Doc-level entities/topics default to the section union; an explicit

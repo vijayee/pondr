@@ -101,6 +101,30 @@ def _maybe_bonsai():
         return None
 
 
+def _maybe_summarizer(model: str, cache_path: str = ""):
+    """Construct the STRM 1f-6 code-section summarizer, else None.
+
+    Only built when ``--summarize-code`` is set. Reuses the local Ollama DeepSeek
+    Oracle (``OracleClient``) via ``CodeSectionSummarizer``; the connection is
+    lazy, and ``summarize_sections`` never raises (a down server -> per-section
+    ``None`` -> the pipeline embeds the raw source, byte-identical to a
+    not-wired ingest). Construction is best-effort: a bad config / import error
+    returns None + a loud warning so a silently-unsummarized run is visible.
+
+    ``cache_path`` enables OracleClient's on-disk prompt-hash cache so an
+    idempotent re-ingest (upsert by source_path) of the SAME repo is free -- the
+    ~5 sections/code-doc x ~58 code-docs calls are cached on the first run and
+    hit on every re-run (a re-run after a crash / config tweak costs nothing).
+    """
+    try:
+        from src.ingestion.code_summarizer import CodeSectionSummarizer
+        return CodeSectionSummarizer(model=model, cache_path=cache_path or None)
+    except Exception as exc:  # noqa: BLE001 - best-effort, cold-start safe
+        print(f"WARNING: code summarizer unavailable -- code sections will embed "
+              f"raw source (byte-identical to pre-1f-6): {exc}", file=sys.stderr)
+        return None
+
+
 def _maybe_embedder(store):
     """Construct the per-chunk section embedder if available, else None.
 
@@ -200,6 +224,19 @@ def main() -> int:
                         "findable via GLiNER + the semantic embedder), so this is a "
                         "safe corpus-build workaround -- production ingest keeps "
                         "them on. Combine with --no-gliner for the smallest batch.")
+    p.add_argument("--summarize-code", action="store_true",
+                   help="STRM 1f-6: generate a 1-2 sentence LLM prose summary per "
+                        "CODE section and use it as the *embedding handle* so code "
+                        "slots are located by MEANING (the 1f-5 doc-kind split showed "
+                        "code-doc z_logit median -0.801 vs text-doc 3.969 -- raw code "
+                        "embeds poorly against prose queries). The recalled code body "
+                        "is NEVER replaced -- only the stored {s}/embedding + the "
+                        "inject-time y_t change. Needs local Ollama DeepSeek Oracle "
+                        "(:11434). OFF by default = byte-identical to 1f-5.")
+    p.add_argument("--summarizer-model", default="deepseek-v4-flash:cloud",
+                   help="Oracle model for --summarize-code (default "
+                        "deepseek-v4-flash:cloud, the flash-over-pro labeling "
+                        "preference). Only used when --summarize-code is set.")
     args = p.parse_args()
 
     store_path = Path(args.store)
@@ -249,11 +286,30 @@ def main() -> int:
         # cold-start. de-wonk: do NOT fabricate a doc_kind.
         doc_kind_tagger = None
 
+        # STRM 1f-6: optional code-section summarizer (the embedding handle).
+        # The on-disk prompt-hash cache lives in the store dir so an idempotent
+        # re-ingest of the same repo is free (cache hits on every re-run).
+        summarizer = (
+            _maybe_summarizer(args.summarizer_model,
+                              cache_path=str(store_path / ".code_summary_cache"))
+            if args.summarize_code else None
+        )
+        if args.summarize_code:
+            if summarizer is None:
+                print("  --summarize-code set but summarizer unavailable; proceeding "
+                      "with raw-source embeddings (byte-identical to 1f-5)",
+                      file=sys.stderr)
+            else:
+                print(f"  --summarize-code ON (model={args.summarizer_model}): code "
+                      f"sections get a prose embedding handle", flush=True)
+
         pipe = UnifiedIngestionPipeline(store, chunker=chunker)
 
         n_ok = 0
         n_skip = 0
         n_sections_total = 0
+        n_code_docs = 0
+        n_sections_summarized = 0
         doc_ids: list[str] = []
         for i, fpath in enumerate(files, 1):
             try:
@@ -264,6 +320,7 @@ def main() -> int:
                     relation_extractor=bonsai,
                     embedder=embedder,
                     doc_kind_tagger=doc_kind_tagger,
+                    summarizer=summarizer,
                     state_assertions=not args.no_state_assertions,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad doc must not kill the build
@@ -273,14 +330,28 @@ def main() -> int:
             n_ok += 1
             doc_ids.append(doc_id)
             # Section count via metadata-only (no cold pull) for the coverage sum.
+            # Also count summarized sections (STRM 1f-6 coverage) so a silently
+            # all-None run (server down) is visible in the per-doc line + the
+            # final summary (de-wonk: no silent degradation).
             try:
                 doc = store.get_document(doc_id, load_bodies=False)
                 n_secs = len(doc.sections) if doc is not None else 0
+                n_summarized = (sum(1 for s in doc.sections if s.summary)
+                                if doc is not None else 0)
+                is_code = (doc is not None and doc.source_type == "code")
             except Exception:  # noqa: BLE001 - coverage is best-effort
                 n_secs = 0
+                n_summarized = 0
+                is_code = False
             n_sections_total += n_secs
+            if is_code:
+                n_code_docs += 1
+                n_sections_summarized += n_summarized
+            tag = ""
+            if summarizer is not None and is_code:
+                tag = f"  [{n_summarized}/{n_secs} sections summarized]"
             print(f"  [{i}/{len(files)}] {'created' if created else 'updated'} "
-                  f"{doc_id}  ({n_secs} sections)  <- {fpath}", flush=True)
+                  f"{doc_id}  ({n_secs} sections){tag}  <- {fpath}", flush=True)
 
         # Coverage summary + the findability assert. ``store_has_documents`` is
         # the SAME probe ``build_ponder`` uses to decide whether to attach a
@@ -301,6 +372,10 @@ def main() -> int:
         print(f"GLiNER:               {'on' if gliner is not None else 'off'}")
         print(f"embedder:             {'on' if embedder is not None else 'off (no semantic path)'}")
         print(f"Bonsai relations:     {'on' if bonsai is not None else 'off'}")
+        if args.summarize_code:
+            print(f"code summarizer:      {'on (model=' + args.summarizer_model + ')' if summarizer is not None else 'off (unavailable)'}")
+            print(f"code docs:            {n_code_docs}")
+            print(f"sections summarized:  {n_sections_summarized}")
         print("=" * 64)
 
         summary = {
@@ -315,6 +390,10 @@ def main() -> int:
             "embedder": embedder is not None,
             "bonsai_relations": bonsai is not None,
             "state_assertions": not args.no_state_assertions,
+            "summarize_code": bool(args.summarize_code and summarizer is not None),
+            "summarizer_model": args.summarizer_model if args.summarize_code else None,
+            "n_code_docs": n_code_docs,
+            "n_sections_summarized": n_sections_summarized,
             "doc_ids": doc_ids,
         }
         summary_path = store_path / "build_summary.json"
@@ -331,6 +410,19 @@ def main() -> int:
                   "files?). The 1f generator would surface zero doc slots. "
                   "Fix the extractor/embedder and re-run (idempotent upsert).",
                   file=sys.stderr)
+            return 1
+        # STRM 1f-6 de-wonk: --summarize-code set + summarizer built + code docs
+        # present but ZERO sections summarized -> the Oracle server was down /
+        # every call failed and the run silently degraded to raw-source embeddings
+        # (byte-identical to 1f-5, i.e. the experiment would not actually test the
+        # lever). Fail loudly so the operator restarts Ollama and re-runs.
+        if (args.summarize_code and summarizer is not None
+                and n_code_docs > 0 and n_sections_summarized == 0):
+            print("ERROR: --summarize-code set but 0/{} code sections summarized -- "
+                  "the Oracle server was down or every call failed. The store is "
+                  "byte-identical to 1f-5 (raw-source embeddings), so re-running the "
+                  "experiment would NOT test the prose-handle lever. Restart Ollama "
+                  "(:11434) and re-run.".format(n_code_docs), file=sys.stderr)
             return 1
         print("OK: doc corpus store is findable.", flush=True)
         return 0

@@ -125,6 +125,7 @@ class DocumentRetriever:
                 "score": r.get("score", 0.0),
                 "entities": list(r.get("entities", [])),
                 "topics": list(r.get("topics", [])),
+                "summary": r.get("section_summary") or "",
             })
         else:  # section
             sections.append(self._section_summary(r))
@@ -152,6 +153,7 @@ class DocumentRetriever:
                     "score": r.get("score", 0.0),
                     "entities": list(r.get("entities", [])),
                     "topics": list(r.get("topics", [])),
+                    "summary": r.get("section_summary") or "",
                 })
         else:  # section
             group["sections"].append(self._section_summary(r))
@@ -168,6 +170,12 @@ class DocumentRetriever:
             "score": r.get("score", 0.0),
             "entities": list(r.get("entities", [])),
             "topics": list(r.get("topics", [])),
+            # STRM 1f-6: the section's LLM prose summary (embedding handle).
+            # ``_build_result`` joins these into the result-level ``embed_text``
+            # so the orchestrator's inject-time embed locates the doc by meaning.
+            # Absent (text docs / cold-start / down summarizer) -> "" -> skipped
+            # in the join -> byte-identical to pre-1f-6.
+            "summary": r.get("section_summary") or "",
         }
 
     def _build_result(self, doc_groups: dict, doc_id: str) -> dict:
@@ -180,6 +188,17 @@ class DocumentRetriever:
             f"Section '{s['heading']}': {s['text']}" for s in g["sections"][:5]
         ]
         text = g["primary_text"] or self._build_document_context(g, total)
+        # STRM 1f-6: the joined prose of the matched sections (the embedding
+        # handle). The orchestrator's inject-time embed (orchestrator.py:660)
+        # prefers ``embed_text`` so a retrieved code doc is located by MEANING
+        # (prose) instead of the synthetic ``summary`` string (which inlines the
+        # full code and embeds poorly against prose queries -- the 1f-5 code-doc
+        # mis-rank). Empty when no section carried a prose summary (text docs /
+        # cold-start / a down summarizer) -> the orchestrator falls back to
+        # ``summary``/``text`` -> byte-identical to pre-1f-6. The recalled
+        # ``summary``/``text`` (full code) are UNCHANGED.
+        embed_text = "; ".join(s.get("summary", "") for s in g["sections"]
+                               if s.get("summary"))
         return {
             "episode_id": doc_id,
             "kind": "document",
@@ -191,6 +210,7 @@ class DocumentRetriever:
                 + "\n".join(f"  - {s}" for s in section_lines)
             ),
             "text": text,
+            "embed_text": embed_text,
             "timestamp": g["timestamp"],
             "entities": sorted(g["entities"]),
             "topics": sorted(g["topics"]),

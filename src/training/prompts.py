@@ -705,3 +705,39 @@ Return ONLY valid JSON:
     {{"type": "File", "name": "auth.py"}},
     {{"type": "Function", "name": "authenticate_user", "defined_in": "auth.py"}}
  ]}}"""
+
+
+# ═══════════════════════════════════════════════════════════════
+# STRM 1f-6: CODE-SECTION PROSE SUMMARY (embedding handle for code docs)
+# ═══════════════════════════════════════════════════════════════
+
+
+def code_section_summary_prompt(heading: str, content: str) -> str:
+    """Prompt for the STRM 1f-6 code-section prose summary.
+
+    A code section's *embedding handle* (what the document retriever + the STRM
+    backbone state locate it by) is computed from the raw source today, which
+    mis-ranks against prose queries -- the 1f-5 doc-kind split showed code-doc
+    z_logit median -0.801 vs text-doc 3.969 ([[pondr-strm-phase1f5-margin-dockind-
+    result]]). This prompt asks the Oracle for a 1-2 sentence plain-prose
+    description of WHAT the function/class does and its role, so the embedding
+    can be computed from prose instead. The summary is an *embedding handle*
+    ONLY -- the actual source stays as the recalled content (the ``text`` field
+    is untouched; see the 1f-6 plan). Returns ONLY the JSON envelope so
+    ``OracleClient``'s ``response_format: json_object`` + salvage parser can
+    recover it. ``content`` is capped by the caller to keep the prompt bounded.
+    """
+    body = content[:4000]
+    return f"""You are describing one section of a source file for a retrieval system that
+finds code by MEANING, not by symbol name. Read the signature and source below
+and write 1-2 plain sentences describing what this {heading or "code section"}
+does and its role or purpose -- its behavior, what it takes in, what it returns
+or changes, and why a program might call it. Write as if explaining to an
+engineer who is searching by intent ("how do I ..."). Do NOT include code, do
+NOT restate the signature, do NOT use bullet points. Be concrete, not generic.
+
+SOURCE:
+{body}
+
+Return ONLY valid JSON:
+{{"summary": "..."}}"""

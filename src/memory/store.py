@@ -1389,7 +1389,7 @@ class HippocampalStore:
     )
     _SEC_FIELDS = (
         "heading", "level", "parent", "blob_hash", "entities", "topics",
-        "embedding",
+        "embedding", "summary",
     )
 
     def _blob_store(self) -> BlobStore:
@@ -1614,6 +1614,12 @@ class HippocampalStore:
             put(f"{s}/topics", json.dumps(sec.topics))
             if sec.embedding is not None:
                 put(f"{s}/embedding", json.dumps(sec.embedding))
+            # STRM 1f-6: prose code-section summary (embedding handle). Written
+            # ONLY when present (conditional, like ``embedding``) so a store
+            # built without a summarizer is byte-identical to pre-1f-6. The
+            # recalled content (``{s}/blob_hash`` -> cold body) is untouched.
+            if sec.summary:
+                put(f"{s}/summary", sec.summary)
         # Upsert index (overwritten in place on update; same key for the same
         # source_path, so the put is idempotent across re-ingests).
         put(f"content/doc_by_source/{safe_edge_component(doc.source_path)}", doc.id)
@@ -1799,6 +1805,9 @@ class HippocampalStore:
             emb_raw = _b2s(self.db.get_sync(f"{s}/embedding"))
             if emb_raw:
                 embedding = _loads(emb_raw, None)
+            # STRM 1f-6: prose summary (embedding handle). Absent key -> None
+            # (byte-identical to a pre-1f-6 / no-summarizer store).
+            summary = _b2s(self.db.get_sync(f"{s}/summary")) or None
             sections.append(DocumentSection(
                 id=sid,
                 heading=_b2s(self.db.get_sync(f"{s}/heading")),
@@ -1809,6 +1818,7 @@ class HippocampalStore:
                 topics=_loads(_b2s(self.db.get_sync(f"{s}/topics")), []),
                 embedding=embedding,
                 blob_hash=blob_hash,
+                summary=summary,
             ))
 
         return Document(

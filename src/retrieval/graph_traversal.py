@@ -575,6 +575,7 @@ class GraphTraversal:
                 "session_id": None, "user_id": None, "follows": None,
                 "score": 0.0, "kind": "document", "source_path": "",
                 "matched_section": "", "sections": [],
+                "section_summary": "", "embed_text": "",
             }
 
         q_ent = {e.lower() for e in (query_entities or [])}
@@ -584,6 +585,10 @@ class GraphTraversal:
         # richest, then earliest). At most one section's body is pulled below.
         matched_sid: Optional[str] = None
         matched_heading = ""
+        # STRM 1f-6: the matched section's LLM prose summary (embedding handle).
+        # ``None`` for text docs / cold-start / a down summarizer -> "" (the
+        # aggregator's ``embed_text`` join skips it, byte-identical to pre-1f-6).
+        matched_summary = ""
         if doc.sections:
             best = max(
                 range(len(doc.sections)),
@@ -593,6 +598,7 @@ class GraphTraversal:
             matched = doc.sections[best]
             matched_sid = matched.id
             matched_heading = matched.heading
+            matched_summary = matched.summary or ""
 
         text = ""
         if matched_sid is not None:
@@ -616,6 +622,8 @@ class GraphTraversal:
             "score": 0.0,
             "source_path": doc.source_path,
             "matched_section": matched_heading,
+            "section_summary": matched_summary,
+            "embed_text": matched_summary,
             "sections": [
                 {
                     "id": s.id, "heading": s.heading, "level": s.level,
@@ -714,16 +722,25 @@ class GraphTraversal:
                 "session_id": None, "user_id": None, "follows": None,
                 "score": 0.0, "kind": "section", "source_path": "",
                 "section_heading": "", "doc_id": doc_id,
+                "section_summary": "", "embed_text": "",
             }
         sec = next((s for s in doc.sections if s.id == sid), None)
         text = ""
         heading = ""
         entities: list[str] = []
         topics: list[str] = []
+        # STRM 1f-6: the LLM prose summary (embedding handle). ``None`` for text
+        # docs / cold-start / a down summarizer -> empty string (callers fall
+        # back to ``summary``/``text``, byte-identical to pre-1f-6). Surfaced on
+        # BOTH ``section_summary`` (the per-section prose, for aggregation) and
+        # ``embed_text`` (the inject-time embedding handle). The recalled body
+        # (``text``) and the doc title (``summary``) are UNCHANGED.
+        section_summary = ""
         if sec is not None:
             heading = sec.heading
             entities = list(sec.entities)
             topics = list(sec.topics)
+            section_summary = sec.summary or ""
             body = self.store.get_section_body(doc_id, sid)
             if body is not None:
                 text = body
@@ -744,6 +761,8 @@ class GraphTraversal:
             "source_path": doc.source_path,
             "section_heading": heading,
             "doc_id": doc_id,
+            "section_summary": section_summary,
+            "embed_text": section_summary,
         }
 
     # ── scoring ──

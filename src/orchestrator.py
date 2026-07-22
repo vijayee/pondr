@@ -657,7 +657,18 @@ class PonderOrchestrator:
 
         # 4. inject each retrieved episode into WM as a gist step.
         if episodes and self.embedder is not None:
-            summaries = [e.get("summary", "") or e.get("text", "") for e in episodes]
+            # STRM 1f-6: prefer the prose ``embed_text`` handle (the LLM-written
+            # code-section summary) so a retrieved CODE doc is injected into the
+            # ring by MEANING, not the synthetic ``summary`` string (which
+            # inlines the full code and embeds poorly against prose queries -- the
+            # 1f-5 code-doc mis-rank, median -0.801). Absent (text docs, conv
+            # slots, summarizer down) -> falls back to ``summary``/``text`` =
+            # byte-identical to pre-1f-6. NOTE: line ~679 (the slot ``text``)
+            # stays ``summary or text`` -- that is the recalled content the
+            # formatter + salience scorer read; touching it would swap full code
+            # for truncated code (the binding code-recall concern).
+            summaries = [e.get("embed_text", "") or e.get("summary", "")
+                         or e.get("text", "") for e in episodes]
             embs = self.working_memory.embed(summaries)
             # Thread provenance (episode_id + summary) into each inject so the
             # WM ring slots carry ``source_id``/``text`` when the ring is ON --

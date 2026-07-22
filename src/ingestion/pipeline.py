@@ -53,6 +53,7 @@ class UnifiedIngestionPipeline:
         relation_extractor=None,
         embedder=None,
         doc_kind_tagger=None,
+        summarizer=None,
         state_assertions: bool = True,
     ) -> tuple[str, bool]:
         """Ingest (or re-ingest) a source. Returns ``(doc_id, created)``.
@@ -92,6 +93,24 @@ class UnifiedIngestionPipeline:
         fire on a semantic signal (both sources ``point_in_time_snapshot``)
         instead of a filename month-prefix, which is inert on real enterprise
         docs.
+
+        ``summarizer`` (STRM 1f-6; any object with
+        ``summarize_sections(items: list[tuple[str, str]]) -> list[Optional[str]]``
+        -- a ``CodeSectionSummarizer`` from ``src.ingestion.code_summarizer``
+        satisfies this) is optional -- when set AND ``parsed.source_type ==
+        "code"``, a 1-2 sentence LLM prose description is computed per code
+        section and assigned to ``sec.summary`` (the *embedding handle*), so the
+        stored ``{s}/embedding`` locates the section by MEANING instead of raw
+        source (raw code embeds poorly against prose queries -- the 1f-5 doc-kind
+        split showed code-doc z_logit median -0.801 vs text-doc 3.969). Never
+        raises: a down server / per-section parse failure leaves ``sec.summary =
+        None`` and the embedder falls back to the raw ``heading + "\\n" + content``
+        (byte-identical to a not-wired ingest). The recalled content
+        (``content``/``text``) is NEVER replaced -- ``summary`` is an embed-side
+        handle only; ``sec_texts`` (the doc-kind tagger input) is untouched so the
+        tagger still sees raw content and code docs are not mis-classified as text.
+        When ``None`` (text docs, conversation slots, structure-only ingest) no
+        summaries are computed -> byte-identical to pre-1f-6.
         """
         if source_type == "auto":
             source_type = detect_type(source_path)
@@ -150,8 +169,40 @@ class UnifiedIngestionPipeline:
                 (s.heading + "\n" + s.content) if s.heading else s.content
                 for s in parsed.sections
             ]
-        if embedder is not None and sec_texts:
-            vecs = embedder.encode(sec_texts)
+
+        # STRM 1f-6: prose code-section summaries as the *embedding handle*.
+        # Computed BEFORE the embed below and assigned to ``sec.summary`` (which
+        # ``Document.from_parse`` persists as ``{s}/summary``). Only for code
+        # docs -- text docs / conv slots never get a summary (byte-identical to
+        # pre-1f-6). Never raises: a down server / per-section failure leaves
+        # ``sec.summary = None`` and the embedder falls back to raw content for
+        # that section. The summary is an embed-side handle ONLY; ``sec_texts``
+        # (the doc-kind tagger input at line ~222) keeps the RAW content so the
+        # tagger still classifies code docs as code, not text.
+        if summarizer is not None and parsed.source_type == "code" and parsed.sections:
+            items = [(s.heading, s.content) for s in parsed.sections]
+            try:
+                summaries = summarizer.summarize_sections(items)
+            except Exception as e:  # noqa: BLE001 - cold-start safe
+                import sys
+                print(f"[code-summarizer-fail] ingest: {e}", file=sys.stderr)
+                summaries = [None] * len(items)
+            for s, sm in zip(parsed.sections, summaries):
+                if sm:
+                    s.summary = sm
+
+        # The embed input: prose summary when present (locate code by meaning),
+        # else the raw chunk text (byte-identical to pre-1f-6). Kept SEPARATE
+        # from ``sec_texts`` so the doc-kind tagger still sees raw content.
+        embed_texts: list[str] = []
+        if parsed.sections:
+            embed_texts = [
+                (s.heading + "\n" + s.summary) if s.summary
+                else ((s.heading + "\n" + s.content) if s.heading else s.content)
+                for s in parsed.sections
+            ]
+        if embedder is not None and embed_texts:
+            vecs = embedder.encode(embed_texts)
             for s, vec in zip(parsed.sections, vecs):
                 s.embedding = list(vec)
 

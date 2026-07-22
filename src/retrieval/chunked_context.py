@@ -119,6 +119,14 @@ class ChunkedContextFormatter:
                 lines.append(f"Source: {src}")
             if summary:
                 lines.append(f"Title: {summary}")
+            # STRM 1f-6: surface the LLM prose description as a one-line handle
+            # so the LLM gets BOTH a meaning-level description AND the full code
+            # body below (serves "reasoning over recalled code"). Additive: only
+            # when ``embed_text`` is non-empty (code docs ingested with a
+            # summarizer); absent -> byte-identical to pre-1f-6.
+            embed_text = ep.get("embed_text", "")
+            if embed_text:
+                lines.append(f"Description: {embed_text}")
             if entities:
                 lines.append(f"Entities: {', '.join(entities)}")
             if topics:
@@ -140,6 +148,12 @@ class ChunkedContextFormatter:
                 lines.append(f"Source: {src}")
             if summary:
                 lines.append(f"Title: {summary}")
+            # STRM 1f-6: surface the LLM prose description as a one-line handle
+            # (see the section branch above for rationale). Additive: only when
+            # ``embed_text`` is non-empty; absent -> byte-identical to pre-1f-6.
+            embed_text = ep.get("embed_text", "")
+            if embed_text:
+                lines.append(f"Description: {embed_text}")
             if entities:
                 lines.append(f"Entities: {', '.join(entities)}")
             if topics:
