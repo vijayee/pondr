@@ -78,20 +78,48 @@ class StateReadout(nn.Module):
     ``best.pt``/``final.pt`` strict-load -- the binding check. The per-kind
     arch uses a SEPARATE key namespace (``body.0.*`` / ``kind_heads.{k}.*``)
     so the two never collide.
+
+    Phase 1f-7 Stage 1 REDESIGN -- MoE on non-overlapping data
+    (``per_kind_full=True``): N INDEPENDENT full readouts
+    ``kind_readouts = ModuleList([Sequential(Linear(dim_in, hidden), ReLU,
+    Linear(hidden, dim_out)) for _ in range(n_doc_kinds)])`` -- NO shared body,
+    so the code readout never shares params with the conv-majority body (the
+    Stage 1 FAIL root cause: the shared body was conv-dominated). Each kind's
+    readout trains ONLY on its own kind's gold (the trainer routes ALL slots of
+    a record through the GOLD's readout, so gradient flows into one readout per
+    record = non-overlapping data, mirroring the Stage 0 code-only win per
+    kind). Separate key namespace ``kind_readouts.{k}.0.*`` / ``.{k}.2.*`` so
+    ``from_state_dict`` can distinguish it from the shared-body arch. Serve
+    routes per-SLOT (unchanged) -- the live gate groups by source_id (one kind
+    per source) so the probe-vs-filler gap is within one readout = well-defined.
     """
 
     def __init__(self, dim_in: int, dim_out: int = Z_DIM, hidden: int | None = None,
-                 n_doc_kinds: int = 0) -> None:
+                 n_doc_kinds: int = 0, per_kind_full: bool = False) -> None:
         super().__init__()
         self.dim_in = int(dim_in)
         self.dim_out = int(dim_out)
         self.hidden = int(hidden) if hidden is not None else None
         self.n_doc_kinds = int(n_doc_kinds)
-        if self.n_doc_kinds > 0 and hidden is None:
-            # The per-kind arch needs a shared body to feed the per-kind heads;
+        self.per_kind_full = bool(per_kind_full)
+        if self.per_kind_full:
+            # MoE: N independent full readouts, no shared body. Needs both
+            # n_doc_kinds>0 and hidden (each readout is the Stage 0 mlp128).
+            if self.n_doc_kinds <= 0:
+                raise ValueError("per_kind_full requires n_doc_kinds>0")
+            if hidden is None:
+                raise ValueError("per_kind_full requires hidden (per-kind MLP body)")
+            self.kind_readouts = nn.ModuleList(
+                [nn.Sequential(nn.Linear(self.dim_in, self.hidden),
+                               nn.ReLU(),
+                               nn.Linear(self.hidden, self.dim_out))
+                 for _ in range(self.n_doc_kinds)]
+            )
+        elif self.n_doc_kinds > 0 and hidden is None:
+            # The shared-body per-kind arch needs a body to feed the heads;
             # a pure-linear per-kind readout is degenerate (no shared depth).
             raise ValueError("n_doc_kinds>0 requires hidden (shared MLP body)")
-        if self.n_doc_kinds > 0:
+        elif self.n_doc_kinds > 0:
             # Shared body 6144 -> hidden (ReLU); per-kind head hidden -> dim_out.
             self.body = nn.Sequential(
                 nn.Linear(self.dim_in, self.hidden),
@@ -115,13 +143,23 @@ class StateReadout(nn.Module):
             x = x.unsqueeze(0)
         if self.n_doc_kinds <= 0:
             return self.net(x)            # [B, dim_out] (byte-identical path)
-        # Per-doc-kind: shared body, then route each row to its kind head.
         if doc_kinds is None:
             raise RuntimeError(
                 "StateReadout(n_doc_kinds>0).forward requires a doc_kinds tensor"
             )
-        h = self.body(x)                  # [B, hidden] (ReLU)
         dk = doc_kinds.to(x.device).long()
+        if self.per_kind_full:
+            # MoE: route each row to its kind's FULL readout (no shared body).
+            # new_zeros (not new_empty) so any out-of-[0,n) kind yields zeros
+            # rather than garbage -- a robustness guard.
+            out = x.new_zeros(x.shape[0], self.dim_out)
+            for k in range(self.n_doc_kinds):
+                mask = dk == k
+                if mask.any():
+                    out[mask] = self.kind_readouts[k](x[mask])
+            return out                    # [B, dim_out]
+        # Shared-body per-doc-kind: body once, then route each row to its head.
+        h = self.body(x)                  # [B, hidden] (ReLU)
         out = x.new_empty(x.shape[0], self.dim_out)
         for k in range(self.n_doc_kinds):
             mask = dk == k
@@ -136,7 +174,10 @@ class StateReadout(nn.Module):
         Linear-vs-MLP is inferred from the keys: ``net.2.weight`` present -> MLP
         with ``hidden = sd["net.0.weight"].shape[0]``; else Linear. The
         per-doc-kind arch is inferred from ``kind_heads.{k}.weight`` keys
-        (n_doc_kinds = the count of distinct kind_heads.{k}.weight). Strict on
+        (n_doc_kinds = the count of distinct kind_heads.{k}.weight). The MoE
+        ``per_kind_full`` arch is inferred from ``kind_readouts.{k}.0.weight``
+        keys (detected FIRST, since its ``kind_readouts.*`` namespace is
+        distinct from the shared-body ``kind_heads.*``). Strict on
         missing/unexpected keys (a mis-wire is a hard error, not a silent load).
         Accepts either bare ``net.*`` keys (a standalone readout) or
         ``readout.net.*`` keys (a composite's readout slice) -- the
@@ -146,16 +187,27 @@ class StateReadout(nn.Module):
         """
         prefix = "readout."
         own = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
-        n_doc_kinds = 0
-        kind_keys = [k for k in own if k.startswith("kind_heads.") and k.endswith(".weight")]
-        if kind_keys:
-            n_doc_kinds = len({k.split(".")[1] for k in kind_keys})
-        hidden = None
-        if n_doc_kinds > 0:
-            hidden = int(own["body.0.weight"].shape[0])
-        elif "net.2.weight" in own:
-            hidden = int(own["net.0.weight"].shape[0])
-        ro = cls(dim_in=dim_in, dim_out=dim_out, hidden=hidden, n_doc_kinds=n_doc_kinds)
+        # MoE per_kind_full FIRST (kind_readouts.* namespace is distinct from
+        # the shared-body kind_heads.* namespace, so order is unambiguous).
+        readout_keys = [k for k in own
+                        if k.startswith("kind_readouts.") and k.endswith(".0.weight")]
+        if readout_keys:
+            per_kind_full = True
+            n_doc_kinds = len({k.split(".")[1] for k in readout_keys})
+            hidden = int(own["kind_readouts.0.0.weight"].shape[0])
+        else:
+            per_kind_full = False
+            n_doc_kinds = 0
+            kind_keys = [k for k in own if k.startswith("kind_heads.") and k.endswith(".weight")]
+            if kind_keys:
+                n_doc_kinds = len({k.split(".")[1] for k in kind_keys})
+            hidden = None
+            if n_doc_kinds > 0:
+                hidden = int(own["body.0.weight"].shape[0])
+            elif "net.2.weight" in own:
+                hidden = int(own["net.0.weight"].shape[0])
+        ro = cls(dim_in=dim_in, dim_out=dim_out, hidden=hidden,
+                 n_doc_kinds=n_doc_kinds, per_kind_full=per_kind_full)
         missing, unexpected = ro.load_state_dict(own, strict=False)
         if missing or unexpected:
             raise RuntimeError(
@@ -180,12 +232,14 @@ class CompositeZHead(nn.Module):
     """
 
     def __init__(self, dim_in: int = DEFAULT_DIM_IN, hidden: int | None = None,
-                 n_doc_kinds: int = 0) -> None:
+                 n_doc_kinds: int = 0, per_kind_full: bool = False) -> None:
         super().__init__()
         self.dim_in = int(dim_in)
         self.n_doc_kinds = int(n_doc_kinds)
+        self.per_kind_full = bool(per_kind_full)
         self.readout = StateReadout(dim_in=self.dim_in, hidden=hidden,
-                                    n_doc_kinds=self.n_doc_kinds)
+                                    n_doc_kinds=self.n_doc_kinds,
+                                    per_kind_full=self.per_kind_full)
         self.z_head = ZRelevanceHead()
         # Mirror the z-head's checkpoint dims; doc_dim = the readout input dim
         # (so the loader rebuilds the readout with the right dim_in).
@@ -235,17 +289,29 @@ class CompositeZHead(nn.Module):
         count of distinct kinds). Strict on missing/unexpected.
         """
         # Infer readout hidden-ness + per-doc-kind from the readout keys.
-        n_doc_kinds = 0
-        kind_keys = [k for k in sd
-                    if k.startswith("readout.kind_heads.") and k.endswith(".weight")]
-        if kind_keys:
-            n_doc_kinds = len({k.split(".")[2] for k in kind_keys})
-        hidden = None
-        if n_doc_kinds > 0:
-            hidden = int(sd["readout.body.0.weight"].shape[0])
-        elif "readout.net.2.weight" in sd:
-            hidden = int(sd["readout.net.0.weight"].shape[0])
-        head = cls(dim_in=dim_in, hidden=hidden, n_doc_kinds=n_doc_kinds)
+        # MoE per_kind_full FIRST (kind_readouts.* namespace is distinct from
+        # the shared-body kind_heads.* namespace).
+        readout_keys = [k for k in sd
+                        if k.startswith("readout.kind_readouts.")
+                        and k.endswith(".0.weight")]
+        if readout_keys:
+            per_kind_full = True
+            n_doc_kinds = len({k.split(".")[2] for k in readout_keys})
+            hidden = int(sd["readout.kind_readouts.0.0.weight"].shape[0])
+        else:
+            per_kind_full = False
+            n_doc_kinds = 0
+            kind_keys = [k for k in sd
+                        if k.startswith("readout.kind_heads.") and k.endswith(".weight")]
+            if kind_keys:
+                n_doc_kinds = len({k.split(".")[2] for k in kind_keys})
+            hidden = None
+            if n_doc_kinds > 0:
+                hidden = int(sd["readout.body.0.weight"].shape[0])
+            elif "readout.net.2.weight" in sd:
+                hidden = int(sd["readout.net.0.weight"].shape[0])
+        head = cls(dim_in=dim_in, hidden=hidden, n_doc_kinds=n_doc_kinds,
+                   per_kind_full=per_kind_full)
         # Rebind the z_head dims to the checkpoint's if they differ (defensive).
         head.z_head = ZRelevanceHead.from_state_dict(
             {k[len("z_head."):]: v for k, v in sd.items() if k.startswith("z_head.")},

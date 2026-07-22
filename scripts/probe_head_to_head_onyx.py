@@ -120,7 +120,8 @@ DEFAULT_LIVE_EVAL_SESSION_IDS = (
 
 def _build_head(arch: str, dim_in: int, hidden: int | None,
                 n_slot_types: int = 0, learnable_temp: bool = False,
-                dropout: float = 0.0, n_doc_kinds: int = 0) -> nn.Module:
+                dropout: float = 0.0, n_doc_kinds: int = 0,
+                per_kind_full: bool = False) -> nn.Module:
     """Construct Head A (bilinear composite) or Head B (cross-slot Transformer).
 
     The Phase-1b/1d knobs (``n_slot_types`` slot-type embedding, ``learnable_temp``
@@ -128,12 +129,19 @@ def _build_head(arch: str, dim_in: int, hidden: int | None,
     A (``CompositeZHead``) ignores them. Defaults 0/False/0.0 = the task #45 arch
     (byte-identical; the existing best.pt strict-loads via ``_load_head``).
 
-    Phase 1f-7 Stage 1 ``n_doc_kinds`` (Head A ONLY): the per-doc-kind readout
-    (shared body + per-kind heads). 0 = byte-identical shared readout. Head B
-    (transformer) ignores it (its ``n_slot_types`` conv/retrieved channel is
-    ORTHOGONAL to doc-kind; do NOT repurpose it)."""
+    Phase 1f-7 Stage 1 ``n_doc_kinds`` (Head A ONLY): the per-doc-kind readout.
+    0 = byte-identical shared readout. Head B (transformer) ignores it (its
+    ``n_slot_types`` conv/retrieved channel is ORTHOGONAL to doc-kind; do NOT
+    repurpose it).
+
+    Phase 1f-7 Stage 1 REDESIGN ``per_kind_full`` (Head A ONLY, MoE on
+    non-overlapping data): N independent full readouts (no shared body) instead of
+    the shared body + per-kind heads. The trainer routes ALL slots of a record
+    through the GOLD's readout (by-gold-kind) so each readout trains only on its
+    own kind's gold. Default False = the shared-body arch (byte-identical)."""
     if arch == "bilinear":
-        return CompositeZHead(dim_in=dim_in, hidden=hidden, n_doc_kinds=n_doc_kinds)
+        return CompositeZHead(dim_in=dim_in, hidden=hidden, n_doc_kinds=n_doc_kinds,
+                               per_kind_full=per_kind_full)
     if arch == "transformer":
         return CrossSlotTransformerZHead(dim_in=dim_in, hidden=hidden,
                                          n_slot_types=n_slot_types,
@@ -144,14 +152,16 @@ def _build_head(arch: str, dim_in: int, hidden: int | None,
 
 def _load_head(arch: str, ckpt_path: str, dim_in: int, hidden: int | None,
                device: str, n_slot_types: int = 0, learnable_temp: bool = False,
-               dropout: float = 0.0, n_doc_kinds: int = 0) -> nn.Module:
+               dropout: float = 0.0, n_doc_kinds: int = 0,
+               per_kind_full: bool = False) -> nn.Module:
     """Reload a trained head from its checkpoint (best.pt or final.pt).
 
     The Phase-1b/1d knobs are read from the checkpoint (a Phase-1 head wrote
     them); a task-#45 checkpoint omits them -> the defaults 0/False/0.0 rebuild
     the byte-identical arch + strict-load. ``n_doc_kinds`` (Phase 1f-7) is read
-    from the ckpt (default 0) for Head A; Head B ignores it. ``_build_head`` is
-    used for Head A (bilinear knobs threaded) + Head B (slot-type knobs threaded)."""
+    from the ckpt (default 0) for Head A; Head B ignores it. ``per_kind_full``
+    (Stage 1 redesign MoE) is read from the ckpt (default False). ``_build_head``
+    is used for Head A (bilinear knobs threaded) + Head B (slot-type knobs threaded)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     sd = ckpt["head"] if isinstance(ckpt, dict) and "head" in ckpt else ckpt
     if isinstance(ckpt, dict) and "head" in ckpt:
@@ -159,9 +169,10 @@ def _load_head(arch: str, ckpt_path: str, dim_in: int, hidden: int | None,
         learnable_temp = bool(ckpt.get("learnable_temp", learnable_temp))
         dropout = float(ckpt.get("dropout", dropout))
         n_doc_kinds = int(ckpt.get("n_doc_kinds", n_doc_kinds))
+        per_kind_full = bool(ckpt.get("per_kind_full", per_kind_full))
     head = _build_head(arch, dim_in, hidden, n_slot_types=n_slot_types,
                        learnable_temp=learnable_temp, dropout=dropout,
-                       n_doc_kinds=n_doc_kinds)
+                       n_doc_kinds=n_doc_kinds, per_kind_full=per_kind_full)
     head.load_state_dict(sd)
     dev = torch.device(device)
     return head.to(dev).eval()
@@ -454,7 +465,8 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                 dropout: float = 0.0, label_smoothing: float = 0.0,
                 cosine_schedule: bool = False,
                 margin_loss: float = 0.0, hard_negative: bool = False,
-                n_doc_kinds: int = 0, kind_head_wd: float = 0.0) -> dict:
+                n_doc_kinds: int = 0, kind_head_wd: float = 0.0,
+                per_kind_full: bool = False) -> dict:
     """Train one head (bilinear OR transformer) on the train sessions with the
     SAME contrastive InfoNCE loss. Mirrors ``p44._train_contrastive`` but is
     generic over the head arch. Uses ``evaluate_relevance`` on the train-internal
@@ -481,14 +493,17 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
     dim_in = int(train[0]["slots_h_raw"].shape[1])
     head = _build_head(arch, dim_in, hidden, n_slot_types=n_slot_types,
                        learnable_temp=learnable_temp, dropout=dropout,
-                       n_doc_kinds=n_doc_kinds).to(dev)
+                       n_doc_kinds=n_doc_kinds, per_kind_full=per_kind_full).to(dev)
     use_slot_types = getattr(head, "n_slot_types", 0) > 0
     use_doc_kinds = getattr(head, "n_doc_kinds", 0) > 0
+    use_moe = bool(getattr(head, "per_kind_full", False))
     n_params = sum(p.numel() for p in head.parameters())
     arch_name = (f"MLP-{hidden}" if hidden else "Linear") if arch == "bilinear" \
         else f"Transformer({'MLP-'+str(hidden) if hidden else 'Linear'} readout)"
     if use_doc_kinds:
         arch_name = f"PerKind-{arch_name}({n_doc_kinds} kinds)"
+        if use_moe:
+            arch_name = f"MoE-{arch_name}(by-gold train, per-slot serve)"
     loss_tag = (f"MARGIN(m={margin_loss}, hard-neg={hard_negative})"
                 if margin_loss > 0.0 else f"CONTRASTIVE(T={temperature})")
     print(f"\ntraining {arch} seed={seed} {loss_tag} ({arch_name} {dim_in}->384, "
@@ -498,13 +513,20 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
           f"cosine={cosine_schedule}) -> {ckpt_dir}", flush=True)
 
     # Phase 1f-7: heavier weight decay on the per-kind heads (the ~400 code
-    # slots overfit; kind_head_wd applies ONLY to kind_heads.* params, the
+    # slots overfit; kind_head_wd applies ONLY to the per-kind params, the
     # shared body + z_head keep the base weight_decay). Param groups by name
-    # prefix; AdamW applies per-group weight_decay.
+    # prefix; AdamW applies per-group weight_decay. The per-kind params are
+    # ``readout.kind_heads.*`` (shared-body arch) OR ``readout.kind_readouts.*``
+    # (MoE per_kind_full arch) -- match either. For the MoE run kind_head_wd=0
+    # (default) so this block is a no-op (base wd on all params = the Stage 1
+    # over-regularization fix).
     if use_doc_kinds and kind_head_wd > 0.0:
         kind_params, base_params = [], []
         for n, p in head.named_parameters():
-            (kind_params if n.startswith("readout.kind_heads.") else base_params).append(p)
+            if n.startswith("readout.kind_heads.") or n.startswith("readout.kind_readouts."):
+                kind_params.append(p)
+            else:
+                base_params.append(p)
         optimizer = torch.optim.AdamW(
             [{"params": base_params, "weight_decay": weight_decay},
              {"params": kind_params, "weight_decay": kind_head_wd}],
@@ -542,6 +564,7 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                     "hidden": hidden,
                     "n_slot_types": int(getattr(head, "n_slot_types", 0)),
                     "n_doc_kinds": int(getattr(head, "n_doc_kinds", 0)),
+                    "per_kind_full": bool(getattr(head, "per_kind_full", False)),
                     "learnable_temp": bool(getattr(head, "learnable_temp", False)),
                     "dropout": float(getattr(head, "dropout", 0.0)),
                     "label_smoothing": float(label_smoothing),
@@ -578,15 +601,24 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                 logits = head.logits(slot_y, z_flat, q,
                                      slot_types=st.to(dev).long()).squeeze(-1)
             elif use_doc_kinds:
-                # Phase 1f-7: per-doc-kind bilinear. ``slot_doc_kinds`` is stamped
-                # on the record in ``main`` (from source_ids + doc_kind_map) and
-                # sliced by ``_drop_self_slot``; absent on old traces -> all-0
-                # (the shared-head path, a no-op for n_doc_kinds=0 but a hard
-                # error for n_doc_kinds>0 -- guarded by the require-doc-store in
-                # main so a per-kind run never sees an unstamped record).
-                dk = rec.get("slot_doc_kinds")
-                if dk is None:
-                    dk = torch.zeros(K, dtype=torch.long)
+                # Phase 1f-7: per-doc-kind bilinear. Two routing regimes:
+                # - MoE per_kind_full (Stage 1 redesign): route ALL slots through
+                #   the GOLD's readout (by-gold-kind) so the gold-vs-filler margin
+                #   loss is WITHIN one readout's logit space (well-defined, exactly
+                #   Stage 0's setup). Gradient flows into one readout per record =
+                #   each readout trains only on its own kind's gold (non-overlapping
+                #   data, no cross-kind competition). ``gold_doc_kind`` is stamped
+                #   on the record in ``main`` AFTER --drop-self-slot (the gold
+                #   index changes when the self-slot is dropped).
+                # - shared-body (Stage 1): per-slot routing via the stamped
+                #   ``slot_doc_kinds`` (each slot -> its own kind head).
+                if use_moe:
+                    gk = int(rec.get("gold_doc_kind", DOC_KIND_CONV))
+                    dk = torch.full((K,), gk, dtype=torch.long)
+                else:
+                    dk = rec.get("slot_doc_kinds")
+                    if dk is None:
+                        dk = torch.zeros(K, dtype=torch.long)
                 logits = head.logits(slot_y, z_flat, q,
                                      slot_doc_kinds=dk.to(dev).long()).squeeze(-1)
             else:
@@ -672,6 +704,10 @@ class _EnsembleHead(nn.Module):
         # attribute; without it a per-kind ensemble would take the no-kwarg path
         # and the member heads would raise "requires doc_kinds").
         self.n_doc_kinds = int(getattr(h0, "n_doc_kinds", 0))
+        # Phase 1f-7 Stage 1 redesign: mirror per_kind_full so the ensemble's
+        # arch_name + ckpt stamp reflect the MoE arch (completeness; the
+        # ensemble is not on the critical path).
+        self.per_kind_full = bool(getattr(h0, "per_kind_full", False))
         self.slot_dim = int(getattr(h0, "slot_dim", 0))
         self.query_dim = int(getattr(h0, "query_dim", 0))
         self.doc_dim = int(getattr(h0, "doc_dim", 0))
@@ -703,7 +739,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
               cosine_schedule: bool = False,
               select_ckpt: str = "best",
               margin_loss: float = 0.0, hard_negative: bool = False,
-              n_doc_kinds: int = 0, kind_head_wd: float = 0.0) -> dict:
+              n_doc_kinds: int = 0, kind_head_wd: float = 0.0,
+              per_kind_full: bool = False) -> dict:
     """Train one arch (one seed), eval on held-out sessions + all-turns ceiling
     + (D0.4a) the live-eval bucket (the 2 live-transcript sessions, held OUT of
     train for every seed -> the genuinely-held-out conversation-ring gap).
@@ -723,7 +760,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
                     dropout=dropout, label_smoothing=label_smoothing,
                     cosine_schedule=cosine_schedule,
                     margin_loss=margin_loss, hard_negative=hard_negative,
-                    n_doc_kinds=n_doc_kinds, kind_head_wd=kind_head_wd)
+                    n_doc_kinds=n_doc_kinds, kind_head_wd=kind_head_wd,
+                    per_kind_full=per_kind_full)
     ckpt_path = r["ckpt_final"] if select_ckpt == "final" else r["ckpt_best"]
     r["select_ckpt"] = select_ckpt
     r["ckpt"] = ckpt_path
@@ -734,7 +772,7 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
     # when the scored ckpt is the final-epoch one.
     r["scored_epoch"] = (epochs - 1) if select_ckpt == "final" else r["best_epoch"]
     head = _load_head(arch, str(ckpt_path), r["dim_in"], hidden, device,
-                      n_doc_kinds=n_doc_kinds)
+                      n_doc_kinds=n_doc_kinds, per_kind_full=per_kind_full)
     r["head"] = head
     # The decisive eval: z_r + z_logit gaps on HELD-OUT sessions (unseen convs).
     r["heldout"] = p41._zr_and_logit_gaps(head, val, device)
@@ -865,6 +903,17 @@ def main() -> int:
                         "readout heads (combats the ~400-code-slot overfit; the "
                         "shared MLP body keeps --weight-decay). 0.0 = same wd as "
                         "the base group = byte-identical optimizer split.")
+    p.add_argument("--per-kind-data-isolation", action="store_true",
+                   help="Phase 1f-7 Stage 1 REDESIGN -- MoE on non-overlapping data: "
+                        "per_kind_full readout (N INDEPENDENT 6144->128->384 "
+                        "readouts, one per kind, NO shared body) + by-GOLD-kind train "
+                        "routing (ALL slots of a record route to the GOLD slot's "
+                        "readout, so the margin loss is within one head = well-defined "
+                        "and gradient flows only into that readout = each readout "
+                        "trains ONLY on its kind's gold, mirroring the Stage 0 code-"
+                        "only win per kind). Implies --n-doc-kinds 3. Serve routes "
+                        "per-slot (unchanged). Default off = byte-identical shared "
+                        "readout (old final.pt strict-loads).")
     p.add_argument("--out", default=DEFAULT_OUT)
     args = p.parse_args()
 
@@ -891,6 +940,16 @@ def main() -> int:
     # slots_h_raw / slot_types / source_ids. conv/unmapped -> 0 (DOC_KIND_CONV),
     # text-doc -> 1 (DOC_KIND_TEXT), code-doc -> 2 (DOC_KIND_CODE). Default off
     # (n_doc_kinds=0) = byte-identical (no stamped field, shared readout).
+    #
+    # Phase 1f-7 Stage 1 REDESIGN (--per-kind-data-isolation): the MoE arch
+    # needs n_doc_kinds=3 (one full readout per kind); imply it when the flag is
+    # on so the user doesn't have to pass both. --doc-store is still required
+    # (the per-slot kinds used at serve + the gold-kind stamp both need the map).
+    if args.per_kind_data_isolation and args.n_doc_kinds == 0:
+        args.n_doc_kinds = 3
+        print("  --per-kind-data-isolation: implied --n-doc-kinds 3 "
+              "(MoE per_kind_full readout, one full 6144->128->384 per kind)",
+              flush=True)
     doc_kind_map = None
     if args.n_doc_kinds > 0:
         if not args.doc_store:
@@ -933,6 +992,47 @@ def main() -> int:
                  "(multi-positive InfoNCE gold)" if args.multi_positive_margin > 0
                  else " | single top-1-cos gold"), flush=True)
 
+    # Phase 1f-7 Stage 1 REDESIGN (--per-kind-data-isolation): stamp the GOLD
+    # slot's doc-kind index on every record so the trainer can route ALL slots of
+    # a record through the GOLD's readout (by-GOLD-kind train routing = within-one-
+    # head margin loss = well-defined, gradient into one readout = non-overlapping
+    # data, mirroring Stage 0's code-only win per kind). Gold = labels.argmax() ->
+    # source_ids[idx] -> _gold_doc_kind; mapped code->2 / text->1 / conv/None->0.
+    # This MUST run AFTER --drop-self-slot: drop_self_slot re-derives gold over the
+    # PRIOR slots (the self-slot cos~1.0 was the trivial gold before, and the
+    # self-slot is never a doc -- its kind would be conv=0, routing every record
+    # to the conv readout, defeating the point). So require --drop-self-slot.
+    # doc_kind_map is already built above (the flag implies --n-doc-kinds 3 ->
+    # --doc-store). Default off = no stamped field = byte-identical.
+    if args.per_kind_data_isolation:
+        if not args.drop_self_slot:
+            print("ERROR: --per-kind-data-isolation requires --drop-self-slot "
+                  "(the gold slot must be a prior doc, never the cos~1.0 self-slot; "
+                  "otherwise every record routes to the conv readout).",
+                  file=sys.stderr)
+            return 1
+        if doc_kind_map is None:
+            # Defensive: the flag implies --n-doc-kinds 3 -> --doc-store, which
+            # builds doc_kind_map above. Reach here only if both were unset.
+            print("ERROR: --per-kind-data-isolation needs --doc-store (the doc_id "
+                  "-> kind map for the gold-kind stamp).", file=sys.stderr)
+            return 1
+        gold_counts = {DOC_KIND_CONV: 0, DOC_KIND_TEXT: 0, DOC_KIND_CODE: 0}
+        for rec in records:
+            gk_str = _gold_doc_kind(rec, doc_kind_map)
+            if gk_str == "code":
+                gk = DOC_KIND_CODE
+            elif gk_str == "text":
+                gk = DOC_KIND_TEXT
+            else:
+                gk = DOC_KIND_CONV
+            rec["gold_doc_kind"] = gk
+            gold_counts[gk] += 1
+        print(f"  --per-kind-data-isolation: stamped gold_doc_kind on "
+              f"{len(records)} records -> conv={gold_counts[DOC_KIND_CONV]} / "
+              f"text={gold_counts[DOC_KIND_TEXT]} / "
+              f"code={gold_counts[DOC_KIND_CODE]} (each readout trains ONLY on "
+              f"its kind's gold = non-overlapping data)", flush=True)
     # Stage 0 diagnostic: filter to records whose GOLD slot is a CODE doc. Gold
     # is the argmax-labels prior slot, so this MUST run AFTER --drop-self-slot
     # (the self-slot is never a doc) and requires --drop-self-slot. The doc_id ->
@@ -1006,7 +1106,8 @@ def main() -> int:
                 margin_loss=args.margin_loss,
                 hard_negative=args.hard_negative,
                 n_doc_kinds=args.n_doc_kinds,
-                kind_head_wd=args.kind_head_wd))
+                kind_head_wd=args.kind_head_wd,
+                per_kind_full=args.per_kind_data_isolation))
 
     # ── Phase 1d ensemble (logit-avg of the per-seed selected ckpts) ──
     # The live_eval bucket is the same 2 live-transcript sessions held OUT of
