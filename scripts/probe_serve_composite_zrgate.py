@@ -131,6 +131,19 @@ def _load_serve_traces(traces_path: str) -> list[dict]:
         if int(labels.sum().item()) == 0:
             continue
         z_flat = h[:, LAST_LAYER, :, :].reshape(K, D_STATE * D_MODEL)  # [K,6144]
+        # Phase 1c (task #51): surface the per-slot ``slot_types`` ([K] long,
+        # 0=conversation, 1=retrieved) the mixed-ring generator emits, so a
+        # Phase-1 ``CrossSlotTransformerZHead`` (n_slot_types=2) can feed its
+        # slot-type embedding. Old conversation-only traces (lmsys + the task
+        # #45 Onyx traces) carry NO slot_types field -> default all-0
+        # (conversation) = byte-identical loading (a head with n_slot_types=0
+        # ignores slot_types anyway; the all-0 default keeps the old traces'
+        # conv-only semantics for any head that DOES read it).
+        st = rec.get("slot_types")
+        if st is None:
+            slot_types = torch.zeros(K, dtype=torch.long)
+        else:
+            slot_types = st.long()
         out.append({
             "query_emb": rec["query_emb"].float().reshape(-1),    # [384]
             "slots_y": rec["slots_y"].float(),                     # [K,256]
@@ -138,6 +151,7 @@ def _load_serve_traces(traces_path: str) -> list[dict]:
             "source_ids": list(rec["source_ids"]),                # [K]
             "cos": rec["cos"].float(),                           # [K]
             "slots_h_raw": z_flat,                               # [K,6144]
+            "slot_types": slot_types,                            # [K] long
         })
     return out
 
@@ -157,7 +171,18 @@ def _zr_per_slot(composite: CompositeZHead, rec: dict, device) -> tuple[Tensor, 
     K = z_flat.shape[0]
     slot_y = torch.zeros(K, int(composite.slot_dim), device=device)
     with torch.no_grad():
-        logit = composite.logits(slot_y, z_flat, q).squeeze(-1)    # [K]
+        # Phase 1c: a Phase-1 CrossSlotTransformerZHead (n_slot_types>0)
+        # requires ``slot_types`` to exercise its slot-type embedding; Head A
+        # (CompositeZHead) + the bare ZRelevanceHead do NOT accept the kwarg,
+        # so gate on ``n_slot_types`` (default 0 = byte-identical, no kwarg).
+        if getattr(composite, "n_slot_types", 0) > 0:
+            st = rec.get("slot_types")
+            if st is None:
+                st = torch.zeros(K, dtype=torch.long)
+            logit = composite.logits(slot_y, z_flat, q,
+                                     slot_types=st.to(device)).squeeze(-1)
+        else:
+            logit = composite.logits(slot_y, z_flat, q).squeeze(-1)    # [K]
         return torch.sigmoid(logit), logit
 
 
