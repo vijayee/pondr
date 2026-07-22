@@ -434,7 +434,37 @@ def _score_ring_with_logits(working_memory, relevance_head, embedder,
                 # mis-wire if a future head ever reads slot_y).
                 slot_y_dummy = torch.zeros(z_stack.shape[0], z_head.slot_dim,
                                            device=head_dev, dtype=torch.float32)
-                z_lg = z_head.logits(slot_y_dummy, z_stack, q)             # [Kz, 1]
+                # Phase 1e: thread ``slot_types`` to the z_head so a Phase-1
+                # head (``n_slot_types > 0`` -- the slot-type embedding from
+                # Phase 1b) can condition cross-slot attention on conv-vs-
+                # retrieved. Built from each scored slot's ``slot_type`` (set
+                # by ``working_memory.update``=0 / ``inject``=1, Phase 1a) with
+                # a ``source_id``-prefix fallback (``#``->0 conv, ``__ep``->1
+                # retrieved) for slots whose ``slot_type`` is None (e.g. an old
+                # ring captured before Phase 1a). Only passed when the head
+                # actually has ``n_slot_types > 0`` -- the task #45/46 heads
+                # (``n_slot_types=0``) take the no-kwarg path -> byte-identical.
+                n_slot_types = getattr(z_head, "n_slot_types", 0)
+                z_slot_types = None
+                if n_slot_types > 0:
+                    z_slot_types = torch.zeros(
+                        z_stack.shape[0], dtype=torch.long, device=head_dev)
+                    k = 0
+                    for j, ok in enumerate(z_mask):
+                        if not ok:
+                            continue
+                        slot = slots[idx_text[j][0]]
+                        st = getattr(slot, "slot_type", None)
+                        if st is None:
+                            sid = getattr(slot, "source_id", None) or ""
+                            st = 0 if "#" in sid and "__ep" not in sid else 1
+                        z_slot_types[k] = int(st)
+                        k += 1
+                if n_slot_types > 0:
+                    z_lg = z_head.logits(slot_y_dummy, z_stack, q,
+                                         slot_types=z_slot_types)    # [Kz, 1]
+                else:
+                    z_lg = z_head.logits(slot_y_dummy, z_stack, q)             # [Kz, 1]
                 z_r = torch.sigmoid(z_lg)                                  # [Kz, 1]
                 k = 0
                 for j, ok in enumerate(z_mask):
