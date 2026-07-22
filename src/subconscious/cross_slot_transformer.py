@@ -66,10 +66,19 @@ class CrossSlotTransformerZHead(nn.Module):
     def __init__(self, dim_in: int = DEFAULT_DIM_IN, hidden: int | None = 128,
                  d_model: int = Z_DIM, n_heads: int = 4, n_layers: int = 2,
                  ffn: int = 512, max_pos: int = 64,
-                 n_slot_types: int = 0, learnable_temp: bool = False) -> None:
+                 n_slot_types: int = 0, learnable_temp: bool = False,
+                 dropout: float = 0.0) -> None:
         super().__init__()
         self.dim_in = int(dim_in)
         self.readout = StateReadout(dim_in=self.dim_in, dim_out=d_model, hidden=hidden)
+        # Phase 1d: dropout on the per-slot readout ``z_i`` (regularizes the
+        # high-variance selection -- the [[pondr-strm-task47-d04a-selection-variance-cuda]]
+        # de-wonk). Applied BEFORE the encoder so the cross-slot attention sees
+        # dropped-out slot features. ``dropout=0.0`` (default) is a no-op in BOTH
+        # train + eval -> byte-identical to the task #45 arch, and ``nn.Dropout``
+        # has NO parameters so the existing best.pt strict-loads unchanged.
+        self.dropout = float(dropout)
+        self.readout_dropout = nn.Dropout(self.dropout)
         self.d_model = int(d_model)
         self.max_pos = int(max_pos)
         # Learned positional embedding for the K slot tokens (positions 1..K; the
@@ -121,6 +130,7 @@ class CrossSlotTransformerZHead(nn.Module):
         to the task #45 arch; required only if ``n_slot_types > 0``).
         """
         z = self.readout(slot_signal)                       # [K, d_model]
+        z = self.readout_dropout(z)                          # Phase 1d (no-op @0.0)
         if z.dim() == 1:
             z = z.unsqueeze(0)
         K = z.shape[0]
@@ -155,20 +165,21 @@ class CrossSlotTransformerZHead(nn.Module):
     def from_state_dict(cls, sd: dict, dim_in: int,
                         hidden: int | None = None,
                         n_slot_types: int = 0,
-                        learnable_temp: bool = False) -> "CrossSlotTransformerZHead":
+                        learnable_temp: bool = False,
+                        dropout: float = 0.0) -> "CrossSlotTransformerZHead":
         """Build a Head B from a raw state_dict and load it (strict).
 
         ``hidden`` is the ``StateReadout`` hidden width (None -> Linear readout).
         The encoder/readout arch is fixed by the ctor defaults (2 layers / 4
         heads / FFN-512 / max_pos=64) -- the checkpoint-carried arch knobs are
-        ``dim_in`` + ``hidden`` + (Phase 1b) ``n_slot_types`` + ``learnable_temp``.
-        Old checkpoints (task #45) carry neither Phase-1b knob -> both default to
-        0/False -> NO new params -> strict load is byte-identical. Strict load: a
-        key mismatch is a hard error (a silent partial load would score with
-        random weights).
+        ``dim_in`` + ``hidden`` + (Phase 1b) ``n_slot_types`` + ``learnable_temp``
+        + (Phase 1d) ``dropout``. Old checkpoints (task #45) carry none of the
+        Phase-1b/1d knobs -> all default to 0/False/0.0 -> NO new params -> strict
+        load is byte-identical. Strict load: a key mismatch is a hard error (a
+        silent partial load would score with random weights).
         """
         head = cls(dim_in=dim_in, hidden=hidden, n_slot_types=n_slot_types,
-                   learnable_temp=learnable_temp)
+                   learnable_temp=learnable_temp, dropout=dropout)
         missing, unexpected = head.load_state_dict(sd, strict=False)
         if missing or unexpected:
             raise RuntimeError(
@@ -200,6 +211,7 @@ def load_cross_slot_transformer(
             hidden = int(hidden)
         n_slot_types = int(ckpt.get("n_slot_types", 0))           # Phase 1b
         learnable_temp = bool(ckpt.get("learnable_temp", False))    # Phase 1b
+        dropout = float(ckpt.get("dropout", 0.0))                   # Phase 1d
         sd = ckpt["head"]
     else:
         # Bare state_dict fallback (not produced by the head-to-head; defensive).
@@ -207,10 +219,11 @@ def load_cross_slot_transformer(
         hidden = None
         n_slot_types = 0
         learnable_temp = False
+        dropout = 0.0
         sd = ckpt
     head = CrossSlotTransformerZHead.from_state_dict(
         sd, dim_in=dim_in, hidden=hidden,
-        n_slot_types=n_slot_types, learnable_temp=learnable_temp)
+        n_slot_types=n_slot_types, learnable_temp=learnable_temp, dropout=dropout)
     if device == "auto":
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:

@@ -118,7 +118,7 @@ def _to_device(traces: list[dict], device: str) -> list[dict]:
 # ── the contrastive (InfoNCE) margin loss ──
 
 def contrastive_loss(logits: Tensor, gold_mask: Tensor,
-                     temperature: float) -> Tensor:
+                     temperature: float, label_smoothing: float = 0.0) -> Tensor:
     """Multi-positive InfoNCE on the composite's per-slot logits.
 
     ``L = logsumexp(logits/T) - logsumexp(logits_gold/T)`` (0 if no gold).
@@ -136,11 +136,33 @@ def contrastive_loss(logits: Tensor, gold_mask: Tensor,
     required margin). The contrastive optimum pushes
     ``gold_logit - mean(filler_logit) ~ T*log(K_neg)`` -- T=1.0 -> ~2.0 for K~8,
     on the 2.0 z_logit gate scale.
+
+    ``label_smoothing`` (Phase 1d, default 0.0 = byte-identical): when >0 the
+    hard gold mask becomes a SOFT target -- gold slots get weight
+    ``(1-eps)/n_gold``, fillers ``eps/n_fill`` -- and the loss becomes the soft
+    cross-entropy ``logsumexp(all/T) - sum_i t_i * (logit_i/T)``. This damps the
+    ``s1=-2.508`` collapse (logits driven to +/-inf for a perfect margin) by
+    leaving a little probability mass on the fillers so the head cannot win by
+    pushing every filler logit to -inf. ``label_smoothing=0.0`` takes the
+    ORIGINAL branch verbatim -- every existing caller (task #44
+    ``_train_contrastive``) is unchanged.
     """
     if gold_mask.sum() == 0:
         return logits.new_zeros(())
-    return (torch.logsumexp(logits / temperature, dim=0)
-            - torch.logsumexp(logits[gold_mask] / temperature, dim=0))
+    if label_smoothing <= 0.0:
+        return (torch.logsumexp(logits / temperature, dim=0)
+                - torch.logsumexp(logits[gold_mask] / temperature, dim=0))
+    K = logits.shape[0]
+    n_gold = int(gold_mask.sum().item())
+    n_fill = K - n_gold
+    if n_fill == 0:
+        return (torch.logsumexp(logits / temperature, dim=0)
+                - torch.logsumexp(logits[gold_mask] / temperature, dim=0))
+    t = logits.new_zeros(K)
+    t[gold_mask] = (1.0 - label_smoothing) / n_gold
+    t[~gold_mask] = label_smoothing / n_fill
+    z = logits / temperature
+    return torch.logsumexp(z, dim=0) - (t * z).sum()
 
 
 # ── contrastive training loop (mirrors fit_relevance's loop, loss swapped) ──

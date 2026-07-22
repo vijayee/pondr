@@ -169,15 +169,25 @@ def _split_queries(n: int, val_fraction: float, seed: int) -> tuple[list[int], l
 # ── eval ──
 
 def _score_slots(head: RelevanceHead, slots_y: Tensor, slots_doc_emb: Tensor,
-                query_emb: Tensor) -> Tensor:
+                query_emb: Tensor, slot_types: Tensor | None = None) -> Tensor:
     """``r_i`` for each slot -> ``[K]`` (sigmoid of the bilinear logit).
 
     Uses ``head.logits`` (the pre-sigmoid score) + sigmoid so the trainer's
     logit path and this eval path share one obvious code site.
+
+    ``slot_types`` (Phase 1d, the slot-type-embedding path) is forwarded ONLY
+    when the head actually has a slot-type embedding (``n_slot_types > 0``);
+    otherwise it is dropped so every existing caller (the shipped 2a
+    CompositeZHead / ZRelevanceHead have no ``n_slot_types`` attribute) hits
+    the byte-identical ``head.logits(slots_y, slots_doc_emb, query_emb)`` path.
     """
     with torch.no_grad():
-        r = torch.sigmoid(head.logits(slots_y, slots_doc_emb,
-                                      query_emb)).squeeze(-1)    # [K]
+        if getattr(head, "n_slot_types", 0) > 0 and slot_types is not None:
+            r = torch.sigmoid(head.logits(slots_y, slots_doc_emb, query_emb,
+                                          slot_types=slot_types)).squeeze(-1)
+        else:
+            r = torch.sigmoid(head.logits(slots_y, slots_doc_emb,
+                                          query_emb)).squeeze(-1)  # [K]
     return r
 
 
@@ -213,7 +223,12 @@ def evaluate_relevance(
         doc_emb = rec[slot_signal_field]
         labels = rec["labels"]
         qemb = rec["query_emb"]
-        r = _score_slots(head, slots, doc_emb, qemb)              # [K]
+        # Phase 1d: forward the per-slot type tensor when present so the
+        # slot-type-embedding head (n_slot_types>0) conditions on slot type at
+        # eval too. Old traces without the field -> None -> dropped -> byte-
+        # identical for every non-slot-type head (shipped 2a / Head A).
+        slot_types = rec.get("slot_types")
+        r = _score_slots(head, slots, doc_emb, qemb, slot_types)  # [K]
         gold_idx = (labels > 0).nonzero(as_tuple=True)[0].tolist()
         n_gold = len(gold_idx)
         if n_gold == 0:

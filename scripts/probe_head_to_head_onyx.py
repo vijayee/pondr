@@ -117,21 +117,42 @@ DEFAULT_LIVE_EVAL_SESSION_IDS = (
 # best.pt checkpoints load via ``load_cross_slot_transformer`` unchanged.
 
 
-def _build_head(arch: str, dim_in: int, hidden: int | None) -> nn.Module:
-    """Construct Head A (bilinear composite) or Head B (cross-slot Transformer)."""
+def _build_head(arch: str, dim_in: int, hidden: int | None,
+                n_slot_types: int = 0, learnable_temp: bool = False,
+                dropout: float = 0.0) -> nn.Module:
+    """Construct Head A (bilinear composite) or Head B (cross-slot Transformer).
+
+    The Phase-1b/1d knobs (``n_slot_types`` slot-type embedding, ``learnable_temp``
+    logit temperature, ``dropout`` readout regularization) are Head B ONLY -- Head
+    A (``CompositeZHead``) ignores them. Defaults 0/False/0.0 = the task #45 arch
+    (byte-identical; the existing best.pt strict-loads via ``_load_head``)."""
     if arch == "bilinear":
         return CompositeZHead(dim_in=dim_in, hidden=hidden)
     if arch == "transformer":
-        return CrossSlotTransformerZHead(dim_in=dim_in, hidden=hidden)
+        return CrossSlotTransformerZHead(dim_in=dim_in, hidden=hidden,
+                                         n_slot_types=n_slot_types,
+                                         learnable_temp=learnable_temp,
+                                         dropout=dropout)
     raise ValueError(f"unknown arch {arch!r}")
 
 
 def _load_head(arch: str, ckpt_path: str, dim_in: int, hidden: int | None,
-               device: str) -> nn.Module:
-    """Reload a trained head from its checkpoint (best.pt)."""
+               device: str, n_slot_types: int = 0, learnable_temp: bool = False,
+               dropout: float = 0.0) -> nn.Module:
+    """Reload a trained head from its checkpoint (best.pt or final.pt).
+
+    The Phase-1b/1d knobs are read from the checkpoint (a Phase-1 head wrote
+    them); a task-#45 checkpoint omits them -> the defaults 0/False/0.0 rebuild
+    the byte-identical arch + strict-load. ``_build_head`` is used for Head A
+    (knobs ignored) + Head B (knobs threaded into the ctor)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     sd = ckpt["head"] if isinstance(ckpt, dict) and "head" in ckpt else ckpt
-    head = _build_head(arch, dim_in, hidden)
+    if isinstance(ckpt, dict) and "head" in ckpt:
+        n_slot_types = int(ckpt.get("n_slot_types", n_slot_types))
+        learnable_temp = bool(ckpt.get("learnable_temp", learnable_temp))
+        dropout = float(ckpt.get("dropout", dropout))
+    head = _build_head(arch, dim_in, hidden, n_slot_types=n_slot_types,
+                       learnable_temp=learnable_temp, dropout=dropout)
     head.load_state_dict(sd)
     dev = torch.device(device)
     return head.to(dev).eval()
@@ -180,24 +201,40 @@ def _session_split(records: list[dict], val_fraction: float, seed: int,
 
 def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | None,
                 temperature: float, epochs: int, lr: float, weight_decay: float,
-                accum_steps: int, seed: int, device: str, ckpt_dir: Path) -> dict:
+                accum_steps: int, seed: int, device: str, ckpt_dir: Path,
+                n_slot_types: int = 0, learnable_temp: bool = False,
+                dropout: float = 0.0, label_smoothing: float = 0.0,
+                cosine_schedule: bool = False) -> dict:
     """Train one head (bilinear OR transformer) on the train sessions with the
     SAME contrastive InfoNCE loss. Mirrors ``p44._train_contrastive`` but is
     generic over the head arch. Uses ``evaluate_relevance`` on the train-internal
     query-val split for the per-epoch TRAIN top-3 gate + best-ckpt selection
-    (this is a TRAINING signal, not the final held-out eval). Writes best.pt."""
+    (this is a TRAINING signal, not the final held-out eval). Writes best.pt +
+    final.pt; the caller chooses which to score (``--select-ckpt``).
+
+    Phase 1d knobs (all default to the byte-identical task-#45 path):
+    ``n_slot_types``/``learnable_temp``/``dropout`` build a Phase-1 Head B;
+    ``label_smoothing`` softens the InfoNCE target (``p44.contrastive_loss``);
+    ``cosine_schedule`` anneals the lr. When all are 0/False the loop is
+    byte-identical to pre-#52 (no slot_types kwarg, hard loss, constant lr)."""
     dev = torch.device(device)
     torch.manual_seed(seed)
     dim_in = int(train[0]["slots_h_raw"].shape[1])
-    head = _build_head(arch, dim_in, hidden).to(dev)
+    head = _build_head(arch, dim_in, hidden, n_slot_types=n_slot_types,
+                       learnable_temp=learnable_temp, dropout=dropout).to(dev)
+    use_slot_types = getattr(head, "n_slot_types", 0) > 0
     n_params = sum(p.numel() for p in head.parameters())
     arch_name = (f"MLP-{hidden}" if hidden else "Linear") if arch == "bilinear" \
         else f"Transformer({'MLP-'+str(hidden) if hidden else 'Linear'} readout)"
     print(f"\ntraining {arch} seed={seed} CONTRASTIVE ({arch_name} {dim_in}->384, "
           f"{n_params:,} params, T={temperature}, wd={weight_decay}, {epochs} "
-          f"epochs) -> {ckpt_dir}", flush=True)
+          f"epochs, slot_types={use_slot_types}, dropout={dropout}, "
+          f"label_smoothing={label_smoothing}, cosine={cosine_schedule}) -> "
+          f"{ckpt_dir}", flush=True)
 
     optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+                 if cosine_schedule else None)
     # Per-epoch TRAIN gate: query-split WITHIN train (mirrors _train_contrastive).
     train_idx, valq_idx = _split_queries(len(train),
                                          RelevanceTrainingConfig().val_fraction, seed)
@@ -220,6 +257,19 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
     ck_query_dim = int(head.query_dim)
     ck_proj_dim = int(head.proj_dim)
 
+    def _save_ckpt(path: Path, pc: dict, epoch: int, go: bool) -> None:
+        torch.save({"head": head.state_dict(), "arch": arch,
+                    "slot_dim": ck_slot_dim, "doc_dim": ck_doc_dim,
+                    "query_dim": ck_query_dim, "proj_dim": ck_proj_dim,
+                    "hidden": hidden,
+                    "n_slot_types": int(getattr(head, "n_slot_types", 0)),
+                    "learnable_temp": bool(getattr(head, "learnable_temp", False)),
+                    "dropout": float(getattr(head, "dropout", 0.0)),
+                    "label_smoothing": float(label_smoothing),
+                    "top3_recall": pc["mean_top3_recall"],
+                    "hit_rate": pc["hit_rate"], "hit_ci95": pc["hit_ci95"],
+                    "go": go, "epoch": epoch, "loss": "contrast"}, path)
+
     for epoch in range(epochs):
         head.train()
         order = list(range(len(train_q)))
@@ -234,9 +284,22 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
             labels = rec["labels"].to(dev).to(torch.float32)          # [K]
             K = z_flat.shape[0]
             slot_y = torch.zeros(K, ck_slot_dim, device=dev)
-            logits = head.logits(slot_y, z_flat, q).squeeze(-1)       # [K]
+            # Phase 1d: thread slot_types into the Phase-1 head (n_slot_types>0);
+            # Head A + the task-#45 Head B (n_slot_types=0) take the no-kwarg path
+            # -> byte-identical. ``rec["slot_types"]`` is present on the mixed-ring
+            # traces; old conv-only traces default to all-0 (loader) -- unused
+            # when the head has no slot-type embedding.
+            if use_slot_types:
+                st = rec.get("slot_types")
+                if st is None:
+                    st = torch.zeros(K, dtype=torch.long)
+                logits = head.logits(slot_y, z_flat, q,
+                                     slot_types=st.to(dev).long()).squeeze(-1)
+            else:
+                logits = head.logits(slot_y, z_flat, q).squeeze(-1)   # [K]
             gold = labels > 0
-            loss = p44.contrastive_loss(logits, gold, temperature) / accum
+            loss = p44.contrastive_loss(logits, gold, temperature,
+                                        label_smoothing=label_smoothing) / accum
             loss.backward()
             total_loss += float(loss.item()) * accum
             n_steps += 1
@@ -246,6 +309,8 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
         if n_steps % accum != 0:
             optimizer.step()
             optimizer.zero_grad()
+        if scheduler is not None:
+            scheduler.step()
 
         train_loss = total_loss / max(n_steps, 1)
         pc = evaluate_relevance(head, valq, slot_signal_field="slots_h_raw")
@@ -263,47 +328,92 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
             best_score = score
             best_pc = pc
             best_epoch = epoch
-            torch.save({"head": head.state_dict(), "arch": arch,
-                        "slot_dim": ck_slot_dim, "doc_dim": ck_doc_dim,
-                        "query_dim": ck_query_dim, "proj_dim": ck_proj_dim,
-                        "hidden": hidden, "top3_recall": pc["mean_top3_recall"],
-                        "hit_rate": pc["hit_rate"], "hit_ci95": pc["hit_ci95"],
-                        "go": last_go, "epoch": epoch, "loss": "contrast"},
-                       ckpt_dir / "best.pt")
+            _save_ckpt(ckpt_dir / "best.pt", pc, epoch, last_go)
 
     if last_pc is not None:
-        torch.save({"head": head.state_dict(), "arch": arch,
-                    "slot_dim": ck_slot_dim, "doc_dim": ck_doc_dim,
-                    "query_dim": ck_query_dim, "proj_dim": ck_proj_dim,
-                    "hidden": hidden, "top3_recall": last_pc["mean_top3_recall"],
-                    "hit_rate": last_pc["hit_rate"], "hit_ci95": last_pc["hit_ci95"],
-                    "go": last_go, "epoch": epochs - 1, "loss": "contrast"},
-                   ckpt_dir / "final.pt")
+        _save_ckpt(ckpt_dir / "final.pt", last_pc, epochs - 1, last_go)
     with open(ckpt_dir / "train_log.json", "w", encoding="utf-8") as f:
         json.dump({"best_epoch": best_epoch, "arch": arch, "loss": "contrast",
                    "temperature": temperature, "seed": seed,
                    "n_train": len(train_q), "n_valq": len(valq),
-                   "n_heldout": len(val), "best_scorecard": best_pc}, f, indent=2)
+                   "n_heldout": len(val), "n_slot_types": n_slot_types,
+                   "learnable_temp": learnable_temp, "dropout": dropout,
+                   "label_smoothing": label_smoothing,
+                   "cosine_schedule": cosine_schedule,
+                   "best_scorecard": best_pc}, f, indent=2)
 
     return {"arch": arch, "arch_name": arch_name, "hidden": hidden,
             "dim_in": dim_in, "n_params": n_params, "best_epoch": best_epoch,
             "train_top3": best_pc["mean_top3_recall"] if best_pc else 0.0,
-            "train_go": last_go, "ckpt": ckpt_dir / "best.pt"}
+            "train_go": last_go,
+            "ckpt_best": ckpt_dir / "best.pt", "ckpt_final": ckpt_dir / "final.pt"}
+
+
+class _EnsembleHead(nn.Module):
+    """Logit-averaging ensemble of N same-arch heads (Phase 1d, the
+    [[jgs-head-multi-gate-best-practice-hypothesis]] pattern: averaging the
+    per-seed logits at EVAL recovers both frontier ends the high-variance
+    best-ckpt selection trades off). Exposes ``n_slot_types``/``slot_dim`` so
+    ``p41._zr_per_slot``'s guarded ``slot_types`` forwarding works unchanged; the
+    ``logits`` call averages the member logits (the softmax/sigmoid of an average
+    is more stable than averaging probabilities, and the 2.0 z_logit gate is on
+    the pre-sigmoid logit, so averaging logits is the gate-faithful aggregation).
+    """
+
+    def __init__(self, heads: list[nn.Module]) -> None:
+        super().__init__()
+        assert heads, "_EnsembleHead needs >=1 head"
+        self.heads = nn.ModuleList(heads)
+        h0 = heads[0]
+        self.n_slot_types = int(getattr(h0, "n_slot_types", 0))
+        self.slot_dim = int(getattr(h0, "slot_dim", 0))
+        self.query_dim = int(getattr(h0, "query_dim", 0))
+        self.doc_dim = int(getattr(h0, "doc_dim", 0))
+        self.proj_dim = int(getattr(h0, "proj_dim", 0))
+
+    def logits(self, slot_y, slot_signal, query_emb, slot_types=None):
+        acc = None
+        for h in self.heads:
+            if self.n_slot_types > 0 and slot_types is not None:
+                lg = h.logits(slot_y, slot_signal, query_emb, slot_types=slot_types)
+            else:
+                lg = h.logits(slot_y, slot_signal, query_emb)
+            acc = lg if acc is None else acc + lg
+        assert acc is not None
+        return acc / len(self.heads)
 
 
 def _run_arch(arch: str, train: list[dict], val: list[dict],
               live_eval: list[dict], hidden: int | None,
               temperature: float, weight_decay: float, epochs: int, lr: float,
-              accum_steps: int, seed: int, device: str, ckpt_root: Path) -> dict:
+              accum_steps: int, seed: int, device: str, ckpt_root: Path,
+              n_slot_types: int = 0, learnable_temp: bool = False,
+              dropout: float = 0.0, label_smoothing: float = 0.0,
+              cosine_schedule: bool = False,
+              select_ckpt: str = "best") -> dict:
     """Train one arch (one seed), eval on held-out sessions + all-turns ceiling
     + (D0.4a) the live-eval bucket (the 2 live-transcript sessions, held OUT of
-    train for every seed -> the genuinely-held-out conversation-ring gap)."""
+    train for every seed -> the genuinely-held-out conversation-ring gap).
+
+    ``select_ckpt`` (Phase 1d, the [[pondr-strm-task47-d04a-selection-variance-cuda]]
+    de-wonk fix): ``"best"`` (default, byte-identical to pre-#52) scores the
+    valq-gate-selected best.pt; ``"final"`` scores the final-epoch ckpt, which
+    sidesteps the high-variance valq draw that selected an undertrained best.pt
+    in D0.4a. The returned ``head`` is the selected ckpt (used by the ensemble
+    in ``main``)."""
     ckpt_dir = ckpt_root / f"{arch}_s{seed}"
     if ckpt_dir.exists():
         shutil.rmtree(ckpt_dir)
     r = _train_head(arch, train, val, hidden, temperature, epochs, lr,
-                    weight_decay, accum_steps, seed, device, ckpt_dir)
-    head = _load_head(arch, str(r["ckpt"]), r["dim_in"], hidden, device)
+                    weight_decay, accum_steps, seed, device, ckpt_dir,
+                    n_slot_types=n_slot_types, learnable_temp=learnable_temp,
+                    dropout=dropout, label_smoothing=label_smoothing,
+                    cosine_schedule=cosine_schedule)
+    ckpt_path = r["ckpt_final"] if select_ckpt == "final" else r["ckpt_best"]
+    r["select_ckpt"] = select_ckpt
+    r["ckpt"] = ckpt_path
+    head = _load_head(arch, str(ckpt_path), r["dim_in"], hidden, device)
+    r["head"] = head
     # The decisive eval: z_r + z_logit gaps on HELD-OUT sessions (unseen convs).
     r["heldout"] = p41._zr_and_logit_gaps(head, val, device)
     # All-turns ceiling (in-sample upper bound -- if even this fails, no signal).
@@ -319,7 +429,7 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
     le_str = (f"  LIVE-EVAL z_logit={le['z_logit']['median']:.3f} "
               f"({'PASS' if le['z_logit']['median'] is not None and le['z_logit']['median']>=ZLOGIT_GATE else 'fail'}, "
               f"n={le['z_logit']['n_eligible']})" if le else "  LIVE-EVAL n/a")
-    print(f"  [{arch} s{seed}] HELD-OUT z_logit={ho['z_logit']['median']:.3f} "
+    print(f"  [{arch} s{seed} {select_ckpt}] HELD-OUT z_logit={ho['z_logit']['median']:.3f} "
           f"(n_ge_2.0={ho['z_logit']['n_ge_gate']}/{ho['z_logit']['n_eligible']}, "
           f"{'PASS' if ho['z_logit']['median'] is not None and ho['z_logit']['median']>=ZLOGIT_GATE else 'fail'})  "
           f"z_r={ho['z_r']['median']:.4f}  |  ALL-TURNS z_logit={on['z_logit']['median']:.3f}"
@@ -349,6 +459,30 @@ def main() -> int:
     p.add_argument("--device", default="cpu",
                    help="train+eval device (cuda trains much faster).")
     p.add_argument("--ckpt-root", default=DEFAULT_CKPT_ROOT)
+    # ── Phase 1d knobs (all default to the byte-identical task-#45 path) ──
+    p.add_argument("--n-slot-types", type=int, default=0,
+                   help="Phase 1b: Head B slot-type embedding size (2 = conv vs "
+                        "retrieved; 0 = NO embedding = byte-identical to task #45).")
+    p.add_argument("--learnable-temp", action="store_true",
+                   help="Phase 1b: Head B learnable logit temperature (default "
+                        "off = byte-identical to task #45).")
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="Phase 1d: readout dropout (0.0 = no-op = byte-identical; "
+                        "0.1 for the Phase 1 retrain).")
+    p.add_argument("--label-smoothing", type=float, default=0.0,
+                   help="Phase 1d: soft-target InfoNCE smoothing (0.0 = hard-mask "
+                        "= byte-identical; 0.05 for the Phase 1 retrain).")
+    p.add_argument("--cosine-schedule", action="store_true",
+                   help="Phase 1d: cosine-anneal the lr over --epochs (default off "
+                        "= constant lr = byte-identical).")
+    p.add_argument("--select-ckpt", choices=["best", "final"], default="best",
+                   help="Phase 1d: which ckpt to score + ensemble. 'best' (default) "
+                        "= the valq-gate-selected best.pt (byte-identical to "
+                        "pre-#52); 'final' = the final-epoch ckpt (sidesteps the "
+                        "high-variance valq draw -- the D0.4a de-wonk).")
+    p.add_argument("--ensemble", action="store_true",
+                   help="Phase 1d: also eval a logit-averaging ensemble of the "
+                        "per-seed selected ckpts (the jgs-head multi-gate pattern).")
     p.add_argument("--live-eval-sessions", default=",".join(DEFAULT_LIVE_EVAL_SESSION_IDS),
                    help="comma-separated Onyx session UUIDs to force OUT of train "
                         "and into a dedicated live-eval bucket every seed (D0.4a; "
@@ -406,7 +540,43 @@ def main() -> int:
             per_arch[arch].append(_run_arch(
                 arch, train, val, live_eval, hidden, args.temperature,
                 args.weight_decay, args.epochs, args.lr, args.accum_steps, seed,
-                args.device, ckpt_root))
+                args.device, ckpt_root, n_slot_types=args.n_slot_types,
+                learnable_temp=args.learnable_temp, dropout=args.dropout,
+                label_smoothing=args.label_smoothing,
+                cosine_schedule=args.cosine_schedule,
+                select_ckpt=args.select_ckpt))
+
+    # ── Phase 1d ensemble (logit-avg of the per-seed selected ckpts) ──
+    # The live_eval bucket is the same 2 live-transcript sessions held OUT of
+    # EVERY seed's train (seed-independent), so it is a CLEAN held-out for the
+    # cross-seed ensemble (the per-seed random held-out val is NOT -- a seed-0
+    # head saw seed-N's val sessions in train). Eval the ensemble ONLY on
+    # live_eval + report; the per-arch per-seed held-out numbers above stand.
+    ensemble = {}
+    if args.ensemble:
+        if len(seeds) < 2:
+            print(f"  [--ensemble] need >=2 seeds to ensemble; have {len(seeds)} "
+                  f"-> ensemble skipped (per-seed numbers above stand).",
+                  flush=True)
+        for arch in ("bilinear", "transformer"):
+            rows = per_arch[arch]
+            heads = [r["head"] for r in rows if r.get("head") is not None]
+            if len(heads) < 2:
+                continue
+            ens = _EnsembleHead(heads).to(args.device).eval()
+            # ``live_eval`` is the last seed's bucket (identical across seeds).
+            ens_le = (p41._zr_and_logit_gaps(ens, live_eval, args.device)
+                      if live_eval else None)
+            ensemble[arch] = {"n_members": len(heads),
+                             "live_eval": ens_le,
+                             "z_logit_median": (ens_le["z_logit"]["median"]
+                                                if ens_le else None)}
+            if ens_le and ens_le["z_logit"]["median"] is not None:
+                m = ens_le["z_logit"]["median"]
+                print(f"  [{arch} ENSEMBLE x{len(heads)} {args.select_ckpt}] "
+                      f"LIVE-EVAL z_logit={m:.3f} "
+                      f"({'PASS' if m >= ZLOGIT_GATE else 'fail'}, "
+                      f"n={ens_le['z_logit']['n_eligible']})", flush=True)
 
     # ── aggregate + DeepSeek decision rule ──
     def _med(rows, key, sub):
@@ -540,6 +710,16 @@ def main() -> int:
             "transformer_live_eval_zlogit_median": b_live,
             "transformer_live_eval_pass": b_live_pass,
             "transformer_live_eval_robust": b_live_robust,
+            "phase1d": {"n_slot_types": args.n_slot_types,
+                        "learnable_temp": args.learnable_temp,
+                        "dropout": args.dropout,
+                        "label_smoothing": args.label_smoothing,
+                        "cosine_schedule": args.cosine_schedule,
+                        "select_ckpt": args.select_ckpt,
+                        "ensemble": args.ensemble},
+            "ensemble": {arch: {"n_members": e["n_members"],
+                                "z_logit_median": e["z_logit_median"]}
+                         for arch, e in ensemble.items()},
             "per_seed": {
                 "bilinear": [{"seed": r["seed"], "best_epoch": r["best_epoch"],
                               "train_top3": r["train_top3"],
