@@ -9,14 +9,15 @@ Two adapters satisfying the pipeline's ``doc_kind_tagger`` contract
 - ``BackboneDocKindTagger``: the deferred step -- a local forward pass through
   the trained ``DocKindHead`` on the frozen backbone (no :8080 contention).
 - ``EnsembleBackboneDocKindTagger``: ensemble serve -- N trained heads on the
-  SHARED frozen backbone, logit-averaged. Ships the gate-clearing pen0+pen2 pair
-  (two attention+temporal heads at opposite ends of the penalty frontier whose
-  averaged logits land BOTH guard classes at 13/17, unsafe=0; no single head
-  clears the strict gate -- the snap/dec coupling is the cost of the 5-way
-  softmax's mutual exclusion, and the ensemble relaxes it). The backbone is
-  loaded ONCE and shared; the embedder + temporal feature are computed ONCE per
-  doc; only the per-head SSM forward is N x (acceptable: doc-kind tagging is
-  per-ingest, not per-query).
+  SHARED frozen backbone, logit-averaged. Ships the single ce0_text2x head
+  (penalty 0.0, attention+temporal) on the frozen text2x backbone -- the only
+  config clearing the strict gate on text2x (snap 15/17, dec 0.706, unsafe 1,
+  CI_lo 0.657); an 8-point penalty-frontier sweep found NO 2-head pair clears
+  (pen0.0 is a frontier optimum whose unique dec>=0.70 dilutes below the gate
+  when averaged with any partner). N=1 is the served path (logit-avg of 1 = the
+  head's own logits). The backbone is loaded ONCE and shared; the embedder +
+  temporal feature are computed ONCE per doc; only the per-head SSM forward is
+  N x (acceptable: doc-kind tagging is per-ingest, not per-query).
 
 ``build_doc_kind_tagger`` centralizes the policy: prefer the ENSEMBLE when
 ``ensemble_paths`` are supplied and all exist; fall back to a single trained
@@ -48,25 +49,33 @@ _BONSAI_TEXT_CAP = 8000
 # Default trained-checkpoint paths. The backbone path mirrors
 # runtime.DEFAULT_BACKBONE_PATH -- duplicated here so ingestion does not depend
 # on the serve-only runtime module (the CLI owns ingest; build_ponder does not
-# ingest and does not load the head).
-DEFAULT_DOC_KIND_HEAD_PATH = "data/training/doc_kind_head/best.pt"
-DEFAULT_BACKBONE_PATH = (
-    "data/pod_runs/phase2a_full/checkpoints/backbone/backbone_final.pt"
+# ingest and does not load the head). Both point at the text2x STRM fine-tune
+# so the doc-kind head loads under the SAME backbone it was trained on (the
+# ce0_text2x head was trained on backbone_v2_full_finetuned_text2x.pt; loading
+# it under the phase2a backbone would be a silent feature-space mismatch).
+DEFAULT_DOC_KIND_HEAD_PATH = (
+    "data/training/doc_kind_head_attn_ce0_text2x/best.pt"
 )
-# Shipped ensemble: pen0 (pure CE, snap-strong: snap 13/17 / dec 11/17) +
-# pen2 (dec-strong: snap 12/17 / dec 12/17), logit-averaged. The averaged logits
-# land BOTH guard classes at 13/17=0.765 with unsafe=0 on the 76-doc clean val
-# -- clearing the full strict gate (snap>=0.70, dec>=0.70, acc>=0.55,
-# unsafe<=1, snap Wilson-CI95 lower>=0.50) that NO single head clears. The
-# two heads sit at opposite ends of the penalty frontier; averaging their
-# logits relaxes the snap/dec coupling that the 5-way softmax's mutual
-# exclusion forces on any one head. Both are attention + temporal-feature
-# heads on the shared frozen backbone. Paths are ``data/`` (gitignored); the
-# ensemble auto-serves when both exist, else falls through to single-head /
+DEFAULT_BACKBONE_PATH = (
+    "data/training/strm_backbone_relevance/backbone_v2_full_finetuned_text2x.pt"
+)
+# Shipped DocKindHead: the SINGLE ce0_text2x head (penalty 0.0, attention +
+# temporal-feature) on the frozen text2x backbone. An 8-point penalty-frontier
+# sweep {0.0,0.5,1.0,1.5,2.0,2.5,3.0,4.0} on the 76-doc clean val found this is
+# the ONLY config clearing the strict gate on text2x: snap 0.882 (15/17),
+# dec 0.706, unsafe 1, acc 0.579, snap Wilson-CI95 lower 0.657 (beats the
+# phase2a pen0+pen2 pair on snap and CI_lo). NO 2-head logit-averaged pair
+# clears -- pen0.0 is a frontier optimum (the only head holding BOTH dec>=0.70
+# AND snap>=0.70), and averaging it with any partner dilutes its unique dec
+# below 0.70 while the partner never adds enough dec back. A 1-element ensemble
+# is the served path the PASS was measured on (EnsembleBackboneDocKindTagger
+# logit-avg of 1 = the head's own logits). The phase2a pen0+pen2 pair
+# (data/training/doc_kind_head_attn_ce{0,2}/best.pt) remains on disk as the
+# --doc-kind-ensemble rollback. Paths are ``data/`` (gitignored); the ensemble
+# auto-serves when its head exists, else falls through to single-head /
 # Bonsai / None (cold-start preserved on a fresh clone).
 DEFAULT_DOC_KIND_ENSEMBLE_PATHS = (
-    "data/training/doc_kind_head_attn_ce0/best.pt",  # pen0 -- pure CE, snap-strong
-    "data/training/doc_kind_head_attn_ce2/best.pt",  # pen2 -- dec-strong
+    "data/training/doc_kind_head_attn_ce0_text2x/best.pt",  # pen0.0 -- the only clearing config on text2x
 )
 
 
@@ -239,7 +248,7 @@ class BackboneDocKindTagger:
 
 class EnsembleBackboneDocKindTagger:
     """Ensemble serve: N trained ``DocKindHead``s on the SHARED frozen backbone,
-    logit-averaged (the gate-clearing pen0+pen2 pair).
+    logit-averaged (the shipped single ce0_text2x head; N=1 is the served path).
 
     Holds N loaded ``DocKindHead``s (each on the SAME frozen backbone object, so
     the 19.5M backbone params load ONCE) and a bge-small embedder. Tags a doc by
@@ -311,14 +320,15 @@ def build_doc_kind_tagger(
 
     Prefers the ``EnsembleBackboneDocKindTagger`` when ``ensemble_paths`` are
     supplied and ALL exist (N heads logit-averaged on the shared frozen backbone
-    -- the shipped gate-clearing pen0+pen2 pair). Falls back to the single
-    ``BackboneDocKindTagger`` when ``head_path`` exists, then to
-    ``BonsaiDocKindTagger`` when a ``bonsai_decider`` is supplied, then
-    ``None`` (the pipeline leaves ``doc_kind`` at the cold-start ``"other"``,
-    byte-identical to pre-7.11). ``ensemble_paths`` defaults to ``None`` so a
-    direct library call is backward-compatible (single-head); the ingest CLI
-    passes the shipped pair so production serves the ensemble by default. A
-    load failure prints a warning and falls through to the next fallback
+    -- the shipped single ce0_text2x head, the only config clearing the strict
+    gate on text2x). Falls back to the single ``BackboneDocKindTagger`` when
+    ``head_path`` exists, then to ``BonsaiDocKindTagger`` when a
+    ``bonsai_decider`` is supplied, then ``None`` (the pipeline leaves
+    ``doc_kind`` at the cold-start ``"other"``, byte-identical to pre-7.11).
+    ``ensemble_paths`` defaults to ``None`` so a direct library call is
+    backward-compatible (single-head); the ingest CLI passes the shipped
+    ensemble so production serves it by default. A load failure prints a warning
+    and falls through to the next fallback
     rather than aborting the ingest.
 
     Heavy deps (torch, the backbone checkpoint, ``sentence_transformers``) are

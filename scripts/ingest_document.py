@@ -27,7 +27,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from src.ingestion.doc_kind import DEFAULT_DOC_KIND_ENSEMBLE_PATHS
+from src.ingestion.doc_kind import (
+    DEFAULT_BACKBONE_PATH,
+    DEFAULT_DOC_KIND_ENSEMBLE_PATHS,
+    DEFAULT_DOC_KIND_HEAD_PATH,
+)
 
 # Make ``src`` importable when run as a script (mirrors run_consolidation.py:
 # insert the REPO ROOT so ``src`` resolves as a package, not ``scripts/src``).
@@ -184,19 +188,22 @@ def main() -> int:
                     help="source type: auto|markdown|text|pdf|code|docx|web|email (default: auto by extension; email = a directory of .eml as a thread)")
     ap.add_argument("--no-extract", action="store_true",
                     help="skip GLiNER/Bonsai extraction (structure-only ingest)")
-    ap.add_argument("--doc-kind-head", default="data/training/doc_kind_head/best.pt",
-                    help="trained doc-kind head checkpoint (default: data/training/doc_kind_head/best.pt; "
-                         "used when --doc-kind-ensemble is disabled or absent; when present, "
-                         "a local forward pass tags doc_kind instead of the Bonsai HTTP call)")
+    ap.add_argument("--doc-kind-head", default=DEFAULT_DOC_KIND_HEAD_PATH,
+                    help="trained doc-kind head checkpoint (default: the single ce0_text2x head "
+                         "on the text2x backbone; used when --doc-kind-ensemble is disabled or "
+                         "absent; when present, a local forward pass tags doc_kind instead of the "
+                         "Bonsai HTTP call)")
     ap.add_argument("--doc-kind-ensemble", nargs="*",
                     default=list(DEFAULT_DOC_KIND_ENSEMBLE_PATHS),
                     help="ensemble of doc-kind head checkpoints (logit-averaged on the shared "
-                         "frozen backbone); default ships the pen0+pen2 pair that clears the "
-                         "strict gate (both guard classes 13/17, unsafe=0). Pass --doc-kind-ensemble "
-                         "with no values to disable and fall back to --doc-kind-head.")
+                         "frozen backbone); default ships the single ce0_text2x head (penalty 0.0) "
+                         "that clears the strict gate on the text2x backbone (snap 15/17, dec "
+                         "0.706, unsafe 1). Pass --doc-kind-ensemble with no values to disable "
+                         "and fall back to --doc-kind-head.")
     ap.add_argument("--backbone",
-                    default="data/pod_runs/phase2a_full/checkpoints/backbone/backbone_final.pt",
-                    help="Phase 2a backbone checkpoint the doc-kind head runs on (frozen)")
+                    default=DEFAULT_BACKBONE_PATH,
+                    help="frozen backbone checkpoint the doc-kind head runs on (default: the "
+                         "text2x STRM fine-tune; MUST match the head's training backbone)")
     ap.add_argument("--device", default="auto",
                     help="device for the doc-kind head backbone (auto|cpu|cuda; default auto)")
     args = ap.parse_args()

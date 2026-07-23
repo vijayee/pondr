@@ -41,11 +41,17 @@ from .subconscious.training.routing_training import (
     load_retrieval_gate,
 )
 
-# Default trained-checkpoint paths (the artifacts the audit found unwired).
+# Default trained-checkpoint paths. The serve backbone is the text2x STRM
+# fine-tune (backbone_v2_full_finetuned_text2x.pt) and the gate is the
+# RetrievalGate retrained on that frozen backbone (val_acc 0.86136, recovered
+# from the 0.258 floor the phase2a gate hit under the text2x backbone). The
+# phase2a pair (data/pod_runs/phase2a_full/.../backbone_final.pt +
+# data/pod_runs/phase2b/best.pt) remains on disk as the --backbone/--gate
+# rollback.
 DEFAULT_BACKBONE_PATH = (
-    "data/pod_runs/phase2a_full/checkpoints/backbone/backbone_final.pt"
+    "data/training/strm_backbone_relevance/backbone_v2_full_finetuned_text2x.pt"
 )
-DEFAULT_GATE_PATH = "data/pod_runs/phase2b/best.pt"
+DEFAULT_GATE_PATH = "data/pod_runs/phase2b_text2x/best.pt"
 
 
 def build_ponder(
