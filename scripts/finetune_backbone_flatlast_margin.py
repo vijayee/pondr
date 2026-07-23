@@ -190,6 +190,12 @@ def main() -> int:
                    help="replay-fidelity abs-diff threshold; above this the run aborts.")
     p.add_argument("--skip-fidelity", action="store_true",
                    help="skip the epoch-0 replay-fidelity gate (NOT recommended).")
+    p.add_argument("--text-oversample", type=int, default=1, metavar="N",
+                   help="duplicate every TEXT-gold record N-1 extra times in-memory "
+                        "(N=1 = no duplication = byte-identical default). Oversampling "
+                        "gives text more gradient steps under the no-replacement "
+                        "sampler (text step count scales with N). DeepSeek consult #5: "
+                        "the text flag is a step-count deficit, not a loss problem.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -246,6 +252,25 @@ def main() -> int:
     print(f"gold-kind counts conv={gk_counts[phh.DOC_KIND_CONV]}/"
           f"text={gk_counts[phh.DOC_KIND_TEXT]}/code={gk_counts[phh.DOC_KIND_CODE]}",
           flush=True)
+
+    # ── text-gold oversampling (DeepSeek consult #5: step-count deficit fix) ──
+    # Duplicate every text-gold record (text_oversample - 1) extra times. The
+    # duplicated entries are shallow refs to the same dict -- the training loop
+    # only READS records (never mutates them), so sharing the underlying tensors
+    # (slots_pre_state/slots_step_input/query_emb/labels) is safe and costs no
+    # extra tensor memory. Under replacement=False + num_samples=len(records),
+    # each copy is seen once/epoch -> text gradient steps scale with the oversample
+    # factor while conv/code are unchanged. The sampler weights below are derived
+    # AFTER duplication, so sqrt-inverse-freq rebalances on the new counts.
+    if args.text_oversample > 1:
+        text_recs = [r for r in records
+                     if int(r["gold_doc_kind"]) == phh.DOC_KIND_TEXT]
+        before = len(records)
+        records = records + text_recs * (args.text_oversample - 1)
+        gk_counts[phh.DOC_KIND_TEXT] = len(text_recs) * args.text_oversample
+        print(f"text-oversample x{args.text_oversample}: text-gold "
+              f"{len(text_recs)} -> {gk_counts[phh.DOC_KIND_TEXT]} copies, "
+              f"dataset {before} -> {len(records)} records", flush=True)
 
     # ── sampler weights (sqrt-freq no-replacement, the #5 protocol) ──
     sqrt_freq = not args.uniform_sampler
