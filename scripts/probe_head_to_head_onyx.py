@@ -494,7 +494,8 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                 per_kind_full: bool = False,
                 class_balanced_gold: bool = False,
                 per_kind_loss_weight: bool = False,
-                code_hard_neg: bool = False) -> dict:
+                code_hard_neg: bool = False,
+                no_replacement_sampler: bool = False) -> dict:
     """Train one head (bilinear OR transformer) on the train sessions with the
     SAME contrastive InfoNCE loss. Mirrors ``p44._train_contrastive`` but is
     generic over the head arch. Uses ``evaluate_relevance`` on the train-internal
@@ -572,16 +573,30 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
           f"(held-out: {len(val)} turns from {len({_session_of(r) for r in val})} "
           f"unseen sessions)", flush=True)
 
-    # Phase 1f-7 Stage 2 (DeepSeek #1): class-balanced per-record sampling weights
-    # on the SHARED readout. Upweight minority gold kinds (code/text) and downweight
-    # conv so each kind contributes ~equally per epoch -- fixes the conv-majority-
-    # dominated shared-body root cause WITHOUT per-kind decomposition, preserving
-    # the cross-kind logit space. weights = 1 / count(gold_doc_kind) over train_q.
-    # The epoch loop uses a WeightedRandomSampler(weights, len(train_q), replace=True)
-    # instead of a uniform shuffle. Default off (class_balanced_gold=False) =
-    # uniform shuffle = byte-identical 1f-6. valq (held-out) is NEVER reweighted.
+    # Phase 1f-7 Stage 2 (DeepSeek #1 / #4): class-balanced per-record sampling
+    # weights on the SHARED readout. Upweight minority gold kinds (code/text) and
+    # downweight conv so each kind contributes ~equally per epoch -- fixes the
+    # conv-majority-dominated shared-body root cause WITHOUT per-kind
+    # decomposition, preserving the cross-kind logit space. weights =
+    # 1 / count(gold_doc_kind) over train_q. Two variants share these weights:
+    #   - --class-balanced-gold (#1): WeightedRandomSampler(replacement=True,
+    #     num_samples=len(train_q)) -- WITH replacement (code ~2x/epoch, some conv
+    #     records unseen/epoch). Passed the gate s2-only (1/3, extreme variance).
+    #   - --no-replacement-sampler (#4, DeepSeek ladder #2): WeightedRandomSampler
+    #     (replacement=False, num_samples=len(train_q)) -- a WEIGHTED SHUFFLE: every
+    #     record seen EXACTLY once/epoch in a weighted order. Removes the
+    #     replacement-sampling noise that drove #1's extreme seed variance (s0/s1
+    #     inverted, s2 passed both) while keeping the per-epoch balance that let s2
+    #     pass BOTH buckets + the per-step loss scale 1.0 (AdamW-clean). DeepSeek's
+    #     ranked variance-tamer for the #1-sampler.
+    # The epoch loop uses a WeightedRandomSampler(sampler_weights, len(train_q),
+    # replacement=cb_replace) instead of a uniform shuffle. Default off (both
+    # flags False) = uniform shuffle = byte-identical 1f-6. valq (held-out) is
+    # NEVER reweighted. ``cb_replace`` is only read when sampler_weights is set
+    # (one of the two flags is on), so it is inert by default.
     sampler_weights = None
-    if class_balanced_gold:
+    cb_replace = True
+    if class_balanced_gold or no_replacement_sampler:
         cb_counts = {DOC_KIND_CONV: 0, DOC_KIND_TEXT: 0, DOC_KIND_CODE: 0}
         for r in train_q:
             cb_counts[int(r.get("gold_doc_kind", DOC_KIND_CONV))] += 1
@@ -589,12 +604,18 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                for k in cb_counts}
         w = [inv[int(r.get("gold_doc_kind", DOC_KIND_CONV))] for r in train_q]
         sampler_weights = torch.tensor(w, dtype=torch.double)
-        print(f"  --class-balanced-gold: train gold-kind counts "
+        cb_replace = not no_replacement_sampler
+        flag_name = ("--no-replacement-sampler" if no_replacement_sampler
+                     else "--class-balanced-gold")
+        repl_desc = ("replacement=False (weighted shuffle, each record "
+                     "once/epoch)" if no_replacement_sampler
+                     else "replacement=True (w/ replacement)")
+        print(f"  {flag_name}: train gold-kind counts "
               f"conv={cb_counts[DOC_KIND_CONV]}/text={cb_counts[DOC_KIND_TEXT]}/"
               f"code={cb_counts[DOC_KIND_CODE]} -> per-record weight "
               f"conv={inv[DOC_KIND_CONV]:.4f}/text={inv[DOC_KIND_TEXT]:.4f}/"
               f"code={inv[DOC_KIND_CODE]:.4f} (WeightedRandomSampler, "
-              f"{len(train_q)} samples/epoch w/ replacement)", flush=True)
+              f"{len(train_q)} samples/epoch, {repl_desc})", flush=True)
 
     # Phase 1f-7 Stage 2 (DeepSeek #2): per-kind inverse-frequency LOSS weighting
     # on the SHARED readout. Same per-kind BALANCE as the sampler (each kind
@@ -673,13 +694,15 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
     for epoch in range(epochs):
         head.train()
         if sampler_weights is not None:
-            # Class-balanced: sample len(train_q) records WITH replacement, weighted
-            # by inverse gold-kind frequency. Per-epoch generator seeded by
-            # (seed, epoch) for determinism (reproducible across reruns).
+            # Class-balanced: sample len(train_q) records, weighted by inverse
+            # gold-kind frequency. ``cb_replace`` selects WITH replacement (#1
+            # sampler) vs WITHOUT (#4 weighted shuffle -- each record once/epoch).
+            # Per-epoch generator seeded by (seed, epoch) for determinism
+            # (reproducible across reruns).
             gen = torch.Generator().manual_seed(seed * 100003 + epoch)
             sampler = torch.utils.data.WeightedRandomSampler(
                 sampler_weights, num_samples=len(train_q),
-                replacement=True, generator=gen)
+                replacement=cb_replace, generator=gen)
             order = list(sampler)
         else:
             order = list(range(len(train_q)))
@@ -883,7 +906,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
               per_kind_full: bool = False,
               class_balanced_gold: bool = False,
               per_kind_loss_weight: bool = False,
-              code_hard_neg: bool = False) -> dict:
+              code_hard_neg: bool = False,
+              no_replacement_sampler: bool = False) -> dict:
     """Train one arch (one seed), eval on held-out sessions + all-turns ceiling
     + (D0.4a) the live-eval bucket (the 2 live-transcript sessions, held OUT of
     train for every seed -> the genuinely-held-out conversation-ring gap).
@@ -907,7 +931,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
                     per_kind_full=per_kind_full,
                     class_balanced_gold=class_balanced_gold,
                     per_kind_loss_weight=per_kind_loss_weight,
-                    code_hard_neg=code_hard_neg)
+                    code_hard_neg=code_hard_neg,
+                    no_replacement_sampler=no_replacement_sampler)
     ckpt_path = r["ckpt_final"] if select_ckpt == "final" else r["ckpt_best"]
     r["select_ckpt"] = select_ckpt
     r["ckpt"] = ckpt_path
@@ -1104,6 +1129,21 @@ def main() -> int:
                         "slot_doc_kinds + gold_doc_kind). Runs on the SHARED readout "
                         "(n_doc_kinds=0, unbalanced -- no sampler). Default off = "
                         "byte-identical 1f-6.")
+    p.add_argument("--no-replacement-sampler", action="store_true",
+                   help="Phase 1f-7 Stage 2 #4 (DeepSeek reconsult ladder step 2): "
+                        "the same class-balanced inverse-frequency gold-kind weights as "
+                        "--class-balanced-gold, but WeightedRandomSampler(replacement="
+                        "False, num_samples=len(train_q)) -- a WEIGHTED SHUFFLE: every "
+                        "record is seen EXACTLY once/epoch (no record unseen, no minority "
+                        "record ~2x/epoch), in an order weighted by inverse gold-kind "
+                        "frequency (minority code/text records tend earlier each epoch). "
+                        "Removes the replacement-sampling noise that drove #1's extreme "
+                        "seed variance (s0/s1 inverted, s2 passed both -> 1/3) while "
+                        "keeping the per-epoch balance that let s2 pass BOTH buckets + "
+                        "the per-step loss scale 1.0 (AdamW-clean). DeepSeek's ranked "
+                        "variance-tamer for the #1-sampler. Requires --drop-self-slot + "
+                        "--doc-store (stamps gold_doc_kind). Default off = byte-identical "
+                        "1f-6.")
     p.add_argument("--out", default=DEFAULT_OUT)
     args = p.parse_args()
 
@@ -1139,12 +1179,13 @@ def main() -> int:
     # (n_doc_kinds=0); --code-hard-neg is a loss-STRUCTURE variant on the SHARED
     # readout (DeepSeek's ladder step 1, run ALONE on unbalanced 1f-6).
     n_rebalance = sum([args.per_kind_data_isolation, args.class_balanced_gold,
-                      args.per_kind_loss_weight, args.code_hard_neg])
+                      args.per_kind_loss_weight, args.code_hard_neg,
+                      args.no_replacement_sampler])
     if n_rebalance > 1:
         print("ERROR: --per-kind-data-isolation / --class-balanced-gold / "
-              "--per-kind-loss-weight / --code-hard-neg are mutually exclusive "
-              "(alternative variants of the gold-kind fix; pick one per run).",
-              file=sys.stderr)
+              "--per-kind-loss-weight / --code-hard-neg / --no-replacement-sampler "
+              "are mutually exclusive (alternative variants of the gold-kind fix; "
+              "pick one per run).", file=sys.stderr)
         return 1
 
     # Phase 1f-7 Stage 2 #3 (--code-hard-neg): implies --hard-negative (the
@@ -1250,18 +1291,20 @@ def main() -> int:
     # weight every record as conv). doc_kind_map built from --doc-store. Default
     # off = no stamped field = byte-identical.
     if args.per_kind_data_isolation or args.class_balanced_gold \
-            or args.per_kind_loss_weight or args.code_hard_neg:
+            or args.per_kind_loss_weight or args.code_hard_neg \
+            or args.no_replacement_sampler:
         if not args.drop_self_slot:
             print("ERROR: --per-kind-data-isolation/--class-balanced-gold/"
-                  "--per-kind-loss-weight/--code-hard-neg require --drop-self-slot "
-                  "(the gold slot must be a prior doc, never the cos~1.0 self-slot, "
-                  "which is conv=0 and would route/weight every record as conv).",
-                  file=sys.stderr)
+                  "--per-kind-loss-weight/--code-hard-neg/--no-replacement-sampler "
+                  "require --drop-self-slot (the gold slot must be a prior doc, "
+                  "never the cos~1.0 self-slot, which is conv=0 and would route/"
+                  "weight every record as conv).", file=sys.stderr)
             return 1
         if not args.doc_store:
             print("ERROR: --per-kind-data-isolation/--class-balanced-gold/"
-                  "--per-kind-loss-weight/--code-hard-neg require --doc-store (the "
-                  "doc_id -> kind map for the gold-kind stamp).", file=sys.stderr)
+                  "--per-kind-loss-weight/--code-hard-neg/--no-replacement-sampler "
+                  "require --doc-store (the doc_id -> kind map for the gold-kind "
+                  "stamp).", file=sys.stderr)
             return 1
         if doc_kind_map is None:
             doc_kind_map = _build_doc_kind_map_cached(args.doc_store, args.onyx)
@@ -1288,10 +1331,14 @@ def main() -> int:
             tag = "--per-kind-loss-weight: inverse-freq loss weight"
             suffix = (" (uniform sampling, per-record loss weight -> shared-"
                       "readout fix)")
-        else:
+        elif args.code_hard_neg:
             tag = "--code-hard-neg: code-restricted hard-neg"
             suffix = (" (code-gold records: hardest filler forced to a CODE slot "
                       "-> code-vs-code separation, AdamW-clean)")
+        else:
+            tag = "--no-replacement-sampler: weighted-shuffle sampling"
+            suffix = (" (inverse-freq weights, replacement=False -> each record "
+                      "seen once/epoch, variance-tamer for #1, AdamW-clean)")
         print(f"  {tag}: stamped gold_doc_kind on {len(records)} records -> "
               f"conv={gold_counts[DOC_KIND_CONV]} / text={gold_counts[DOC_KIND_TEXT]} "
               f"/ code={gold_counts[DOC_KIND_CODE]}{suffix}", flush=True)
@@ -1372,7 +1419,8 @@ def main() -> int:
                 per_kind_full=args.per_kind_data_isolation,
                 class_balanced_gold=args.class_balanced_gold,
                 per_kind_loss_weight=args.per_kind_loss_weight,
-                code_hard_neg=args.code_hard_neg))
+                code_hard_neg=args.code_hard_neg,
+                no_replacement_sampler=args.no_replacement_sampler))
 
     # ── Phase 1d ensemble (logit-avg of the per-seed selected ckpts) ──
     # The live_eval bucket is the same 2 live-transcript sessions held OUT of
