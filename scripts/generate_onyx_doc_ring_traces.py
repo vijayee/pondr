@@ -171,7 +171,8 @@ def _infer_slot_type(source_id: str | None, slot_type: int | None) -> int:
 
 def _build_mixed_record(ring, query_emb, ld_head, slot_doc_embs,
                         slot_source_ids, slot_slot_types,
-                        emit_question: bool, question: str) -> dict | None:
+                        emit_question: bool, question: str,
+                        capture_pre_state: bool = False) -> dict | None:
     """Build ONE fit_relevance-format record from the current MIXED ring.
 
     Pure tensor assembly (no embedding -- the caller embeds each slot's text
@@ -179,12 +180,28 @@ def _build_mixed_record(ring, query_emb, ld_head, slot_doc_embs,
     ``_build_mixed_record`` for the shared fields (same shapes/dtypes the
     downstream loader expects) PLUS ``slot_types`` [K'] long. Drops slots whose
     Phase-A state capture (``slot.h``) is missing or whose text is empty.
+
+    ``capture_pre_state`` (Stage 3 fine-tune replay, default False): also stack
+    ``slots_pre_state`` [K',4,16,384] fp16 -- each kept slot's ``h_pre`` (the
+    cumulative state BEFORE its step) -- AND ``slots_step_input`` [K',384] fp32
+    -- each kept slot's ``u`` (the EXACT step-input embedding, post-pin/pre-SSM).
+    ``u`` is NOT ``embed(slot.text)``: retrieved CODE docs are injected by
+    MEANING (``embed(embed_text)``), not their synthetic ``summary`` string
+    (``slot.text``), so re-embedding ``slot.text`` diverges from the stepped
+    vector for ~20% of slots; ``u`` is the stepped vector, so the replay seed
+    ``(h_pre, u)`` reproduces ``h`` exactly. When True, a slot with ``h_pre is
+    None`` OR ``u is None`` is dropped too (a missing seed would bogus the
+    replay). The False path is byte-identical (no ``slots_pre_state`` /
+    ``slots_step_input`` keys, no extra guard branch).
     """
     if len(ring) < 3:
         return None
     kept = [(j, s) for j, s in enumerate(ring)
             if getattr(s, "h", None) is not None
-            and s.text is not None and str(s.text).strip()]
+            and s.text is not None and str(s.text).strip()
+            and (not capture_pre_state
+                 or (getattr(s, "h_pre", None) is not None
+                     and getattr(s, "u", None) is not None))]
     if len(kept) < 3:
         return None
     q = query_emb.to("cpu").to(torch.float32).reshape(-1)
@@ -226,6 +243,26 @@ def _build_mixed_record(ring, query_emb, ld_head, slot_doc_embs,
         "slots_h_raw": slots_h_raw,
         "slot_types": slot_types,
     }
+    if capture_pre_state:
+        # Stage 3 fine-tune replay seed: each kept slot's pre-step WM state.
+        # Mirror slots_h_raw's assembly (h_pre is a list of 4 fp16 [1,16,384]).
+        slots_pre_state = torch.stack([
+            torch.stack([
+                layer.detach().to("cpu").to(torch.float16).reshape(D_STATE, D_MODEL)
+                for layer in s.h_pre
+            ])
+            for _j, s in kept
+        ])                                                    # [K',4,16,384] fp16
+        rec["slots_pre_state"] = slots_pre_state
+        # The EXACT step-input embedding per kept slot (post-pin, pre-SSM). This
+        # -- NOT slots_doc_emb (embed(slot.text)) -- is what the replay re-steps
+        # to reproduce slots_h_raw exactly (code docs are injected by meaning,
+        # not their summary string). u is a fp32 [1,384] clone on the slot.
+        slots_step_input = torch.stack([
+            s.u.detach().to("cpu").to(torch.float32).squeeze(0).reshape(-1)
+            for _j, s in kept
+        ])                                                    # [K',384] fp32
+        rec["slots_step_input"] = slots_step_input
     if emit_question:
         rec["question"] = question
     return rec
@@ -287,6 +324,14 @@ def main() -> int:
                    help="retain the 'question' field (message text) on disk. "
                         "OFF by default -- PRIVATE chats; only embeddings + "
                         "source_ids + raw state + slot_types are written.")
+    p.add_argument("--capture-pre-state", action="store_true",
+                   help="Stage 3 backbone fine-tune replay: capture per-kept-"
+                        "slot pre-step WM state 'slots_pre_state' [K,4,16,384] "
+                        "fp16 (the cumulative state each step starts FROM, the "
+                        "seed for single-step replay). Default off = byte-"
+                        "identical trace (no slots_pre_state key). Writes to a "
+                        "DISTINCT --out (the pre-state trace is ~2x size and "
+                        "only consumed by finetune_backbone_flatlast_margin.py).")
     args = p.parse_args()
 
     sessions_path = Path(args.sessions)
@@ -370,7 +415,7 @@ def main() -> int:
         store=store, retriever=retriever, backbone=backbone, embedder=embedder,
         mode_a=_StubModeA(), config=cfg, user_id="pondr_doc_ring",
         encoder=None, relevance_head=None, ring_capacity=args.ring_capacity,
-        identity_instance=True,
+        identity_instance=True, capture_pre_state=args.capture_pre_state,
     )
 
     records: list[dict] = []
@@ -462,7 +507,8 @@ def main() -> int:
                     n_turns_with_doc += 1
                 rec = _build_mixed_record(
                     ring, prompt_emb, ld_head, slot_doc_embs,
-                    slot_source_ids, slot_slot_types, emit_question, u)
+                    slot_source_ids, slot_slot_types, emit_question, u,
+                    capture_pre_state=args.capture_pre_state)
                 if rec is not None:
                     records.append(rec)
                     n_user_turns_total += 1

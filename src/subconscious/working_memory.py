@@ -88,6 +88,31 @@ class RingSlot:
     (NOT in ``snapshot()``/checkpoints), so the field is checkpoint-backward-
     compatible and defaults to ``None`` for any existing positional constructor.
 
+    ``h_pre`` (Stage 3 fine-tune replay) is the per-layer SSM recurrent state
+    captured BEFORE this slot's ``super().step`` -- i.e. the cumulative state the
+    step starts FROM (the previous step's post-state, including all prior
+    overflowed/dropped steps the ring no longer holds). Same shape/dtype as ``h``
+    (list of ``n_layers`` (4) fp16 ``[1,16,384]`` tensors). It is the SEED for the
+    single-step replay fine-tune: re-step ONLY this slot's input from ``h_pre``
+    (detached) with grad through ``layer.step`` to reproduce ``h`` within fp16
+    epsilon AND backprop into the shared backbone params (truncated-BPTT-depth-1
+    -- no cross-slot unroll, so no overflow/drop-gap, no memory blowup). Captured
+    only when ``WorkingMemory(capture_pre_state=True)`` (default off -> ``None``
+    and ``step`` is byte-identical). In-memory only (NOT in ``snapshot()``/
+    checkpoints) -> checkpoint-backward-compatible, defaults ``None``.
+
+    ``u`` (Stage 3 fine-tune replay) is the EXACT step-input embedding -- the
+    ``input_embedding`` actually fed to ``super().step`` (post-pin, pre-SSM),
+    captured when ``capture_pre_state=True``. This is NOT ``embed(slot.text)``:
+    retrieved CODE docs are injected "by MEANING" (``embed(embed_text)``), not by
+    their synthetic ``summary`` string (which is what ``slot.text`` stores), so
+    re-embedding ``slot.text`` at trace-build time yields a DIFFERENT vector than
+    the one that was stepped -> the single-step replay would diverge for ~20% of
+    slots (the code-doc slots). Capturing ``u`` at step time makes the replay
+    seed ``(h_pre, u)`` reproduce ``h`` EXACTLY (within fp16 epsilon). A detached
+    fp32 ``[1, 384]`` clone. Default off -> ``None`` (``step`` byte-identical,
+    no per-slot input storage). In-memory only.
+
     ``slot_type`` (Phase 1a) tags whether this slot is a CONVERSATION message
     (``0``, the user's prompt stepped via ``update``) or a RETRIEVED doc-episode
     (``1``, stepped via ``inject``), so the cross-slot Transformer's slot-type
@@ -105,6 +130,8 @@ class RingSlot:
     text: Optional[str]
     pinned: bool = False
     h: Optional[list[Tensor]] = None
+    h_pre: Optional[list[Tensor]] = None
+    u: Optional[Tensor] = None
     slot_type: Optional[int] = None
 
 
@@ -143,6 +170,7 @@ class WorkingMemory(JGSInstance):
         ring_capacity: Optional[int] = None,
         pin_tag: Optional[PinTag] = None,
         identity_instance: bool = False,
+        capture_pre_state: bool = False,
     ) -> None:
         cfg = config or INSTANCE_CONFIGS["working_memory"]
         super().__init__(backbone, cfg, identity_instance=identity_instance)
@@ -169,6 +197,11 @@ class WorkingMemory(JGSInstance):
         # except the salience re-inject) never reads this, so it is
         # byte-identical to pre-Step-3.
         self._pin_tag = pin_tag if pin_tag is not None else PinTag()
+        # Stage 3 fine-tune replay: when True, ``step`` snapshots ``self.state``
+        # BEFORE ``super().step`` into each ``RingSlot.h_pre`` -- the cumulative
+        # state the step starts from, the seed for single-step replay. Default
+        # False -> no snapshot, ``h_pre=None``, ``step`` byte-identical.
+        self._capture_pre_state = bool(capture_pre_state)
 
     # ── state evolution ──
 
@@ -287,6 +320,20 @@ class WorkingMemory(JGSInstance):
         """
         if pin and self._ring_capacity > 0:
             input_embedding = self._pin_tag(input_embedding)
+        # Stage 3 fine-tune replay: snapshot the cumulative state BEFORE the
+        # step (the seed for single-step replay). self.state here is the
+        # previous step's post-state (overflowed/dropped steps included) -- the
+        # exact context this step starts from. A read of self.state only; the
+        # False path skips this entirely -> byte-identical.
+        h_pre = None
+        u = None
+        if self._capture_pre_state and self._ring_capacity > 0 and self.state is not None:
+            h_pre = [s.detach().to(torch.float16).clone() for s in self.state]
+            # Capture the EXACT step-input embedding (post-pin, pre-SSM). NOT
+            # embed(text): code docs are injected by MEANING, not their summary
+            # string, so re-embedding slot.text would diverge from the stepped
+            # vector. fp32 [1,384] clone; the replay seeds (h_pre, u) -> h exact.
+            u = input_embedding.detach().to(torch.float32).clone()
         result = super().step(input_embedding, context)
         self._apply_decay()
         if self._ring_capacity > 0:
@@ -305,7 +352,7 @@ class WorkingMemory(JGSInstance):
             )
             self._ring.append(
                 RingSlot(output.detach().clone(), source_id, text, pinned=pin,
-                         h=h, slot_type=slot_type)
+                         h=h, h_pre=h_pre, u=u, slot_type=slot_type)
             )
         return result
 

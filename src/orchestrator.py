@@ -182,6 +182,7 @@ class PonderOrchestrator:
         strm_salience: bool = False,
         salience_thresholds=None,
         identity_instance: bool = False,
+        capture_pre_state: bool = False,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -323,6 +324,7 @@ class PonderOrchestrator:
         self.working_memory = WorkingMemory(
             backbone, embedder=embedder, decay_alpha=config.working_memory.decay_alpha,
             ring_capacity=ring_capacity, identity_instance=identity_instance,
+            capture_pre_state=capture_pre_state,
         )
         self.ssm_chunker = SSMChunker(backbone, embedder, config)
         self.presentation_gate = PresentationGate(config, embedder)

@@ -241,3 +241,134 @@ def test_per_kind_full_zero_init_unmatched_kind():
     # The in-range rows still route correctly.
     assert torch.allclose(ro.kind_readouts[0](x[:1]), out[:1], atol=1e-6)
     assert torch.allclose(ro.kind_readouts[1](x[2:3]), out[2:3], atol=1e-6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1f-7 Stage 2 #6: per_kind_bodies arch (per-kind bodies + shared head).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_per_kind_bodies_keys():
+    """per_kind_bodies builds N bodies + ONE shared head; no body/kind_heads/net."""
+    ro = StateReadout(dim_in=DEFAULT_DIM_IN, hidden=128, n_doc_kinds=3,
+                     per_kind_bodies=True)
+    assert _prefixes(ro) == [
+        "head",
+        "kind_bodies.0.0",
+        "kind_bodies.1.0",
+        "kind_bodies.2.0",
+    ]
+    assert ro.n_doc_kinds == 3
+    assert ro.per_kind_bodies is True
+    assert ro.per_kind_full is False
+    # No shared-body / kind_heads / kind_readouts / net params.
+    assert not hasattr(ro, "body")
+    assert not hasattr(ro, "kind_heads")
+    assert not hasattr(ro, "kind_readouts")
+    assert not hasattr(ro, "net")
+
+
+def test_per_kind_bodies_routing():
+    """A doc_kinds tensor routes each row through its kind body then the shared head."""
+    ro = StateReadout(dim_in=DEFAULT_DIM_IN, hidden=128, n_doc_kinds=3,
+                     per_kind_bodies=True)
+    x = torch.randn(6, DEFAULT_DIM_IN)
+    dk = torch.tensor([0, 0, 1, 1, 2, 2])
+    out = ro(x, doc_kinds=dk)
+    assert out.shape == (6, 384)
+    # Each kind's rows == its body -> the SHARED head (the head is shared/linear,
+    # so per-slice application == routing all rows through body+head).
+    assert torch.allclose(ro.head(ro.kind_bodies[0](x[:2])), out[:2], atol=1e-6)
+    assert torch.allclose(ro.head(ro.kind_bodies[1](x[2:4])), out[2:4], atol=1e-6)
+    assert torch.allclose(ro.head(ro.kind_bodies[2](x[4:])), out[4:], atol=1e-6)
+
+
+def test_per_kind_bodies_round_trip_infers():
+    """from_state_dict infers per_kind_bodies + n_doc_kinds from the keys."""
+    ro = StateReadout(dim_in=DEFAULT_DIM_IN, hidden=128, n_doc_kinds=3,
+                     per_kind_bodies=True)
+    x = torch.randn(6, DEFAULT_DIM_IN)
+    dk = torch.tensor([0, 0, 1, 1, 2, 2])
+    out = ro(x, doc_kinds=dk)
+    rebuilt = StateReadout.from_state_dict(ro.state_dict(), dim_in=DEFAULT_DIM_IN)
+    assert rebuilt.per_kind_bodies is True
+    assert rebuilt.per_kind_full is False
+    assert rebuilt.n_doc_kinds == 3
+    assert torch.allclose(rebuilt(x, doc_kinds=dk), out, atol=1e-6)
+
+
+def test_per_kind_bodies_requires_n_doc_kinds_and_hidden():
+    """per_kind_bodies=True with n_doc_kinds=0 or hidden=None raises ValueError."""
+    try:
+        StateReadout(dim_in=DEFAULT_DIM_IN, hidden=128, n_doc_kinds=0,
+                     per_kind_bodies=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("per_kind_bodies with n_doc_kinds=0 should raise")
+    try:
+        StateReadout(dim_in=DEFAULT_DIM_IN, hidden=None, n_doc_kinds=3,
+                     per_kind_bodies=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("per_kind_bodies with hidden=None should raise")
+
+
+def test_composite_per_kind_bodies_round_trip():
+    """CompositeZHead per_kind_bodies routes + round-trips through from_state_dict."""
+    c = CompositeZHead(dim_in=DEFAULT_DIM_IN, hidden=128, n_doc_kinds=3,
+                      per_kind_bodies=True)
+    assert c.per_kind_bodies is True
+    assert c.per_kind_full is False
+    sy = torch.zeros(6, c.slot_dim)
+    sig = torch.randn(6, DEFAULT_DIM_IN)
+    q = torch.randn(384)
+    dk = torch.tensor([0, 0, 1, 1, 2, 2])
+    out = c.logits(sy, sig, q, slot_doc_kinds=dk)
+    # Matches the per-kind readout routed manually (bodies -> shared head).
+    z_i = c.readout(sig, doc_kinds=dk)
+    assert torch.allclose(out, c.z_head.logits(sy, z_i, q), atol=1e-6)
+    # Round-trip via from_state_dict (infers per_kind_bodies=True from keys).
+    c2 = CompositeZHead.from_state_dict(c.state_dict(), dim_in=DEFAULT_DIM_IN)
+    assert c2.per_kind_bodies is True
+    assert c2.per_kind_full is False
+    assert c2.n_doc_kinds == 3
+    assert torch.allclose(c2.logits(sy, sig, q, slot_doc_kinds=dk), out, atol=1e-6)
+
+
+def test_per_kind_bodies_zero_init_unmatched_kind():
+    """An out-of-[0,n) doc_kind yields ZERO rows (new_zeros guard), not garbage."""
+    ro = StateReadout(dim_in=DEFAULT_DIM_IN, hidden=128, n_doc_kinds=3,
+                     per_kind_bodies=True)
+    x = torch.randn(4, DEFAULT_DIM_IN)
+    # kind=5 / kind=99 are out of [0,3) -> those rows stay zero (no body owns them).
+    dk = torch.tensor([0, 5, 1, 99])
+    out = ro(x, doc_kinds=dk)
+    assert torch.allclose(out[1], torch.zeros(384))
+    assert torch.allclose(out[3], torch.zeros(384))
+    # The in-range rows still route through their kind body -> shared head.
+    assert torch.allclose(ro.head(ro.kind_bodies[0](x[:1])), out[:1], atol=1e-6)
+    assert torch.allclose(ro.head(ro.kind_bodies[1](x[2:3])), out[2:3], atol=1e-6)
+
+
+def test_per_kind_bodies_distinct_from_moe_and_shared_body():
+    """A per_kind_bodies state_dict is NOT mis-detected as per_kind_full/shared-body."""
+    ro = StateReadout(dim_in=DEFAULT_DIM_IN, hidden=128, n_doc_kinds=3,
+                     per_kind_bodies=True)
+    sd = ro.state_dict()
+    # The per_kind_bodies namespace is disjoint from the other two per-kind
+    # namespaces -- no kind_readouts.* / kind_heads.* / body.0.* keys present.
+    assert not any(k.startswith("kind_readouts.") for k in sd)
+    assert not any(k.startswith("kind_heads.") for k in sd)
+    assert not any(k.startswith("body.") for k in sd)
+    rebuilt = StateReadout.from_state_dict(sd, dim_in=DEFAULT_DIM_IN)
+    assert rebuilt.per_kind_bodies is True
+    assert rebuilt.per_kind_full is False
+    assert rebuilt.n_doc_kinds == 3
+    # Composite-level inference is likewise distinct.
+    c = CompositeZHead(dim_in=DEFAULT_DIM_IN, hidden=128, n_doc_kinds=3,
+                      per_kind_bodies=True)
+    c2 = CompositeZHead.from_state_dict(c.state_dict(), dim_in=DEFAULT_DIM_IN)
+    assert c2.per_kind_bodies is True
+    assert c2.per_kind_full is False
