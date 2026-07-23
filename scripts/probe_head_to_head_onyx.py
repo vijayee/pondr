@@ -466,7 +466,9 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                 cosine_schedule: bool = False,
                 margin_loss: float = 0.0, hard_negative: bool = False,
                 n_doc_kinds: int = 0, kind_head_wd: float = 0.0,
-                per_kind_full: bool = False) -> dict:
+                per_kind_full: bool = False,
+                class_balanced_gold: bool = False,
+                per_kind_loss_weight: bool = False) -> dict:
     """Train one head (bilinear OR transformer) on the train sessions with the
     SAME contrastive InfoNCE loss. Mirrors ``p44._train_contrastive`` but is
     generic over the head arch. Uses ``evaluate_relevance`` on the train-internal
@@ -544,6 +546,73 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
           f"(held-out: {len(val)} turns from {len({_session_of(r) for r in val})} "
           f"unseen sessions)", flush=True)
 
+    # Phase 1f-7 Stage 2 (DeepSeek #1): class-balanced per-record sampling weights
+    # on the SHARED readout. Upweight minority gold kinds (code/text) and downweight
+    # conv so each kind contributes ~equally per epoch -- fixes the conv-majority-
+    # dominated shared-body root cause WITHOUT per-kind decomposition, preserving
+    # the cross-kind logit space. weights = 1 / count(gold_doc_kind) over train_q.
+    # The epoch loop uses a WeightedRandomSampler(weights, len(train_q), replace=True)
+    # instead of a uniform shuffle. Default off (class_balanced_gold=False) =
+    # uniform shuffle = byte-identical 1f-6. valq (held-out) is NEVER reweighted.
+    sampler_weights = None
+    if class_balanced_gold:
+        cb_counts = {DOC_KIND_CONV: 0, DOC_KIND_TEXT: 0, DOC_KIND_CODE: 0}
+        for r in train_q:
+            cb_counts[int(r.get("gold_doc_kind", DOC_KIND_CONV))] += 1
+        inv = {k: (1.0 / cb_counts[k] if cb_counts[k] > 0 else 0.0)
+               for k in cb_counts}
+        w = [inv[int(r.get("gold_doc_kind", DOC_KIND_CONV))] for r in train_q]
+        sampler_weights = torch.tensor(w, dtype=torch.double)
+        print(f"  --class-balanced-gold: train gold-kind counts "
+              f"conv={cb_counts[DOC_KIND_CONV]}/text={cb_counts[DOC_KIND_TEXT]}/"
+              f"code={cb_counts[DOC_KIND_CODE]} -> per-record weight "
+              f"conv={inv[DOC_KIND_CONV]:.4f}/text={inv[DOC_KIND_TEXT]:.4f}/"
+              f"code={inv[DOC_KIND_CODE]:.4f} (WeightedRandomSampler, "
+              f"{len(train_q)} samples/epoch w/ replacement)", flush=True)
+
+    # Phase 1f-7 Stage 2 (DeepSeek #2): per-kind inverse-frequency LOSS weighting
+    # on the SHARED readout. Same per-kind BALANCE as the sampler (each kind
+    # contributes equally to the loss) but UNIFORM sampling: every record is
+    # seen exactly once/epoch, NO replacement. Per-record loss weight =
+    # 1/count(gold_doc_kind), normalized to mean 1.0 so the effective lr/loss
+    # scale is unchanged -- only the per-record gradient RATIO shifts (code
+    # ~3.6x conv per record).
+    #
+    # RESULT (recorded negative, [[pondr-strm-phase1f7-stage2-lossweight-fail]]):
+    # this COLLAPSES training under AdamW -- all 3 seeds/both archs stuck at the
+    # margin-loss ceiling (train_loss ~2.495, top3 ~0.27) from ~epoch 5, r_pos
+    # -> 0.03 (degenerate anti-correlated ranking). Root: per-record loss
+    # SCALING fights AdamW's adaptive moments -- the running first/second
+    # moments MIX gradients scaled by different per-record weights (0.57x conv
+    # to 2.0x code), and the eps + bias-correction terms break the per-step
+    # scale invariance AdamW normally provides, so the optimizer is pushed to a
+    # degenerate fixed point. This is WORSE than the sampler (#1), which kept
+    # each step's loss at scale 1.0 (only the record MIX changed) and so trained
+    # normally in-sample (top3 ~0.65) -- the sampler is the AdamW-clean
+    # rebalancing mechanism; loss-weighting is not. Default off
+    # (per_kind_loss_weight=False) = unweighted loss = byte-identical 1f-6.
+    record_loss_weights = None
+    if per_kind_loss_weight:
+        lw_counts = {DOC_KIND_CONV: 0, DOC_KIND_TEXT: 0, DOC_KIND_CODE: 0}
+        for r in train_q:
+            lw_counts[int(r.get("gold_doc_kind", DOC_KIND_CONV))] += 1
+        inv_lw = {k: (1.0 / lw_counts[k] if lw_counts[k] > 0 else 0.0)
+                  for k in lw_counts}
+        raw = torch.tensor(
+            [inv_lw[int(r.get("gold_doc_kind", DOC_KIND_CONV))] for r in train_q],
+            dtype=torch.double)
+        mean_w = float(raw.mean()) if raw.numel() else 1.0
+        if mean_w <= 0.0:
+            mean_w = 1.0
+        record_loss_weights = (raw / mean_w).to(torch.float32)
+        print(f"  --per-kind-loss-weight: train gold-kind counts "
+              f"conv={lw_counts[DOC_KIND_CONV]}/text={lw_counts[DOC_KIND_TEXT]}/"
+              f"code={lw_counts[DOC_KIND_CODE]} -> normalized per-record loss "
+              f"weight (mean=1.0) conv={inv_lw[DOC_KIND_CONV]/mean_w:.3f}/"
+              f"text={inv_lw[DOC_KIND_TEXT]/mean_w:.3f}/"
+              f"code={inv_lw[DOC_KIND_CODE]/mean_w:.3f} (uniform sampling, no "
+              f"replacement -> preserves text 30.16)", flush=True)
+
     rng = random.Random(seed)
     best_score: tuple | None = None
     best_pc: dict | None = None
@@ -577,8 +646,18 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
 
     for epoch in range(epochs):
         head.train()
-        order = list(range(len(train_q)))
-        rng.shuffle(order)
+        if sampler_weights is not None:
+            # Class-balanced: sample len(train_q) records WITH replacement, weighted
+            # by inverse gold-kind frequency. Per-epoch generator seeded by
+            # (seed, epoch) for determinism (reproducible across reruns).
+            gen = torch.Generator().manual_seed(seed * 100003 + epoch)
+            sampler = torch.utils.data.WeightedRandomSampler(
+                sampler_weights, num_samples=len(train_q),
+                replacement=True, generator=gen)
+            order = list(sampler)
+        else:
+            order = list(range(len(train_q)))
+            rng.shuffle(order)
         total_loss = 0.0
         n_steps = 0
         optimizer.zero_grad()
@@ -630,6 +709,14 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
             else:
                 loss = p44.contrastive_loss(logits, gold, temperature,
                                             label_smoothing=label_smoothing) / accum
+            # Phase 1f-7 Stage 2 #2: scale this record's loss by its normalized
+            # inverse-frequency weight (uniform sampling preserved). Applied
+            # AFTER the /accum so the per-step gradient keeps the per-record ratio
+            # and the accumulated-batch mean stays 1.0. ``qi`` is the train_q index
+            # the sampler/shuffle selected for this step -> matches the weight
+            # tensor's index space. Byte-identical when record_loss_weights is None.
+            if record_loss_weights is not None:
+                loss = loss * float(record_loss_weights[qi])
             loss.backward()
             total_loss += float(loss.item()) * accum
             n_steps += 1
@@ -740,7 +827,9 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
               select_ckpt: str = "best",
               margin_loss: float = 0.0, hard_negative: bool = False,
               n_doc_kinds: int = 0, kind_head_wd: float = 0.0,
-              per_kind_full: bool = False) -> dict:
+              per_kind_full: bool = False,
+              class_balanced_gold: bool = False,
+              per_kind_loss_weight: bool = False) -> dict:
     """Train one arch (one seed), eval on held-out sessions + all-turns ceiling
     + (D0.4a) the live-eval bucket (the 2 live-transcript sessions, held OUT of
     train for every seed -> the genuinely-held-out conversation-ring gap).
@@ -761,7 +850,9 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
                     cosine_schedule=cosine_schedule,
                     margin_loss=margin_loss, hard_negative=hard_negative,
                     n_doc_kinds=n_doc_kinds, kind_head_wd=kind_head_wd,
-                    per_kind_full=per_kind_full)
+                    per_kind_full=per_kind_full,
+                    class_balanced_gold=class_balanced_gold,
+                    per_kind_loss_weight=per_kind_loss_weight)
     ckpt_path = r["ckpt_final"] if select_ckpt == "final" else r["ckpt_best"]
     r["select_ckpt"] = select_ckpt
     r["ckpt"] = ckpt_path
@@ -914,6 +1005,35 @@ def main() -> int:
                         "only win per kind). Implies --n-doc-kinds 3. Serve routes "
                         "per-slot (unchanged). Default off = byte-identical shared "
                         "readout (old final.pt strict-loads).")
+    p.add_argument("--class-balanced-gold", action="store_true",
+                   help="Phase 1f-7 Stage 2 (DeepSeek consult #1, the cross-kind-gate "
+                        "fix): inverse-frequency per-record sampling on the SHARED "
+                        "readout (n_doc_kinds=0). Upweights minority gold kinds (code "
+                        "143 / text 229) and downweights conv (562) so each kind "
+                        "contributes ~equally per epoch -- fixes the conv-majority-"
+                        "dominated shared-body root cause WITHOUT per-kind "
+                        "decomposition, preserving the cross-kind logit space that "
+                        "MoE/Stage 1 broke (the all-turns 0.000 ceiling). Uses a "
+                        "WeightedRandomSampler over train records weighted by 1/count "
+                        "of the record's gold-doc-kind. Requires --drop-self-slot + "
+                        "--doc-store (stamps gold_doc_kind). Default off = uniform "
+                        "shuffle = byte-identical 1f-6.")
+    p.add_argument("--per-kind-loss-weight", action="store_true",
+                   help="Phase 1f-7 Stage 2 (DeepSeek consult #2): per-record inverse-"
+                        "frequency LOSS weighting on the SHARED readout (n_doc_kinds=0). "
+                        "Same per-kind BALANCE as --class-balanced-gold (each kind "
+                        "contributes equally to the loss) but UNIFORM sampling -- every "
+                        "record seen once/epoch, no replacement. Per-record loss weight = "
+                        "1/count(gold_doc_kind), normalized to mean 1.0. RECORDED NEGATIVE "
+                        "RESULT: this COLLAPSES training under AdamW (all seeds/both archs "
+                        "stuck at the margin-loss ceiling, top3 ~0.27, r_pos -> 0.03 from "
+                        "~epoch 5) -- per-record loss scaling fights AdamW's adaptive "
+                        "moments (running-moment mixing + eps break the per-step scale "
+                        "invariance). The sampler (#1, scale-1.0 steps) is the AdamW-clean "
+                        "mechanism; this flag is kept for reproducibility of the negative "
+                        "result, not for production. Requires --drop-self-slot + --doc-store "
+                        "(stamps gold_doc_kind). Default off = uniform shuffle + unweighted "
+                        "loss = byte-identical 1f-6.")
     p.add_argument("--out", default=DEFAULT_OUT)
     args = p.parse_args()
 
@@ -941,6 +1061,20 @@ def main() -> int:
     # text-doc -> 1 (DOC_KIND_TEXT), code-doc -> 2 (DOC_KIND_CODE). Default off
     # (n_doc_kinds=0) = byte-identical (no stamped field, shared readout).
     #
+    # Phase 1f-7 Stage 2: the three gold-kind mechanisms are MUTUALLY EXCLUSIVE
+    # alternative variants of the same idea (they all stamp gold_doc_kind and
+    # rebalance/route). --per-kind-data-isolation is a different ARCH (MoE
+    # n_doc_kinds=3); --class-balanced-gold / --per-kind-loss-weight are training
+    # variants on the SHARED readout (n_doc_kinds=0). Combining them double-
+    # rebalances or mixes arches -- prevent it.
+    n_rebalance = sum([args.per_kind_data_isolation, args.class_balanced_gold,
+                      args.per_kind_loss_weight])
+    if n_rebalance > 1:
+        print("ERROR: --per-kind-data-isolation / --class-balanced-gold / "
+              "--per-kind-loss-weight are mutually exclusive (alternative variants "
+              "of the same gold-kind rebalance; pick one).", file=sys.stderr)
+        return 1
+
     # Phase 1f-7 Stage 1 REDESIGN (--per-kind-data-isolation): the MoE arch
     # needs n_doc_kinds=3 (one full readout per kind); imply it when the flag is
     # on so the user doesn't have to pass both. --doc-store is still required
@@ -992,31 +1126,38 @@ def main() -> int:
                  "(multi-positive InfoNCE gold)" if args.multi_positive_margin > 0
                  else " | single top-1-cos gold"), flush=True)
 
-    # Phase 1f-7 Stage 1 REDESIGN (--per-kind-data-isolation): stamp the GOLD
-    # slot's doc-kind index on every record so the trainer can route ALL slots of
-    # a record through the GOLD's readout (by-GOLD-kind train routing = within-one-
-    # head margin loss = well-defined, gradient into one readout = non-overlapping
-    # data, mirroring Stage 0's code-only win per kind). Gold = labels.argmax() ->
-    # source_ids[idx] -> _gold_doc_kind; mapped code->2 / text->1 / conv/None->0.
-    # This MUST run AFTER --drop-self-slot: drop_self_slot re-derives gold over the
-    # PRIOR slots (the self-slot cos~1.0 was the trivial gold before, and the
-    # self-slot is never a doc -- its kind would be conv=0, routing every record
-    # to the conv readout, defeating the point). So require --drop-self-slot.
-    # doc_kind_map is already built above (the flag implies --n-doc-kinds 3 ->
-    # --doc-store). Default off = no stamped field = byte-identical.
-    if args.per_kind_data_isolation:
+    # Phase 1f-7 Stage 1 REDESIGN + Stage 2: stamp the GOLD slot's doc-kind index
+    # on every record. Used by THREE orthogonal mechanisms that all need the gold's
+    # kind per record:
+    # - --per-kind-data-isolation: by-GOLD-kind train routing (MoE per_kind_full)
+    #   = within-one-head margin loss = non-overlapping data per kind.
+    # - --class-balanced-gold: inverse-frequency per-record SAMPLING weights
+    #   (upweight minority code/text gold, downweight conv) on the SHARED readout
+    #   = fixes the conv-majority-dominated shared-body root cause WITHOUT per-kind
+    #   decomposition, preserving the cross-kind logit space (DeepSeek #1).
+    # - --per-kind-loss-weight: same balance as #1 but via per-record LOSS weights
+    #   (uniform sampling preserved) = the stable variant, preserves text 30.16
+    #   (DeepSeek #2).
+    # Gold = labels.argmax() -> source_ids[idx] -> _gold_doc_kind; mapped
+    # code->2 / text->1 / conv/None->0. MUST run AFTER --drop-self-slot (gold =
+    # prior doc, never the cos~1.0 self-slot, which is conv=0 and would route/
+    # weight every record as conv). doc_kind_map built from --doc-store. Default
+    # off = no stamped field = byte-identical.
+    if args.per_kind_data_isolation or args.class_balanced_gold \
+            or args.per_kind_loss_weight:
         if not args.drop_self_slot:
-            print("ERROR: --per-kind-data-isolation requires --drop-self-slot "
-                  "(the gold slot must be a prior doc, never the cos~1.0 self-slot; "
-                  "otherwise every record routes to the conv readout).",
-                  file=sys.stderr)
+            print("ERROR: --per-kind-data-isolation/--class-balanced-gold/"
+                  "--per-kind-loss-weight require --drop-self-slot (the gold slot "
+                  "must be a prior doc, never the cos~1.0 self-slot, which is conv=0 "
+                  "and would route/weight every record as conv).", file=sys.stderr)
+            return 1
+        if not args.doc_store:
+            print("ERROR: --per-kind-data-isolation/--class-balanced-gold/"
+                  "--per-kind-loss-weight require --doc-store (the doc_id -> kind "
+                  "map for the gold-kind stamp).", file=sys.stderr)
             return 1
         if doc_kind_map is None:
-            # Defensive: the flag implies --n-doc-kinds 3 -> --doc-store, which
-            # builds doc_kind_map above. Reach here only if both were unset.
-            print("ERROR: --per-kind-data-isolation needs --doc-store (the doc_id "
-                  "-> kind map for the gold-kind stamp).", file=sys.stderr)
-            return 1
+            doc_kind_map = _build_doc_kind_map_cached(args.doc_store, args.onyx)
         gold_counts = {DOC_KIND_CONV: 0, DOC_KIND_TEXT: 0, DOC_KIND_CODE: 0}
         for rec in records:
             gk_str = _gold_doc_kind(rec, doc_kind_map)
@@ -1028,11 +1169,21 @@ def main() -> int:
                 gk = DOC_KIND_CONV
             rec["gold_doc_kind"] = gk
             gold_counts[gk] += 1
-        print(f"  --per-kind-data-isolation: stamped gold_doc_kind on "
-              f"{len(records)} records -> conv={gold_counts[DOC_KIND_CONV]} / "
-              f"text={gold_counts[DOC_KIND_TEXT]} / "
-              f"code={gold_counts[DOC_KIND_CODE]} (each readout trains ONLY on "
-              f"its kind's gold = non-overlapping data)", flush=True)
+        if args.per_kind_data_isolation:
+            tag = "--per-kind-data-isolation: by-gold routing"
+            suffix = (" (each readout trains ONLY on its kind's gold = "
+                      "non-overlapping)")
+        elif args.class_balanced_gold:
+            tag = "--class-balanced-gold: inverse-freq sampling"
+            suffix = (" (upweight code/text, downweight conv -> shared-readout "
+                      "fix)")
+        else:
+            tag = "--per-kind-loss-weight: inverse-freq loss weight"
+            suffix = (" (uniform sampling, per-record loss weight -> stable "
+                      "shared-readout fix)")
+        print(f"  {tag}: stamped gold_doc_kind on {len(records)} records -> "
+              f"conv={gold_counts[DOC_KIND_CONV]} / text={gold_counts[DOC_KIND_TEXT]} "
+              f"/ code={gold_counts[DOC_KIND_CODE]}{suffix}", flush=True)
     # Stage 0 diagnostic: filter to records whose GOLD slot is a CODE doc. Gold
     # is the argmax-labels prior slot, so this MUST run AFTER --drop-self-slot
     # (the self-slot is never a doc) and requires --drop-self-slot. The doc_id ->
@@ -1107,7 +1258,9 @@ def main() -> int:
                 hard_negative=args.hard_negative,
                 n_doc_kinds=args.n_doc_kinds,
                 kind_head_wd=args.kind_head_wd,
-                per_kind_full=args.per_kind_data_isolation))
+                per_kind_full=args.per_kind_data_isolation,
+                class_balanced_gold=args.class_balanced_gold,
+                per_kind_loss_weight=args.per_kind_loss_weight))
 
     # ── Phase 1d ensemble (logit-avg of the per-seed selected ckpts) ──
     # The live_eval bucket is the same 2 live-transcript sessions held OUT of
