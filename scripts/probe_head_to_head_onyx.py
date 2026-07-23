@@ -419,7 +419,8 @@ def _session_split(records: list[dict], val_fraction: float, seed: int,
 # ── the contrastive training loop (generic over Head A / Head B) ──
 
 def margin_ranking_loss(logits: Tensor, gold_mask: Tensor, margin: float,
-                        hard_negative: bool = False) -> Tensor:
+                        hard_negative: bool = False,
+                        neg_mask: Tensor | None = None) -> Tensor:
     """Pairwise hinge margin loss that DIRECTLY optimizes the z_logit gate.
 
     ``L = mean_{g in gold, f in filler} relu(margin - (logit_g - logit_f))``.
@@ -444,13 +445,37 @@ def margin_ranking_loss(logits: Tensor, gold_mask: Tensor, margin: float,
     gradient on the most-violated pair per gold (the filler the head is most
     tempted to rank above the gold) instead of averaging over easy, already-
     satisfied pairs. 0 if no gold or no filler.
+
+    ``neg_mask`` (Phase 1f-7 Stage 2 #3, code hard-neg mining, DeepSeek's
+    highest-leverage step): an optional boolean mask over slots restricting which
+    non-gold slots are ELIGIBLE fillers. When provided, ``f`` is drawn from
+    ``(~gold_mask) & neg_mask`` instead of ``~gold_mask``. For a code-gold record
+    passing ``neg_mask = (slot_doc_kinds == DOC_KIND_CODE)``, the hardest filler is
+    forced to be a CODE slot -- the hinge pushes the code gold above the highest-
+    scoring code FILLER specifically, teaching code-vs-code separation (the exact
+    1f-6 code mis-ranking failure mode: code gold and code fillers both score
+    high -> no gap). AdamW-clean (a loss-STRUCTURE change, not gradient
+    weighting). ``None`` = all non-gold slots eligible = byte-identical.
     """
     if gold_mask.sum() == 0:
-        return logits.new_zeros(())
+        # Grad-safe zero: ``logits.new_zeros(())`` has no grad_fn, so
+        # ``loss.backward()`` in the train loop would raise ("element 0 of
+        # tensors does not require grad"). ``logits.sum() * 0.0`` returns
+        # exactly 0.0 with a grad_fn that propagates a ZERO gradient -- the
+        # empty-filler record contributes nothing but the backward pass
+        # succeeds. Phase 1f-7 Stage 2 #3 (code hard-neg): the
+        # ``f.numel() == 0`` branch below is now reachable for the ~3/143
+        # code-gold records whose ring has NO other code filler (the mask
+        # empties the pool). In 1f-6 (no neg_mask) this path is never hit
+        # (every record has >=1 gold and >=2 fillers) -> byte-identical.
+        return logits.sum() * 0.0
     g = logits[gold_mask]                       # [n_gold]
-    f = logits[~gold_mask]                      # [n_fill]
+    fill_mask = ~gold_mask
+    if neg_mask is not None:
+        fill_mask = fill_mask & neg_mask
+    f = logits[fill_mask]                        # [n_fill]
     if f.numel() == 0:
-        return logits.new_zeros(())
+        return logits.sum() * 0.0
     if hard_negative:
         hardest = f.max()
         return torch.relu(margin - (g - hardest)).mean()
@@ -468,7 +493,8 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
                 n_doc_kinds: int = 0, kind_head_wd: float = 0.0,
                 per_kind_full: bool = False,
                 class_balanced_gold: bool = False,
-                per_kind_loss_weight: bool = False) -> dict:
+                per_kind_loss_weight: bool = False,
+                code_hard_neg: bool = False) -> dict:
     """Train one head (bilinear OR transformer) on the train sessions with the
     SAME contrastive InfoNCE loss. Mirrors ``p44._train_contrastive`` but is
     generic over the head arch. Uses ``evaluate_relevance`` on the train-internal
@@ -703,9 +729,36 @@ def _train_head(arch: str, train: list[dict], val: list[dict], hidden: int | Non
             else:
                 logits = head.logits(slot_y, z_flat, q).squeeze(-1)   # [K]
             gold = labels > 0
+            # Phase 1f-7 Stage 2 #3 (DeepSeek #1): code hard-neg mining. For
+            # code-gold records, RESTRICT the margin-hinge negatives to CODE
+            # filler slots (neg_mask = slot_doc_kinds == DOC_KIND_CODE). This
+            # forces the hardest negative to be a code slot, directly teaching
+            # code-vs-code separation -- the 1f-6 code mis-rank failure (code
+            # gold + code fillers both scoring high -> no gap). AdamW-CLEAN: a
+            # loss-STRUCTURE change (which negatives are in the hinge), NOT a
+            # gradient-weight change -- each step's loss stays at scale 1.0, so
+            # AdamW's running moments behave normally (unlike #2 loss-weighting,
+            # which collapsed). Text/conv-gold records keep an unrestricted
+            # hinge (neg_mask=None) so the text 30.16 direction is untouched.
+            # Only valid for the shared readout (n_doc_kinds=0): per-slot kinds
+            # are stamped for the mask even though the head does not route on
+            # them (slot_doc_kinds is stamped in main when code_hard_neg is on).
+            neg_mask = None
+            if code_hard_neg and int(rec.get("gold_doc_kind", DOC_KIND_CONV)) == DOC_KIND_CODE:
+                sdk = rec.get("slot_doc_kinds")
+                if sdk is not None:
+                    # ``slot_doc_kinds`` is stamped in ``main`` AFTER
+                    # ``_to_device`` -> it stays on CPU even when
+                    # ``args.device`` is CUDA (the MoE/n_doc_kinds>0 path hides
+                    # this by ``dk.to(dev)`` at the logits call, which does not
+                    # touch the stored field). Build the mask on the logits'
+                    # device so the ``& gold_mask`` + ``logits[fill_mask]``
+                    # index stay co-located.
+                    neg_mask = (sdk.to(logits.device) == DOC_KIND_CODE)
             if margin_loss > 0.0:
                 loss = margin_ranking_loss(logits, gold, margin_loss,
-                                           hard_negative=hard_negative) / accum
+                                           hard_negative=hard_negative,
+                                           neg_mask=neg_mask) / accum
             else:
                 loss = p44.contrastive_loss(logits, gold, temperature,
                                             label_smoothing=label_smoothing) / accum
@@ -829,7 +882,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
               n_doc_kinds: int = 0, kind_head_wd: float = 0.0,
               per_kind_full: bool = False,
               class_balanced_gold: bool = False,
-              per_kind_loss_weight: bool = False) -> dict:
+              per_kind_loss_weight: bool = False,
+              code_hard_neg: bool = False) -> dict:
     """Train one arch (one seed), eval on held-out sessions + all-turns ceiling
     + (D0.4a) the live-eval bucket (the 2 live-transcript sessions, held OUT of
     train for every seed -> the genuinely-held-out conversation-ring gap).
@@ -852,7 +906,8 @@ def _run_arch(arch: str, train: list[dict], val: list[dict],
                     n_doc_kinds=n_doc_kinds, kind_head_wd=kind_head_wd,
                     per_kind_full=per_kind_full,
                     class_balanced_gold=class_balanced_gold,
-                    per_kind_loss_weight=per_kind_loss_weight)
+                    per_kind_loss_weight=per_kind_loss_weight,
+                    code_hard_neg=code_hard_neg)
     ckpt_path = r["ckpt_final"] if select_ckpt == "final" else r["ckpt_best"]
     r["select_ckpt"] = select_ckpt
     r["ckpt"] = ckpt_path
@@ -1034,6 +1089,21 @@ def main() -> int:
                         "result, not for production. Requires --drop-self-slot + --doc-store "
                         "(stamps gold_doc_kind). Default off = uniform shuffle + unweighted "
                         "loss = byte-identical 1f-6.")
+    p.add_argument("--code-hard-neg", action="store_true",
+                   help="Phase 1f-7 Stage 2 #3 (DeepSeek reconsult, highest-leverage): "
+                        "for code-gold records, force the hardest negative to be a CODE "
+                        "filler (restrict the margin-hinge fillers to code-kind non-gold "
+                        "slots). Teaches code-vs-code separation -- the exact 1f-6 code "
+                        "mis-ranking failure mode (code gold and code fillers both score "
+                        "high -> no gap). AdamW-CLEAN (a loss-STRUCTURE change, not "
+                        "gradient weighting -- unlike --per-kind-loss-weight which "
+                        "collapsed under AdamW). Leaves text-gold and conv-gold records "
+                        "untouched (their hard-neg is still the hardest filler overall) "
+                        "-> preserves text 30.16. Implies --hard-negative; requires "
+                        "--margin-loss > 0, --drop-self-slot, --doc-store (stamps "
+                        "slot_doc_kinds + gold_doc_kind). Runs on the SHARED readout "
+                        "(n_doc_kinds=0, unbalanced -- no sampler). Default off = "
+                        "byte-identical 1f-6.")
     p.add_argument("--out", default=DEFAULT_OUT)
     args = p.parse_args()
 
@@ -1061,19 +1131,47 @@ def main() -> int:
     # text-doc -> 1 (DOC_KIND_TEXT), code-doc -> 2 (DOC_KIND_CODE). Default off
     # (n_doc_kinds=0) = byte-identical (no stamped field, shared readout).
     #
-    # Phase 1f-7 Stage 2: the three gold-kind mechanisms are MUTUALLY EXCLUSIVE
-    # alternative variants of the same idea (they all stamp gold_doc_kind and
-    # rebalance/route). --per-kind-data-isolation is a different ARCH (MoE
-    # n_doc_kinds=3); --class-balanced-gold / --per-kind-loss-weight are training
-    # variants on the SHARED readout (n_doc_kinds=0). Combining them double-
-    # rebalances or mixes arches -- prevent it.
+    # Phase 1f-7 Stage 2: the gold-kind mechanisms are MUTUALLY EXCLUSIVE -- pick
+    # ONE per run (they stamp overlapping fields and combining double-rebalances,
+    # mixes arches, or layers loss changes untested together). --per-kind-data-
+    # isolation is a different ARCH (MoE n_doc_kinds=3); --class-balanced-gold /
+    # --per-kind-loss-weight are data/loss variants on the SHARED readout
+    # (n_doc_kinds=0); --code-hard-neg is a loss-STRUCTURE variant on the SHARED
+    # readout (DeepSeek's ladder step 1, run ALONE on unbalanced 1f-6).
     n_rebalance = sum([args.per_kind_data_isolation, args.class_balanced_gold,
-                      args.per_kind_loss_weight])
+                      args.per_kind_loss_weight, args.code_hard_neg])
     if n_rebalance > 1:
         print("ERROR: --per-kind-data-isolation / --class-balanced-gold / "
-              "--per-kind-loss-weight are mutually exclusive (alternative variants "
-              "of the same gold-kind rebalance; pick one).", file=sys.stderr)
+              "--per-kind-loss-weight / --code-hard-neg are mutually exclusive "
+              "(alternative variants of the gold-kind fix; pick one per run).",
+              file=sys.stderr)
         return 1
+
+    # Phase 1f-7 Stage 2 #3 (--code-hard-neg): implies --hard-negative (the
+    # code-restricted filler only matters under the hardest-filler hinge) and
+    # requires --margin-loss > 0 (it is a margin-loss technique), --drop-self-slot
+    # (gold = prior doc, never the self-slot), and --doc-store (the per-slot
+    # kind map for the code-filler mask + the gold-kind stamp).
+    if args.code_hard_neg:
+        if args.margin_loss <= 0.0:
+            print("ERROR: --code-hard-neg requires --margin-loss > 0 (it restricts "
+                  "the margin-hinge fillers; the InfoNCE path has no filler mask).",
+                  file=sys.stderr)
+            return 1
+        if not args.hard_negative:
+            args.hard_negative = True
+            print("  --code-hard-neg: implied --hard-negative (the code-restricted "
+                  "filler is the hardest CODE slot)", flush=True)
+        if not args.drop_self_slot:
+            print("ERROR: --code-hard-neg requires --drop-self-slot (the gold slot "
+                  "must be a prior doc, never the cos~1.0 self-slot).",
+                  file=sys.stderr)
+            return 1
+        if not args.doc_store:
+            print("ERROR: --code-hard-neg requires --doc-store (the doc_id -> kind "
+                  "map for the per-slot code-filler mask + the gold-kind stamp).",
+                  file=sys.stderr)
+            return 1
 
     # Phase 1f-7 Stage 1 REDESIGN (--per-kind-data-isolation): the MoE arch
     # needs n_doc_kinds=3 (one full readout per kind); imply it when the flag is
@@ -1085,19 +1183,28 @@ def main() -> int:
               "(MoE per_kind_full readout, one full 6144->128->384 per kind)",
               flush=True)
     doc_kind_map = None
-    if args.n_doc_kinds > 0:
+    # Phase 1f-7 Stage 2 #3: --code-hard-neg needs the per-slot kind map to build
+    # the code-filler mask even on the SHARED readout (n_doc_kinds=0, where the head
+    # ignores slot_doc_kinds but the loss code reads it). Stamp slot_doc_kinds in
+    # that case too (BEFORE --drop-self-slot, same as the n_doc_kinds>0 path).
+    if args.n_doc_kinds > 0 or args.code_hard_neg:
         if not args.doc_store:
-            print("ERROR: --n-doc-kinds > 0 requires --doc-store (the doc_id -> "
-                  "kind map source).", file=sys.stderr)
+            print("ERROR: --n-doc-kinds > 0 / --code-hard-neg requires --doc-store "
+                  "(the doc_id -> kind map source).", file=sys.stderr)
             return 1
         doc_kind_map = _build_doc_kind_map_cached(args.doc_store, args.onyx)
         n_stamped = 0
         for rec in records:
             rec["slot_doc_kinds"] = _slot_doc_kinds(rec, doc_kind_map)
             n_stamped += 1
-        print(f"  --n-doc-kinds {args.n_doc_kinds}: stamped slot_doc_kinds on "
-              f"{n_stamped} records (conv=0/text=1/code=2; "
-              f"--kind-head-wd {args.kind_head_wd})", flush=True)
+        if args.n_doc_kinds > 0:
+            print(f"  --n-doc-kinds {args.n_doc_kinds}: stamped slot_doc_kinds on "
+                  f"{n_stamped} records (conv=0/text=1/code=2; "
+                  f"--kind-head-wd {args.kind_head_wd})", flush=True)
+        else:
+            print(f"  --code-hard-neg: stamped slot_doc_kinds on {n_stamped} "
+                  f"records (conv=0/text=1/code=2; SHARED readout n_doc_kinds=0, "
+                  f"kinds used ONLY for the code-filler mask, not routed)", flush=True)
 
     # Phase 1d root-cause fix: the mixed-ring generator scores the ring AFTER
     # orch.query adds the current prompt, so the self-slot (cos ~= 1.0) is the
@@ -1127,34 +1234,34 @@ def main() -> int:
                  else " | single top-1-cos gold"), flush=True)
 
     # Phase 1f-7 Stage 1 REDESIGN + Stage 2: stamp the GOLD slot's doc-kind index
-    # on every record. Used by THREE orthogonal mechanisms that all need the gold's
-    # kind per record:
+    # on every record. Used by FOUR mechanisms that all need the gold's kind:
     # - --per-kind-data-isolation: by-GOLD-kind train routing (MoE per_kind_full)
     #   = within-one-head margin loss = non-overlapping data per kind.
     # - --class-balanced-gold: inverse-frequency per-record SAMPLING weights
     #   (upweight minority code/text gold, downweight conv) on the SHARED readout
     #   = fixes the conv-majority-dominated shared-body root cause WITHOUT per-kind
     #   decomposition, preserving the cross-kind logit space (DeepSeek #1).
-    # - --per-kind-loss-weight: same balance as #1 but via per-record LOSS weights
-    #   (uniform sampling preserved) = the stable variant, preserves text 30.16
-    #   (DeepSeek #2).
+    # - --per-kind-loss-weight: per-record LOSS weights (DeepSeek #2, refuted).
+    # - --code-hard-neg: identify CODE-gold records whose margin-hinge fillers are
+    #   restricted to code slots (DeepSeek #3, AdamW-clean).
     # Gold = labels.argmax() -> source_ids[idx] -> _gold_doc_kind; mapped
     # code->2 / text->1 / conv/None->0. MUST run AFTER --drop-self-slot (gold =
     # prior doc, never the cos~1.0 self-slot, which is conv=0 and would route/
     # weight every record as conv). doc_kind_map built from --doc-store. Default
     # off = no stamped field = byte-identical.
     if args.per_kind_data_isolation or args.class_balanced_gold \
-            or args.per_kind_loss_weight:
+            or args.per_kind_loss_weight or args.code_hard_neg:
         if not args.drop_self_slot:
             print("ERROR: --per-kind-data-isolation/--class-balanced-gold/"
-                  "--per-kind-loss-weight require --drop-self-slot (the gold slot "
-                  "must be a prior doc, never the cos~1.0 self-slot, which is conv=0 "
-                  "and would route/weight every record as conv).", file=sys.stderr)
+                  "--per-kind-loss-weight/--code-hard-neg require --drop-self-slot "
+                  "(the gold slot must be a prior doc, never the cos~1.0 self-slot, "
+                  "which is conv=0 and would route/weight every record as conv).",
+                  file=sys.stderr)
             return 1
         if not args.doc_store:
             print("ERROR: --per-kind-data-isolation/--class-balanced-gold/"
-                  "--per-kind-loss-weight require --doc-store (the doc_id -> kind "
-                  "map for the gold-kind stamp).", file=sys.stderr)
+                  "--per-kind-loss-weight/--code-hard-neg require --doc-store (the "
+                  "doc_id -> kind map for the gold-kind stamp).", file=sys.stderr)
             return 1
         if doc_kind_map is None:
             doc_kind_map = _build_doc_kind_map_cached(args.doc_store, args.onyx)
@@ -1177,10 +1284,14 @@ def main() -> int:
             tag = "--class-balanced-gold: inverse-freq sampling"
             suffix = (" (upweight code/text, downweight conv -> shared-readout "
                       "fix)")
-        else:
+        elif args.per_kind_loss_weight:
             tag = "--per-kind-loss-weight: inverse-freq loss weight"
-            suffix = (" (uniform sampling, per-record loss weight -> stable "
-                      "shared-readout fix)")
+            suffix = (" (uniform sampling, per-record loss weight -> shared-"
+                      "readout fix)")
+        else:
+            tag = "--code-hard-neg: code-restricted hard-neg"
+            suffix = (" (code-gold records: hardest filler forced to a CODE slot "
+                      "-> code-vs-code separation, AdamW-clean)")
         print(f"  {tag}: stamped gold_doc_kind on {len(records)} records -> "
               f"conv={gold_counts[DOC_KIND_CONV]} / text={gold_counts[DOC_KIND_TEXT]} "
               f"/ code={gold_counts[DOC_KIND_CODE]}{suffix}", flush=True)
@@ -1260,7 +1371,8 @@ def main() -> int:
                 kind_head_wd=args.kind_head_wd,
                 per_kind_full=args.per_kind_data_isolation,
                 class_balanced_gold=args.class_balanced_gold,
-                per_kind_loss_weight=args.per_kind_loss_weight))
+                per_kind_loss_weight=args.per_kind_loss_weight,
+                code_hard_neg=args.code_hard_neg))
 
     # ── Phase 1d ensemble (logit-avg of the per-seed selected ckpts) ──
     # The live_eval bucket is the same 2 live-transcript sessions held OUT of
