@@ -272,6 +272,107 @@ def salient_anchors(anchors: list[SalienceAnchor]) -> list[SalienceAnchor]:
     return [a for a in anchors if a.salient]
 
 
+# ── cosine+age salience (the OOD-immune trigger) ──────────────────────────────
+#
+# The learned-head AND (rec_i<theta)&(r_i>phi)&(surprise_i<surprise_cap) was the
+# Phase 4 ship-eval blocker: ALL THREE heads are OOD-fragile at serve (see
+# pondr-strm-salience-three-heads-ood.md). surprise blocks 100% of turns (serve
+# surprise ~100-280x above the val-percentile cap); rec_i never crosses theta
+# (and is run-to-run unstable); r_i saturates near 1.0 and never discriminates
+# (the yt_sidepath OOD offset pins it high). The permissive upper-bound smoke
+# ``works`` only because it sets all three thresholds to +/-inf -- i.e. it
+# ignores the heads and fires on any provenance-bearing slot, which trivially
+# hits the right fact in a synthetic one-fact ring but does NOT test targeting.
+#
+# The fix: drop the three learned heads for the salience DECISION and use two
+# frozen, OOD-immune signals -- bge cosine (a fixed encoder, never OOD) for
+# TARGETING (which slot is relevant to the query) + ring age (a deterministic
+# forgotten-proxy, no learned head) for the "old enough to bother recalling"
+# gate. The Step 5 retrieval + Step 6 signal path is shared unchanged (the
+# anchors carry ``doc_emb`` so ``retrieve_by_embedding`` works identically).
+#
+# Validated on the synthetic ship bank: cross-fact cosine discriminates 6/6
+# (own fact is the max over the other 5, median gap +0.263) -- the targeting the
+# saturated 2a head cannot do. The real-serve bar (cosine vs OTHER RECALLED
+# episodes, not unrelated fillers) is tighter and is the real ship gate (the
+# documented real-onyx held-out follow-on); this mode is the synthetic clearing.
+
+
+@dataclass(frozen=True)
+class CosineAgeSalienceConfig:
+    """The frozen-signal salience config (no learned heads).
+
+    ``salient = (bge_cos(query_emb, slot_doc_emb) > cos_phi) AND
+    (age >= age_threshold)`` where ``age`` is the ring-position proxy (0 = newest
+    slot). ``cos_phi`` is a serve-calibrated cosine floor (NOT a val percentile
+    of a learned head -- bge is frozen so this is distribution-stable). Slots
+    with no text/provenance are unscoreable -> never salient (same rule as the
+    learned path). OOD-immune: no 2a/2b/2c head is read.
+    """
+
+    cos_phi: float            # min bge_cos(query, slot_text) to be salient
+    age_threshold: int         # min ring-age (turns since written proxy) to be salient
+    basis: str = ""
+
+
+def compute_salience_cosine_age(
+    ring_slots: list,
+    working_memory,
+    embedder,
+    query_emb: Tensor,
+    config: CosineAgeSalienceConfig,
+) -> list[SalienceAnchor]:
+    """Score every ring slot with frozen bge cosine + ring age (no learned heads).
+
+    Mirrors ``compute_salience``'s shape so the orchestrator's Step 5/6 path is
+    reused unchanged: one ``SalienceAnchor`` per ring slot (oldest-first) with
+    ``r_i`` = the bge cosine score (carried to the consumer signal), ``rec_i``
+    / ``surprise_i`` = None (not used), ``doc_emb`` = the re-embedded slot text
+    (the Step 5 retrieval query), and ``salient`` = the cosine+age decision.
+    Slots with no text get ``r_i = None`` -> not salient (unscoreable), matching
+    the learned path. Empty list if the ring is empty.
+    """
+    n = len(ring_slots)
+    if n == 0:
+        return []
+
+    r_is: list[Optional[float]] = [None] * n
+    doc_embs: list = [None] * n
+    if embedder is not None:
+        idx_text = [(i, s.text) for i, s in enumerate(ring_slots)
+                    if s.text is not None and str(s.text).strip()]
+        if idx_text:
+            # Re-embed each slot's text (the SAME 384-d bge path the learned r_i
+            # uses for its doc vector); this doubles as the Step 5 query.
+            doc_emb_tensors = working_memory.embed([t for _, t in idx_text])
+            q = query_emb.detach().to(torch.float32).reshape(-1)
+            q_norm = torch.norm(q) + 1e-12
+            for j, (i, _) in enumerate(idx_text):
+                d = doc_emb_tensors[j].to(torch.float32).reshape(-1)
+                cos = float(torch.dot(q, d) / (q_norm * (torch.norm(d) + 1e-12)))
+                r_is[i] = cos
+                doc_embs[i] = doc_emb_tensors[j]
+
+    anchors: list[SalienceAnchor] = []
+    for i, slot in enumerate(ring_slots):
+        age = (n - 1) - i  # ring-position proxy (0 = newest); oldest slot = n-1
+        salient = (r_is[i] is not None
+                   and r_is[i] > config.cos_phi
+                   and age >= config.age_threshold)
+        anchors.append(SalienceAnchor(
+            slot_index=i,
+            source_id=slot.source_id,
+            text=slot.text,
+            r_i=r_is[i],
+            rec_i=None,
+            surprise_i=None,
+            age=age,
+            salient=salient,
+            doc_emb=doc_embs[i],
+        ))
+    return anchors
+
+
 def format_salience_gap(signals: list[dict]) -> str:
     """Build the consumer-facing gap statement for ``stale_uncertain`` signals.
 

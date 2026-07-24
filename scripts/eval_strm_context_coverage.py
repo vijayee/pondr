@@ -257,11 +257,18 @@ def _build_orchestrator(store: HippocampalStore, retriever: HippocampalRetriever
                         thresholds: Optional[SalienceThresholds],
                         recoverability_head, latent_dynamics_head, relevance_head,
                         ring_capacity: int, cfg: Phase2cConfig,
-                        mode_a=None) -> PonderOrchestrator:
+                        mode_a=None,
+                        salience_mode: str = "learned",
+                        cos_age_salience=None) -> PonderOrchestrator:
     # ``mode_a=None`` (default) preserves the original no-LLM stub behavior so
     # Probe 1 + Probe 3 are byte-identical. Pass a real generator (e.g.
     # ``ModeAGenerator``) to synthesize live answers -- the Phase 4 ship-
     # deciding eval does this for its factual-accuracy tier.
+    # ``salience_mode`` defaults to ``"learned"`` (the three-head AND) so the
+    # existing probes are byte-identical; ``"cosine_age"`` swaps in the OOD-immune
+    # trigger (``cos_age_salience`` carries the config). The learned heads are
+    # still wired (harmless; cosine_age never reads them) so a caller can flip
+    # the mode without rebuilding.
     if mode_a is None:
         mode_a = _StubModeA()
     return PonderOrchestrator(
@@ -272,6 +279,7 @@ def _build_orchestrator(store: HippocampalStore, retriever: HippocampalRetriever
         latent_dynamics_head=latent_dynamics_head,
         relevance_head=relevance_head,
         strm_salience=strm_salience, salience_thresholds=thresholds,
+        salience_mode=salience_mode, cos_age_salience=cos_age_salience,
     )
 
 

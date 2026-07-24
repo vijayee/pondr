@@ -333,14 +333,27 @@ def _thresholds(theta: float, permissive: bool) -> SalienceThresholds:
         n_latent_dynamics=shipped.n_latent_dynamics)
 
 
+def _cos_age_config(cos_phi: float, age_threshold: int):
+    """Build the ``CosineAgeSalienceConfig`` for the ``cosine_age`` salience
+    mode (None when the learned path is selected)."""
+    from src.subconscious.salience import CosineAgeSalienceConfig
+    return CosineAgeSalienceConfig(
+        cos_phi=cos_phi, age_threshold=age_threshold,
+        basis=f"synthetic ship eval: cos_phi={cos_phi}, age_threshold={age_threshold}",
+    )
+
+
 def _run_tier1(*, n_facts: int, horizon: int, ring_capacity: int,
                theta: float, facts3: list, schedule: list,
-               permissive: bool = False) -> dict:
+               permissive: bool = False,
+               salience_mode: str = "learned",
+               cos_phi: float = 0.6, age_threshold: int = 3) -> dict:
     """Reuses the validated cost-parity runners. Returns the summary (no raw
     tensor-bearing records) + the STRM cost used to tune FIXED's N for Tier 2."""
     facts2 = [(s, q) for (s, q, _g) in facts3]
     fact_ids = [f"fact_{i:02d}" for i in range(n_facts)]
     retuned = _thresholds(theta, permissive)
+    cos_age = _cos_age_config(cos_phi, age_threshold) if salience_mode == "cosine_age" else None
 
     tmpdir = tempfile.mkdtemp(prefix="pondr_ship_t1_")
     store: Optional[HippocampalStore] = None
@@ -363,6 +376,7 @@ def _run_tier1(*, n_facts: int, horizon: int, ring_capacity: int,
         orch_strm = _build_orchestrator(
             backbone=bb_strm, strm_salience=True, thresholds=retuned,
             recoverability_head=rec, latent_dynamics_head=ld, relevance_head=rel,
+            salience_mode=salience_mode, cos_age_salience=cos_age,
             **common)
         bb_off = load_backbone(str(BACKBONE), BackboneConfig(), device="cpu")
         orch_off = _build_orchestrator(
@@ -511,7 +525,9 @@ def _run_acc_off(orch, schedule, facts3, gmap) -> list:
 
 def _run_tier2(*, n_facts: int, horizon: int, ring_capacity: int, theta: float,
                facts3: list, schedule: list, N: int,
-               permissive: bool = False) -> dict:
+               permissive: bool = False,
+               salience_mode: str = "learned",
+               cos_phi: float = 0.6, age_threshold: int = 3) -> dict:
     """Live factual accuracy for STRM / FIXED / OFF. Real Bonsai 8B synthesis
     (``ModeAGenerator`` on :8080) + DeepSeek-flash judge panel. The self-chat
     tool loop + feedback salience are turned OFF for a clean one-shot synthesis
@@ -519,6 +535,7 @@ def _run_tier2(*, n_facts: int, horizon: int, ring_capacity: int, theta: float,
     facts2 = [(s, q) for (s, q, _g) in facts3]
     gmap = _gold_map(facts3)
     retuned = _thresholds(theta, permissive)
+    cos_age = _cos_age_config(cos_phi, age_threshold) if salience_mode == "cosine_age" else None
 
     tmpdir = tempfile.mkdtemp(prefix="pondr_ship_t2_")
     store: Optional[HippocampalStore] = None
@@ -541,16 +558,16 @@ def _run_tier2(*, n_facts: int, horizon: int, ring_capacity: int, theta: float,
         common = dict(store=store, retriever=retriever, embedder=embedder,
                       ring_capacity=ring_capacity, cfg=cfg)
 
-        def _mk(salience, thresholds, rcd, ldd, rld):
+        def _mk(salience, thresholds, rcd, ldd, rld, *, mode="learned", ca=None):
             bb = load_backbone(str(BACKBONE), BackboneConfig(), device="cpu")
             mode_a = ModeAGenerator(retriever, model=_bonsai_model(),
                                    endpoint=BONSAI_ENDPOINT)
             return _build_orchestrator(
                 backbone=bb, strm_salience=salience, thresholds=thresholds,
                 recoverability_head=rcd, latent_dynamics_head=ldd, relevance_head=rld,
-                mode_a=mode_a, **common)
+                mode_a=mode_a, salience_mode=mode, cos_age_salience=ca, **common)
 
-        orch_strm = _mk(True, retuned, rec, ld, rel)
+        orch_strm = _mk(True, retuned, rec, ld, rel, mode=salience_mode, ca=cos_age)
         orch_fix = _mk(False, None, None, None, None)
         orch_off = _mk(False, None, None, None, None)
 
@@ -589,7 +606,9 @@ def _run_tier2(*, n_facts: int, horizon: int, ring_capacity: int, theta: float,
 
 def run_eval(*, n_facts: int, horizon: int, ring_capacity: int, theta: float,
              seed: int, tier1_only: bool, skip_acc_if_cov_fails: bool,
-             permissive: bool = False) -> dict:
+             permissive: bool = False,
+             salience_mode: str = "learned",
+             cos_phi: float = 0.6, age_threshold: int = 3) -> dict:
     facts3 = list(SHIP_FACT_BANK[:n_facts])
     # AUTO ring-cap: preserve fact slots so the salience hook can score them
     # (a too-small ring evicts the seeded facts before their probe -> coverage 0).
@@ -599,7 +618,9 @@ def run_eval(*, n_facts: int, horizon: int, ring_capacity: int, theta: float,
 
     tier1 = _run_tier1(n_facts=n_facts, horizon=horizon, ring_capacity=ring_capacity,
                        theta=theta, facts3=facts3, schedule=schedule,
-                       permissive=permissive)
+                       permissive=permissive,
+                       salience_mode=salience_mode, cos_phi=cos_phi,
+                       age_threshold=age_threshold)
 
     cov_pass = bool(tier1["strm_beats_fixed"] and tier1["budget_parity"])
     run_acc = (not tier1_only) and (not skip_acc_if_cov_fails or cov_pass)
@@ -607,7 +628,9 @@ def run_eval(*, n_facts: int, horizon: int, ring_capacity: int, theta: float,
         tier2 = _run_tier2(n_facts=n_facts, horizon=horizon,
                            ring_capacity=ring_capacity, theta=theta,
                            facts3=facts3, schedule=schedule, N=tier1["N"],
-                           permissive=permissive)
+                           permissive=permissive,
+                           salience_mode=salience_mode, cos_phi=cos_phi,
+                           age_threshold=age_threshold)
         skipped_accuracy = False
     else:
         tier2 = {
@@ -626,6 +649,7 @@ def run_eval(*, n_facts: int, horizon: int, ring_capacity: int, theta: float,
     return {
         "seed": seed, "n_facts": n_facts, "horizon": horizon,
         "ring_capacity": ring_capacity, "theta": theta,
+        "salience_mode": salience_mode,
         "fact_probe_turns": fact_turns,
         "tier1_coverage": tier1,
         "tier2_accuracy": tier2,
@@ -639,7 +663,8 @@ def _print_report(rep: dict) -> None:
     t1, t2 = rep["tier1_coverage"], rep["tier2_accuracy"]
     print("=" * 72)
     print(f"STRM SHIP-DECIDING EVAL (facts={rep['n_facts']} horizon={rep['horizon']} "
-          f"ring={rep['ring_capacity']} seed={rep['seed']} theta={rep['theta']})")
+          f"ring={rep['ring_capacity']} seed={rep['seed']} theta={rep['theta']} "
+          f"mode={rep.get('salience_mode', 'learned')})")
     print(f"probe turns: {rep['fact_probe_turns']}")
     print("-" * 72)
     print("  TIER 1 -- coverage / cost-parity (offline)")
@@ -656,7 +681,10 @@ def _print_report(rep: dict) -> None:
     print("-" * 72)
     print("  TIER 2 -- factual accuracy (live 8B + flash judge)")
     if rep["skipped_accuracy"]:
-        print("  [SKIPPED -- coverage failed and --skip-accuracy-if-coverage-fails is on]")
+        if rep["coverage_pass"]:
+            print("  [SKIPPED -- --tier1-only (coverage passed; accuracy not run)]")
+        else:
+            print("  [SKIPPED -- coverage failed and --skip-accuracy-if-coverage-fails is on]")
     else:
         for name, c in (("OFF", t2["off"]), ("STRM", t2["strm"]), ("FIXED", t2["fixed"])):
             print(f"  {name:6} acc={c['acc']:.3f} ({c['correct']}/{c['n']}) "
@@ -690,6 +718,18 @@ def _main() -> int:
                     help="DEBUG: use permissive thresholds (every scored anchor is "
                          "salient) to confirm the salience->merge->8B->judge wiring "
                          "fires end-to-end. NOT the ship gate (the gate uses retuned theta).")
+    ap.add_argument("--salience-mode", default="learned",
+                    choices=["learned", "cosine_age"],
+                    help="learned (default) = the three-head AND (rec<theta & r>phi & "
+                         "surprise<cap); cosine_age = the OOD-immune trigger "
+                         "(bge_cos > cos_phi AND age >= age_threshold) -- drops the "
+                         "three learned heads for the salience DECISION.")
+    ap.add_argument("--cos-phi", type=float, default=0.6,
+                    help="cosine_age mode: min bge_cos(query, slot_text) to be salient "
+                         "(validated 0.60: own-fact 0.66-0.84, cross-fact <=0.55).")
+    ap.add_argument("--age-threshold", type=int, default=3,
+                    help="cosine_age mode: min ring-age (turns since written) to be "
+                         "salient (must be < the fact's probe turn; facts probe at >=8).")
     args = ap.parse_args()
     if not ARTIFACTS_PRESENT:
         print("MISSING ARTIFACTS -- need the trained backbone + 2a/2b/2c heads + "
@@ -699,7 +739,9 @@ def _main() -> int:
                    ring_capacity=args.ring_cap, theta=args.theta, seed=args.seed,
                    tier1_only=args.tier1_only,
                    skip_acc_if_cov_fails=not args.no_skip_accuracy_if_coverage_fails,
-                   permissive=args.permissive)
+                   permissive=args.permissive,
+                   salience_mode=args.salience_mode, cos_phi=args.cos_phi,
+                   age_threshold=args.age_threshold)
     _print_report(rep)
     if args.out:
         # Drop the verbose per-probe detail from the written JSON (keep the

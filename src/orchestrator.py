@@ -181,6 +181,8 @@ class PonderOrchestrator:
         context_builder=None,
         strm_salience: bool = False,
         salience_thresholds=None,
+        salience_mode: str = "learned",
+        cos_age_salience=None,
         identity_instance: bool = False,
         capture_pre_state: bool = False,
     ) -> None:
@@ -244,6 +246,16 @@ class PonderOrchestrator:
         # hook is swallowed (anchors stay None, the turn proceeds unchanged).
         self.strm_salience = bool(strm_salience)
         self.salience_thresholds = salience_thresholds
+        # Salience DECISION source. ``"learned"`` (default) = the three-head AND
+        # (rec_i<theta)&(r_i>phi)&(surprise_i<cap) -- the original Phase 4 path,
+        # byte-identical when ``strm_salience`` is off. ``"cosine_age"`` = the
+        # OOD-immune trigger (bge cosine > cos_phi AND age >= age_threshold) that
+        # drops the three OOD-fragile heads for the salience decision (see
+        # pondr-strm-salience-three-heads-ood.md). ``cos_age_salience`` carries
+        # the ``CosineAgeSalienceConfig`` (cos_phi, age_threshold); the learned
+        # path ignores it. Step 5/6 are shared -- only the anchor scoring differs.
+        self.salience_mode = str(salience_mode)
+        self.cos_age_salience = cos_age_salience
         self._salience_anchors = None
         # Step 5: episodes the salience trigger proactively recalled from LTM
         # (state-conditioned, pin-tagged re-inject). Reset to None each turn;
@@ -350,21 +362,33 @@ class PonderOrchestrator:
     # ── STRM Phase 4 Step 4: salience trigger ──
 
     def _salience_armed(self) -> bool:
-        """True iff the salience trigger has everything it needs to run: the
-        ``--strm-salience`` flag is on, all three read-out heads (2a relevance,
-        2b recoverability, 2c latent-dynamics) are wired, the thresholds sidecar
-        is loaded, and the ring is ON (salience reads ring slots). A missing
+        """True iff the salience trigger has everything it needs to run.
+
+        ``"learned"`` (default): the ``--strm-salience`` flag is on, all three
+        read-out heads (2a relevance, 2b recoverability, 2c latent-dynamics) are
+        wired, the thresholds sidecar is loaded, and the ring is ON. A missing
         piece disarms the trigger -- the salience AND needs all three scores, so
         a missing head means no anchor can be salient. Flag-off (the default)
         disarms here so the query() seam skips the state capture + hook entirely
-        (byte-identical to pre-Step-4)."""
+        (byte-identical to pre-Step-4).
+
+        ``"cosine_age"``: the OOD-immune trigger -- needs the flag on, the ring
+        ON, an embedder (bge), and a ``CosineAgeSalienceConfig``. No learned head
+        is read, so none is required (the three heads may stay None). This is the
+        path that clears the synthetic ship eval ([[pondr-strm-salience-three-heads-ood]]).
+        """
+        if not self.strm_salience or self.working_memory.ring_capacity <= 0:
+            return False
+        if self.salience_mode == "cosine_age":
+            return (
+                self.cos_age_salience is not None
+                and self.embedder is not None
+            )
         return (
-            self.strm_salience
-            and self.relevance_head is not None
+            self.relevance_head is not None
             and self.recoverability_head is not None
             and self.latent_dynamics_head is not None
             and self.salience_thresholds is not None
-            and self.working_memory.ring_capacity > 0
         )
 
     def _run_salience_hook(self, prompt_emb, prev_state_tensors, signal: str) -> None:
@@ -401,24 +425,37 @@ class PonderOrchestrator:
                 self._salience_fired_episodes = None
                 self._salience_signals = None
                 return
-            state_tensors = self.working_memory.state_tensors()
             from src.subconscious.salience import (
                 compute_salience,
+                compute_salience_cosine_age,
                 salient_anchors,
                 SALIENCE_RETRIEVAL_BUDGET,
             )
-            self._salience_anchors = compute_salience(
-                ring_slots=ring_slots,
-                state_tensors=state_tensors,
-                prev_state_tensors=prev_state_tensors,
-                working_memory=self.working_memory,
-                relevance_head=self.relevance_head,
-                recoverability_head=self.recoverability_head,
-                latent_dynamics_head=self.latent_dynamics_head,
-                embedder=self.embedder,
-                query_emb=prompt_emb,
-                thresholds=self.salience_thresholds,
-            )
+            if self.salience_mode == "cosine_age":
+                # OOD-immune trigger: bge cosine + ring age, no learned heads.
+                # Step 5/6 below are shared (anchors carry doc_emb). No state
+                # tensors needed (the cosine path reads only slot text + age).
+                self._salience_anchors = compute_salience_cosine_age(
+                    ring_slots=ring_slots,
+                    working_memory=self.working_memory,
+                    embedder=self.embedder,
+                    query_emb=prompt_emb,
+                    config=self.cos_age_salience,
+                )
+            else:
+                state_tensors = self.working_memory.state_tensors()
+                self._salience_anchors = compute_salience(
+                    ring_slots=ring_slots,
+                    state_tensors=state_tensors,
+                    prev_state_tensors=prev_state_tensors,
+                    working_memory=self.working_memory,
+                    relevance_head=self.relevance_head,
+                    recoverability_head=self.recoverability_head,
+                    latent_dynamics_head=self.latent_dynamics_head,
+                    embedder=self.embedder,
+                    query_emb=prompt_emb,
+                    thresholds=self.salience_thresholds,
+                )
             # Step 5: fire state-conditioned retrieval per salient anchor.
             # Step 6: track per-anchor retrieval outcome + age to emit the
             # ``recall`` (got hits) / ``stale_uncertain`` (young anchor, no hits)
