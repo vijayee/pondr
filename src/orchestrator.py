@@ -441,7 +441,27 @@ class PonderOrchestrator:
                 age = (self._salience_turn_count
                        - self._source_entry_turn.get(sid, self._salience_turn_count))
                 hits: list = []
-                if anchor.doc_emb is not None and self.retriever is not None:
+                # IngestionTracker (STRM Phase 5): if this anchor's source_id is
+                # an episode Thread 2 is STILL distilling, build the recalled-
+                # episode dict straight from the in-flight stub snapshot -- NO
+                # vector round-trip (the cheap read Phase 5 wants) and NO age
+                # heuristic (queue membership is ground truth, not the
+                # placeholder turn-lag watermark). The snapshot has no graph
+                # edges, so this serves only the vector-gist re-inject path,
+                # not graph-traversal retrieval. Inert when the worker is None
+                # (async-distill off) or the rollback flag is False ->
+                # byte-identical retrieve_by_embedding fall-through.
+                inflight = None
+                if (getattr(_runtime_config, "strm_salience_inflight_shortcut", True)
+                        and self._distill_worker is not None):
+                    inflight = self._distill_worker.snapshot_if_inflight(sid)
+                if inflight is not None:
+                    eid = inflight.get("episode_id")
+                    if eid is not None and eid not in seen_ids:
+                        seen_ids.add(eid)
+                        fired.append(inflight)
+                    hits = [inflight]  # truthy -> got_hits -> kind="recall"
+                elif anchor.doc_emb is not None and self.retriever is not None:
                     try:
                         hits = self.retriever.retrieve_by_embedding(
                             anchor.doc_emb, signal=signal,

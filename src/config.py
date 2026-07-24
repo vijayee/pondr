@@ -257,6 +257,17 @@ class Config:
     # "fresh" -- possibly still being distilled). Only read when
     # ``--strm-salience`` is armed.
     strm_salience_freshness_lag: int = 3
+    # ``strm_salience_inflight_shortcut``: STRM Phase 5 IngestionTracker. When
+    # the salience hook scores an anchor whose ``source_id`` is an episode
+    # Thread 2's async-distill worker is STILL distilling, serve the recalled-
+    # episode dict straight from the in-flight stub snapshot -- NO vector
+    # round-trip (the cheap read Phase 5 wants) and NO age heuristic (queue
+    # membership is ground truth). The snapshot has no graph edges, so this
+    # serves only the vector-gist re-inject path, not graph-traversal
+    # retrieval. Default ON; False -> byte-identical vector round-trip (the
+    # A/B guard + rollback). Only read when ``--strm-salience`` is armed AND
+    # async-distill is on (no worker -> no in-flight map -> inert).
+    strm_salience_inflight_shortcut: bool = True
 
     # ── Paths ──
     data_dir: Path = Path("./data")

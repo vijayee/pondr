@@ -17,6 +17,7 @@ result dict (byte-identical to pre-Step-6).
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -192,5 +193,118 @@ def test_signal_shape_carries_scores_and_age(tmp_path, monkeypatch):
         assert sig["r_i"] is not None
         assert sig["rec_i"] is not None
         assert isinstance(sig["age"], int)
+    finally:
+        store.close()
+
+
+# ── STRM Phase 5 IngestionTracker: in-flight short-circuit ─────────────────
+
+
+class _StubDistillWorker:
+    """Stand-in for DistillWorker exposing only the read API the salience hook
+    uses (``snapshot_if_inflight``). Returns a COPY of the registered snapshot
+    so the hook cannot mutate the live map (mirrors the real worker). Also
+    carries a ``foreground_busy`` Event because the orchestrator sets/clears it
+    at query() entry/exit regardless of which object holds the worker slot."""
+    def __init__(self, snapshots):
+        self._snapshots = dict(snapshots)
+        self.foreground_busy = threading.Event()
+
+    def snapshot_if_inflight(self, episode_id):
+        if episode_id is None or episode_id not in self._snapshots:
+            return None
+        return dict(self._snapshots[episode_id])
+
+
+@pytest.mark.skipif(not _HEADS_PRESENT, reason="STRM head checkpoints not trained")
+def test_inflight_anchor_short_circuits_to_recall_no_vector_roundtrip(tmp_path, monkeypatch):
+    """An anchor whose source_id is an episode Thread 2 is still distilling is
+    served straight from the in-flight stub snapshot -- NO vector round-trip
+    (retrieve_by_embedding must NOT be called) and NO age heuristic -> the
+    signal is ``recall`` (the cheap read Phase 5 wants), not ``stale_uncertain``.
+    """
+    rec, ld, rel = _load_heads()
+    orch, store = _build(tmp_path, strm_salience=True, salience_thresholds=_thresh(),
+                        recoverability_head=rec, latent_dynamics_head=ld,
+                        relevance_head=rel, ring_capacity=16)
+    _preinject(orch, [("ep_old", "Alice chose Postgres for the audit log")])
+    orch.retriever.retrieve = lambda *a, **k: []  # no prompt-driven injects
+    # retrieve_by_embedding MUST NOT be called -- raise if it is.
+    def _boom(*a, **k):
+        raise AssertionError("retrieve_by_embedding must not be called for an in-flight anchor")
+    orch.retriever.retrieve_by_embedding = _boom
+    # Stub the in-flight map: ep_old is mid-distill.
+    orch._distill_worker = _StubDistillWorker({
+        "ep_old": {"episode_id": "ep_old", "summary": "Alice chose Postgres",
+                   "text": "Alice chose Postgres for the audit log",
+                   "embed_text": "Alice chose Postgres", "summary_embedding": None},
+    })
+    try:
+        res = orch.query("What did Alice say?")
+        sigs = res["salience_signals"]
+        assert len(sigs) == 1
+        assert sigs[0]["kind"] == "recall"  # NOT stale_uncertain
+        assert sigs[0]["anchor_source_id"] == "ep_old"
+        # The in-flight snapshot fired -> one recalled episode, no stale gap.
+        assert res["salience_retrieval_count"] == 1
+        assert res["salience_gap_text"] == ""
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(not _HEADS_PRESENT, reason="STRM head checkpoints not trained")
+def test_inflight_shortcut_disabled_falls_through_to_retrieve(tmp_path, monkeypatch):
+    """Rollback guard: with strm_salience_inflight_shortcut=False the hook is
+    byte-identical to pre-Phase-5 -- retrieve_by_embedding IS called (even
+    though the anchor is in-flight) and the vector result decides the kind."""
+    rec, ld, rel = _load_heads()
+    orch, store = _build(tmp_path, strm_salience=True, salience_thresholds=_thresh(),
+                        recoverability_head=rec, latent_dynamics_head=ld,
+                        relevance_head=rel, ring_capacity=16)
+    _preinject(orch, [("ep_old", "Alice chose Postgres for the audit log")])
+    orch.retriever.retrieve = lambda *a, **k: []  # no prompt-driven injects
+    calls: list = []
+    def _track(*a, **k):
+        calls.append(a)
+        return [{"episode_id": "ep_recall", "summary": "Alice chose Postgres",
+                 "entities": [], "topics": [], "tones": [],
+                 "timestamp": "2026-07-01T10:00:00", "score": 0.4}]
+    orch.retriever.retrieve_by_embedding = _track
+    # ep_old is in-flight, but the shortcut is OFF -> the hook must call the vector path.
+    orch._distill_worker = _StubDistillWorker({
+        "ep_old": {"episode_id": "ep_old", "summary": "Alice chose Postgres",
+                   "text": "x", "embed_text": "Alice chose Postgres",
+                   "summary_embedding": None},
+    })
+    import src.orchestrator as orch_mod
+    monkeypatch.setattr(orch_mod._runtime_config, "strm_salience_inflight_shortcut", False)
+    try:
+        res = orch.query("What did Alice say?")
+        assert calls, "retrieve_by_embedding must be called when the shortcut is disabled"
+        assert res["salience_signals"][0]["kind"] == "recall"  # via the vector hit
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(not _HEADS_PRESENT, reason="STRM head checkpoints not trained")
+def test_no_distill_worker_falls_through_to_retrieve(tmp_path, monkeypatch):
+    """When async-distill is off (no worker -> self._distill_worker is None) the
+    short-circuit is inert: the hook calls retrieve_by_embedding as before
+    (byte-identical to pre-Phase-5). This is the production default-off-salience
+    + the async-distill-off combination."""
+    rec, ld, rel = _load_heads()
+    orch, store = _build(tmp_path, strm_salience=True, salience_thresholds=_thresh(),
+                        recoverability_head=rec, latent_dynamics_head=ld,
+                        relevance_head=rel, ring_capacity=16)
+    _preinject(orch, [("ep_old", "Alice chose Postgres for the audit log")])
+    orch.retriever.retrieve = lambda *a, **k: []
+    calls: list = []
+    orch.retriever.retrieve_by_embedding = lambda *a, **k: (calls.append(a) or [])
+    assert orch._distill_worker is None  # the _build harness wires no encoder/worker
+    try:
+        res = orch.query("What did Alice say?")
+        assert calls, "retrieve_by_embedding must be called when no worker is wired"
+        # no hits + young -> stale_uncertain (the pre-Phase-5 watermark path)
+        assert res["salience_signals"][0]["kind"] == "stale_uncertain"
     finally:
         store.close()

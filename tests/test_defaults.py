@@ -59,3 +59,14 @@ def test_strm_graduation_logging_defaults_off():
         "side-effect-only and the v2 labels only matter once a graduation training "
         "run is gated on them; a cold start must accumulate nothing"
     )
+
+
+def test_strm_salience_inflight_shortcut_defaults_on():
+    """STRM Phase 5 IngestionTracker: the in-flight anchor short-circuit defaults
+    ON so the cheap read (snapshot straight from the DistillWorker in-flight map,
+    no vector round-trip) ships by default. Only read when --strm-salience is
+    armed; False -> byte-identical to the pre-Phase-5 vector path (A/B rollback)."""
+    assert Config().strm_salience_inflight_shortcut is True, (
+        "strm_salience_inflight_shortcut default flipped off -- the cheap-read "
+        "in-flight short-circuit is the production salience-recall path"
+    )

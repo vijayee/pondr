@@ -256,3 +256,136 @@ def test_stub_runs_on_main_fill_runs_on_worker():
         )
     finally:
         worker.drain(timeout=5.0)
+
+
+# ── #12 in-flight stub snapshot (STRM Phase 5 IngestionTracker) ────────────
+
+
+def _snapshot_ep(eid="E:1"):
+    """An episode carrying the fill-immutable fields the snapshot reads
+    (summary/full_text/summary_embedding). The real encoder's stub builds an
+    Episode with these; SimpleNamespace mirrors the attribute shape."""
+    return SimpleNamespace(
+        id=eid, summary="Alice chose Postgres", full_text="User: q\nAssistant: a",
+        summary_embedding=[0.1, 0.2, 0.3, 0.4],
+    )
+
+
+def test_enqueue_snapshots_inflight_fields():
+    """enqueue() snapshots the fill-immutable stub fields into the in-flight
+    map. snapshot_if_inflight returns a copy carrying exactly the keys the
+    orchestrator merge (episode_id) + inject (embed_text/summary/text) read."""
+    encoder = _FakeEncoder()
+    store = _FakeStore()
+    worker = DistillWorker(encoder, store)
+    try:
+        ep = _snapshot_ep("E:1")
+        worker.enqueue(ep, "E:1")
+        snap = worker.snapshot_if_inflight("E:1")
+        assert snap is not None, "in-flight snapshot missing right after enqueue"
+        assert snap["episode_id"] == "E:1"
+        assert snap["summary"] == "Alice chose Postgres"
+        assert snap["text"] == "User: q\nAssistant: a"
+        assert snap["embed_text"] == "Alice chose Postgres"  # inject reads this first
+        assert snap["summary_embedding"] == [0.1, 0.2, 0.3, 0.4]
+    finally:
+        worker.drain(timeout=5.0)
+
+
+def test_snapshot_is_a_copy_not_live():
+    """snapshot_if_inflight returns a COPY -- mutating it must not touch the
+    live map (the foreground must never read the object the worker mid-mutates
+    during fill, and the caller must not corrupt the worker's snapshot)."""
+    encoder = _FakeEncoder(fill_sleep=0.0)
+    store = _FakeStore()
+    worker = DistillWorker(encoder, store)
+    try:
+        worker.foreground_busy.set()  # hold the fill so the snapshot stays live
+        worker.enqueue(_snapshot_ep("E:1"), "E:1")
+        snap = worker.snapshot_if_inflight("E:1")
+        snap["summary"] = "MUTATED"
+        snap["episode_id"] = "MUTATED"
+        # Re-read: the live snapshot is untouched.
+        again = worker.snapshot_if_inflight("E:1")
+        assert again["summary"] == "Alice chose Postgres"
+        assert again["episode_id"] == "E:1"
+    finally:
+        worker.foreground_busy.clear()
+        worker.drain(timeout=5.0)
+
+
+def test_snapshot_drained_after_fill_completes():
+    """Once the worker finishes the fill, the episode is no longer in flight --
+    snapshot_if_inflight returns None (queue membership was the ground-truth
+    in-flight signal)."""
+    encoder = _FakeEncoder(fill_sleep=0.3)
+    store = _FakeStore()
+    worker = DistillWorker(encoder, store)
+    try:
+        worker.enqueue(_snapshot_ep("E:1"), "E:1")
+        # While the fill is in flight, the snapshot is present.
+        encoder.fill_started.wait(timeout=5.0)
+        assert worker.snapshot_if_inflight("E:1") is not None, (
+            "snapshot missing while the fill is still in flight"
+        )
+        # After the fill completes + drain, the snapshot is gone.
+        assert worker.drain(timeout=5.0), "worker thread did not join"
+        assert worker.snapshot_if_inflight("E:1") is None, (
+            "snapshot survived the fill -- not drained in _run's finally"
+        )
+    finally:
+        worker.drain(timeout=5.0)
+
+
+def test_snapshot_popped_on_fill_failure():
+    """A failed fill still pops the in-flight snapshot (in the finally, not the
+    try) -- the episode stays a vector-retrievable stub, so the salience hook's
+    retrieve_by_embedding fall-through finds it; it must not stay 'in flight'
+    forever (which would short-circuit retrieval on a stub that is already
+    vector-retrievable)."""
+    encoder = _FakeEncoder(fail_on_eid="E:1")
+    store = _FakeStore()
+    worker = DistillWorker(encoder, store)
+    try:
+        worker.enqueue(_snapshot_ep("E:1"), "E:1")
+        assert worker.drain(timeout=5.0), "worker thread did not join"
+        # The fill raised, but the finally still popped the snapshot.
+        assert worker.snapshot_if_inflight("E:1") is None, (
+            "snapshot survived a fill failure -- pop not in finally"
+        )
+    finally:
+        worker.drain(timeout=5.0)
+
+
+def test_snapshot_none_for_unknown_and_none_id():
+    """snapshot_if_inflight returns None for an unknown id AND for a None id
+    (an anchor with no provenance) -- the hook falls through to
+    retrieve_by_embedding (byte-identical to pre-Phase-5)."""
+    encoder = _FakeEncoder()
+    store = _FakeStore()
+    worker = DistillWorker(encoder, store)
+    try:
+        worker.enqueue(_snapshot_ep("E:1"), "E:1")
+        assert worker.snapshot_if_inflight("E:unknown") is None
+        assert worker.snapshot_if_inflight(None) is None
+    finally:
+        worker.drain(timeout=5.0)
+
+
+def test_drain_clears_inflight_map():
+    """drain() clears the in-flight map so abandoned in-flight episodes (their
+    fill was dropped by the drain) do not leave stale snapshots."""
+    encoder = _FakeEncoder()
+    store = _FakeStore()
+    worker = DistillWorker(encoder, store)
+    try:
+        worker.foreground_busy.set()  # hold the fill so the entries stay in flight
+        worker.enqueue(_snapshot_ep("E:1"), "E:1")
+        worker.enqueue(_snapshot_ep("E:2"), "E:2")
+        assert worker.snapshot_if_inflight("E:1") is not None
+        assert worker.snapshot_if_inflight("E:2") is not None
+    finally:
+        # drain clears the map even though the fills never ran.
+        worker.drain(timeout=5.0)
+        assert worker.snapshot_if_inflight("E:1") is None
+        assert worker.snapshot_if_inflight("E:2") is None
