@@ -522,6 +522,7 @@ class PonderOrchestrator:
         model_size: Optional[str] = None,
         signal: str = "routine",
         auto_persist: bool = True,
+        preset_salience_fired: Optional[list] = None,
     ) -> dict:
         """Run the full 2c pipeline and return the result dict.
 
@@ -571,6 +572,14 @@ class PonderOrchestrator:
             # Step 6: advance the freshness-watermark turn counter for this
             # armed query (the hook computes anchor age = turn_count - entry_turn).
             self._salience_turn_count += 1
+        # Phase 4 ship-deciding eval: a DISARMED caller may pre-set the
+        # salience-fired episodes to surface a schedule-gated recall through the
+        # SAME merge path the armed hook uses (the FIXED-interval condition).
+        # Honored only when disarmed (armed -> the hook owns the attribute);
+        # default None -> no-op -> byte-identical to pre-Phase-4. The merge below
+        # checks the attribute, not the armed flag, so this surfaces fairly.
+        if not salience_armed and preset_salience_fired is not None:
+            self._salience_fired_episodes = list(preset_salience_fired)
         prev_state_tensors = None
         if salience_armed and self.working_memory.state is not None:
             prev_state_tensors = [t.clone() for t in self.working_memory.state_tensors()]

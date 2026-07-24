@@ -256,10 +256,17 @@ def _build_orchestrator(store: HippocampalStore, retriever: HippocampalRetriever
                         embedder, backbone, *, strm_salience: bool,
                         thresholds: Optional[SalienceThresholds],
                         recoverability_head, latent_dynamics_head, relevance_head,
-                        ring_capacity: int, cfg: Phase2cConfig) -> PonderOrchestrator:
+                        ring_capacity: int, cfg: Phase2cConfig,
+                        mode_a=None) -> PonderOrchestrator:
+    # ``mode_a=None`` (default) preserves the original no-LLM stub behavior so
+    # Probe 1 + Probe 3 are byte-identical. Pass a real generator (e.g.
+    # ``ModeAGenerator``) to synthesize live answers -- the Phase 4 ship-
+    # deciding eval does this for its factual-accuracy tier.
+    if mode_a is None:
+        mode_a = _StubModeA()
     return PonderOrchestrator(
         store=store, retriever=retriever, backbone=backbone, embedder=embedder,
-        mode_a=_StubModeA(), config=cfg, user_id="probe",
+        mode_a=mode_a, config=cfg, user_id="probe",
         ring_capacity=ring_capacity,
         recoverability_head=recoverability_head,
         latent_dynamics_head=latent_dynamics_head,
