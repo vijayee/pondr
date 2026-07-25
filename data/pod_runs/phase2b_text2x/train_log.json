@@ -1,0 +1,127 @@
+{
+  "best_val": 0.8613612565445028,
+  "log": [
+    {
+      "epoch": 0,
+      "train_loss": 4.612739,
+      "val_accuracy": 0.642595
+    },
+    {
+      "epoch": 1,
+      "train_loss": 3.531576,
+      "val_accuracy": 0.646859
+    },
+    {
+      "epoch": 2,
+      "train_loss": 3.278585,
+      "val_accuracy": 0.657277
+    },
+    {
+      "epoch": 3,
+      "train_loss": 3.112713,
+      "val_accuracy": 0.690838
+    },
+    {
+      "epoch": 4,
+      "train_loss": 3.02686,
+      "val_accuracy": 0.676178
+    },
+    {
+      "epoch": 5,
+      "train_loss": 2.761284,
+      "val_accuracy": 0.690576
+    },
+    {
+      "epoch": 6,
+      "train_loss": 2.561907,
+      "val_accuracy": 0.733089
+    },
+    {
+      "epoch": 7,
+      "train_loss": 2.286493,
+      "val_accuracy": 0.807173
+    },
+    {
+      "epoch": 8,
+      "train_loss": 2.158312,
+      "val_accuracy": 0.789873
+    },
+    {
+      "epoch": 9,
+      "train_loss": 1.954654,
+      "val_accuracy": 0.800292
+    },
+    {
+      "epoch": 10,
+      "train_loss": 1.782432,
+      "val_accuracy": 0.847307
+    },
+    {
+      "epoch": 11,
+      "train_loss": 1.740947,
+      "val_accuracy": 0.855161
+    },
+    {
+      "epoch": 12,
+      "train_loss": 1.547076,
+      "val_accuracy": 0.830105
+    },
+    {
+      "epoch": 13,
+      "train_loss": 1.452225,
+      "val_accuracy": 0.854712
+    },
+    {
+      "epoch": 14,
+      "train_loss": 1.225903,
+      "val_accuracy": 0.851832
+    },
+    {
+      "epoch": 15,
+      "train_loss": 1.244903,
+      "val_accuracy": 0.858482
+    },
+    {
+      "epoch": 16,
+      "train_loss": 1.162809,
+      "val_accuracy": 0.859267
+    },
+    {
+      "epoch": 17,
+      "train_loss": 1.141597,
+      "val_accuracy": 0.855864
+    },
+    {
+      "epoch": 18,
+      "train_loss": 1.094543,
+      "val_accuracy": 0.858482
+    },
+    {
+      "epoch": 19,
+      "train_loss": 1.035301,
+      "val_accuracy": 0.861361
+    }
+  ],
+  "n_train": 765,
+  "n_val": 191,
+  "config": {
+    "d_model": 384,
+    "d_state": 16,
+    "lora_rank": 4,
+    "epochs": 20,
+    "batch_size": 32,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "skill_loss_weight": 0.5,
+    "online_lr": 1e-05,
+    "replay_buffer_capacity": 1000,
+    "outcome_batch_size": 32,
+    "min_buffer": 50,
+    "dtype": "float32",
+    "device": "auto",
+    "val_fraction": 0.2,
+    "seed": 0,
+    "backbone_path": "data\\training\\strm_backbone_relevance\\backbone_v2_full_finetuned_text2x.pt",
+    "checkpoint_dir": "data/pod_runs/phase2b_text2x"
+  }
+}

@@ -1,0 +1,363 @@
+{
+  "stages": {
+    "smoke": {
+      "headline": {
+        "status": "measured",
+        "value": {
+          "ran": true,
+          "queries_run": 3,
+          "retrieved_total": 10,
+          "endpoint_up": true
+        },
+        "target": "build_ponder + query() on trained 2a backbone + 2b gate",
+        "notes": "build_ponder constructed on trained backbone+gate; 3 queries ran; endpoint_up=True; response non-empty requires endpoint_up + synthesize end-state."
+      },
+      "endpoint_up": true,
+      "queries": [
+        {
+          "query": "What did the customer want?",
+          "pathway": "graph_retrieve",
+          "supported": true,
+          "retrieved": 5,
+          "end_state": "EndStatePlan(end_state='synthesize', format_spec=None, extract_schema=None, model_size='bonsai', jepa_default=True, rationale='synthesize: 5>3 episodes \u2192 reason across them')",
+          "response_len": 208,
+          "latency_ms": 14779.4,
+          "measured_expand_count": 0
+        },
+        {
+          "query": "What was discussed about the database?",
+          "pathway": "graph_retrieve",
+          "supported": true,
+          "retrieved": 0,
+          "end_state": "EndStatePlan(end_state='direct', format_spec=None, extract_schema=None, model_size=None, jepa_default=True, rationale='direct: factual lookup + 0\u22643 episodes')",
+          "response_len": 0,
+          "latency_ms": 3000.8,
+          "measured_expand_count": 0
+        },
+        {
+          "query": "hello",
+          "pathway": "graph_retrieve",
+          "supported": true,
+          "retrieved": 5,
+          "end_state": "EndStatePlan(end_state='synthesize', format_spec=None, extract_schema=None, model_size='bonsai', jepa_default=True, rationale='synthesize: 5>3 episodes \u2192 reason across them')",
+          "response_len": 32,
+          "latency_ms": 9637.5,
+          "measured_expand_count": 0
+        }
+      ]
+    },
+    "encoding": {
+      "status": "measured",
+      "value": {
+        "entity_recall": 0.875,
+        "topic_recall": 0.217,
+        "tone_recall": 0.4,
+        "n": 20,
+        "device": "cpu"
+      },
+      "target": ">90% entity F1, >85% relation F1",
+      "notes": "recall on 20 hand-crafted convs (Phase 1a DoD proxy; not F1 on held-out bench); device=cpu"
+    },
+    "retrieval": {
+      "recall": {
+        "status": "measured",
+        "value": {
+          "n_queries": 2,
+          "pass": 2,
+          "q1_frustrated_pass": true,
+          "q1_ids": [
+            "conv_013",
+            "conv_015",
+            "conv_017",
+            "conv_018",
+            "conv_020"
+          ],
+          "q2_alice_decide_pass": true,
+          "q2_ids": [
+            "conv_012",
+            "conv_017"
+          ]
+        },
+        "target": ">80% single-session, >60% cross-session",
+        "notes": "n=2 hand-coded gold queries on 20-conv corpus -- illustrative, not a benchmark"
+      },
+      "precision": {
+        "status": "gold_missing",
+        "value": null,
+        "target": ">85%",
+        "notes": "no precision gold on the 20-conv corpus"
+      },
+      "latency": {
+        "status": "measured",
+        "value": {
+          "p50_ms": 1.81,
+          "per_query_ms": [
+            2.33,
+            1.29
+          ]
+        },
+        "target": "<50ms graph traversal + HBTrie load",
+        "notes": "n=2 in-memory corpus queries; not the graph-traversal+HBTrie p50 at scale"
+      }
+    },
+    "routing": {
+      "status": "measured",
+      "value": {
+        "val_accuracy": 0.826,
+        "observed_pathways": [
+          "graph_retrieve",
+          "graph_retrieve",
+          "graph_retrieve"
+        ]
+      },
+      "target": ">90% correct domain routing",
+      "notes": "training val-accuracy proxy (routing-vs-Oracle gold missing -- Phase 1d routing pairs not scaled); observed pathways from Stage 0 smoke"
+    },
+    "consolidation": {
+      "status": "measured",
+      "value": {
+        "ran": true,
+        "trained": true,
+        "subgraphs_scored": 20,
+        "edges_proposed": 213,
+        "edges_accepted": 0,
+        "edges_unverified": 107,
+        "anomalies": 532,
+        "ontology_proposed": 2908,
+        "pruned": 2875,
+        "contradictions_resolved": 0,
+        "verifier_validation_rate": null,
+        "dry_run": true,
+        "decider": "off (--no-bonsai; Bonsai killed)",
+        "subgraph_cap": "none (full smoke corpus)",
+        "db": "scored DB: 20-conv smoke corpus (subgraphs_scored in the report confirms the size); full-corpus timing not measured"
+      },
+      "target": ">70% GNN-predicted edges validated by Bonsai",
+      "notes": "dry-run dream-pass; decider off (Bonsai killed) so edges_accepted=0 and verifier_validation_rate=null -- the Phase 5 'GNN-predicted edges validated by Bonsai' cell is gold-missing. "
+    },
+    "contradiction": {
+      "det_contradiction_recall": {
+        "status": "measured",
+        "value": {
+          "recall": 1.0,
+          "n_catchable": 4,
+          "threshold": 0.75
+        },
+        "target": ">=0.75 (deterministic-normalizer ceiling)",
+        "notes": "deterministic-path recall on catchable pairs; paraphrased-only pairs are honest misses (Bonsai's job)"
+      },
+      "citation_resolve": {
+        "status": "measured",
+        "value": {
+          "rate": 1.0,
+          "n": 5,
+          "threshold": 0.8
+        },
+        "target": ">=0.80",
+        "notes": "find_document_by_title_or_url on the 5 vendored erag pairs"
+      },
+      "guard_soundness": {
+        "status": "measured",
+        "value": {
+          "n_adjudication": 200,
+          "by_type": {
+            "different_entity": {
+              "n": 46,
+              "guard_fired": 46
+            },
+            "real": {
+              "n": 59,
+              "guard_fired": 0
+            },
+            "complementary_temporal": {
+              "n": 36,
+              "guard_fired": 36
+            },
+            "same_value": {
+              "n": 59,
+              "guard_fired": 59
+            }
+          },
+          "nonreal_guard_fires": 141,
+          "nonreal_n": 141,
+          "guard_fire_rate": 1.0
+        },
+        "target": "non-real false-fix MUST be 0",
+        "notes": "deterministic-guards-only slice (Bonsai killed). The 0-false-fix decider soundness needs Bonsai up -- run scripts/_scratch/guard_coverage_200.py to measure."
+      }
+    }
+  },
+  "scorecard": {
+    "Runtime runs end-to-end (trained models)": {
+      "status": "measured",
+      "value": {
+        "ran": true,
+        "queries_run": 3,
+        "retrieved_total": 10,
+        "endpoint_up": true
+      },
+      "target": "build_ponder + query() on trained 2a backbone + 2b gate",
+      "notes": "build_ponder constructed on trained backbone+gate; 3 queries ran; endpoint_up=True; response non-empty requires endpoint_up + synthesize end-state."
+    },
+    "Encoding accuracy": {
+      "status": "measured",
+      "value": {
+        "entity_recall": 0.875,
+        "topic_recall": 0.217,
+        "tone_recall": 0.4,
+        "n": 20,
+        "device": "cpu"
+      },
+      "target": ">90% entity F1, >85% relation F1",
+      "notes": "recall on 20 hand-crafted convs (Phase 1a DoD proxy; not F1 on held-out bench); device=cpu"
+    },
+    "Retrieval recall": {
+      "status": "measured",
+      "value": {
+        "n_queries": 2,
+        "pass": 2,
+        "q1_frustrated_pass": true,
+        "q1_ids": [
+          "conv_013",
+          "conv_015",
+          "conv_017",
+          "conv_018",
+          "conv_020"
+        ],
+        "q2_alice_decide_pass": true,
+        "q2_ids": [
+          "conv_012",
+          "conv_017"
+        ]
+      },
+      "target": ">80% single-session, >60% cross-session",
+      "notes": "n=2 hand-coded gold queries on 20-conv corpus -- illustrative, not a benchmark"
+    },
+    "Retrieval precision": {
+      "status": "gold_missing",
+      "value": null,
+      "target": ">85%",
+      "notes": "no precision gold on the 20-conv corpus"
+    },
+    "Retrieval latency": {
+      "status": "measured",
+      "value": {
+        "p50_ms": 1.81,
+        "per_query_ms": [
+          2.33,
+          1.29
+        ]
+      },
+      "target": "<50ms graph traversal + HBTrie load",
+      "notes": "n=2 in-memory corpus queries; not the graph-traversal+HBTrie p50 at scale"
+    },
+    "Routing accuracy": {
+      "status": "measured",
+      "value": {
+        "val_accuracy": 0.826,
+        "observed_pathways": [
+          "graph_retrieve",
+          "graph_retrieve",
+          "graph_retrieve"
+        ]
+      },
+      "target": ">90% correct domain routing",
+      "notes": "training val-accuracy proxy (routing-vs-Oracle gold missing -- Phase 1d routing pairs not scaled); observed pathways from Stage 0 smoke"
+    },
+    "Consolidation quality": {
+      "status": "measured",
+      "value": {
+        "ran": true,
+        "trained": true,
+        "subgraphs_scored": 20,
+        "edges_proposed": 213,
+        "edges_accepted": 0,
+        "edges_unverified": 107,
+        "anomalies": 532,
+        "ontology_proposed": 2908,
+        "pruned": 2875,
+        "contradictions_resolved": 0,
+        "verifier_validation_rate": null,
+        "dry_run": true,
+        "decider": "off (--no-bonsai; Bonsai killed)",
+        "subgraph_cap": "none (full smoke corpus)",
+        "db": "scored DB: 20-conv smoke corpus (subgraphs_scored in the report confirms the size); full-corpus timing not measured"
+      },
+      "target": ">70% GNN-predicted edges validated by Bonsai",
+      "notes": "dry-run dream-pass; decider off (Bonsai killed) so edges_accepted=0 and verifier_validation_rate=null -- the Phase 5 'GNN-predicted edges validated by Bonsai' cell is gold-missing. "
+    },
+    "Contradiction detection (deterministic recall)": {
+      "status": "measured",
+      "value": {
+        "recall": 1.0,
+        "n_catchable": 4,
+        "threshold": 0.75
+      },
+      "target": ">=0.75 (deterministic-normalizer ceiling)",
+      "notes": "deterministic-path recall on catchable pairs; paraphrased-only pairs are honest misses (Bonsai's job)"
+    },
+    "Citation resolution": {
+      "status": "measured",
+      "value": {
+        "rate": 1.0,
+        "n": 5,
+        "threshold": 0.8
+      },
+      "target": ">=0.80",
+      "notes": "find_document_by_title_or_url on the 5 vendored erag pairs"
+    },
+    "Adjudicator guard soundness (non-real false-fix)": {
+      "status": "measured",
+      "value": {
+        "n_adjudication": 200,
+        "by_type": {
+          "different_entity": {
+            "n": 46,
+            "guard_fired": 46
+          },
+          "real": {
+            "n": 59,
+            "guard_fired": 0
+          },
+          "complementary_temporal": {
+            "n": 36,
+            "guard_fired": 36
+          },
+          "same_value": {
+            "n": 59,
+            "guard_fired": 59
+          }
+        },
+        "nonreal_guard_fires": 141,
+        "nonreal_n": 141,
+        "guard_fire_rate": 1.0
+      },
+      "target": "non-real false-fix MUST be 0",
+      "notes": "deterministic-guards-only slice (Bonsai killed). The 0-false-fix decider soundness needs Bonsai up -- run scripts/_scratch/guard_coverage_200.py to measure."
+    },
+    "Forgetting accuracy": {
+      "status": "gold_missing",
+      "value": null,
+      "target": "<5% of pruned edges later needed",
+      "notes": "no harness; Phase 3b unit tests only"
+    },
+    "Context efficiency": {
+      "status": "gold_missing",
+      "value": null,
+      "target": "graph context <=50% size of full-history for equal recall",
+      "notes": "no harness; graph-context vs full-history not measured"
+    },
+    "Uncertainty calibration": {
+      "status": "gold_missing",
+      "value": null,
+      "target": ">80% precision on 'I don't know'",
+      "notes": "Uncertainty Detector / Self-Model not trained (Phase 4 not started)"
+    },
+    "Delegation efficiency": {
+      "status": "gold_missing",
+      "value": null,
+      "target": ">80% of queries handled by <=8B model",
+      "notes": "no harness; model-sizing/delegation not wired at runtime"
+    }
+  }
+}

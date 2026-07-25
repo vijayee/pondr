@@ -1,0 +1,201 @@
+{
+  "n_in_window": 17,
+  "target_top1_rate": 0.2941,
+  "target_in_top3_rate": 0.5882,
+  "competitor_beats_rate": 0.7059,
+  "median_breadth": 3.0,
+  "ship": false,
+  "per_pair": [
+    {
+      "sid": "682afdd9",
+      "q": 6,
+      "t": 2,
+      "age": 3,
+      "rank": 1,
+      "top1": true,
+      "in_top3": true,
+      "beats": false,
+      "breadth": 3
+    },
+    {
+      "sid": "682afdd9",
+      "q": 7,
+      "t": 2,
+      "age": 4,
+      "rank": 1,
+      "top1": true,
+      "in_top3": true,
+      "beats": false,
+      "breadth": 3
+    },
+    {
+      "sid": "682afdd9",
+      "q": 8,
+      "t": 3,
+      "age": 4,
+      "rank": 1,
+      "top1": true,
+      "in_top3": true,
+      "beats": false,
+      "breadth": 3
+    },
+    {
+      "sid": "682afdd9",
+      "q": 9,
+      "t": 4,
+      "age": 4,
+      "rank": 2,
+      "top1": false,
+      "in_top3": true,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 17,
+      "t": 12,
+      "age": 4,
+      "rank": 2,
+      "top1": false,
+      "in_top3": true,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 19,
+      "t": 14,
+      "age": 4,
+      "rank": 9,
+      "top1": false,
+      "in_top3": false,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 21,
+      "t": 7,
+      "age": 13,
+      "rank": 1,
+      "top1": true,
+      "in_top3": true,
+      "beats": false,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 24,
+      "t": 9,
+      "age": 14,
+      "rank": 2,
+      "top1": false,
+      "in_top3": true,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 26,
+      "t": 12,
+      "age": 13,
+      "rank": 4,
+      "top1": false,
+      "in_top3": false,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 32,
+      "t": 17,
+      "age": 14,
+      "rank": 5,
+      "top1": false,
+      "in_top3": false,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 36,
+      "t": 32,
+      "age": 3,
+      "rank": 9,
+      "top1": false,
+      "in_top3": false,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 37,
+      "t": 21,
+      "age": 15,
+      "rank": 2,
+      "top1": false,
+      "in_top3": true,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 52,
+      "t": 40,
+      "age": 11,
+      "rank": 2,
+      "top1": false,
+      "in_top3": true,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 53,
+      "t": 40,
+      "age": 12,
+      "rank": 1,
+      "top1": true,
+      "in_top3": true,
+      "beats": false,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 54,
+      "t": 48,
+      "age": 5,
+      "rank": 8,
+      "top1": false,
+      "in_top3": false,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 57,
+      "t": 53,
+      "age": 3,
+      "rank": 14,
+      "top1": false,
+      "in_top3": false,
+      "beats": true,
+      "breadth": 3
+    },
+    {
+      "sid": "69e17901",
+      "q": 58,
+      "t": 52,
+      "age": 5,
+      "rank": 11,
+      "top1": false,
+      "in_top3": false,
+      "beats": true,
+      "breadth": 3
+    }
+  ],
+  "base_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  "train_rows": 568,
+  "epochs": 3,
+  "neg_per_pos": 4
+}

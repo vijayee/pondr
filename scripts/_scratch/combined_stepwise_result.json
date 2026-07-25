@@ -1,0 +1,461 @@
+{
+  "v1": {
+    "strict": 0,
+    "relaxed": 6,
+    "fp": 0,
+    "avg_rels": 1.3125,
+    "t_avg": 2.2586081062499943,
+    "t_p50": 2.246118999995815,
+    "t_p95": 2.362721800003783,
+    "t_max": 2.5212014999997336,
+    "class_emit": {
+      "has_state": 4,
+      "decides": 3,
+      "expresses": 0,
+      "questions": 0,
+      "suggests": 0,
+      "explains": 0,
+      "concerns": 0,
+      "involves": 0,
+      "contradicts": 0,
+      "follows_up_on": 0
+    },
+    "max_tokens": 768,
+    "rows": [
+      {
+        "id": "F1_database_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "F2_ticket_status_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "F3_deploy_target_field_is",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "F4_cache_field_eq",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "P5_data_layer_paraphrased",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 1
+      },
+      {
+        "id": "P6_database_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 2
+      },
+      {
+        "id": "P7_deploy_target_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 2,
+        "n_new": 2
+      },
+      {
+        "id": "P8_framework_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 2,
+        "n_new": 1
+      },
+      {
+        "id": "P9_hosting_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 2
+      },
+      {
+        "id": "P10_ci_runner_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 1
+      },
+      {
+        "id": "P11_secrets_landed_on",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 1
+      },
+      {
+        "id": "P12_pkg_manager_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "P13_region_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 1
+      },
+      {
+        "id": "N14_complementary_temporal",
+        "conflict": false,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 1,
+        "n_new": 2
+      },
+      {
+        "id": "N15_same_value_no_conflict",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "N16_different_entity_same_value",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1
+      }
+    ]
+  },
+  "iso": {
+    "strict": 11,
+    "relaxed": 11,
+    "fp": 1,
+    "avg_rels": 4.875,
+    "t_avg": 22.791120143749367,
+    "t_p50": 22.795978799993463,
+    "t_p95": 23.130175999998755,
+    "t_max": 23.14619659998425,
+    "class_emit": {
+      "has_state": 33,
+      "decides": 13,
+      "expresses": 13,
+      "questions": 10,
+      "suggests": 19,
+      "explains": 4,
+      "concerns": 29,
+      "involves": 33,
+      "contradicts": 1,
+      "follows_up_on": 1
+    },
+    "max_tokens": 768,
+    "rows": [
+      {
+        "id": "F1_database_field",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 7,
+        "n_new": 7
+      },
+      {
+        "id": "F2_ticket_status_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "F3_deploy_target_field_is",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 4,
+        "n_new": 5
+      },
+      {
+        "id": "F4_cache_field_eq",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 5,
+        "n_new": 6
+      },
+      {
+        "id": "P5_data_layer_paraphrased",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 5,
+        "n_new": 3
+      },
+      {
+        "id": "P6_database_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 5,
+        "n_new": 7
+      },
+      {
+        "id": "P7_deploy_target_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 10
+      },
+      {
+        "id": "P8_framework_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 6,
+        "n_new": 7
+      },
+      {
+        "id": "P9_hosting_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 6,
+        "n_new": 6
+      },
+      {
+        "id": "P10_ci_runner_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 5,
+        "n_new": 4
+      },
+      {
+        "id": "P11_secrets_landed_on",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 4,
+        "n_new": 3
+      },
+      {
+        "id": "P12_pkg_manager_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 3,
+        "n_new": 5
+      },
+      {
+        "id": "P13_region_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 4,
+        "n_new": 3
+      },
+      {
+        "id": "N14_complementary_temporal",
+        "conflict": false,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 3,
+        "n_new": 4
+      },
+      {
+        "id": "N15_same_value_no_conflict",
+        "conflict": false,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 8,
+        "n_new": 7
+      },
+      {
+        "id": "N16_different_entity_same_value",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 6,
+        "n_new": 4
+      }
+    ]
+  },
+  "v5_stepwise": {
+    "strict": 10,
+    "relaxed": 10,
+    "fp": 1,
+    "avg_rels": 1.9375,
+    "t_avg": 2.3075044000004254,
+    "t_p50": 2.310267600005318,
+    "t_p95": 2.411986600003729,
+    "t_max": 2.414322799995716,
+    "class_emit": {
+      "has_state": 59,
+      "decides": 1,
+      "expresses": 0,
+      "questions": 0,
+      "suggests": 0,
+      "explains": 0,
+      "concerns": 1,
+      "involves": 1,
+      "contradicts": 0,
+      "follows_up_on": 0
+    },
+    "max_tokens": 1536,
+    "rows": [
+      {
+        "id": "F1_database_field",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 1,
+        "n_new": 2
+      },
+      {
+        "id": "F2_ticket_status_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "F3_deploy_target_field_is",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "F4_cache_field_eq",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 2
+      },
+      {
+        "id": "P5_data_layer_paraphrased",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 2,
+        "n_new": 3
+      },
+      {
+        "id": "P6_database_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 2
+      },
+      {
+        "id": "P7_deploy_target_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 3,
+        "n_new": 2
+      },
+      {
+        "id": "P8_framework_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 3,
+        "n_new": 2
+      },
+      {
+        "id": "P9_hosting_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 2,
+        "n_new": 2
+      },
+      {
+        "id": "P10_ci_runner_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 2
+      },
+      {
+        "id": "P11_secrets_landed_on",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 2
+      },
+      {
+        "id": "P12_pkg_manager_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 3,
+        "n_new": 2
+      },
+      {
+        "id": "P13_region_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 3,
+        "n_new": 2
+      },
+      {
+        "id": "N14_complementary_temporal",
+        "conflict": false,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 2
+      },
+      {
+        "id": "N15_same_value_no_conflict",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "N16_different_entity_same_value",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 2,
+        "n_new": 2
+      }
+    ]
+  }
+}

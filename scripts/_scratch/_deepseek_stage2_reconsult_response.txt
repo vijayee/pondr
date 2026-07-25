@@ -1,0 +1,61 @@
+=== DEEPSEEK_CALL_OK ===
+elapsed_seconds=57.12
+attempt=1
+model=deepseek-v4-pro:cloud
+======================================================================
+
+**Verdict: CONTINUE. A full pass is within reach. The 1f‑6 shared readout already ships text (30.16, 2/3). Sampler #1 seed 2 proved a shared readout can pass both buckets simultaneously. The remaining blocker is code‑lift + variance. The highest‑leverage single action is hard‑negative mining for code – it directly attacks the code‑ranking weakness without touching data balance or optimizer dynamics.**
+
+---
+
+### 1. Variance‑taming for the sampler – ranked by expected leverage
+
+**(b) No‑replacement weighted sampling (weighted shuffle)** – **highest leverage.**  
+Each record appears exactly once per epoch, order weighted by inverse frequency. This eliminates the replacement noise (records seen 0 or 2×) while keeping per‑step loss scale = 1.0 – fully AdamW‑clean. It preserves the per‑epoch balance that gave seed 2 its win, and drastically reduces seed‑to‑seed variance. Implement as a `WeightedRandomSampler(replacement=False, num_samples=len(dataset))` with the same class‑balanced weights. Expect stable ≥2/3 pass.
+
+**(a) Milder upweighting (sqrt‑inverse‑freq or temperature)** – **medium leverage, fallback.**  
+Reduces gradient imbalance, which may lower variance, but risks losing the code‑lift that made seed 2 pass. Only try if (b) still shows inverted seeds; tune the temperature on a 3‑seed sweep.
+
+**(d) Seed ensemble (logit‑average)** – **low leverage, band‑aid.**  
+Inverted seeds (s0, s1) would drag down the average; unlikely to yield a clean ≥2.0 gap. Not a robust solution.
+
+**(c) More seeds + majority vote** – **lowest leverage.**  
+The pass criterion demands ≥2/3 seeds. If the true pass rate is 1/3, 6 seeds give ~2/6 = 33 % → FAIL. Only helps if the true rate is already > 1/3, which we don’t have evidence for.
+
+---
+
+### 2. Hard‑negative mining for code – **ranked #1 overall**
+
+For every code‑gold record, force the hardest negative to be a **code filler** (instead of any filler). This is a pure loss‑structure change: the margin hinge now pushes the correct code slot above the highest‑scoring *incorrect code* slot. It directly teaches the shared readout to separate code slots from one another, attacking the exact failure mode (code mis‑ranks). It is AdamW‑clean, requires no data rebalancing, and leaves text training untouched. Expected effect: lifts `ret_code` to ≥2.0 while preserving `ret_text` 30.16. **This is the single highest‑leverage next step.**
+
+---
+
+### 3. Per‑kind bodies + shared head – **architectural fallback, rank after data/loss fixes**
+
+Separate 6144→128 bodies per kind, feeding a **single shared 128→384 head**. The shared head guarantees a common logit space → cross‑kind comparability is preserved. The per‑kind bodies escape the conv‑majority pull. This is the correct architectural answer if data/loss fixes prove insufficient. Risk: the bodies may produce incompatible 128‑dim representations that the shared head struggles to reconcile; training dynamics are untested. **Implement only if hard‑negative mining + no‑replacement sampling both fail.**
+
+---
+
+### 4. Stage 2 backbone retrain – **lowest priority**
+
+The code signal already exists in the frozen backbone (held‑out 6.76). The bottleneck is the readout, not the representations. Stage 2 is a large effort and unnecessary until all readout‑side fixes are exhausted. **Do not escalate now.**
+
+---
+
+### 5. Ship‑vs‑continue
+
+- **Text‑only partial ship:** Not viable. The live‑gate criterion explicitly requires both `retrieved_text ≥ 2.0` AND `retrieved_code ≥ 2.0`. Code is a hard requirement.
+- **Full ship path:**  
+  1. Hard‑negative mining on 1f‑6 (1–2 days) → expected to pass both.  
+  2. If not, no‑replacement balanced sampling (1 day) → stabilises the proven seed 2 result.  
+  3. If still not, per‑kind bodies + shared head (3–5 days) → architectural guarantee.  
+  Probability of full pass with step 1 alone is high; step 2 makes it near‑certain.
+
+**Continue. Do not ship until code passes.**
+
+---
+
+### 6. Single highest‑leverage next step
+
+**Implement hard‑negative mining for code‑gold records: force the hardest negative to be a code filler.**  
+This is a minimal code change, AdamW‑clean, and directly targets the code‑ranking deficit. Run on the existing 1f‑6 setup (unbalanced data, shared readout). If `ret_code` reaches ≥2.0 in ≥2/3 seeds while `ret_text` holds, ship immediately. If not, proceed to no‑replacement balanced sampling.

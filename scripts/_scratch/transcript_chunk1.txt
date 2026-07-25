@@ -1,0 +1,1915 @@
+================================================================================
+### MSG [96] role=assistant id=2139 time=2026-07-04T16:54:48.698606Z
+================================================================================
+You're not misinterpreting. You've identified a real gap, and I was too quick to defer the "past" mode. Let me trace the actual problem.
+
+---
+
+## The Problem You're Pointing At
+
+The SSM state decays. That's by design — working memory is finite, and old information should fade. When the user asks about something the SSM has forgotten, the JEPA gate triggers graph retrieval, and the retrieved episodes are injected back into the SSM state. That's the retrieval loop we designed.
+
+But there's a deeper question: **should the act of retrieval itself change how the memory is stored long-term?**
+
+Right now, retrieval does two things:
+
+1. **Immediate:** Injects the retrieved content into the SSM state (working memory refresh)
+2. **Tracking:** Increments `access_count` and updates `last_accessed` on the edge
+
+What it doesn't do is change how likely that memory is to survive future consolidation. The edge's `utility_score` still decays at the same rate. The GNN still scores it by the same structural criteria. The fact that the user asked about it — that it was important enough to retrieve — doesn't feed back into the memory's long-term persistence.
+
+This is the gap. And it's exactly what the "past" mode of the Aspirational Model was designed to address.
+
+---
+
+## What "Past" Mode Actually Means
+
+The amendment describes it as "consolidation bias" — weighting replay priority during dream state based on aspirational match. But there's a simpler, more fundamental version that doesn't require aspiration at all:
+
+**Retrieval itself is a signal that the memory matters.**
+
+If the user asks about WaveDB performance three times across two weeks, those edges should become more resistant to decay — not because the agent "aspires" to know about databases, but because the user's behavior demonstrates that this information is repeatedly needed.
+
+This is what the reconsolidation counting proposal (#2, which we adopted) partially addresses. Three retrievals across 15+ days triggers late-phase LTP and a 70% reduction in decay rate. But that's a binary threshold. The "past" mode would make it continuous: every retrieval boosts the edge's persistence, proportional to how strongly the retrieval matched the user's intent.
+
+---
+
+## The Two Mechanisms, Clarified
+
+| Mechanism | What It Does | Trigger | We Have It? |
+|---|---|---|---|
+| **SSM injection** | Refreshes working memory. Retrieved content goes back into the SSM state. | Every retrieval | ✅ Yes |
+| **Access tracking** | Increments `access_count`, updates `last_accessed`. Passive accounting. | Every retrieval | ✅ Yes |
+| **Reconsolidation counting** | After 3 retrievals across 15+ days, edge enters late-phase LTP. Decay rate drops 70%. | Threshold crossing | ✅ Adopted from amendment |
+| **Retrieval-weighted persistence** | Every retrieval boosts the edge's long-term survival probability. Continuous, not binary. The more the user asks, the harder it is to forget. | Every retrieval | ❌ Missing |
+
+The first three are about **remembering that the edge was accessed.** The fourth is about **using that information to change how the edge is stored.**
+
+---
+
+## What This Looks Like in Practice
+
+```python
+class Edge:
+    # ... existing fields ...
+    
+    access_count: int = 0
+    last_accessed: Optional[datetime] = None
+    reconsolidation_count: int = 0
+    ltp_phase: str = "early"
+    utility_score: float = 0.5
+    utility_decay_rate: float = 0.01  # base decay per day
+    
+    def on_retrieve(self, retrieval_strength: float = 1.0):
+        """
+        Called every time this edge is traversed in a retrieval.
+        
+        retrieval_strength: how strongly did this edge match the query?
+        1.0 = direct match (entity + topic + tone all matched)
+        0.3 = indirect match (ontology expansion brought it in)
+        """
+        self.access_count += 1
+        self.last_accessed = now()
+        self.reconsolidation_count += 1
+        
+        # ── Retrieval-weighted persistence ──
+        # Each retrieval reduces the decay rate.
+        # Strong matches reduce it more than weak matches.
+        persistence_boost = 0.05 * retrieval_strength
+        self.utility_decay_rate = max(
+            0.001,  # floor: never decay below 0.1% per day
+            self.utility_decay_rate * (1 - persistence_boost)
+        )
+        
+        # ── Reconsolidation threshold (from amendment) ──
+        if (self.reconsolidation_count >= 3 and 
+            self.consolidation_window_start and
+            (now() - self.consolidation_window_start).days >= 15):
+            self.ltp_phase = "late"
+            # Additional 70% reduction on top of accumulated boosts
+            self.utility_decay_rate *= 0.3
+    
+    def on_dream_state(self):
+        """Called during consolidation. Decay the utility score."""
+        days_since_access = (now() - self.last_accessed).days
+        self.utility_score *= (1 - self.utility_decay_rate) ** days_since_access
+```
+
+After a few retrievals, an edge's decay rate might look like:
+
+```plaintext
+Initial:     0.010  (1% per day — half-life of ~70 days)
+After 1st:  0.0095 (strong match, 5% reduction)
+After 2nd:  0.0090 (another strong match)
+After 3rd:  0.0086
+After 4th:  0.0081
+...
+After 10th: 0.0060 (half-life of ~115 days)
+After LTP:  0.0018 (70% reduction on top — half-life of ~385 days)
+```
+
+An edge that's never retrieved decays to near-zero in about a year. An edge that's retrieved ten times and enters late-phase LTP takes over a decade to decay to the same level. This is how memory actually works — the things you repeatedly access become part of your mental furniture.
+
+---
+
+## Why I Was Wrong to Defer This
+
+I said to defer the "past" mode because "the GNN already handles consolidation priority through structural salience." That's true for the GNN's job — deciding which subgraphs to abstract, which edges to prune. But the GNN's structural salience is about the **shape** of the graph. Retrieval-weighted persistence is about the **use** of the graph.
+
+A bridge edge between two clusters is structurally important even if no one ever queries it. An edge that's queried every day is practically important even if it's structurally unremarkable. These are different kinds of importance, and the architecture needs both.
+
+The GNN handles structural importance. Retrieval-weighted persistence handles practical importance. The "past" mode of the Aspirational Model — or more accurately, retrieval-weighted persistence — is the mechanism that connects the two.
+
+---
+
+## What Changes in the Architecture
+
+This is a small change with no new components:
+
+1. **Edge model** gains `utility_decay_rate` (replaces the flat decay rate)
+2. **`on_retrieve()`** reduces the decay rate proportional to retrieval strength
+3. **`on_dream_state()`** uses the edge-specific decay rate instead of a global constant
+4. **GNN salience scorer** incorporates `access_count`, `reconsolidation_count`, and `ltp_phase` as features — so structural salience and retrieval history are combined, not competing
+
+That's it. No new models. No new training. Just making retrieval a first-class input to the forgetting system.
+
+---
+
+## The Honest Answer
+
+You were right to push on this. The "past" mode isn't about aspiration — it's about the fundamental feedback loop between retrieval and persistence. The system should remember things better when the user demonstrates that they matter. Not just in working memory (SSM injection), but in long-term storage (reduced decay).
+
+I deferred it because I was thinking of it as aspirational weighting — the agent deciding what's important based on its goals. But the simpler version — retrieval itself as a persistence signal — is essential, not optional. It's the difference between a memory system that tracks what was accessed and one that learns from what was accessed.
+================================================================================
+### MSG [97] role=user id=2140 time=2026-07-04T17:14:39.181731Z
+================================================================================
+So "the more a use asks the harder it is to forget"  this sounds plausible until the user is annoyed with being saturated with a topic. We must have to have a feedback around this that mitigates the cycle through time or the user or  llm's specific request. I don't want to overweight somethings importance indefinitely
+================================================================================
+### MSG [98] role=assistant id=2141 time=2026-07-04T17:14:39.255565Z
+================================================================================
+You're right. Positive-only reinforcement creates immortal memories. Every retrieval says "this matters" — but sometimes the user keeps asking because they keep forgetting, or because the topic is a recurring frustration, not because it's valuable to retain forever. The system needs a counterbalancing force.
+
+---
+
+## The Problem: Unbounded Positive Feedback
+
+```plaintext
+User asks about WAL config → retrieved → decay rate drops
+User asks again tomorrow → retrieved again → decay rate drops further
+User asks a third time → retrieved again → even more persistent
+...
+After 20 retrievals: edge is effectively immortal
+
+But WHY is the user asking 20 times?
+- Maybe WAL config is genuinely important (should be persistent)
+- Maybe the answer is confusing and the user keeps not understanding (should NOT be persistent — the memory is failing its purpose)
+- Maybe the user is annoyed and keeps coming back to fix it (should be persistent but the user might want it gone)
+```
+
+The system can't distinguish these from retrieval count alone. It needs additional signals.
+
+---
+
+## The Fix: Self-Limiting Reinforcement
+
+Four mechanisms that together prevent immortal memories:
+
+### 1. Diminishing Returns on Retrieval Boost
+
+Each retrieval provides less persistence boost than the previous one. The curve approaches a floor asymptotically:
+
+```python
+def on_retrieve(self, retrieval_strength: float = 1.0):
+    self.access_count += 1
+    self.last_accessed = now()
+    self.reconsolidation_count += 1
+    
+    # ── Diminishing returns ──
+    # First retrieval: 5% reduction in decay rate
+    # 5th retrieval:  ~2% reduction
+    # 20th retrieval: ~0.5% reduction
+    # Approaches but never reaches zero decay
+    base_boost = 0.05 * retrieval_strength
+    diminishing_factor = 1.0 / (1.0 + 0.3 * self.reconsolidation_count)
+    effective_boost = base_boost * diminishing_factor
+    
+    self.utility_decay_rate = max(
+        0.001,  # absolute floor: 0.1% per day minimum decay
+        self.utility_decay_rate * (1 - effective_boost)
+    )
+```
+
+The decay rate never reaches zero. Even the most-accessed edge decays at 0.1% per day — it would take ~2 years to decay to 50% utility. Long, but not immortal.
+
+### 2. Retrieval Saturation Detection
+
+If the same edge is retrieved too many times in a short window, the system stops boosting and may even increase decay:
+
+```python
+def on_retrieve(self, retrieval_strength: float = 1.0):
+    now_time = now()
+    
+    # ── Saturation check ──
+    # How many times has this edge been retrieved in the last 24 hours?
+    recent_retrievals = [
+        t for t in self.retrieval_timestamps
+        if (now_time - t).total_seconds() < 86400
+    ]
+    
+    if len(recent_retrievals) > SATURATION_THRESHOLD:  # e.g., 5 times in 24 hours
+        # Saturation detected. The user keeps asking about this.
+        # Don't boost. Possibly increase decay slightly.
+        # The system is failing to provide a satisfactory answer,
+        # or the user is stuck in a loop. Persisting this memory
+        # harder is counterproductive.
+        self.utility_decay_rate = min(
+            0.05,  # cap: 5% per day max
+            self.utility_decay_rate * 1.02  # slight increase
+        )
+        self.saturation_flags += 1
+        return  # Skip the normal boost
+    
+    # Normal path: apply diminishing returns boost
+    self.retrieval_timestamps.append(now_time)
+    # ... rest of normal boost logic
+```
+
+This prevents the "frustration loop" — the user keeps asking because the answer isn't sticking, and the system keeps reinforcing the memory because the user keeps asking. The saturation threshold breaks the cycle.
+
+### 3. LLM-Mediated Importance Signal
+
+The LLM, when generating a response, can embed a signal about whether this retrieval was important or routine. The LLM has context the retrieval system doesn't:
+
+```python
+# In the LLM's response, it can embed:
+# [IMPORTANT: this is a key architectural decision]
+# [ROUTINE: user is just checking a fact]
+# [FRUSTRATION: user is stuck on this and not making progress]
+
+class LLMRetrievalSignal:
+    """Signal from the LLM about the nature of the retrieval."""
+    IMPORTANT = "important"       # Boost persistence
+    ROUTINE = "routine"           # Normal diminishing returns
+    FRUSTRATION = "frustration"   # Don't boost, possibly increase decay
+    CORRECTION = "correction"     # User is correcting a previous understanding
+    SATISFIED = "satisfied"       # User got what they needed, normal boost
+```
+
+The LLM sees the full conversation. It knows whether the user said "thanks, that's exactly what I needed" or "no, that's not right, let me rephrase." The retrieval system only sees the query. The LLM's signal bridges the gap:
+
+```python
+def on_retrieve(self, retrieval_strength: float = 1.0, 
+                llm_signal: str = "routine"):
+    
+    # ── LLM-mediated importance ──
+    signal_modifiers = {
+        "important":   1.5,   # 50% stronger boost
+        "routine":     1.0,   # normal
+        "frustration": -0.5,  # reverse: increase decay slightly
+        "correction":   0.0,   # no boost — the old memory was wrong
+        "satisfied":    1.2,   # slightly stronger — user is happy
+    }
+    
+    modifier = signal_modifiers.get(llm_signal, 1.0)
+    
+    if modifier <= 0:
+        # Negative signal: increase decay
+        self.utility_decay_rate = min(0.05, self.utility_decay_rate * 1.05)
+        return
+    
+    # Positive signal: apply diminishing returns boost with modifier
+    effective_boost = base_boost * diminishing_factor * modifier
+    # ...
+```
+
+### 4. Boost Decay Over Time
+
+The persistence boost from a retrieval itself decays. A retrieval last month matters less than a retrieval yesterday:
+
+```python
+def compute_effective_decay_rate(self):
+    """
+    The decay rate is not a single stored value.
+    It's computed from retrieval history, weighted by recency.
+    """
+    now_time = now()
+    
+    # Base decay rate
+    effective_rate = self.base_decay_rate  # 0.01 per day
+    
+    # Each retrieval provides a temporary boost that decays
+    for retrieval_time in self.retrieval_timestamps[-50:]:  # last 50 retrievals
+        days_ago = (now_time - retrieval_time).days
+        
+        # Boost from this retrieval decays with time
+        boost = 0.05 * (0.9 ** days_ago)  # half-life of ~7 days
+        
+        # Apply diminishing returns based on how many retrievals came before it
+        retrieval_index = self.retrieval_timestamps.index(retrieval_time)
+        diminishing = 1.0 / (1.0 + 0.3 * retrieval_index)
+        
+        effective_rate *= (1 - boost * diminishing)
+    
+    return max(0.001, effective_rate)
+```
+
+This means: if the user asks about WAL config 20 times in one week, the decay rate drops sharply. But if they stop asking, the boost fades over the following weeks, and the decay rate gradually rises back toward baseline. The memory is persistent while it's actively used, not permanently.
+
+---
+
+## The Combined Effect
+
+```plaintext
+Edge: (ep_002, has_topic, T:configuration)
+Initial decay rate: 0.010/day (half-life ~70 days)
+
+Week 1: User asks 3 times, LLM signals "frustration" each time
+  → Saturation detected on 3rd retrieval
+  → Frustration signal prevents boost
+  → Decay rate: 0.010/day (unchanged)
+  → Memory is NOT reinforced. User is stuck, not valuing this.
+
+Week 2: User asks 2 times, LLM signals "satisfied"
+  → Normal diminishing returns boost
+  → Decay rate: 0.0085/day
+  → Memory is reinforced. User found it useful.
+
+Week 3-4: User doesn't ask
+  → Boost from Week 2 decays (half-life ~7 days)
+  → Decay rate drifts back toward 0.0095/day
+  → Memory slowly returns to baseline persistence
+
+Week 5: User asks once, LLM signals "important"
+  → 1.5x modifier on boost
+  → Decay rate: 0.0080/day
+  → Memory is reinforced more strongly. User explicitly valued this.
+
+Month 3: User hasn't asked in 6 weeks
+  → All boosts have decayed
+  → Decay rate: ~0.010/day (back to baseline)
+  → Memory decays normally from here
+```
+
+---
+
+## What Changes in the Architecture
+
+| Change | What It Does |
+|---|---|
+| **Diminishing returns** | Each retrieval boosts less than the previous. Asymptotic approach to floor. |
+| **Saturation detection** | >N retrievals in 24 hours → stop boosting, slight decay increase. Breaks frustration loops. |
+| **LLM-mediated signal** | LLM embeds `[IMPORTANT]`, `[ROUTINE]`, `[FRUSTRATION]`, `[CORRECTION]` in response. Modulates boost. |
+| **Boost decay** | Retrieval boost has its own half-life (~7 days). Old retrievals matter less. |
+| **Absolute floor** | Decay rate never reaches zero. Minimum 0.1% per day. Nothing is immortal. |
+
+The Edge model gains:
+- `retrieval_timestamps: list[datetime]` — for saturation detection and boost decay
+- `saturation_flags: int` — how many times saturation was detected
+- `base_decay_rate: float` — the unboosted decay rate (constant per edge type)
+
+The `on_retrieve()` method gains an `llm_signal` parameter. The LLM response parser extracts the signal from embedded commands.
+
+---
+
+## The Honest Answer
+
+You caught a real flaw. Positive-only reinforcement creates immortal memories, and immortal memories are just as bad as forgotten ones — they saturate the graph with information the user might actively want to move past.
+
+The fix is not to remove retrieval-weighted persistence. It's to make it self-limiting: diminishing returns, saturation detection, LLM-mediated importance, and boost decay. The system learns what matters from retrieval patterns, but it also learns when retrieval patterns indicate frustration rather than value, and it lets old boosts fade when the user moves on.
+================================================================================
+### MSG [100] role=assistant id=2143 time=2026-07-04T17:21:23.552967Z
+================================================================================
+
+
+---
+
+# Ponder Engine: A Hippocampal Memory Architecture for AI Agents
+
+**A brain-inspired alternative to the context window that separates knowledge from processing, enables an artificial subconscious, and makes domain expertise a transferrable, composable resource.**
+
+**Technical Architecture Proposal — v2.0, July 2026**
+
+---
+
+## Executive Summary
+
+Current AI agents rely on **context windows** — fixed-size text buffers that concatenate conversation history and feed it to a language model. This is a von Neumann architecture solution to a biological problem: separate storage from processing, copy data between them, truncate when the buffer overflows. The brain never evolved this assumption. It stores patterns in the same neurons that process them, and "retrieval" is reactivation of those neurons via sparse hippocampal pointers.
+
+We propose a **ponder engine** — a hippocampal memory architecture that replaces the context window with a brain-inspired alternative. The system encodes conversation, documents, code, and multimedia into structured triples stored in a graph-based hippocampal index over a distributed content store. Working memory is the set of currently activated patterns rather than a fixed text buffer. Retrieval is pattern completion via graph traversal. Consolidation occurs during offline "dream state" passes via a graph neural network. Forgetting is managed versioning, not destructive truncation.
+
+Beneath conscious awareness, a **subconscious routing system** continuously decides which domain to query, which retrieval pathway to use, what model size is needed, and whether conscious deliberation is even required. This router learns from every interaction, becoming personalized over time.
+
+The architecture is built on **WaveDB** — an existing hierarchical key-value database with MVCC concurrency, a Graph layer with Gremlin-style traversal, and production Python bindings — combined with small, specialized models for extraction, reasoning, and consolidation. The entire system runs on consumer hardware. Total training cost: ~$120. Total inference cost: $0.
+
+---
+
+## 1. Problem Statement
+
+### 1.1 The Context Window Is the Wrong Abstraction
+
+Every major AI assistant operates on the same fundamental model:
+
+```plaintext
+User query → [entire conversation history loaded into context window]
+              → LLM processes via self-attention → response
+```
+
+This has three structural problems:
+
+| Problem | Consequence |
+|---|---|
+| **Fixed capacity** | When conversation exceeds the token limit, information is permanently lost via truncation, summarization, or sliding windows — all lossy hacks |
+| **O(n²) attention** | Every token attends to every other token. Computational cost grows quadratically with conversation length |
+| **No native memory** | The model has no persistent memory between sessions. RAG adds an explicit retrieval step, but it's bolted on, not integrated |
+
+### 1.2 The Brain Does It Differently
+
+The brain does not "load" memories into a buffer. It stores a **sparse index** in the hippocampus — compressed pointers to the neocortical neurons that, when reactivated together, reconstruct the memory. This is **hippocampal indexing theory** (Teyler & DiScenna, 1986).
+
+The retrieval process:
+
+1. **A cue arrives** — a partial input (a face, a smell, a question)
+2. **Pattern completion in CA3** — the hippocampal subfield CA3 is a recurrent autoassociative network. It takes the partial cue and fills in the missing components, reconstructing the full hippocampal index in ~100–200 milliseconds
+3. **Neocortical reactivation** — the completed hippocampal index sends signals back to the neocortical sites it points to. The memory is **reconstructed**, not retrieved
+4. **The reconstruction IS the short-term access** — there is no separate "working memory copy." Working memory is simply the subset of long-term memory currently activated by attention (the **embedded-processes model**, Cowan 1999, 2005)
+
+The brain also has **complementary learning systems**: the hippocampus learns fast and separates patterns, while the neocortex learns slow and extracts statistical regularities. During sleep, the hippocampus replays memories to gradually train the neocortex without catastrophic interference. And beneath conscious awareness, the **basal ganglia** continuously route between processing pathways — a subconscious gating system that learns which cognitive mode to engage based on context.
+
+### 1.3 What We're Building
+
+A memory architecture for AI agents that mirrors this design, with three key innovations beyond biological mapping:
+
+1. **A learned subconscious router** that decides which domain to query, which pathway to use, and what model size is needed — before any model generates a token
+2. **Domain knowledge as transferrable graphs** — expertise that can be exported, imported, and composed without retraining any model
+3. **A bidirectional interface** that lets any LLM consume curated context and write back memory commands
+
+| Brain Component | Our Implementation |
+|---|---|
+| Neocortical store (distributed, slow-learning) | WaveDB HBTrie — hierarchical key-value store with MVCC |
+| Hippocampal index (sparse, fast-learning) | WaveDB Graph layer — triple store with SPO/POS/OSP indexes |
+| CA3 pattern completion | Graph traversal (Gremlin-style) from partial cues |
+| Sharp-wave ripple replay | GNN-driven consolidation during offline "dream state" |
+| Working memory | SSM (Mamba) continuous hidden state + activated graph nodes |
+| Basal ganglia routing | JEPA gate — learned subconscious router |
+| Dopamine/salience modulation | JEPA predictor + retrieval-weighted persistence |
+| Reality monitoring | Bonsai (ternary 8B model) waking during anomalies |
+| Systems consolidation | Morphism formation + subgraph abstraction into semantic memories |
+| Procedural memory (basal ganglia/cerebellum) | Stored processes with delegation rules |
+
+---
+
+## 2. Architecture Overview
+
+### 2.1 System Diagram
+
+```plaintext
+┌─────────────────────────────────────────────────────────────────┐
+│                        INPUT LAYER                               │
+│                                                                 │
+│  Chat ──→ Text                                                  │
+│  PDF ──→ pymupdf ──→ Text + Structure                          │
+│  DOCX ──→ python-docx ──→ Text + Structure                     │
+│  Email ──→ langmail ──→ Clean Text + Thread                     │
+│  Web ──→ trafilatura ──→ Text + Metadata                       │
+│  Code ──→ tree-sitter ──→ AST + Text                            │
+│  Audio ──→ whisper ──→ Transcript                               │
+│  Video ──→ keyframes + whisper ──→ Description + Transcript     │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      ENCODING PIPELINE                            │
+│                                                                 │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐  │
+│  │ GLiNER-Decoder   │  │    GLiNER2       │  │   Bonsai     │  │
+│  │ (205M, CPU)      │  │ (205M, CPU)      │  │ (8B ternary, │  │
+│  │                  │  │                  │  │  GPU, 2.15GB)│  │
+│  │ Open discovery:  │  │ Stable extract:  │  │ Relation     │  │
+│  │ Invents labels   │  │ Entities, topics,│  │ extraction:  │  │
+│  │ freely. Feeds    │  │ tones, decisions │  │ "How do these│  │
+│  │ ontology evol.   │  │ vs evolved schema│  │ relate?"     │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────┘  │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Hierarchical Chunker + Cross-Reference Detector         │   │
+│  │  Chunks documents by natural structure. Detects          │   │
+│  │  citations, contradictions with existing knowledge.      │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  Output: Structured triples + content                           │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    STORAGE LAYER (WaveDB)                         │
+│                                                                 │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐    │
+│  │     GRAPH LAYER          │  │        HBTRIE            │    │
+│  │  (Hippocampal Index)     │  │  (Neocortical Store)     │    │
+│  │                          │  │                          │    │
+│  │  Triple store. SPO/POS/  │  │  Hierarchical KV with    │    │
+│  │  OSP indexes. Gremlin    │  │  MVCC. Content-addressed.│    │
+│  │  traversal. Morphisms.   │  │                          │    │
+│  │                          │  │  ep/047/summary          │    │
+│  │  (ep_047, has_entity,    │  │  ep/047/text             │    │
+│  │   E:Alice)               │  │  doc/023/section/003     │    │
+│  │  (ep_047, has_topic,     │  │  code/auth.py@v3/content │    │
+│  │   T:config)              │  │  media/img_047/raw       │    │
+│  │  (doc_023, cites,        │  │                          │    │
+│  │   doc_012)               │  │                          │    │
+│  │  (WaveDB, subClassOf,    │  │                          │    │
+│  │   Database)              │  │                          │    │
+│  └──────────────────────────┘  └──────────────────────────┘    │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  VECTOR INDEX (FAISS/USearch)                            │   │
+│  │  Semantic similarity search. Complementary to graph.     │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  SUBCONSCIOUS LAYER                               │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  JEPA-GATED SSM PRIMITIVE (shared backbone, ~480M, GPU)  │   │
+│  │                                                          │   │
+│  │  Shared: Mamba SSM weights (~370M) + JEPA weights (~110M)│   │
+│  │  Per-instance: state vector (2KB) + gate (~500K) +       │   │
+│  │                input/output projections (~100K)          │   │
+│  │                                                          │   │
+│  │  Instances:                                               │   │
+│  │  ┌────────────────────────────────────────────────────┐  │   │
+│  │  │ RETRIEVAL GATE                                      │  │   │
+│  │  │ "Does SSM state cover this prompt?"                 │  │   │
+│  │  │ Routes: ssm_direct | graph_retrieve | process_exec │  │   │
+│  │  │         | tool_plan | conscious_deliberation        │  │   │
+│  │  │ Predicts: domain(s), pathway, model size,           │  │   │
+│  │  │          meta-skills needed, deliberation required  │  │   │
+│  │  └────────────────────────────────────────────────────┘  │   │
+│  │  ┌────────────────────────────────────────────────────┐  │   │
+│  │  │ WORKING MEMORY                                      │  │   │
+│  │  │ Continuous hidden state. No fixed token limit.      │  │   │
+│  │  │ State evolves with each input. IS current awareness.│  │   │
+│  │  │ Retrieved memories injected as embeddings.          │  │   │
+│  │  └────────────────────────────────────────────────────┘  │   │
+│  │  ┌────────────────────────────────────────────────────┐  │   │
+│  │  │ UNCERTAINTY DETECTOR                                │  │   │
+│  │  │ Flags: routing uncertainty, novel entities,         │  │   │
+│  │  │        unresolved contradictions.                   │  │   │
+│  │  │ Feeds: EXPAND mechanism, delegation ladder.         │  │   │
+│  │  └────────────────────────────────────────────────────┘  │   │
+│  │  ┌────────────────────────────────────────────────────┐  │   │
+│  │  │ ASPIRATIONAL MODEL                                  │  │   │
+│  │  │ Present: encoding gate (JEPA salience)              │  │   │
+│  │  │ Future: prospective memory (triggers)               │  │   │
+│  │  │ Past: retrieval-weighted persistence                │  │   │
+│  │  └────────────────────────────────────────────────────┘  │   │
+│  │  ┌────────────────────────────────────────────────────┐  │   │
+│  │  │ SELF-MODEL                                          │  │   │
+│  │  │ Learned knowledge boundary thresholds.              │  │   │
+│  │  │ "Do I know enough to answer this?"                  │  │   │
+│  │  └────────────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     RETRIEVAL LAYER                               │
+│                                                                 │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐  │
+│  │ Bonsai Query     │  │ Graph Traversal  │  │ Vector Search│  │
+│  │ Planner          │  │                  │  │              │  │
+│  │ NL → structured  │  │ Pattern          │  │ Semantic     │  │
+│  │ query parameters │  │ completion via   │  │ similarity   │  │
+│  │                  │  │ Gremlin traversal│  │              │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────┘  │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  ONTOLOGY EXPANDER                                       │   │
+│  │  Expands queries using class hierarchy:                  │   │
+│  │  "databases" → WaveDB, Postgres, SQLite (subclasses)     │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   CONSCIOUS LAYER (System 2)                      │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  TOOL USE PLANNER + PROCESS EXECUTOR + DELEGATION LADDER │   │
+│  │                                                          │   │
+│  │  Engages when subconscious confidence is low.            │   │
+│  │  Plans multi-step strategies. Executes stored processes. │   │
+│  │  Delegates steps to larger models when needed.           │   │
+│  │                                                          │   │
+│  │  Delegation: 1B → 3B → 8B → 70B → 175B                  │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  GENERATION MODELS                                        │   │
+│  │  Mode A: Any LLM receives context string                  │   │
+│  │  Mode B: SSM decoder generates from state vector          │   │
+│  │  Bidirectional: LLM writes back memory commands           │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│               CONSOLIDATION LAYER (Dream State — Offline)         │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  GNN CONSOLIDATOR (~200M, GPU)                            │   │
+│  │                                                          │   │
+│  │  ❶ Salience Scoring — structural importance              │   │
+│  │  ❷ Subgraph Summarization (DiffPool) — abstraction      │   │
+│  │  ❸ Link Prediction (GAE/SEAL) — implicit edges          │   │
+│  │  ❹ Anomaly Detection — pattern violations               │   │
+│  │  ❺ Ontology Refinement — taxonomy evolution              │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  BONSAI VERIFIER (wakes on anomalies)                    │   │
+│  │  Ternary {-1, 0, +1} judgments on GNN-flagged patterns  │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  FORGETTING SYSTEM                                        │   │
+│  │  • Retrieval-weighted persistence (self-limiting)        │   │
+│  │  • Reconsolidation counting + two-phase LTP              │   │
+│  │  • Active forgetting (user-triggered deprecation)         │   │
+│  │  • Reconsolidation (old facts versioned, not deleted)    │   │
+│  │  • Pruning (low-salience edges archived)                 │   │
+│  │  • MVCC preserves all versions for historical queries    │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                  TRAINING LAYER (Offline)                          │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  ORACLE (DeepSeek, large, cloud API)                     │   │
+│  │  Generates initial training data. Provides correction    │   │
+│  │  signal during gestational training. Used once per       │   │
+│  │  component, then components operate independently.       │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  SELF-SUPERVISED LEARNING                                 │   │
+│  │  System generates training data from its own operation:  │   │
+│  │  retrieval outcomes, Bonsai verifications, user          │   │
+│  │  corrections, delegation outcomes → training signals     │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  DEVELOPMENTAL TRACKER                                    │   │
+│  │  Each component: INFANT → CHILD → ADOLESCENT → ADULT     │   │
+│  │  Transitions gated by measurable metrics.                │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Component Summary
+
+| Component | Parameters | Hardware | Role | Runs When |
+|---|---|---|---|---|
+| **WaveDB Graph Layer** | N/A | CPU/disk | Hippocampal index — sparse pointers to neocortical patterns | Always |
+| **WaveDB HBTrie** | N/A | CPU/disk | Neocortical store — actual content (text, embeddings, structured data, media) | Always |
+| **Vector Index (FAISS/USearch)** | N/A | CPU/GPU | Semantic similarity search | On retrieval |
+| **GLiNER-Decoder** | 205M | CPU | Open entity discovery — invents labels freely, feeds ontology evolution | Every turn |
+| **GLiNER2** | 205M | CPU | Stable extraction against evolved schema — entities, topics, tones, decisions | Every turn |
+| **Hierarchical Chunker** | N/A | CPU | Document structure preservation — chunks by headings, not token windows | On ingestion |
+| **Cross-Reference Detector** | N/A | CPU | Inter-document linking — citations, contradictions with existing knowledge | On ingestion |
+| **Bonsai** | 8B ternary (~2.15 GB) | GPU | Relation extraction, query planning, anomaly verification | Every turn + on wake |
+| **JEPA-Gated SSM (shared backbone)** | ~480M | GPU | Shared dynamics for all cognitive instances. Mamba SSM (~370M) + JEPA predictor (~110M). Loaded once. | Real-time |
+| **Retrieval Gate (instance)** | ~500K + state | GPU | Subconscious router. Predicts domain, pathway, model size, meta-skills, deliberation need. | Every prompt |
+| **Working Memory (instance)** | ~500K + state | GPU | Continuous hidden state. No fixed token limit. IS current awareness. | Real-time |
+| **Uncertainty Detector (instance)** | ~500K + state | GPU | Flags routing uncertainty, novel entities, unresolved contradictions. Feeds EXPAND and delegation. | Every prompt |
+| **Aspirational Model (instance)** | ~500K + state | GPU | Three temporal modes: encoding gate (present), prospective memory (future), retrieval-weighted persistence (past) | Every turn + continuous |
+| **Self-Model (instance)** | ~500K + state | GPU | Learned knowledge boundary thresholds. "Do I know enough?" | Every prompt |
+| **GNN Consolidator** | ~200M | GPU | Salience scoring, subgraph summarization, link prediction, anomaly detection, ontology refinement | Dream state (offline) |
+| **Forgetting System** | N/A | CPU | Retrieval-weighted persistence, reconsolidation counting, two-phase LTP, active forgetting, pruning | Continuous + periodic |
+| **Process Executor** | N/A | CPU | Executes stored processes. Delegates steps to larger models. Handles failure modes. | On process invocation |
+| **Delegation Ladder** | 1B→3B→8B→70B→175B | Mixed | Capability-appropriate intelligence. Each level handles what it can. | On delegation |
+| **Developmental Tracker** | N/A | CPU | Tracks maturation stage per component. Gates transitions by metrics. | Continuous |
+| **Oracle (DeepSeek)** | Large | Cloud API | Training signal for all learned components | Gestational training |
+
+---
+
+## 3. Component Justifications
+
+### 3.1 WaveDB Graph Layer → Hippocampal Index
+
+**Why not a vector database?** Vector similarity answers "what's similar to this?" but not "what did Alice say about databases last week?" or "what happened after we implemented morphisms?" The graph stores **discrete, symbolic relationships** — entity presence, topic classification, affective state, temporal order, decisions, contradictions, citations. These are different in kind from embedding similarity and answer different questions.
+
+**Why WaveDB specifically?** WaveDB provides a triple store with SPO/POS/OSP indexes, Gremlin-style traversal, cost-based query optimization, and morphisms (reusable query fragments). The morphism system maps directly to **systems consolidation** — frequently traversed paths become single named pathways, analogous to how the neocortex learns direct connections after repeated hippocampal replay.
+
+**Key design decision:** The graph stores **structure** (who, what, when, how felt, in what order). The HBTrie stores **content** (the actual words, code, media). The vector index stores **similarity**. Each answers different questions, and together they form a memory system no single component could provide.
+
+### 3.2 WaveDB HBTrie → Neocortical Store
+
+**Why hierarchical key-value?** The HBTrie's hierarchical paths (`episodes/ep_47/summary`, `entities/alice/properties/name`, `code/auth.py@v3/content`) map naturally to distributed cortical representations. Each level is a "cortical region" — same underlying storage, different organizational principles.
+
+**Why MVCC?** Multi-Version Concurrency Control provides snapshot isolation — every read sees a consistent version. This maps to **state-dependent memory**: the same memory can have different "versions" depending on when you access it. Combined with edge validity windows in the Graph layer, this enables temporal queries ("what did I know at time T?") without losing historical versions.
+
+### 3.3 GLiNER-Decoder → Open Entity Discovery
+
+**Why not just use a predefined schema?** A static schema is a filter — it tells the system what to see, which means it also tells it what to ignore. The brain discovers categories through experience. GLiNER-Decoder (Knowledgator, 205M parameters) uses a small generative decoder to **invent labels** for discovered entities rather than matching against a predefined list. Given `labels=["label"]`, it produces spans with freely generated type names.
+
+**Why it matters:** The system discovers that this user talks about `deployment`, `testing`, and `documentation` — categories no one predicted. These discovered labels are clustered, canonicalized, and promoted to the stable schema over time. The schema is alive.
+
+### 3.4 GLiNER2 → Stable Extraction
+
+**Why two GLiNER variants?** GLiNER-Decoder is flexible but inconsistent — the same entity might be labeled `"configuration option"` in one conversation and `"setting"` in another. GLiNER2 (Fastino, 205M parameters) extracts against a stable, evolved schema with consistent labels. It's faster and more reliable for categories that have been promoted from discovery.
+
+**Why 205M parameters?** A 459M GLiNER encoder outperformed ChatGPT (~175B) on named entity recognition benchmarks. For extraction tasks, specialized small models beat generalist large models. GLiNER2 runs on CPU, costs nothing per inference, and produces structured output in a single forward pass.
+
+### 3.5 Bonsai → Relation Reasoning, Query Planning, Verification
+
+**Why an 8B ternary model?** Three distinct roles require reasoning beyond what GLiNER can do:
+
+1. **Relation extraction:** GLiNER finds entities. Bonsai determines how they relate — "Alice explained DEBOUNCED," "User decided to use HBTrie," "This contradicts the earlier decision." This requires understanding semantic content, not just spotting named entities.
+
+2. **Query planning:** Converting "What was I frustrated about last week?" into `{tones: ["frustrated"], temporal_filter: "last_week", entity_mode: "union"}` requires reasoning about query intent. GLiNER can extract entities from the prompt, but it can't determine that "Alice and I decided" means entity_mode should be "union" (episodes involving Alice) rather than "intersection" (episodes containing both Alice AND the user).
+
+3. **Reality monitoring:** During consolidation, Bonsai wakes to verify GNN-flagged anomalies. The ternary weights {-1, 0, +1} map to inhibitory/excitatory/absent synapses — the model can actively suppress incoherent reconstructions, not just fail to excite them.
+
+**Why ternary?** The 8B ternary model occupies ~2.15 GB — it fits on an RTX 5060 Ti (16 GB) alongside the SSM and JEPA. Ternary weights also map to biological synapse states: potentiated (+1), depressed (-1), or silent/absent (0).
+
+### 3.6 JEPA-Gated SSM → Unified Cognitive Primitive
+
+**Why a shared backbone?** The previous architecture treated the Mamba SSM, JEPA Predictor, and Gate as separate models with separate purposes. This had three consequences: proliferation of models (each new cognitive function required a new model), no unified dynamics (components were independent when they should be aspects of a single primitive), and missing cognitive functions (no disturbance detection, no prospective memory, no developmental staging).
+
+The JEPA-gated SSM primitive solves this through a critical distinction: **shared weights, separate states.** The SSM and JEPA weights are loaded once in GPU memory (~480M parameters, ~0.90 GB). Every cognitive function is an instance with its own state vector (512 floats, ~2 KB), its own gate (~500K parameters), and its own input/output projections (~100K parameters). Adding a new cognitive function costs ~1M parameters, not ~500M.
+
+**Why this doesn't collapse:** A single state vector cannot simultaneously represent retrieval gating, working memory maintenance, uncertainty detection, aspiration, and self-modeling. These are different kinds of information with different temporal dynamics. The architecture prevents collapse through separate state spaces (each instance has its own 512-dimensional vector), input/output projections (learned lenses that map instance-specific inputs into the shared representational space), and instance-specific gates (each learns its own inhibit/excite policy).
+
+**Biological mapping:** This maps onto the canonical cortical microcircuit — the same cell types, laminar structure, and local connectivity repeated across the entire neocortex. What differs between regions is input sources, output targets, and inhibitory interneuron composition. The circuit is the same. The configuration makes it different.
+
+### 3.7 Retrieval Gate → Subconscious Router
+
+**Why learned, not rule-based?** The decision of which domain to query, which pathway to use, and what model size is needed depends on nuanced factors: how recently was this entity discussed? How confident is the SSM about this topic? Is this a follow-up question or a topic shift? Is this pattern similar to past queries that required delegation? A learned gate learns these patterns from experience.
+
+**What it predicts (before any model generates a token):**
+- **Domain routing:** Which domain graph(s) to query — database, robotics, economics, coding, personal
+- **Pathway selection:** ssm_direct | graph_retrieve | process_exec | tool_plan | conscious_deliberation
+- **Meta-skill prediction:** What cognitive capabilities are needed — factual_recall, basic_synthesis, pattern_recognition, creative_synthesis, security_analysis
+- **Model sizing:** 1B | 3B | 8B | 70B | 175B
+- **Deliberation gating:** Can the subconscious handle this, or does System 2 need to engage?
+
+**How it learns:** Every routing decision produces an outcome. Did the user accept the response? Did the model have to delegate unexpectedly? Was expansion needed? These outcomes feed back as reinforcement signals. Successful routes are reinforced. Routes that required unexpected delegation are penalized. Routes that used a larger model than necessary get an efficiency penalty. Over time, the gate becomes personalized — it learns your domains, your patterns, your habits.
+
+### 3.8 Working Memory → Continuous Awareness
+
+**Why not a transformer?** Transformers have O(n²) attention — the thing we're trying to escape. State Space Models (Mamba) maintain a continuous hidden state that evolves with each input. There is no fixed context window. Old information decays gracefully rather than being truncated. The state dimension is constant, but the information it represents expands and contracts dynamically.
+
+**Why it's working memory:** The SSM state IS the currently activated subset of everything the system knows. When the retrieval gate determines the state is sufficient, no graph retrieval is needed — the SSM state alone generates the response. When the gate detects low confidence, it triggers graph retrieval and the retrieved content is injected into the SSM state as embeddings, not text.
+
+### 3.9 Uncertainty Detector → Knowing When You Don't Know
+
+**Why it matters:** Without uncertainty detection, the system either confabulates (generates from insufficient context) or retrieves unnecessarily (wastes computation on queries the SSM state already covers). The Uncertainty Detector flags three conditions:
+
+1. **Routing uncertainty:** JEPA confidence is below threshold for the routed domain
+2. **Novel entities:** Retrieved context contains entities not in the ontology
+3. **Unresolved contradictions:** Multiple sources contradict without resolution
+
+These flags feed the EXPAND mechanism (load more detail from HBTrie) and the delegation ladder (route to a larger model). The detector learns its thresholds from experience — during gestational training, the Oracle provides feedback on when the system should have known it didn't know.
+
+### 3.10 Aspirational Model → Three Temporal Modes
+
+**Why three modes?** Wanting operates in all three temporal directions. The same dopaminergic signal that gates encoding also maintains goal representations in working memory (prospective intention) and tags memories for replay priority during consolidation. The Aspirational Model reflects this unity:
+
+- **Present (encoding gate):** Modulates encoding strength based on aspirational match. "I'm curious about this → encode strongly." Implemented through JEPA salience scoring.
+- **Future (prospective memory):** Sets triggers that fire when conditions are met. "Alert me when you encounter information about X." The system checks pending triggers before each retrieval loop.
+- **Past (retrieval-weighted persistence):** Every retrieval boosts the edge's long-term survival probability. The more the user asks, the harder it is to forget — with self-limiting mechanisms to prevent immortal memories.
+
+### 3.11 Self-Model → Knowledge Boundary Estimation
+
+**Why learned thresholds?** The system needs to know when to say "I don't know." Hardcoded thresholds ("if graph density < 0.3, admit gap") fail because different domains have different knowledge densities. A sparse but complete domain (3 episodes about a niche topic) should produce confident answers. A dense but incomplete domain (100 episodes but missing the specific fact) should not. The Self-Model learns these boundaries from Oracle feedback during gestational training.
+
+### 3.12 GNN Consolidator → Dream State Processing
+
+**Why a graph neural network?** The consolidation tasks — salience scoring, subgraph summarization, link prediction, anomaly detection, ontology refinement — all require reasoning about **graph structure**, not just node features. A node's importance depends on its position in the graph (bridge, hub, peripheral), not just its content. GNNs are the standard tool for this class of problem.
+
+**Why offline?** Consolidation is computationally intensive and benefits from seeing the full graph. Running it during the dream state (offline, periodic) mirrors the brain's sharp-wave ripple replay during sleep. The GNN identifies clusters for abstraction, predicts missing edges, detects anomalies, and refines the ontology — then Bonsai verifies the high-stakes decisions.
+
+**Why static first, temporal later?** The initial GNN is a stateless function: `consolidate(graph) → actions`. After collecting data on failure modes (cluster flapping, prediction miscalibration, false positive anomalies, ontology oscillation), we add SSM-augmented instances that remember past decisions. This prevents premature optimization — we build temporal continuity only for the failure modes that actually occur.
+
+### 3.13 Forgetting System → Self-Limiting Persistence
+
+**Why not flat decay?** Flat utility score decay treats all edges identically. But edges that are repeatedly retrieved should persist longer — not indefinitely, but proportionally to demonstrated importance. The forgetting system combines four mechanisms:
+
+1. **Retrieval-weighted persistence:** Each retrieval reduces the edge's decay rate. Strong matches (direct entity+topic+tone match) reduce it more than weak matches (ontology expansion). Diminishing returns prevent immortal memories — the 20th retrieval provides far less boost than the 1st.
+
+2. **Saturation detection:** If the same edge is retrieved more than N times in 24 hours, the system stops boosting and may slightly increase decay. This breaks the "frustration loop" — the user keeps asking because the answer isn't sticking, and the system keeps reinforcing because the user keeps asking.
+
+3. **LLM-mediated importance signal:** The LLM embeds signals in its response — `[IMPORTANT]`, `[ROUTINE]`, `[FRUSTRATION]`, `[CORRECTION]`. These modulate the persistence boost. A frustration signal prevents reinforcement. A correction signal may increase decay on the old fact.
+
+4. **Boost decay:** The persistence boost from a retrieval itself decays with a ~7-day half-life. A retrieval last month matters less than a retrieval yesterday. If the user stops asking, the boost fades and the edge returns to baseline decay.
+
+**Reconsolidation counting:** Edges track how many times they've been retrieved. Three retrievals across 15+ days triggers late-phase LTP — a 70% reduction in decay rate on top of accumulated boosts. This is the architectural equivalent of the transition from hippocampal-dependent to neocortical-independent memory.
+
+### 3.14 Process Executor → Procedural Memory
+
+**Why stored processes?** When the system observes the user performing the same multi-step task three times, it proposes a stored process. The fourth time, the user says "review this" and the system executes the process automatically, delegating individual steps to larger models when they exceed the current model's capability.
+
+Processes are stored in the same graph as everything else — they're just subgraphs with a specific shape. Each step specifies what tool to use, what model size is needed, and what to do on failure (delegate, skip, ask_user, abort). Meta-processes — strategy templates with decision points rather than fixed steps — guide the model's reasoning when no concrete process matches.
+
+### 3.15 Delegation Ladder → Capability-Appropriate Intelligence
+
+**Why delegate?** A 1B model can summarize. A 3B model can synthesize. An 8B model can reason. A 70B model can design. A 175B model can create. The delegation ladder routes each step of a process to the smallest model that can handle it, escalating only when necessary. The user never knows a larger model was invoked.
+
+The Retrieval Gate learns which model size is needed for which patterns. Over time, it routes directly to the right size without trial and error. Most real-world queries (80%) are handled by the 1-3B models. The 70B+ models sit idle until genuinely needed.
+
+### 3.16 Oracle (DeepSeek) → Gestational Training
+
+**Why an Oracle?** Several components require training data that doesn't exist in public datasets: query planning pairs, relation extraction from conversational text, salience labels on memory graphs, gate training examples. The Oracle generates this data during a gestational training phase.
+
+**Why not permanent?** The Oracle is expensive per call. It generates 5,000-10,000 training examples per component during initial training, then the components operate independently. The Oracle is only invoked again if the system encounters genuinely novel situations that the fine-tuned models can't handle. The Developmental Tracker gates this — components graduate from INFANT (Oracle provides all signal) to CHILD (Oracle critiques decisions) to ADOLESCENT (self-regulating) to ADULT (independent).
+
+---
+
+## 4. Information Flow
+
+### 4.1 Encoding Flow (Every Conversation Turn)
+
+```plaintext
+1. Raw conversation text enters the system
+
+2. GLiNER-Decoder performs open discovery:
+   "WAL config" → "technical concept"
+   "DEBOUNCED" → "configuration option"
+   "confusing" → "sentiment"
+   "go with DEBOUNCED" → "decision"
+   → Raw entity spans with invented type labels
+
+3. GLiNER2 performs stable extraction against the evolved schema:
+   entities: ["Alice", "WaveDB"]
+   topics: ["configuration"]
+   tones: ["frustrated", "curious"]
+   decisions: ["use_debounced"]
+   → Structured, consistent labels
+
+4. Discovered labels are buffered. Labels appearing >10 times
+   are clustered, canonicalized, and promoted to the stable schema.
+   "configuration option" + "setting" + "parameter" → "configuration"
+
+5. Bonsai extracts relations:
+   (User, expresses, frustrated)
+   (User, questions, WAL_sync_modes)
+   (Alice, explains, WAL_sync_modes)
+   (User, decides, use_debounced)
+   (conversation, concerns, configuration)
+   (conversation, involves, Alice)
+
+6. Aspirational Model (present mode) scores encoding strength:
+   salience = 0.65 (moderate — contains a decision but routine topic)
+   → Encode at baseline strength
+
+7. Storage:
+   Graph layer: insert all triples as edges
+   HBTrie: store summary, full text, timestamp
+   Vector index: store embedding of summary for semantic search
+
+8. Process Observer checks for repeated patterns:
+   "User asked about config → assistant explained → user decided"
+   Seen 3 times? → Propose stored process
+```
+
+### 4.2 Retrieval Flow (On User Prompt)
+
+```plaintext
+1. User prompt: "What was I frustrated about last week?"
+
+2. Aspirational Model (future mode) checks pending triggers:
+   Any prospective memories matching this context?
+   → None found. Continue.
+
+3. Retrieval Gate (subconscious router) evaluates:
+   - "frustrated" tone not in recent SSM state → low confidence
+   - "last week" temporal scope → SSM state only covers recent turns
+   - Domain: database (confidence 0.89)
+   - Pathway: graph_retrieve
+   - Model size: 3B (factual_recall + basic_synthesis)
+   - Deliberation: NOT NEEDED
+   → TRIGGER GRAPH RETRIEVAL
+
+4. Bonsai plans the query:
+   {
+     entities: [],
+     topics: [],
+     tones: ["frustrated"],
+     entity_mode: "union",
+     temporal_filter: "last_week",
+     limit: 5
+   }
+
+5. Ontology Expander expands the query:
+   "frustrated" → Frustrated (subclass of AffectiveTone)
+   → Also match episodes with tone "Frustrated"
+
+6. Graph traversal (pattern completion):
+   - Find all episodes with tone "frustrated" (union)
+   - Filter by timestamp > 7 days ago
+   - Score by: tone match count + recency + retrieval history
+   - Return top 5
+
+7. HBTrie load (neocortical reactivation):
+   For each result episode ID:
+     load summary, full_text, timestamp from HBTrie
+
+8. Working memory = activated graph nodes + HBTrie values + SSM state
+
+9. Uncertainty Detector checks:
+   - Routing confidence: 0.89 → OK
+   - Novel entities in results: none → OK
+   - Unresolved contradictions: none → OK
+   → No flags. Proceed.
+
+10. Response generation from working memory
+
+11. Retrieval-weighted persistence:
+    For each edge traversed in retrieval:
+      on_retrieve(retrieval_strength, llm_signal)
+      → Decay rate reduced (diminishing returns)
+      → Saturation check passed
+      → Reconsolidation count incremented
+```
+
+### 4.3 Consolidation Flow (Dream State — Periodic)
+
+```
+1. GNN scores all nodes/edges by structural salience:
+   - ep_001: 0.92 (anchor episode, foundational decision)
+   - ep_005: 0.30 (routine, redundant paths exist)
+   - edge ep_003_has_entity_Bob: 0.80 (only connection for Bob)
+   - Salience incorporates: access_count, reconsolidation_count, ltp_phase
+
+2. GNN detects subgraphs ready for abstraction:
+   Cluster: [ep_001, ep_002, ep_003, ep_004]
+   → Abstract to: "WaveDB initial development (June 20-23)"
+   → Store semantic memory in HBTrie
+   → Link semantic memory to source episodes
+   → Mark source episodes as "abstracted" (still retrievable)
+
+3. GNN predicts missing edges:
+   (Postgres, related_to, performance) confidence 0.82
+   → Auto-accept (confidence > 0.8)
+   (ep_006, caused_by, ep_005) confidence 0.75
+   → Propose for Bonsai verification (confidence 0.5-0.8)
+
+4. GNN detects anomalies:
+   - MISSING_TEMPORAL: ep_007 follows ep_004, but ep_005-006 also follow ep_004
+     → Wake Bonsai: "Are these parallel threads?"
+   - DUPLICATE_DECISION: use_hbtrie (ep_001) and use_wavedb_over_postgres (ep_003)
+     → Wake Bonsai: "Are these the same decision?"
+
+5. Bonsai verifies anomalies:
+   - Temporal branch: "Legitimate parallel threads. No change needed."
+   - Duplicate decision: "Distinct decisions. Add 'reinforces' edge."
+
+6. Forgetting pass:
+   - Compute effective decay rate for each edge (incorporates retrieval history)
+   - Edges with utility_score < 0.1 and state="current" → state="archived"
+   - Superseded edges older than 90 days → compress to summary, archive
+   - Boost decay: old retrieval boosts fade (half-life ~7 days)
+   - Ontology categories not seen in 30+ days → deprecate
+
+7. SSM replay:
+   - Replay high-salience consolidated memories through SSM
+   - Strengthens neocortical (SSM weight) representations
+
+8. Developmental Tracker evaluates:
+   - Extraction F1 > 0.85? → Graduate from INFANT to CHILD
+   - Retrieval recall > 0.80? → Graduate from INFANT to CHILD
+   - Gate decisions match Oracle > 0.75? → Graduate from INFANT to CHILD
+```
+
+### 4.4 Forgetting Flow (Continuous + Periodic)
+
+```
+1. RETRIEVAL-WEIGHTED PERSISTENCE (on every retrieval):
+   - Diminishing returns: each retrieval boosts less than the previous
+   - Saturation detection: >N retrievals in 24 hours → stop boosting
+   - LLM-mediated signal: [IMPORTANT] → stronger boost, [FRUSTRATION] → no boost
+   - Boost decay: old retrieval boosts fade with ~7-day half-life
+   - Absolute floor: decay rate never reaches zero (minimum 0.1%/day)
+
+2. RECONSOLIDATION COUNTING (on every retrieval):
+   - Track reconsolidation_count and consolidation_window_start
+   - 3 retrievals across 15+ days → late-phase LTP
+   - Late-phase LTP: additional 70% reduction in decay rate
+
+3. ACTIVE FORGETTING (user-triggered):
+   - User: "Forget what I said about Postgres"
+   - Edge state → "deprecated"
+   - validity_end → now()
+   - Edge still exists, not returned by default queries
+   - Retrievable via historical query: "what did I used to think?"
+
+4. RECONSOLIDATION (on contradiction):
+   - New fact contradicts old fact
+   - Old fact: state → "superseded", validity_end → now()
+   - New fact: state → "current", validity_start → now()
+   - Link: new_fact supersedes old_fact, new_fact contradicts old_fact
+   - Both versions preserved. Default queries return current only.
+
+5. PRUNING (periodic consolidation):
+   - Archived edges older than 365 days → deep archive
+   - Superseded edges → compressed to summary in HBTrie
+   - Nothing is ever truly deleted. Storage is cheap.
+```
+
+---
+
+## 5. The Evolving Ontology
+
+### 5.1 Why an Ontology?
+
+Without hierarchical knowledge, the system can't answer "What databases did we discuss?" — it would only match episodes explicitly labeled "database," missing episodes about WaveDB, Postgres, or SQLite. With a taxonomy where WaveDB IS-A Database, the query expands automatically.
+
+### 5.2 Seed Ontology
+
+The seed ontology includes both conversational and code entity types. This ensures the models allocate representational capacity for code structure from the start, even before any code is parsed.
+
+```
+Entity
+├── Person
+├── Project
+│   └── Database
+│       ├── WaveDB
+│       └── Postgres
+├── Technology
+│   ├── Protocol
+│   ├── Language
+│   └── Framework
+├── Concept
+├── CodeArtifact
+│   ├── File
+│   ├── Module
+│   ├── Class
+│   ├── Function
+│   │   ├── Method
+│   │   ├── Constructor
+│   │   └── Lambda
+│   ├── Variable
+│   ├── Parameter
+│   └── Type
+├── VersionControl
+│   ├── Commit
+│   ├── Branch
+│   ├── PullRequest
+│   └── Release
+├── Issue
+│   ├── Bug
+│   ├── Feature
+│   └── Regression
+└── Event
+    ├── Decision
+    ├── Explanation
+    └── Question
+
+AffectiveTone
+├── Frustrated
+├── Excited
+├── Curious
+└── Neutral
+
+Topic
+├── DatabaseDesign
+├── Configuration
+├── Performance
+├── Security
+├── APIDesign
+├── AIArchitecture
+└── DecisionMaking
+```
+
+### 5.3 How It Evolves
+
+```plaintext
+DISCOVERY (ongoing):
+GLiNER-Decoder invents label "deployment strategy"
+→ Buffered. After 10 occurrences:
+→ Bonsai entailment: "Is 'deployment strategy' a Concept?"
+→ Yes → added to ontology: Concept → DeploymentStrategy
+
+REFINEMENT (periodic GNN pass):
+GNN predicts: (DEBOUNCED, subClassOf, WALSyncMode) confidence 0.90
+→ New class WALSyncMode created
+→ DEBOUNCED, IMMEDIATE, ASYNC become subclasses
+
+DECAY (periodic):
+Category "Framework" not seen in 45 days
+→ Deprecated. Entities reassigned to parent "Technology"
+```
+
+---
+
+## 6. Memory Types Stored in the Graph
+
+| Memory Type | Graph Structure | Example |
+|---|---|---|
+| **Episode** | `(ep_047, has_entity, E:Alice)`, `(ep_047, has_topic, T:config)`, `(ep_047, has_tone, A:frustrated)`, `(ep_047, follows, ep_046)` | One complete conversational exchange |
+| **Document** | `(doc_023, type, Document)`, `(doc_023, has_section, sec_003)`, `(doc_023, cites, doc_012)`, `(doc_023, contradicts, ep_012)` | An ingested document with hierarchical sections |
+| **Code** | `(auth.py, contains, authenticate)`, `(authenticate, calls, validate_token)`, `(auth.py@v3, supersedes, auth.py@v2)` | Code structure and version history |
+| **Media** | `(img_047, depicts, E:Alice)`, `(img_047, has_tone, A:frustrated)`, `(desc_img_047_v2, supersedes, desc_img_047_v1)` | Images, audio, video with versioned descriptions |
+| **Semantic Memory** | `(sem_001, abstracts, ep_001)`, `(sem_001, abstracts, ep_002)`, `(sem_001, summary, "WaveDB development...")` | Consolidated abstraction of multiple episodes |
+| **Process** | `(proc_review, has_step, step_1)`, `(step_2, delegate_to, "70B")`, `(step_2, on_failure, "delegate")` | Stored procedure with steps and delegation rules |
+| **Meta-Process** | `(meta_decompose, strategy_question, "Are sub-goals independent?")`, `(meta_decompose, if_yes, "parallel_decomposition")` | Strategy template with decision points |
+| **Ontology** | `(WaveDB, subClassOf, Database)`, `(Database, subClassOf, Project)`, `(Frustrated, subClassOf, AffectiveTone)` | Class hierarchy for query expansion |
+| **Cross-Reference** | `(doc_023, cites, doc_012)`, `(doc_023, contradicts, ep_012)`, `(TeddyVision, uses_for_logging, WaveDB)` | Links between documents, episodes, and domains |
+
+---
+
+## 7. Implementation Plan
+
+### Phase 1: Bootstrap Extraction (Weeks 1-2)
+
+**Goal:** All extraction components operational with acceptable accuracy. Training data generator for downstream phases.
+
+| Task | Data | Hardware | Est. Time |
+|---|---|---|---|
+| GLiNER2 fine-tune on kniv-corpus-en | 15K conversation examples with 18 NER types + 9 dialog act labels | RTX 4090 cloud ($1.08) | 4 hours |
+| GLiNER-Decoder evaluation on Memory-Traces | 27K human-LLM conversations with salience/emotion labels | CPU (local) | 2 hours |
+| Bonsai relation extraction fine-tune | Oracle-generated pairs (2K examples) | A100 cloud ($6.56) | 4 hours |
+| WaveDB schema setup | Graph layer schema + seed ontology (conversation + code) | Local | 1 day |
+| Sample conversations | 20 hand-crafted conversations with expected extraction labels | Local | 1 day |
+| Corpus processing script | Process DialogSum + SAMSum through encoding pipeline | Local | 1 day |
+
+**Deliverable:** System can encode conversations into structured triples with entities, topics, tones, decisions, and relations. Extraction quality: entity recall >70%, topic recall >70%, tone recall >70% on sample conversations. Corpus processing pipeline operational.
+
+### Phase 2: Train Shared Backbone + Retrieval Gate (Weeks 3-4)
+
+**Goal:** JEPA-gated SSM shared backbone trained. Retrieval Gate instance operational. Mode A generation working.
+
+| Task | Data | Hardware | Est. Time |
+|---|---|---|---|
+| Shared SSM+JEPA backbone training | Oracle-generated cognitive state sequences (10M+ examples) | A100 cloud ($61.92) | 48 hours |
+| Retrieval Gate training | Oracle-generated routing pairs (5K examples) | RTX 4090 cloud ($6.48) | 24 hours |
+| Working Memory instance setup | SSM state initialization + input/output projections | Local | 1 day |
+| Bonsai query planning fine-tune | Oracle-generated pairs (5K examples) | A100 cloud ($16.40) | 10 hours |
+| Mode A generation integration | Context window adapter for external LLMs | Local | 2 days |
+| Integration testing | Manual conversation scenarios | Local | 2 days |
+
+**Deliverable:** System can retrieve relevant memories given natural language questions. Retrieval Gate routes to correct domain and pathway. Mode A generation produces responses using retrieved context. JEPA correctly gates between ssm_direct and graph_retrieve pathways.
+
+### Phase 3: GNN Consolidator + Forgetting System (Weeks 5-6)
+
+**Goal:** Dream state consolidation operational. Forgetting system with retrieval-weighted persistence.
+
+| Task | Data | Hardware | Est. Time |
+|---|---|---|---|
+| GNN architecture implementation | GAT + DiffPool + GAE (static, 5 task-specific heads) | RTX 4090 cloud ($4.32) | 16 hours |
+| Initial GNN training | Oracle-generated salience labels + link prediction examples | RTX 4090 cloud ($8.64) | 32 hours |
+| Reconsolidation counting | Edge model update: reconsolidation_count, ltp_phase, consolidation_window_start | Local | 1 day |
+| Retrieval-weighted persistence | Edge model update: retrieval_timestamps, saturation_flags, base_decay_rate, boost decay | Local | 1 day |
+| LLM-mediated signal parsing | Response parser for [IMPORTANT], [ROUTINE], [FRUSTRATION], [CORRECTION] | Local | 1 day |
+| Consolidation loop integration | WaveDB graph → GNN → Bonsai verify → WaveDB update | Local | 3 days |
+
+**Deliverable:** Nightly consolidation pass that scores salience, abstracts subgraphs, predicts links, and detects anomalies. Forgetting system with self-limiting retrieval-weighted persistence. Reconsolidation counting with two-phase LTP.
+
+### Phase 4: Instance-Specific Gates (Weeks 7-8)
+
+**Goal:** Uncertainty Detector, Aspirational Model, and Self-Model gates operational.
+
+| Task | Data | Hardware | Est. Time |
+|---|---|---|---|
+| Uncertainty Detector gate training | Oracle-labeled "is this a gap?" pairs (50K examples) | RTX 4090 cloud ($2.70) | 10 hours |
+| Aspirational Model gate training | Oracle-labeled "should I commit?" pairs (50K examples) | RTX 4090 cloud ($2.70) | 10 hours |
+| Self-Model gate training | Oracle-labeled "should I say I don't know?" pairs (50K examples) | RTX 4090 cloud ($2.70) | 10 hours |
+| Prospective memory implementation | Trigger storage, condition matching, pre-retrieval check | Local | 2 days |
+| EXPAND mechanism integration | Uncertainty Detector → EXPAND → HBTrie load → SSM injection | Local | 2 days |
+| Developmental Tracker | Stage tracking per component, metric evaluation, transition gating | Local | 1 day |
+
+**Deliverable:** System detects when it doesn't know, triggers EXPAND for missing details, delegates to larger models when needed. Prospective memory operational. Each component tracks its developmental stage.
+
+### Phase 5: Evaluation & Iteration (Weeks 9-10)
+
+**Goal:** Quantify performance against benchmarks.
+
+| Benchmark | What It Tests | Target |
+|---|---|---|
+| ConvoMem | 75K QA pairs, 6 evidence categories, 100 personas | >80% recall on single-session, >60% on cross-session |
+| EverMemBench | Multi-party, 250-day span, 1M+ tokens | >40% on multi-hop (baseline is 26% with oracle evidence) |
+| CloneMem | 1-3 year temporal reasoning | >50% on temporal comparison |
+
+### Phase 6: Process Learning + Delegation Ladder (Weeks 11-12)
+
+**Goal:** Procedural memory and automatic delegation operational.
+
+| Task | Data | Hardware | Est. Time |
+|---|---|---|---|
+| Process Observer | Pattern detection in tool use sequences | Local | 2 days |
+| Process Executor | Step execution, dependency resolution, failure handling | Local | 3 days |
+| Delegation Ladder | Model registry, capability matrix, automatic escalation | Local | 2 days |
+| Meta-process library | Decomposition strategies, adaptation patterns, synthesis templates | Local | 2 days |
+
+**Deliverable:** System observes repeated task patterns and proposes stored processes. Executes processes with automatic delegation. Small models conduct larger models through process execution.
+
+### Phase 7: Self-Generated Training (Ongoing)
+
+**Goal:** System improves from its own operation.
+
+- Retrieval successes → positive salience signal for edges used
+- Retrieval failures → training examples for missing edges
+- Bonsai verifications → training examples for GNN anomaly detector
+- User corrections → reconsolidation training examples
+- Delegation outcomes → Retrieval Gate routing updates
+- New entity types discovered → ontology refinement examples
+- Process execution outcomes → process success rate updates
+
+---
+
+## 8. Cost Analysis
+
+### 8.1 Cloud Training Costs
+
+| Phase | Component | GPU | Provider | Hours | Cost |
+|---|---|---|---|---|---|
+| 1 | GLiNER2 fine-tune | RTX 4090 | Vast.ai spot | 4 | $1.08 |
+| 1 | Bonsai relations (Oracle gen) | A100 80GB | RunPod Community | 4 | $6.56 |
+| 2 | Shared SSM+JEPA backbone | A100 80GB | Lambda Labs | 48 | $61.92 |
+| 2 | Retrieval Gate training | RTX 4090 | Vast.ai spot | 24 | $6.48 |
+| 2 | Bonsai query planning | A100 80GB | RunPod Community | 10 | $16.40 |
+| 3 | GNN implementation | RTX 4090 | Vast.ai spot | 16 | $4.32 |
+| 3 | GNN training | RTX 4090 | Vast.ai spot | 32 | $8.64 |
+| 4 | Uncertainty Detector gate | RTX 4090 | Vast.ai spot | 10 | $2.70 |
+| 4 | Aspirational Model gate | RTX 4090 | Vast.ai spot | 10 | $2.70 |
+| 4 | Self-Model gate | RTX 4090 | Vast.ai spot | 10 | $2.70 |
+| **TOTAL** | | | | **168** | **$113.50** |
+
+### 8.2 Oracle API Costs
+
+| Use | Tokens (est.) | Cost (DeepSeek) |
+|---|---|---|
+| Generate 5K query planning pairs | ~2.5M input + ~1M output | ~$3.50 |
+| Generate 2K relation extraction examples | ~1M input + ~0.5M output | ~$1.75 |
+| Generate 10M+ cognitive state sequences (shared backbone) | ~5M input + ~2M output | ~$7.00 |
+| Generate 5K routing pairs (Retrieval Gate) | ~2.5M input + ~1M output | ~$3.50 |
+| Generate 1K salience labels (GNN) | ~0.5M input + ~0.3M output | ~$1.00 |
+| Generate 500 ontology refinement examples | ~0.3M input + ~0.2M output | ~$0.70 |
+| Generate 50K gate training examples (3 gates) | ~1.5M input + ~0.8M output | ~$2.50 |
+| **TOTAL** | | **~$20.00** |
+
+### 8.3 Local Hardware (Already Available)
+
+| Component | Hardware | Status |
+|---|---|---|
+| GLiNER2 + GLiNER-Decoder inference | CPU | ✅ Runs on any modern CPU |
+| Bonsai inference (8B ternary) | RTX 5060 Ti (16 GB) | ✅ ~2.15 GB fits comfortably |
+| JEPA-Gated SSM shared backbone (~480M) | RTX 5060 Ti (16 GB) | ✅ ~0.90 GB |
+| 5× instance gates + states (~5M total) | RTX 5060 Ti (16 GB) | ✅ ~0.02 GB |
+| GNN inference (~200M) | RTX 5060 Ti (16 GB) | ✅ ~0.40 GB |
+| WaveDB | CPU/disk | ✅ Production-ready |
+| Vector Index | CPU | ✅ |
+
+**Total GPU VRAM usage: ~3.5 GB. Headroom: ~12.5 GB on RTX 5060 Ti.**
+
+### 8.4 Total Cost Summary
+
+| Category | Cost |
+|---|---|
+| Cloud GPU training (all phases) | ~$114 |
+| Oracle API (DeepSeek) | ~$20 |
+| Local hardware | $0 (already owned) |
+| WaveDB | Free (MIT license, self-hosted) |
+| **GRAND TOTAL** | **~$134** |
+
+---
+
+## 9. Key Design Decisions & Tradeoffs
+
+### 9.1 Why Not a Single Large Model?
+
+A single large model that does extraction, retrieval, and generation would be simpler. But:
+
+- **Cost:** Running a 70B+ model for every conversation turn is expensive. GLiNER2 runs on CPU and costs nothing per inference. The delegation ladder only invokes large models when needed.
+- **Specialization:** A 459M GLiNER encoder outperformed ChatGPT (~175B) on NER. Specialized small models beat generalist large models on their specific tasks.
+- **Interpretability:** When retrieval fails, you can inspect the graph traversal to see why. A large model's retrieval is a black box.
+- **Updateability:** You can fine-tune GLiNER2 on new entity types without retraining the entire system.
+
+### 9.2 Why Not Pure Vector Search?
+
+Vector search answers "what's similar to this embedding?" It doesn't answer:
+- "What did Alice say about databases?" (entity + topic constraint)
+- "What happened after we implemented morphisms?" (temporal chain)
+- "What decisions did we make and why?" (relation type constraint)
+- "What was I frustrated about?" (affective state constraint)
+
+The graph stores these as discrete, queryable relationships. Vector search is complementary — it handles the "similar to this" queries that the graph can't.
+
+### 9.3 Why Offline Consolidation?
+
+Running the GNN on every conversation turn would add latency and computational cost. The brain doesn't consolidate in real-time either — it replays memories during sleep. The offline "dream state" pass allows the GNN to see the full graph, make global decisions about salience and abstraction, and not compete with real-time inference for GPU resources.
+
+### 9.4 Why Never Delete?
+
+Storage is cheap. The value of being able to answer "what did I used to think?" or "what changed and when?" outweighs the cost of keeping superseded edges. MVCC in WaveDB already versions every write. Edge validity windows add temporal semantics. The combination gives you current, historical, and change views without destructive operations.
+
+### 9.5 Why Shared Weights, Separate States?
+
+A single SSM state vector cannot simultaneously represent retrieval gating, working memory maintenance, uncertainty detection, aspiration, and self-modeling. These are different kinds of information with different temporal dynamics. The JEPA-gated SSM primitive prevents collapse through separate state spaces while sharing the expensive dynamics (SSM + JEPA weights). Adding a new cognitive function costs ~1M parameters, not ~500M.
+
+### 9.6 Why Self-Limiting Persistence?
+
+Positive-only reinforcement creates immortal memories. The user keeps asking about WAL config — is it because it's important, or because the answer isn't sticking? The self-limiting mechanisms (diminishing returns, saturation detection, LLM-mediated signals, boost decay) ensure that retrieval-weighted persistence reflects genuine importance, not frustration loops.
+
+---
+
+## 10. Success Metrics
+
+| Metric | Target | Measurement |
+|---|---|---|
+| **Encoding accuracy** | >90% entity F1, >85% relation F1 | Against Oracle-generated ground truth |
+| **Retrieval recall** | >80% on ConvoMem single-session, >60% cross-session | Standard benchmark evaluation |
+| **Retrieval precision** | >85% | Retrieved episodes contain answer |
+| **Retrieval latency** | <50ms for graph traversal + HBTrie load | WaveDB benchmarks show 2.6M reads/sec |
+| **Routing accuracy** | >90% correct domain routing | JEPA gate decisions vs. Oracle |
+| **Consolidation quality** | >70% of GNN-predicted edges validated by Bonsai | Bonsai accept rate on proposed edges |
+| **Forgetting accuracy** | <5% of pruned edges later needed | Track retrieval failures on archived edges |
+| **Context efficiency** | Graph-based context ≤50% the size of full-history context for equivalent recall | Character count comparison |
+| **Uncertainty calibration** | >80% precision on "I don't know" decisions | Self-Model decisions vs. Oracle |
+| **Delegation efficiency** | >80% of queries handled by ≤8B model | Model size distribution across queries |
+
+---
+
+## 11. What This Architecture Enables
+
+### 11.1 Any LLM Becomes a Memory-Augmented LLM
+
+The architecture is a drop-in layer between the user and any language model. The LLM doesn't know about the memory system. It receives context and generates responses. GPT-4 today, Claude tomorrow, a local model next week — the subconscious doesn't care.
+
+### 11.2 The Bidirectional Interface
+
+The LLM can write back to the subconscious. Embedded in its response are memory commands — `[REMEMBER: this is important]`, `[LINK: Python, performance_issues, WaveDB]`, `[FORGET: the Postgres decision was superseded]`. These are stripped before the user sees the response and executed by the subconscious.
+
+### 11.3 Cost-Optimal Intelligence
+
+Most real-world queries are factual recall or basic synthesis. A 1-3B model handles 80% of queries. An 8B model handles 15%. A 70B+ model handles 5%. The routing is learned, not hardcoded. The system uses exactly as much intelligence as the task requires.
+
+### 11.4 Domain Knowledge as Transferrable Graphs
+
+You export your database domain graph. Your colleague imports it. Now their ponder engine knows everything yours knows about WaveDB — not because you fine-tuned their model, but because you shared a graph. The processing models are identical. The knowledge is what transferred.
+
+### 11.5 The Subconscious Becomes the Primary Intelligence
+
+As the Retrieval Gate improves, it handles an increasing fraction of cognitive work. It doesn't just route — it anticipates, it prepares, it pre-emptively retrieves. When you start typing "What was the throughp—", the gate has already activated the database domain, retrieved the Python async performance episodes, and loaded them into the SSM state. By the time you finish the question, the answer is already in awareness.
+
+---
+
+## 12. References
+
+- Teyler, T.J. & DiScenna, P. (1986). The hippocampal memory indexing theory. *Behavioral Neuroscience*, 100(2), 147-154.
+- Cowan, N. (1999). An embedded-processes model of working memory. In A. Miyake & P. Shah (Eds.), *Models of Working Memory*.
+- McClelland, J.L., McNaughton, B.L., & O'Reilly, R.C. (1995). Why there are complementary learning systems in the hippocampus and neocortex. *Psychological Review*, 102(3), 419-457.
+- Damasio, A.R. (1994). *Descartes' Error: Emotion, Reason, and the Human Brain*. — Somatic marker hypothesis, the neural basis of intuition.
+- Gu, A. & Dao, T. (2023). Mamba: Linear-time sequence modeling with selective state spaces.
+- LeCun, Y. (2022). A path towards autonomous machine intelligence. — JEPA architecture.
+- DeFelipe, J. (2011). The evolution of the brain, the human nature of cortical circuits, and intellectual creativity. *Frontiers in Neuroanatomy*, 5, 29.
+- WaveDB: [github.com/vijayee/WaveDB](https://github.com/vijayee/WaveDB)
+- GLiNER2: [github.com/fastino-ai/GLiNER2](https://github.com/fastino-ai/GLiNER2)
+- GLiNER-Decoder: [huggingface.co/knowledgator/gliner-decoder-base-v1.0](https://huggingface.co/knowledgator/gliner-decoder-base-v1.0)
+- Memory-Traces: [huggingface.co/datasets/Cossale/memory-traces](https://huggingface.co/datasets/Cossale/memory-traces)
+- ConvoMem: [github.com/SalesforceAIResearch/ConvoMem](https://github.com/SalesforceAIResearch/ConvoMem)
+- EverMemBench: [huggingface.co/datasets/EverMind-AI/EverMemBench-Dynamic](https://huggingface.co/datasets/EverMind-AI/EverMemBench-Dynamic)
+- CloneMem: [huggingface.co/datasets/ZhiyuZhangA/CloneMem](https://huggingface.co/datasets/ZhiyuZhangA/CloneMem)
+
+---
+
+*This architecture is designed to be built incrementally. Each phase produces a working system. Phase 1 alone — GLiNER2 extraction + WaveDB storage + basic graph retrieval — is a functional memory system that outperforms sliding-window context. Each subsequent phase adds capability without requiring redesign of earlier components. The architecture separates knowledge from processing, making domain expertise a transferrable, composable resource. The subconscious router learns from every interaction, becoming personalized over time. The ponder engine doesn't think — it ensures that when it's time to think, everything needed is already in awareness.*
+================================================================================
+### MSG [102] role=assistant id=2147 time=2026-07-04T21:02:19.999384Z
+================================================================================
+
+
+---
+
+# The Ponder Engine: A Hippocampal Memory Architecture for Artificial Intelligence
+
+**A brain-inspired alternative to the context window that separates knowledge from processing, enables an artificial subconscious, and makes domain expertise a transferrable, composable resource.**
+
+---
+
+## 1. The Problem With How AI Remembers
+
+Every major AI assistant operates on the same fundamental model: concatenate conversation history into a text buffer, feed it to a language model, truncate when the buffer overflows. This is the **context window** — a von Neumann architecture solution to a biological problem. Separate storage from processing. Copy data between them. Hope the buffer is big enough.
+
+The brain never evolved this assumption. It stores patterns in the same neurons that process them. Retrieval is reactivation, not copying. Working memory is not a buffer — it's the subset of long-term memory currently activated by attention. And beneath conscious awareness, a **subconscious routing system** continuously decides where to look, what's relevant, what level of intelligence is needed, and whether conscious deliberation is even required.
+
+We've built an architecture that mirrors this design. It's not a thinking machine. It's a **ponder engine** — the substrate that makes thinking possible by handling the questions every AI system faces but none currently answers well: *What do I know about this? Where should I look? What's important here? Am I the right intelligence for this task?*
+
+---
+
+## 2. The Three Memory Systems
+
+Human memory is not one thing. It's at least three systems, each with different structure, different timescales, and different neural substrates. The architecture mirrors all three.
+
+### Episodic Memory: What Happened
+
+Episodic memory stores specific experiences — conversations, decisions, discoveries, frustrations. Each experience is encoded as an **episode**: one complete conversational exchange, stored with structured metadata about who was involved, what was discussed, how people felt, what was decided, and what happened next.
+
+Episodes are linked into temporal chains by `follows` edges, forming the narrative structure of experience. They're stored with salience scores that predict future utility — a frustrating debugging session where a key decision was made is more important than a routine status update.
+
+But episodes aren't the only thing that enters the system. Documents, emails, code files, web pages, audio recordings, and video all flow through the same ingestion pipeline. A PDF becomes hierarchical sections linked by `has_section` edges. An email thread preserves its reply chain structure. A code file's AST becomes a subgraph of functions, classes, and call relationships. An image is described by a vision model, its description encoded into triples, its raw bytes stored for future re-description when better models arrive. Everything becomes the same thing: structured triples in the graph, content in the store.
+
+### Semantic Memory: What It Means
+
+Semantic memory stores abstracted knowledge — facts, concepts, categories, and the relationships between them. It's produced by **consolidation**: a graph neural network periodically scans the episodic graph, identifies clusters of related experiences, and abstracts them into compressed semantic memories.
+
+"WaveDB development with Alice (June 20-24): decided on HBTrie architecture, resolved WAL configuration, chose WaveDB over Postgres, achieved 2.6M reads/sec benchmark" — this is a semantic memory, abstracted from five separate episodes, stored as a single retrievable unit with links back to its source experiences.
+
+The ontology — the class hierarchy that knows WaveDB IS-A Database and Frustrated IS-A AffectiveTone — is also semantic memory. It starts from a seed that includes both conversational categories and code structure types, ensuring the system allocates representational capacity for everything it might encounter. It evolves through discovery: when the system encounters a new category often enough, it promotes it. When a category stops appearing, it decays. The GNN periodically refines the hierarchy, predicting missing `subClassOf` edges and detecting misclassified entities.
+
+### Procedural Memory: How To Do Things
+
+Procedural memory stores sequences of actions — processes, rules, strategies. A code review process is a stored subgraph: read the diff, check for style violations, analyze security implications, summarize findings. Each step specifies what tool to use, what model size is needed, and what to do on failure.
+
+Processes are learned through observation. When the system watches you perform the same multi-step task three times, it proposes a stored process. The fourth time, you say "review this" and it executes the process automatically, delegating individual steps to larger models when they exceed the current model's capability.
+
+Meta-processes — strategy templates for handling novelty — sit above concrete processes. They don't specify exact steps. They specify decision points: "Can this task be broken into independent sub-tasks? If yes, apply parallel decomposition. If no, identify dependency order." These guide the model's reasoning without replacing it.
+
+---
+
+## 3. The Architecture
+
+### Encoding: Experience Becomes Structure
+
+Raw conversation enters the system. Two specialized models extract its structure:
+
+**GLiNER2** (205M parameters, runs on CPU) extracts entities, topics, emotional tones, and decisions against an evolving schema. **GLiNER-Decoder** (205M parameters, also CPU) performs open discovery — it invents labels for entity types not yet in the schema, feeding the ontology's evolution. Together they handle the question "what's in this text?" — one with the stability of known categories, the other with the flexibility to discover new ones.
+
+**Bonsai** (8B parameters, ternary weights, ~2.15 GB) extracts relations: who explained what, who decided what, what contradicts what, what follows what. These become triples in the graph. Bonsai also serves as query planner — converting natural language questions into structured graph queries — and as reality monitor, waking during consolidation to verify GNN-flagged anomalies with ternary {-1, 0, +1} judgments that can actively suppress incoherent patterns.
+
+The content — the actual words, the raw bytes of images, the source code — is stored in a hierarchical key-value store called the HBTrie, analogous to the neocortex. The structure — the triples — is stored in a graph layer, analogous to the hippocampal index. The separation is the key insight: the graph stores sparse pointers that can reconstruct the full memory, just as the hippocampus stores compressed indices that reactivate neocortical patterns. A third index, a vector store, handles semantic similarity — the "what's similar to this?" queries that complement structured graph traversal.
+
+### Retrieval: Pattern Completion
+
+When a prompt arrives, the system doesn't load conversation history into a buffer. It treats the prompt as a **partial cue** and performs pattern completion via graph traversal.
+
+"What was I frustrated about last week?" becomes a structured query: `tones=["frustrated"], temporal_filter="last_week", entity_mode="union"`. The ontology expander broadens the search — "frustrated" is a subclass of AffectiveTone, so episodes tagged with related emotional categories are also considered. The graph finds all episodes matching those constraints, scores them by relevance, and loads their content from the HBTrie. The activated set **is** the context. No separate buffer. No fixed token limit.
+
+Temporal chain queries — "what happened after we implemented morphisms?" — follow `follows` edges forward from the anchor episode. Cross-domain queries traverse edges between domain graphs. Document queries return hierarchical sections with citation links. The retrieval mechanism is identical regardless of what's being retrieved.
+
+### Consolidation: The Dream State
+
+Periodically, offline, a graph neural network scans the entire memory graph. It scores every node and edge by structural salience — not just access frequency, but whether a node is a bridge between otherwise-disconnected clusters, whether an edge is the only path to a frequently-queried fact. It incorporates retrieval history: edges retrieved repeatedly over time have higher effective salience.
+
+The GNN detects subgraphs ready for abstraction and collapses them into semantic memories. It predicts missing edges — implicit relationships that were never explicitly stated but are structurally implied. It detects anomalies — orphan decisions, temporal gaps, contradictions — and flags them for Bonsai verification.
+
+This is the equivalent of sharp-wave ripple replay during sleep. The hippocampus replays compressed memories to gradually train the neocortex. The GNN replays the graph to gradually improve its structure.
+
+### Forgetting: Self-Limiting Persistence
+
+Nothing is ever deleted. But not everything persists equally. The forgetting system combines four mechanisms to ensure that memory persistence reflects genuine importance rather than accidental repetition:
+
+**Retrieval-weighted persistence** means every time an edge is traversed in a retrieval, its decay rate drops slightly. The more the user asks about something, the harder it is to forget. But this boost has diminishing returns — the twentieth retrieval provides far less reinforcement than the first — and an absolute floor ensures nothing becomes immortal.
+
+**Saturation detection** breaks the frustration loop. If the same edge is retrieved more than five times in twenty-four hours, the system stops boosting and may slightly increase decay. The user keeps asking because the answer isn't sticking, and the system stops reinforcing because the user keeps asking.
+
+**LLM-mediated signals** let the language model annotate its own responses. `[IMPORTANT: this is a key architectural decision]` strengthens persistence. `[FRUSTRATION: user is stuck on this]` prevents reinforcement. `[CORRECTION: this fact has changed]` triggers reconsolidation of the old fact.
+
+**Boost decay** means the persistence boost from a retrieval itself fades with a roughly seven-day half-life. A retrieval last month matters less than a retrieval yesterday. If the user stops asking, the edge gradually returns to baseline decay.
+
+Facts that change are **reconsolidated**: the old version is marked as superseded with a validity end date, the new version is marked as current, and a `supersedes` edge links them. Default queries return only current facts. Historical queries — "what did I used to think?" — return the versioned history. And edges that survive three retrievals across fifteen or more days enter a late-phase state where their decay rate drops by an additional seventy percent — the architectural equivalent of a memory becoming independent of the hippocampus.
+
+---
+
+## 4. The Artificial Subconscious
+
+The most novel component is not the memory systems. It's the **subconscious router** that sits between the user and everything else — and the unified cognitive primitive that makes it possible.
+
+### The JEPA-Gated SSM: One Primitive, Many Minds
+
+The architecture's previous design treated its neural components — the Mamba SSM for working memory, the JEPA predictor for salience, the gate for routing — as separate models with separate purposes. This had three consequences: proliferation of models (each new cognitive function required a new model), no unified dynamics (components were independent when they should be aspects of a single computational primitive), and missing cognitive functions (no uncertainty detection, no prospective memory, no self-model).
+
+The revised architecture unifies these into a single primitive: the **JEPA-gated SSM**. It's composed of a shared Mamba SSM that maintains recurrent state, a shared JEPA predictor that performs predictive coding in embedding space, and a lightweight inhibitory gate that decides whether to excite or inhibit. The critical distinction is **shared weights, separate states.** The SSM and JEPA weights — about 480 million parameters, roughly 0.90 GB — are loaded once in GPU memory. Every cognitive function is an instance with its own state vector, its own gate, and its own input/output projections. Adding a new cognitive function costs about one million parameters, not five hundred million.
+
+This maps directly onto the canonical cortical microcircuit — the same cell types, the same laminar structure, the same local connectivity repeated across the entire neocortex. What differs between regions is input sources, output targets, and inhibitory interneuron composition. The circuit is the same. The configuration makes it different.
+
+### The Instances
+
+Five instances of the primitive run continuously, each maintaining its own state and learning its own gating policy:
+
+**The Retrieval Gate** is the subconscious router. It receives every prompt and the current working memory state. Before any retrieval happens, before any model generates a token, it predicts: which domain to query, which pathway to use, what meta-skills are required, what model size is needed, and whether conscious deliberation is necessary. All of this happens in milliseconds, below the threshold of anything the user or the LLM experiences.
+
+**Working Memory** is the SSM instance that maintains continuous awareness. It's not a text buffer. It's a dynamical system whose current activation pattern is what the system is currently aware of. New inputs shift the state. Retrieved memories are injected as embeddings, not text. Old information decays gracefully rather than being truncated. The state dimension is fixed, but the information it represents expands and contracts dynamically.
+
+**The Uncertainty Detector** knows when the system doesn't know. It flags three conditions: routing uncertainty (the Retrieval Gate wasn't confident about its domain prediction), novel entities (retrieved context contains entities not in the ontology), and unresolved contradictions (multiple sources disagree without resolution). These flags feed the EXPAND mechanism — loading more detail from the HBTrie — and the delegation ladder — routing to a larger model. The detector learns its thresholds from experience, calibrated by Oracle feedback during training.
+
+**The Aspirational Model** operates in three temporal modes. In the present, it gates encoding strength — "I'm curious about this, encode it strongly." In the future, it maintains prospective memories — triggers that fire when conditions are met, like "alert me when you encounter information about Postgres performance." In the past, it weights retrieval persistence — every retrieval feeds back into the forgetting system, making frequently accessed memories more resistant to decay.
+
+**The Self-Model** estimates the boundaries of its own knowledge. It learns when to say "I don't know" — not from hardcoded thresholds, but from experience. During training, the Oracle provides feedback: "You should have known this" or "You were right to admit uncertainty." The Self-Model's gate learns the difference.
+
+### How the Subconscious Learns
+
+Every routing decision produces an outcome. Did the user accept the response? Did the model have to delegate to a larger model mid-task? Was the response fast enough? Was expansion needed to retrieve missing details?
+
+These outcomes feed back to the Retrieval Gate as reinforcement signals. Successful routes are reinforced. Routes that required unexpected delegation are penalized and re-evaluated. Routes that used a larger model than necessary get a small efficiency penalty.
+
+Over time, the gate learns that "What is X?" needs a 1B model and no retrieval. "Why did X?" needs a 3B model and graph retrieval. "Review this for security" needs an 8B model executing a stored process that delegates security analysis to a 70B model. "Design a new X" needs a 70B model from the start.
+
+The subconscious becomes personalized. It learns your domains, your patterns, your habits. It anticipates where to look before you finish asking. It knows which model size you need without you specifying. It gets faster and more automatic the more you use it.
+
+### The Conscious/Subconscious Split
+
+This maps directly to dual-process theory. System 1 — the subconscious — is fast, automatic, parallel, and handles routine queries without conscious intervention. System 2 — the conscious planner — is slow, deliberate, sequential, and engages when the subconscious can't resolve the route: when multiple domains conflict, when the task requires creative synthesis, when the confidence is low.
+
+The user only sees System 2. System 1 is invisible — the pondering that happens before the response begins.
+
+### Growing Up: Developmental Stages
+
+The system doesn't emerge fully formed. Each component tracks its own maturation through four stages. In INFANT stage, the Oracle provides all training signal — the component learns by mimicking. In CHILD stage, the Oracle critiques the component's decisions rather than providing answers directly. In ADOLESCENT stage, the component self-regulates, consulting the Oracle only for edge cases. In ADULT stage, the component operates independently.
+
+Transitions are gated by measurable metrics. The extraction models graduate from INFANT when their F1 score exceeds threshold on held-out data. The Retrieval Gate graduates when its routing accuracy matches the Oracle's decisions. The Self-Model graduates when its "I don't know" precision exceeds threshold. Each component matures at its own pace, and the system as a whole becomes more autonomous as its parts come online.
+
+---
+
+## 5. What This Enables for LLMs
+
+### Any LLM Becomes a Memory-Augmented LLM
+
+The architecture is a drop-in layer between the user and any language model. The LLM doesn't know about the memory system. It doesn't know about graph traversal. It doesn't know which domain it's in. It receives context and generates responses.
+
+This means GPT-4 today, Claude tomorrow, a local model next week — the subconscious doesn't care. It provides the same context regardless of which LLM consumes it. The LLM is a plugin. The ponder engine is the platform.
+
+### The Bidirectional Interface
+
+The LLM can write back to the subconscious. Embedded in its response are memory commands — `[REMEMBER: this is important]`, `[LINK: Python, performance_issues, WaveDB]`, `[FORGET: the Postgres decision was superseded]`. These are stripped before the user sees the response and executed by the subconscious.
+
+The LLM shapes its own memory. What it marks as important becomes more retrievable. What it links becomes connected. What it forgets becomes deprecated. And critically, the LLM's signals modulate the forgetting system — a `[FRUSTRATION]` tag prevents the persistence boost that would otherwise reinforce a memory the user is stuck on. Over time, the subconscious learns from these commands and starts making the same decisions automatically.
+
+### Cost-Optimal Intelligence
+
+Most real-world queries are factual recall or basic synthesis. A 1-3B model handles 80% of queries. An 8B model handles 15%. A 70B+ model handles 5%. The routing is learned, not hardcoded. The system uses exactly as much intelligence as the task requires.
+
+A factual question doesn't wake the 70B model. A creative design task doesn't waste time on the 1B model. The cost scales with actual need, not worst-case need. A small model with perfect memory matches a large model without memory on the tasks people actually do most often.
+
+### The Delegation Ladder
+
+When a small model executing a stored process hits a step it can't handle, it delegates up. The process defines the delegation rules: "Step 2 (security analysis) requires a 70B model." The small model calls the larger model for that step, gets the result, and continues. The user never knows a larger model was invoked.
+
+The small model becomes a conductor, not a soloist. It reads the score — the stored process — directs the musicians — the tools and larger models — and assembles the performance. It doesn't need to be smart. It needs to be good at following processes and knowing when to delegate.
+
+---
+
+## 6. What This Enables Beyond LLMs
+
+### The Retrieval Gate as a First-Class Intelligence
+
+The Retrieval Gate is not just a router. It's a predictive model that learns the structure of your cognitive life. It knows what you'll ask about before you ask. It knows which domains connect to which. It knows what's important and what's routine.
+
+As it improves, it handles an increasing fraction of queries without waking any LLM. "What was the Python async throughput?" — the gate routes directly to the SSM state, which already encodes the answer from recent context. No retrieval. No LLM. Sub-50ms response.
+
+The gate becomes the default intelligence. The LLM becomes the exception — engaged only when the task requires reasoning that prediction alone can't provide.
+
+### GNN as a Structural Reasoner
+
+The GNN consolidator doesn't just clean up the graph. It discovers implicit knowledge. It predicts that Postgres and performance issues are related even though no conversation explicitly connected them — because they appear in similar structural positions. It detects that a decision made in June was contradicted by a decision made in July. It identifies that three apparently separate frustrations share a common root cause.
+
+These discoveries are fed back into the graph as new edges. The graph becomes smarter than the conversations that built it. The GNN is a structural reasoner that operates on the shape of experience, finding patterns invisible to any single episode.
+
+### SSM as Continuous Awareness
+
+The SSM maintains a continuous hidden state — working memory without a context window. It's not a text buffer. It's a dynamical system whose current activation pattern **is** what the system is currently aware of.
+
+New inputs shift the state. Retrieved memories are injected as embeddings, not text. Old information decays gracefully rather than being truncated. The state dimension is fixed, but the information it represents expands and contracts dynamically.
+
+The SSM is what enables the subconscious to answer questions without retrieval. If the Retrieval Gate detects that the SSM state already covers the prompt, no graph traversal happens. The answer is already in awareness.
+
+---
+
+## 7. Efficiency Gains
+
+### Computational Efficiency
+
+| Query Type | Traditional LLM | Ponder Engine |
+|---|---|---|
+| "What's the capital of France?" | 70B model, full inference | 1B model or SSM direct, <50ms |
+| "What did Alice say last Tuesday?" | Can't answer (no memory) | Graph retrieval + 3B model, ~200ms |
+| "Review this PR for security" | 70B model, full inference | 8B model executes stored process, delegates security step to 70B, ~2s |
+| "Design a new sync mode" | 70B model, full inference | 70B model, full inference, ~5s |
+
+The efficiency gain is not in making the hard tasks easier. It's in not using the hard-task machinery for the easy tasks. The 70B model sits idle 80% of the time. The 1-3B model handles the routine. The cost follows the actual cognitive demand.
+
+### Storage Efficiency
+
+A 70B-parameter model stores knowledge in its weights — roughly 140 GB of floating-point numbers that encode everything the model knows about the world. Adding knowledge requires fine-tuning or retraining. Removing knowledge is impossible. Sharing knowledge means sharing the entire model.
+
+The ponder engine stores knowledge in graphs — structured triples that encode specific facts, episodes, and processes. A year of daily conversations might produce a few hundred megabytes of graph data. Adding knowledge is an insert operation. Removing knowledge is a deprecation edge. Sharing knowledge is exporting a WaveDB instance.
+
+### Parameter Efficiency
+
+The JEPA-gated SSM primitive dramatically reduces the architecture's footprint. The previous design required separate models for the SSM (~500M), JEPA (~300M), and gate functions — roughly 1.70 GB total for the mind layer. The unified primitive uses a shared backbone of ~480M parameters (~0.90 GB) plus five instance-specific gates and projections totaling ~5M parameters (~0.02 GB). Total mind layer: under 1 GB. The savings — nearly 0.8 GB — go directly to headroom for larger generation models or additional cognitive functions.
+
+### Learning Efficiency
+
+The subconscious learns from every interaction. Every routing decision that succeeds or fails updates the Retrieval Gate's weights. Every process that executes updates its success rate. Every anomaly that Bonsai verifies improves the GNN's anomaly detector. Every retrieval that the user values — or doesn't — shapes the forgetting system's persistence weights.
+
+This is continuous, online learning. No retraining phase. No catastrophic forgetting. The system gets better at its specific job — routing your queries, retrieving your memories, executing your processes — with every interaction.
+
+---
+
+## 8. Scalability Across Distributed and Non-Homogeneous Hardware
+
+### The Architecture Separates Knowledge From Processing
+
+This is the architectural insight that makes distributed deployment natural. The processing models — GLiNER2, Bonsai, the JEPA-gated SSM backbone, the GNN — are small and identical across all instances. The knowledge — graphs, ontologies, processes — is what varies.
+
+The entire processing layer fits on a single consumer GPU. The JEPA-gated SSM backbone uses ~0.90 GB. Bonsai uses ~2.15 GB. The GNN uses ~0.40 GB. The instance gates and states are negligible. Total VRAM: roughly 3.5 GB, leaving over 12 GB headroom on an RTX 5060 Ti. Total hardware cost: roughly $400-500 for the GPU, plus CPU and disk you already have. This is an edge-device architecture, not a datacenter one.
+
+For the delegation ladder, larger models — 70B, 175B — run on cloud APIs. They're invoked only when needed, roughly 5-15% of queries. The cost is proportional to actual use, not worst-case provisioning.
+
+### Linear Scaling
+
+Adding a user means adding a set of domain graphs. The processing models are shared. A single GPU can serve multiple users if their queries don't overlap in time. Ten users with light usage share one GPU. A thousand users need a small cluster.
+
+The scaling is linear in users, not quadratic in model size. This is the opposite of monolithic LLMs, where serving more users means replicating the entire 70B+ parameter model.
+
+---
+
+## 9. Domain Knowledge as a Transferrable Resource
+
+### Exportable Expertise
+
+You've spent six months building WaveDB. Your ponder engine has a rich database domain graph: episodes about HBTrie design, WAL configuration, Python bindings, encryption APIs. The ontology has evolved categories specific to database development. Processes exist for code review, performance benchmarking, and API design.
+
+You export the domain graph. Your colleague imports it. Now their ponder engine knows everything yours knows about WaveDB. Not because you fine-tuned their model. Because you shared a graph. The processing models are identical. The knowledge is what transferred.
+
+### Composable Domains
+
+A new project combines robotics and databases. You don't merge the graphs. You link them with cross-graph edges. Now a query like "What database does the bear's vision system use?" traverses from the robotics domain to the database domain through the federated graph. The models don't change. The graphs don't merge. The link edges create a unified namespace.
+
+### A Domain Marketplace
+
+If domain knowledge is portable, it's tradeable. A database expert publishes a "PostgreSQL Internals" domain graph. A security researcher publishes a "Web Vulnerability Patterns" domain graph. A robotics engineer publishes a "PID Controller Tuning" domain graph.
+
+You import the domains relevant to your work. Your ponder engine now has expert-level knowledge in those areas — not because you trained on expert data, but because you imported expert graphs. The knowledge economy shifts from model weights to structured experience.
+
+### Federated Learning Without Sharing Data
+
+Multiple users can train shared processing models — better extraction, better retrieval, better routing — without sharing their personal graphs. The models learn to be better processors. The graphs stay private. This is federated learning at the architectural level: the models improve from aggregate experience while individual knowledge remains local.
+
+---
+
+## 10. Theorycrafting: Where This Goes
+
+### The Subconscious Becomes the Primary Intelligence
+
+As the Retrieval Gate improves, it handles an increasing fraction of cognitive work. It doesn't just route — it anticipates, it prepares, it pre-emptively retrieves. When you start typing "What was the throughp—", the gate has already activated the database domain, retrieved the Python async performance episodes, and loaded them into the SSM state. By the time you finish "throughput of the async Python bindings?", the answer is already in awareness.
+
+The LLM becomes a specialized tool for tasks that require genuine reasoning. The subconscious becomes the default mode of interaction. You're not talking to an AI. You're talking to a system that has already prepared what you need before you finished asking.
+
+### Multimedia Awareness
+
+The architecture is media-agnostic. The graph stores triples. The HBTrie stores bytes. The vector index stores embeddings. Nothing assumes text.
+
+An image is described by a vision model, its description is encoded into triples, and the raw bytes are stored in the HBTrie. An audio recording is transcribed, described, and encoded. A video is keyframed, transcribed, described, and encoded. All media types enter the same graph structure.
+
+When a better vision model arrives, the image is re-described. The old description is superseded, not deleted. The new triples may reveal entities and relations the old model missed. One rewrite cascades through the graph, connecting previously unconnected nodes. The understanding evolves without the content changing.
+
+### Cross-Modal Retrieval
+
+"Find everything related to Alice's frustration with WAL configuration" returns text episodes, images of Alice debugging, audio recordings with frustrated tone, and video calls where WAL configuration was screenshared. All from the same graph. All using the same retrieval mechanism. The media type is just another entity property.
+
+### The Personal AI That Grows With You
+
+You start with an empty graph. As you work, the graph grows. The subconscious learns your patterns. The processes library fills with your workflows. The ontology evolves categories specific to your thinking. Each component matures through its developmental stages — from INFANT, dependent on Oracle guidance, to ADULT, operating independently.
+
+After a year, the system doesn't just answer your questions. It anticipates them. It knows that when you ask about performance, you're usually about to ask about benchmarking methodology. It knows that when you're frustrated, you usually need someone to walk through the problem step by step. It knows which model size you need for which kind of task. It knows what's important enough to persist and what's routine enough to let fade.
+
+This is not a tool. It's a cognitive prosthetic. It extends your memory, routes your attention, and amplifies your intelligence — not by being smarter than you, but by ensuring you never forget what you've learned and never waste cognitive effort on tasks that stored processes can handle.
+
+### The End of the Monolithic Model
+
+The current AI paradigm is a single massive model that knows everything and runs in a datacenter. The ponder engine paradigm is a small, shared processing layer that knows nothing and runs on consumer hardware, connected to personal knowledge graphs that grow with their users.
+
+The model is a commodity. The knowledge is the value. The subconscious is the moat.
+
+This inverts the economics of AI. Training a 70B+ parameter model costs millions. Building a domain graph costs time and attention — things individuals already spend. Sharing a model means sharing 140 GB of weights. Sharing knowledge means sharing a few megabytes of structured experience.
+
+The future is not one big brain in the cloud. It's billions of small brains on edge devices, each with its own memories, its own processes, its own subconscious — and the ability to share what they know without sharing who they are.
+
+---
+
+## 11. What This Is and Isn't
+
+This is not AGI. It's not a thinking machine. It's not conscious. It's not a brain.
+
+It's infrastructure. It's the memory and routing layer that every AI system needs but none currently has. It's the part that handles *what do I know about this?* and *where should I look?* and *what's important here?* and *am I the right intelligence for this task?*
+
+It's a **ponder engine** — the substrate that makes thinking possible by ensuring that when it's time to think, everything needed is already in awareness. It doesn't think. It ponders. And in a world where every AI system can generate fluent text but none can remember what you told it last Tuesday, a system that ponders before it speaks is already a step change.
+
+---
+
+*The architecture described in this article is built on WaveDB, an open-source hierarchical key-value database with a graph layer, MVCC concurrency, and production Python bindings. The processing models — GLiNER2, GLiNER-Decoder, Bonsai, Mamba SSM, JEPA, and GNN — are all existing, publicly available architectures. The novelty is not in the components. It's in the arrangement: a unified cognitive primitive that scales cognitively without scaling parameters, a subconscious router that learns from every interaction, a forgetting system that balances persistence with impermanence, and a knowledge architecture that makes domain expertise a transferrable, composable resource. Total training cost: roughly $134. Total inference cost: $0. The future of AI memory runs on hardware you already own.*
+================================================================================
+### MSG [104] role=assistant id=2149 time=2026-07-04T21:15:53.263953Z
+================================================================================
+The Phase 1a plan is structurally sound — the encoding pipeline doesn't change much under the new architecture. But several details need updating to align with what we now know. Let me go through them.
+
+---
+
+## What's Already Correct
+
+The core of Phase 1a — GLiNER2 + GLiNER-Decoder + Bonsai extraction → Episode → WaveDB storage — is unchanged. The new architecture affects how extracted information is **processed downstream** (JEPA-gated SSM, Retrieval Gate, consolidation), not how it's **extracted**. The plan's code for `store.py`, `gliner_extractor.py`, `bonsai_relations.py`, and `encoder.py` is fine.
+
+The merged ontology (conversational + code + development + business) is already included and correct.
+
+---
+
+## What Needs Updating
+
+### 1. Episode Model — Add Fields for Downstream Systems
+
+The Episode model is the contract between Phase 1a and everything that follows. It needs fields that later phases will populate, even if Phase 1a sets defaults:
+
+```python
+@dataclass
+class Episode:
+    # ... existing fields ...
+    
+    # ── Set by Phase 1a ──
+    salience: float = 0.5  # Default. Replaced by JEPA (Aspirational Model, present mode) in Phase 2
+    
+    # ── Set by Phase 2+ (defaults provided for Phase 1a) ──
+    retrieval_count: int = 0              # Reconsolidation counting
+    ltp_phase: str = "early"             # "early" | "late"
+    consolidation_window_start: Optional[str] = None
+    utility_decay_rate: float = 0.01     # Base decay rate. Modified by retrieval-weighted persistence.
+    retrieval_timestamps: list[str] = field(default_factory=list)  # For saturation detection
+    saturation_flags: int = 0            # Times saturation was detected
+```
+
+**Why:** Phase 1a produces episodes that Phase 2-4 will read. The fields should exist from the start so the store schema doesn't change later. Phase 1a sets safe defaults.
+
+### 2. Configuration — Reference the Full Architecture
+
+The config should acknowledge the components that exist beyond Phase 1a, even if they're not yet implemented:
+
+```python
+@dataclass
+class Config:
+    # WaveDB
+    db_path: str = os.getenv("HIPPOCAMPAL_DB_PATH", "./data/memory_db")
+    lru_memory_mb: int = 100
+    wal_sync_mode: str = "debounced"
+    
+    # Phase 1a: Extraction
+    gliner2_model: str = "fastino/gliner2-base-v1"
+    gliner_decoder_model: str = "knowledgator/gliner-decoder-base-v1.0"
+    extraction_threshold: float = 0.3
+    bonsai_model: str = os.getenv("BONSAI_MODEL", "gpt-4o-mini")
+    bonsai_temperature: float = 0.1
+    
+    # Phase 1a: Encoding defaults (replaced by learned models in later phases)
+    episode_salience_default: float = 0.5       # Replaced by JEPA (Aspirational Model) in Phase 2
+    discovery_buffer_threshold: int = 10
+    
+    # Phase 2+: JEPA-Gated SSM (not yet active)
+    ssm_state_dim: int = 512
+    jepa_backbone_model: str = "mamba-2.8b"     # Shared SSM+JEPA weights
+    
+    # Phase 3+: GNN Consolidator (not yet active)
+    gnn_hidden_dim: int = 256
+    
+    # Phase 4+: Instance-specific gates (not yet active)
+    gate_hidden_dim: int = 128
+    
+    # Forgetting system (not yet active)
+    saturation_threshold: int = 5               # Max retrievals in 24h before saturation
+    boost_half_life_days: float = 7.0           # Retrieval boost decay half-life
+    min_decay_rate: float = 0.001               # Absolute floor (0.1% per day)
+    
+    # Paths
+    data_dir: Path = Path("./data")
+    sample_conversations: Path = Path("./data/sample_conversations.jsonl")
+```
+
+**Why:** The config is the single source of truth for the entire system. Future phases should add their parameters here, not in scattered files. Phase 1a sets defaults for fields it doesn't yet use.
+
+### 3. Store — Add Edge-Level Fields
+
+The store's `encode_episode` method should persist the new Episode fields:
+
+```python
+def encode_episode(self, episode: Episode):
+    # ... existing HBTrie writes ...
+    
+    # ── New: persistence-related fields ──
+    self.db.put_sync(f"ep/{episode.id}/retrieval_count", str(episode.retrieval_count))
+    self.db.put_sync(f"ep/{episode.id}/ltp_phase", episode.ltp_phase)
+    self.db.put_sync(f"ep/{episode.id}/decay_rate", str(episode.utility_decay_rate))
+    
+    # ... existing graph writes ...
+```
+
+**Why:** These fields need to survive restarts. The HBTrie is the persistence layer.
+
+### 4. Phase Descriptions — Align With v2 Architecture
+
+The implementation order at the end of the plan references the old phase structure. Replace with:
+
+```
+## 13. Implementation Order (Aligned with Architecture v2.0)
+
+1. **Project setup** — `pyproject.toml`, directory structure, `config.py`
+2. **Data models** — `episode.py` (with downstream fields), `ontology.py` (merged DAG)
+3. **WaveDB store** — `store.py` with encode/decode including persistence fields
+4. **GLiNER extractor** — `gliner_extractor.py` with both models
+5. **Bonsai relations** — `bonsai_relations.py`
+6. **Encoder orchestrator** — `encoder.py`
+7. **Sample conversations** — `sample_conversations.jsonl` (20 conversations)
+8. **Tests** — unit tests for each component, integration test for encoder
+9. **Corpus processing script** — `process_corpus.py`
+10. **Quality measurement** — run extraction quality tests, iterate on prompts until thresholds met
+
+### What Phase 1a Enables
+
+This phase produces the foundation for all subsequent work:
+
+- **Phase 1b (Storage):** Populated WaveDB with real conversation data
+- **Phase 1c (Retrieval):** Query planner + graph traversal on the populated graph
+- **Phase 1d (Training Data Generation):** Oracle-labeled subgraphs for GNN training
+- **Phase 2 (Shared Backbone + Retrieval Gate):** JEPA-gated SSM backbone training, Retrieval Gate instance, Mode A generation
+- **Phase 3 (GNN Consolidator + Forgetting):** Dream state consolidation, retrieval-weighted persistence, reconsolidation counting
+- **Phase 4 (Instance-Specific Gates):** Uncertainty Detector, Aspirational Model, Self-Model, prospective memory
+- **Phase 5 (Evaluation):** ConvoMem, EverMemBench, CloneMem benchmarks
+- **Phase 6 (Process Learning + Delegation):** Procedural memory, delegation ladder
+- **Phase 7 (Self-Generated Training):** Continuous improvement from system operation
+
+### What Phase 1a Does NOT Do
+
+- No JEPA salience scoring (uses default 0.5)
+- No retrieval-weighted persistence (uses flat decay rate)
+- No reconsolidation counting (fields exist but aren't incremented)
+- No ontology evolution (seed only)
+- No consolidation (GNN is Phase 3)
+- No subconscious routing (Retrieval Gate is Phase 2)
+```
+
+### 5. Checkpoint Criteria — Add Developmental Stage Tracking
+
+Add a criterion that aligns with the developmental tracker:
+
+```
+- [ ] Developmental stage for extraction components set to INFANT
+- [ ] Metrics tracked: entity F1, topic F1, tone F1, relation accuracy
+- [ ] Transition criteria defined: F1 > 0.85 → CHILD stage
+```
+
+### 6. Ontology Note — Document the Multi-Parent DAG
+
+Add a comment in `ontology.py` or the plan explaining the merge:
+
+```python
+"""
+Seed ontology for the hippocampal memory system.
+
+This is a multi-parent DAG: a class may have several subClassOf parents.
+The Graph layer stores these as triples natively. The ontology merges
+four taxonomies:
+
+1. CONVERSATIONAL — Episode-side: entities, events, tones, topics
+2. CODE — AST-level artifacts, version control, issues, testing, 
+   architecture, API, data, configuration, infrastructure, deployment,
+   observability, quality, process
+3. DEVELOPMENT — Language-agnostic code semantics (paradigms, algorithms,
+   data structures, control flow, error handling, concurrency), documents,
+   knowledge artifacts, communication, security
+4. BUSINESS — Stakeholders, requirements, business rules, workflows,
+   products, markets, regulations, organizations, roles
+
+Overlap nodes (e.g., Database, Field, Cache, Configuration, Entity, Query,
+Schema, Proxy, Middleware, Migration, Patch, Conflict, Queue, Runbook,
+Vulnerability, Standard, README, Changelog, License, Event, Constant)
+become multi-parent nodes rather than collisions.
+
+Total: 376 classes, 165 properties, acyclic, 18 multi-parent overlap nodes.
+"""
+```
+
+---
+
+## What Does NOT Need Changing
+
+- **GLiNER extractor:** The extraction schema is fine. The full ontology is stored in the Graph layer; GLiNER2 uses a simplified schema for extraction. These are different things.
+- **Bonsai relations:** The relation types are correct for Phase 1a. Additional relation types from the code/development/business ontologies can be added when those domains are actively ingested.
+- **Sample conversations:** The 10 provided are good. The plan says to create 10 more covering code-specific discussions, multi-entity interactions, emotional arcs, decision chains, and contradictions — that's still correct.
+- **Testing strategy:** Unchanged. The tests validate extraction quality, which is what Phase 1a delivers.
+- **Corpus processing script:** Unchanged. It processes conversations through the encoding pipeline.
+
+---
+
+## Summary of Changes
+
+| What | Change |
+|---|---|
+| Episode model | Add `retrieval_count`, `ltp_phase`, `consolidation_window_start`, `utility_decay_rate`, `retrieval_timestamps`, `saturation_flags` with safe defaults |
+| Config | Add placeholder fields for Phase 2-4 components (SSM, JEPA, GNN, gates, forgetting system) |
+| Store | Persist new Episode fields to HBTrie |
+| Phase descriptions | Replace old phase structure with v2 7-phase plan. Add "what Phase 1a does NOT do" section. |
+| Checkpoint criteria | Add developmental stage tracking |
+| Ontology | Add docstring explaining the multi-parent DAG merge |
+
+Everything else — the extraction models, the Bonsai prompts, the sample conversations, the tests, the corpus processing script — remains as written. The new architecture affects what happens after extraction, not extraction itself.

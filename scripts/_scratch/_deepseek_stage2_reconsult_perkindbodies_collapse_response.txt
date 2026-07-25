@@ -1,0 +1,51 @@
+=== DEEPSEEK_CALL_OK ===
+elapsed_seconds=42.84
+attempt=1
+model=deepseek-v4-pro:cloud
+======================================================================
+
+1. DIAGNOSIS: ROOT CAUSE IS A REPRESENTATION PROBLEM, NOT A READOUT-ARCH PROBLEM
+
+The evidence is conclusive. Stage 0 proves the code signal exists in h but only when the readout is trained on code-only data (z_logit median 6.76). Every attempt to mix kinds in a single readout—shared body (#5) or any per-kind decomposition—either collapses the code direction or produces incompatible subspaces. The per-kind bodies + shared head collapse on the best seed (s0) is the smoking gun: three independently initialized 6144→128 bodies learn kind-specific projections in arbitrary orientations, and the shared 128→384 head, under margin loss with no coordination mechanism, cannot map them to a common logit scale. The cross-kind loss signal does not force alignment; it forces the head to output a near-constant (top3 ≈ 1/slots, r_pos → 0). This is exactly the “incompatible body representations” failure mode you called low-risk.
+
+The backbone was trained for procedural routing, not cross-kind document relevance. Its flat_last 6144 features are kind-isolated: each kind’s relevance signal lives in a separate subspace, and no single linear+MLP projection can simultaneously extract all of them without destructive interference. The shared body (#5) occasionally finds a fragile compromise (2/6 seeds), but that is the ceiling of what the frozen h supports. Per-kind decomposition is fundamentally incompatible with this backbone. The readout-only path is exhausted.
+
+2. COORDINATION MECHANISMS FOR PER-KIND BODIES: ALL DEAD
+
+Given the root cause, none of these can escape the incompatible-subspace collapse. They are ranked and refuted:
+
+- (a) Warm-start from the same shared #5 body: The bodies will still diverge to specialize to kind-specific features, and the shared head will again face misaligned representations. The collapse will recur as soon as the bodies drift.
+- (b) Freeze bodies → train head → unfreeze: The head will learn a mapping for the initial aligned bodies, but once unfrozen, the bodies will drift and the head will break. Staged training does not create a common subspace; it only delays the collapse.
+- (c) Alignment/orthogonality regularizer: Forcing bodies to stay aligned defeats the purpose of per-kind decomposition (they become a shared body). An orthogonality regularizer would push them apart, making the head’s job harder. Neither solves the absence of a common cross-kind subspace in h.
+- (d) Shared first layer + per-kind second layer: This is a partial decomposition that still suffers from the same fundamental issue—the shared first layer must extract features that work for all kinds, which is exactly what the shared body already fails to do robustly.
+
+Per-kind decomposition is dead for this frozen backbone. Do not invest further.
+
+3. NEXT-HIGHEST-LEVERAGE FIX
+
+The data/loss ladder (#1–#5) and all architectural decompositions have failed. The only remaining path that addresses the root cause is (B) backbone retrain. The other options are non-solutions:
+
+- (A) 2-seed logit-ensemble of #5 s0+s1: This is a band-aid. It does not meet the 6-seed gate requirement (4/6 seeds must pass both buckets; you have only 2 passing seeds). An ensemble of two deterministic seeds is too thin to generalize to live traffic; it will break under distribution shift because the underlying representation problem remains. Its rank does not change—it is still low-leverage and not shippable.
+- (C) Other readout archs (residual gating, MoE with shared gating, per-kind normalization, etc.): All are readout-only solutions. They cannot create a common cross-kind relevance subspace that the backbone never learned. They will fail for the same reason. More data or seed-selection rules are patches, not fixes.
+
+The primary fix is now (B): backbone retrain to learn a common cross-kind query-document relevance subspace.
+
+4. SINGLE HIGHEST-LEVERAGE NEXT STEP: MULTI-TASK BACKBONE FINE-TUNE WITH CROSS-KIND RELEVANCE LOSS
+
+Ship-vs-continue verdict: DO NOT SHIP. The 2-seed ensemble is not robust. CONTINUE with backbone retrain.
+
+Concrete specification for the minimal backbone retrain:
+
+- Objective: Multi-task fine-tune the entire ReferenceSSM backbone (4 layers, d_model=384, d_state=16) with two losses:
+  - L_routing: the original procedural routing loss (keep existing functionality; do not break it).
+  - L_relevance: a margin loss (m=2.5, hard-negative mining) on the onyx doc ring, using a simple shared linear readout from flat_last (6144 → 1 scalar logit). This readout is trained from scratch jointly with the backbone; it is discarded after fine-tuning—the goal is to force the backbone to produce a flat_last that supports cross-kind relevance.
+- Data:
+  - Routing data: the same data used to train the original backbone (preserve routing performance).
+  - Relevance data: the 934-record onyx doc ring + the 52 private onyx sessions. Use the same sqrt-inverse-freq no-replacement sampler (AdamW-clean) to balance conv/text/code. Positive pairs: (query, relevant doc of any kind). Negative pairs: hard negatives from the ring.
+- Training recipe:
+  - Optimizer: AdamW, same base LR as original backbone training (or 1/10th for fine-tuning). Use a loss weight λ = 0.1 for L_relevance initially; tune if routing degrades.
+  - Freeze nothing; fine-tune all backbone parameters. The flat_last projection is already part of the backbone (it’s the final linear map from the SSM output to 6144). Keep dropout 0.1 on the backbone.
+  - Train for a small number of epochs (5–10) monitoring both routing accuracy and relevance gate performance on a held-out validation set (the 52 private sessions). Stop when relevance gate improves without routing regression.
+- Evaluation: After fine-tuning, freeze the backbone again. Train the #5 shared-body readout (6144→128→384) from scratch on the doc ring with the same sampler, and run the 6-seed gate. Expected outcome: ≥4/6 seeds pass both buckets, because the backbone now encodes a common cross-kind relevance subspace.
+
+This is the single highest-leverage next step. It directly addresses the root cause and has a clear success criterion. All other actions are distractions. Execute this now.

@@ -1,0 +1,222 @@
+{
+  "which": "both",
+  "budget": 3,
+  "cos_floors": [
+    0.3,
+    0.4,
+    0.5,
+    0.6
+  ],
+  "rerankers": [
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "BAAI/bge-reranker-v2-m3"
+  ],
+  "sets": {
+    "heldout-17": {
+      "cross-encoder/ms-marco-MiniLM-L-6-v2|cos_floor=0.3|heldout-17": {
+        "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "is_nli": false,
+        "cos_floor": 0.3,
+        "n_in_window": 17,
+        "target_top1_rate": 0.2941,
+        "target_in_top3_rate": 0.5882,
+        "competitor_beats_rate": 0.7059,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "cross-encoder/ms-marco-MiniLM-L-6-v2|cos_floor=0.4|heldout-17": {
+        "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "is_nli": false,
+        "cos_floor": 0.4,
+        "n_in_window": 17,
+        "target_top1_rate": 0.2941,
+        "target_in_top3_rate": 0.5882,
+        "competitor_beats_rate": 0.7059,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "cross-encoder/ms-marco-MiniLM-L-6-v2|cos_floor=0.5|heldout-17": {
+        "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "is_nli": false,
+        "cos_floor": 0.5,
+        "n_in_window": 17,
+        "target_top1_rate": 0.2941,
+        "target_in_top3_rate": 0.5882,
+        "competitor_beats_rate": 0.7059,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "cross-encoder/ms-marco-MiniLM-L-6-v2|cos_floor=0.6|heldout-17": {
+        "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "is_nli": false,
+        "cos_floor": 0.6,
+        "n_in_window": 17,
+        "target_top1_rate": 0.2941,
+        "target_in_top3_rate": 0.5882,
+        "competitor_beats_rate": 0.7059,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "BAAI/bge-reranker-v2-m3|cos_floor=0.3|heldout-17": {
+        "model": "BAAI/bge-reranker-v2-m3",
+        "is_nli": false,
+        "cos_floor": 0.3,
+        "n_in_window": 17,
+        "target_top1_rate": 0.2353,
+        "target_in_top3_rate": 0.5882,
+        "competitor_beats_rate": 0.7647,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "BAAI/bge-reranker-v2-m3|cos_floor=0.4|heldout-17": {
+        "model": "BAAI/bge-reranker-v2-m3",
+        "is_nli": false,
+        "cos_floor": 0.4,
+        "n_in_window": 17,
+        "target_top1_rate": 0.2353,
+        "target_in_top3_rate": 0.5882,
+        "competitor_beats_rate": 0.7647,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "BAAI/bge-reranker-v2-m3|cos_floor=0.5|heldout-17": {
+        "model": "BAAI/bge-reranker-v2-m3",
+        "is_nli": false,
+        "cos_floor": 0.5,
+        "n_in_window": 17,
+        "target_top1_rate": 0.2353,
+        "target_in_top3_rate": 0.5882,
+        "competitor_beats_rate": 0.7647,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "BAAI/bge-reranker-v2-m3|cos_floor=0.6|heldout-17": {
+        "model": "BAAI/bge-reranker-v2-m3",
+        "is_nli": false,
+        "cos_floor": 0.6,
+        "n_in_window": 17,
+        "target_top1_rate": 0.2353,
+        "target_in_top3_rate": 0.6471,
+        "competitor_beats_rate": 0.7647,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      }
+    },
+    "loo-8-normal": {
+      "cross-encoder/ms-marco-MiniLM-L-6-v2|cos_floor=0.3|loo-8-normal": {
+        "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "is_nli": false,
+        "cos_floor": 0.3,
+        "n_in_window": 62,
+        "target_top1_rate": 0.3548,
+        "target_in_top3_rate": 0.6452,
+        "competitor_beats_rate": 0.6452,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "cross-encoder/ms-marco-MiniLM-L-6-v2|cos_floor=0.4|loo-8-normal": {
+        "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "is_nli": false,
+        "cos_floor": 0.4,
+        "n_in_window": 62,
+        "target_top1_rate": 0.3548,
+        "target_in_top3_rate": 0.6452,
+        "competitor_beats_rate": 0.6452,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "cross-encoder/ms-marco-MiniLM-L-6-v2|cos_floor=0.5|loo-8-normal": {
+        "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "is_nli": false,
+        "cos_floor": 0.5,
+        "n_in_window": 62,
+        "target_top1_rate": 0.3871,
+        "target_in_top3_rate": 0.6774,
+        "competitor_beats_rate": 0.6129,
+        "fires_on_target_rate": 0.9677,
+        "median_breadth": 3.0
+      },
+      "cross-encoder/ms-marco-MiniLM-L-6-v2|cos_floor=0.6|loo-8-normal": {
+        "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "is_nli": false,
+        "cos_floor": 0.6,
+        "n_in_window": 62,
+        "target_top1_rate": 0.4194,
+        "target_in_top3_rate": 0.6935,
+        "competitor_beats_rate": 0.5806,
+        "fires_on_target_rate": 0.8871,
+        "median_breadth": 3.0
+      },
+      "BAAI/bge-reranker-v2-m3|cos_floor=0.3|loo-8-normal": {
+        "model": "BAAI/bge-reranker-v2-m3",
+        "is_nli": false,
+        "cos_floor": 0.3,
+        "n_in_window": 62,
+        "target_top1_rate": 0.4355,
+        "target_in_top3_rate": 0.7903,
+        "competitor_beats_rate": 0.5645,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "BAAI/bge-reranker-v2-m3|cos_floor=0.4|loo-8-normal": {
+        "model": "BAAI/bge-reranker-v2-m3",
+        "is_nli": false,
+        "cos_floor": 0.4,
+        "n_in_window": 62,
+        "target_top1_rate": 0.4355,
+        "target_in_top3_rate": 0.7903,
+        "competitor_beats_rate": 0.5645,
+        "fires_on_target_rate": 1.0,
+        "median_breadth": 3.0
+      },
+      "BAAI/bge-reranker-v2-m3|cos_floor=0.5|loo-8-normal": {
+        "model": "BAAI/bge-reranker-v2-m3",
+        "is_nli": false,
+        "cos_floor": 0.5,
+        "n_in_window": 62,
+        "target_top1_rate": 0.4355,
+        "target_in_top3_rate": 0.7903,
+        "competitor_beats_rate": 0.5645,
+        "fires_on_target_rate": 0.9677,
+        "median_breadth": 3.0
+      },
+      "BAAI/bge-reranker-v2-m3|cos_floor=0.6|loo-8-normal": {
+        "model": "BAAI/bge-reranker-v2-m3",
+        "is_nli": false,
+        "cos_floor": 0.6,
+        "n_in_window": 62,
+        "target_top1_rate": 0.4516,
+        "target_in_top3_rate": 0.7581,
+        "competitor_beats_rate": 0.5484,
+        "fires_on_target_rate": 0.8871,
+        "median_breadth": 3.0
+      }
+    }
+  },
+  "best": {
+    "heldout-17": {
+      "config_key": "BAAI/bge-reranker-v2-m3|cos_floor=0.6|heldout-17",
+      "model": "BAAI/bge-reranker-v2-m3",
+      "is_nli": false,
+      "cos_floor": 0.6,
+      "n_in_window": 17,
+      "target_top1_rate": 0.2353,
+      "target_in_top3_rate": 0.6471,
+      "competitor_beats_rate": 0.7647,
+      "fires_on_target_rate": 1.0,
+      "median_breadth": 3.0
+    },
+    "loo-8-normal": {
+      "config_key": "BAAI/bge-reranker-v2-m3|cos_floor=0.3|loo-8-normal",
+      "model": "BAAI/bge-reranker-v2-m3",
+      "is_nli": false,
+      "cos_floor": 0.3,
+      "n_in_window": 62,
+      "target_top1_rate": 0.4355,
+      "target_in_top3_rate": 0.7903,
+      "competitor_beats_rate": 0.5645,
+      "fires_on_target_rate": 1.0,
+      "median_breadth": 3.0
+    }
+  }
+}

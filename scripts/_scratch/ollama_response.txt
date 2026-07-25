@@ -1,0 +1,30 @@
+=== OLLAMA_CALL_OK ===
+elapsed_seconds=40.94
+attempt=1
+model=deepseek-v4-pro
+eval_count=3501
+=== CONTENT ===
+1. **Failure-mode split is correct, but the transformer’s collapse is overfitting, not a fundamental backbone deficiency.**  
+   - Bilinear: the backbone’s `h_raw` for text-docs carries a usable semantic similarity signal (prose-trained backbone + prose queries). Code-docs (signatures/source bytes) are out-of-distribution → mis-rank. Conv slots are flat because the backbone’s routing-trained state for user messages encodes procedural features (turn, recency) not semantic content, so a per-slot bilinear projection to the query state yields no relevance contrast.  
+   - Transformer: the within-corpus latch (s2=2.666) that vanished live (0.344) is textbook overfitting to spurious cross-slot patterns in 934 records. The backbone *does* contain text-doc relevance signal (bilinear proves it), but the 2.98M-parameter cross-slot attention head memorised training-set noise instead of learning a generalisable relevance function. This is a data/regularisation problem, not proof the backbone lacks cross-slot signal.  
+   - **Verdict:** Bilinear is the viable head; transformer is salvageable only with heavy regularisation + more data, but that path is low-leverage given bilinear already clears the gate on text-docs.
+
+2. **Ranked next experiments to reach SHIPPABLE (all assume bilinear head):**  
+   - **#1 (highest leverage): Generate prose summaries for code-docs and re-evaluate.**  
+     Use an LLM (e.g., GPT-4o-mini) to produce a 1–2 sentence natural-language description of each code section (function/class). Embed the summary instead of the raw signature+source. This makes code-docs semantically similar to text-docs. Expect bilinear to pass the live gate on the full mixed ring (text+code) with median ≥2.0 in ≥2/3 seeds. Effort: ~1 day. Probability of success: high.  
+   - **#2: Diagnose and fix the conv flatness.**  
+     The conv gate is likely ill-posed: the query is the last user message; previous user/assistant turns are rarely “relevant” in a retrieval sense. Run a sanity check: compute the selectivity gap on conv slots using a simple BM25 or embedding cosine against the query. If even a strong baseline is flat, the gate metric is invalid for conv → relax the conv requirement or remove it from the gate. If a baseline *can* separate, then the backbone’s conv-slot state lacks semantic content → add a lightweight query-conditioned adapter (e.g., a small cross-attention layer that reads the raw message embedding) on top of the frozen backbone, trained only on conv slots with the same margin loss. Effort: 2–3 days. Probability: medium (depends on baseline result).  
+   - **#3: Slot-type-specific gate as a partial-ship fallback.**  
+     Require ≥2.0 only for `retrieved_text`; set a lower bar (e.g., ≥0.5) or no gate for `retrieved_code` and `conv`. This is product-viable if the primary use-case is prose-document retrieval and code/conv ranking is non-critical. Risk: code-docs will be mis-ranked, degrading experience if they appear in the ring. Mitigation: exclude code-docs from the ring until #1 is done. Effort: trivial (config change). Probability of acceptance: high for an MVP.  
+   - **#4 (only if transformer is a hard requirement): Query-conditioned low-rank projection + aggressive dropout + data augmentation.**  
+     Project `h_raw` (6144→384) with a query-dependent linear map, then feed into a shallower cross-slot transformer (1 layer, 4 heads) with dropout 0.5, weight decay 1e-2, and augment training data with synthetic relevance labels (e.g., using an LLM to generate query-relevant turns). This addresses overfitting but still faces the fundamental data scarcity. Effort: 1–2 weeks. Probability: low-medium.  
+   - **#5: Joint backbone fine-tune (your #7).**  
+     Only necessary if we insist on transformer *and* need conv/code relevance beyond what adapters can fix. Given bilinear already works for text, this is overkill for an MVP. Effort: high. Probability: medium (risk of breaking routing).  
+
+3. **Ship-vs-continue verdict:**  
+   - **Ship PARTIAL now:** Deploy with bilinear head, text-docs only (exclude code-docs), and remove the conv gate requirement. The live gate on `retrieved_text` is already 2/3 robust pass (median 3.969). This delivers a working document-retrieval feature.  
+   - **Continue for full ship:** Execute experiment #1 (code summarisation) immediately. If it lifts `retrieved_code` to ≥2.0, ship the full mixed ring. If not, ship text-only and iterate on code representation.  
+   - **Do not ship the transformer head in its current state; it is not on the critical path.**  
+
+4. **Single highest-leverage next step:**  
+   **Generate prose summaries for the 58 code-docs, re-ingest, and re-run the live gate evaluation with the bilinear head.** This directly attacks the only blocker preventing a full-ring pass and requires no architecture changes.

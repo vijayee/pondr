@@ -1,0 +1,42 @@
+=== DEEPSEEK_CALL_OK ===
+elapsed_seconds=37.77
+attempt=1
+model=deepseek-v4-pro:cloud
+======================================================================
+
+**1. Structural diagnosis: correct, but not absolute.**  
+Your core insight is right: the live gate is a *cross-kind* selectivity measure, so logits must live in a single, comparable space. The MoE’s per-kind readouts break that comparability because each head learns its own scale and bias, making cross-head logit comparisons meaningless. The all-turns ceiling of 0.0 confirms this.  
+
+However, a variant you didn’t test could preserve cross-kind comparability: **per-kind bodies + a single shared final projection head** (the inverse of Stage 1). Here, each kind gets its own 6144→128 body, but all bodies feed into one shared 128→384 head trained on all data. The shared head enforces a common logit space, while per-kind bodies can specialise without conv-dominated gradients in the first layer. This is not guaranteed to work—the bodies may still produce incompatible representations—but it’s a plausible architecture that avoids the “shared body pulled by conv” failure. I’d rank it below the simpler data-balancing fixes, but it’s a valid fallback if those fail.
+
+**2. Ranked experiments to reach shippable state (full live gate ≥2.0 on text AND code):**
+
+1. **Shared readout + class-balanced mini-batch sampling** (upweight code/text, downweight conv).  
+   - *Expected effect*: High. Directly addresses the root cause (conv-majority gradients). Code gold count 143 vs conv 562 → ~4× under-representation. Balancing will give code/text gradients equal footing.  
+   - *Risk to text*: Low. Text already has strong signal (30.16) and 229 golds; balancing will not starve it.  
+   - *Effort*: Minimal (change sampler, retrain 3 seeds).  
+   - *Verdict*: Highest-leverage first step.
+
+2. **Per-kind loss weighting (inverse frequency) on the same shared readout.**  
+   - *Expected effect*: Similar to (1) but less direct—weights affect loss magnitude, not which examples the model sees. May be slightly less effective than sampling because hard negatives from over-represented classes still dominate gradient steps.  
+   - *Risk*: Low.  
+   - *Rank*: Second, as a cheaper variant if sampling is somehow problematic.
+
+3. **Hard-negative mining focused on code-gold records** (force code fillers as negatives).  
+   - *Expected effect*: Targeted code lift by teaching the readout to separate code-gold from code-fillers specifically. Could complement (1).  
+   - *Risk*: Overfitting to code-code separation; might not generalise to cross-kind fillers.  
+   - *Rank*: Third, as an augmentation to (1) if code still lags.
+
+4. **Stage 2 backbone retrain (joint fine-tune).**  
+   - *Necessity*: Not yet. Stage 0 proved the code signal exists in *h* (6.76 held-out). The bottleneck is the readout training, not the backbone. Escalate only if data-balancing fails to lift code above 2.0.  
+   - *Rank*: Fourth, as a fallback.
+
+5. **Per-kind gate (partial ship).**  
+   - *Product viability*: If the product can operate with text-doc retrieval only (e.g., code docs are a nice-to-have), shipping text ≥2.0 now is viable. But if code retrieval is a core requirement, the -4.94 is a blocker. You must clarify with product.  
+   - *Rank*: Fifth, as a temporary measure while fixing code.
+
+**3. Ship-vs-continue verdict:**  
+**Continue.** 1f-6’s text 30.16 is a strong signal, but code -4.94 and conv flat are blockers for a full ship. A partial ship (text only) is acceptable only if code docs are non-critical. Given the narrow problem (data imbalance), the fix is cheap and high-probability. Do not ship until code passes.
+
+**4. Single highest-leverage next step:**  
+**Retrain 1f-6 with class-balanced sampling (upweight code/text to match conv frequency).** This directly attacks the root cause, preserves the proven cross-kind logit space, and has minimal risk to text. Expect code to rise from -4.94 to ≥2.0 within 3 seeds. If it doesn’t, immediately try per-kind loss weighting + hard-negative mining for code. Only then consider architecture changes or backbone retraining.

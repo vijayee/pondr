@@ -1,0 +1,47 @@
+=== OLLAMA_CALL_OK ===
+elapsed_seconds=29.23
+attempt=1
+model=deepseek-v4-pro
+eval_count=2902
+=== CONTENT ===
+**Recalibration.**  
+Your #7 fine‑tune recommendation (my P(clear)=0.80, top1=0.71) is **falsified**.  
+The CE learned a topic/session‑style signal that fits the 51 trained sessions (pos>neg 0.821) but transfers **zero** discrimination to the 2 held‑out meta‑engine sessions. The pairwise (query,candidate) format is the root cause: it conflates anaphora with topic match, and the held‑out register is topically distant. The CE reranker path is **dead** for this gate.
+
+---
+
+### 1. Is the 2‑session / 17‑pair held‑out set too small / pathologically hard?
+**Yes, it is too small and likely pathologically hard.**  
+The two sessions are both self‑referential “meta‑engine” talks – a register that appears nowhere in the 51 trained sessions. 17 pairs from 2 sessions cannot distinguish a genuine generalization failure from a test‑set outlier.  
+**Highest‑leverage next step (before any fork): author gold on a third held‑out session.**  
+Split one trained session out as a second generalization set (8–10 pairs, same non‑circular guard). Re‑evaluate the zero‑shot CE and the fine‑tuned CE on this new set. If the fine‑tuned CE still shows zero lift, the generalization gap is confirmed and we proceed. If the new set shows even modest lift (e.g., top1 ≥ 0.5), the original 17‑pair set is an outlier and the gate should be recalibrated with the new data.  
+**Effort: 1 day. Expected outcome: confirms the gap; P(confirms) = 0.85.**  
+Do this **now** – it is the single highest‑leverage action.
+
+---
+
+### 2. Fork ranking (recalibrated against both misses)
+
+| Fork | P(clear) | Predicted top1 / in_top3 on 17 held‑out | Effort | P(clear)×(1/effort) | Notes |
+|------|----------|----------------------------------------|--------|---------------------|-------|
+| **A. LLM‑as‑salience** | **0.75** | top1 = 0.76, in_top3 = 0.88 | Medium (prompt engineering + integration, ~3 days) | **0.25** | Directly attacks the diagnosis: the LLM sees the full window. Use **DeepSeek‑7B** (local :11434) with a **multiple‑choice prompt** (list the 16 turns as options A–P, ask “Which turn does the query refer back to? Reply with the letter.”). Multiple‑choice is more reliable than free‑form quote‑and‑match for small models. Latency ~2–3 s/query, acceptable for onyx. |
+| B. Sequence‑to‑choice trainable model | 0.35 | top1 = 0.50, in_top3 = 0.70 | High (architecture design, training, validation, ~2 weeks) | 0.025 | Encodes (window, query) → choice distribution. The 123‑pair training set is small and the held‑out register is out‑of‑distribution; risk of overfitting to training‑session discourse patterns is high. Seeing the window helps, but 123 examples are unlikely to teach a topic‑invariant anaphora function. |
+| C. Revisit learned STRM heads | 0.20 | top1 = 0.35, in_top3 = 0.65 | High (retrain heads, integrate, ~2 weeks) | 0.010 | The original heads went OOD on their old objective. Retraining on 123 anaphora pairs does not fix the fundamental issue: the SSM state trajectory is likely also topic‑bound. Low probability of generalizing to the meta‑engine register. |
+| D. Hold + productize partial win | 0.0 (gate not met) | – | – | – | Current recall@3 = 0.588 (10/17) fails the gate’s target_in_top3 ≥ 2/3 (0.667). Shipping a shortlist‑3 surface with 0.588 recall is not a “clear.” This fork is not a ship option unless the gate is relaxed, which requires the test‑set recalibration above. |
+
+**Ranking by P(clear)×(1/effort): A ≫ B > C; D is not a clear path.**
+
+---
+
+### 3. Single highest‑leverage next step
+**Author gold on a third held‑out session (split from trained) and re‑evaluate the fine‑tuned CE.**  
+- If the fine‑tuned CE shows **any lift** on the new set → the original 17‑pair set is an outlier; recalibrate the gate with the new data and re‑assess.  
+- If the fine‑tuned CE again shows **zero lift** → the generalization gap is real; proceed immediately to **Fork A (LLM‑as‑salience)**.  
+
+**I expect the gap to be confirmed (P=0.85).** Then Fork A is the clear winner.
+
+---
+
+### Ship‑vs‑continue verdict on the CE reranker path
+**HOLD – do not ship, do not continue.**  
+Both zero‑shot and fine‑tuned CE are capped at top1=0.294 on the held‑out set. The pairwise format is structurally incapable of capturing the anaphoric signal, which lives in the window context. No further investment in pairwise CE reranking.

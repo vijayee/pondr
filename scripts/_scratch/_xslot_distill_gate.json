@@ -1,0 +1,1388 @@
+{
+  "ckpt": "C:\\Users\\victor morrow\\Git-projects\\Pondr\\scripts\\_scratch\\_xslot_distill_s0\\best.pt",
+  "device": "cuda",
+  "backbone": "data/training/strm_backbone_relevance/backbone_v2_full_finetuned_text2x.pt",
+  "ring_capacity": 16,
+  "budget": 3,
+  "n_turn_records": 591,
+  "baselines_heldout17": {
+    "C1": [
+      0.235,
+      0.647
+    ],
+    "C2": [
+      0.294,
+      0.647
+    ],
+    "C3": [
+      0.353,
+      0.355
+    ],
+    "bar_in_top3": 0.647
+  },
+  "sets": {
+    "heldout-17": {
+      "label": "heldout-17",
+      "n_in_window": 17,
+      "target_top1_rate": 0.0588,
+      "target_in_top3_rate": 0.2353,
+      "competitor_beats_rate": 0.9412,
+      "target_in_ring_rate": 0.5882,
+      "median_breadth": 3.0,
+      "per_pair": [
+        {
+          "sid": "682afdd9",
+          "q": 6,
+          "t": 2,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            5,
+            2,
+            4
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "682afdd9",
+          "q": 7,
+          "t": 2,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            6,
+            2,
+            3
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "682afdd9",
+          "q": 8,
+          "t": 3,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            7,
+            2
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "682afdd9",
+          "q": 9,
+          "t": 4,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            7,
+            8,
+            2
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 17,
+          "t": 12,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            3,
+            12,
+            13
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 19,
+          "t": 14,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            18,
+            17,
+            8
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 21,
+          "t": 7,
+          "age": 13,
+          "target_in_ring": false,
+          "picked": [
+            18,
+            17,
+            10
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 24,
+          "t": 9,
+          "age": 14,
+          "target_in_ring": false,
+          "picked": [
+            10,
+            1,
+            7
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 26,
+          "t": 12,
+          "age": 13,
+          "target_in_ring": false,
+          "picked": [
+            24,
+            9,
+            22
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 32,
+          "t": 17,
+          "age": 14,
+          "target_in_ring": false,
+          "picked": [
+            7,
+            28,
+            2
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 36,
+          "t": 32,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            28,
+            7
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 37,
+          "t": 21,
+          "age": 15,
+          "target_in_ring": false,
+          "picked": [
+            10,
+            0,
+            28
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 52,
+          "t": 40,
+          "age": 11,
+          "target_in_ring": false,
+          "picked": [
+            42,
+            28,
+            34
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 53,
+          "t": 40,
+          "age": 12,
+          "target_in_ring": true,
+          "picked": [
+            40,
+            42,
+            34
+          ],
+          "rank": 1,
+          "top1": true,
+          "in_top3": true,
+          "competitor_beats": false,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 54,
+          "t": 48,
+          "age": 5,
+          "target_in_ring": false,
+          "picked": [
+            38,
+            34,
+            10
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 57,
+          "t": 53,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            28,
+            52,
+            48
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "69e17901",
+          "q": 58,
+          "t": 52,
+          "age": 5,
+          "target_in_ring": true,
+          "picked": [
+            39,
+            28,
+            42
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        }
+      ]
+    },
+    "loo-8-normal": {
+      "label": "loo-8-normal",
+      "n_in_window": 62,
+      "target_top1_rate": 0.129,
+      "target_in_top3_rate": 0.371,
+      "competitor_beats_rate": 0.871,
+      "target_in_ring_rate": 0.629,
+      "median_breadth": 3.0,
+      "per_pair": [
+        {
+          "sid": "54bc3670",
+          "q": 5,
+          "t": 0,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            1
+          ],
+          "rank": 1,
+          "top1": true,
+          "in_top3": true,
+          "competitor_beats": false,
+          "breadth": 2
+        },
+        {
+          "sid": "54bc3670",
+          "q": 8,
+          "t": 3,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            3,
+            0,
+            7
+          ],
+          "rank": 1,
+          "top1": true,
+          "in_top3": true,
+          "competitor_beats": false,
+          "breadth": 3
+        },
+        {
+          "sid": "54bc3670",
+          "q": 9,
+          "t": 0,
+          "age": 8,
+          "target_in_ring": true,
+          "picked": [
+            7,
+            3,
+            2
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "54bc3670",
+          "q": 10,
+          "t": 5,
+          "age": 4,
+          "target_in_ring": false,
+          "picked": [
+            7,
+            3,
+            0
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "54bc3670",
+          "q": 17,
+          "t": 7,
+          "age": 9,
+          "target_in_ring": true,
+          "picked": [
+            15,
+            10,
+            14
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "54bc3670",
+          "q": 18,
+          "t": 7,
+          "age": 10,
+          "target_in_ring": true,
+          "picked": [
+            10,
+            14,
+            11
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "54bc3670",
+          "q": 19,
+          "t": 6,
+          "age": 12,
+          "target_in_ring": false,
+          "picked": [
+            10,
+            0,
+            7
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "54bc3670",
+          "q": 20,
+          "t": 6,
+          "age": 13,
+          "target_in_ring": false,
+          "picked": [
+            10,
+            7,
+            18
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b11be917",
+          "q": 5,
+          "t": 1,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            1,
+            4
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b11be917",
+          "q": 6,
+          "t": 0,
+          "age": 5,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            5,
+            1
+          ],
+          "rank": 1,
+          "top1": true,
+          "in_top3": true,
+          "competitor_beats": false,
+          "breadth": 3
+        },
+        {
+          "sid": "b11be917",
+          "q": 20,
+          "t": 6,
+          "age": 13,
+          "target_in_ring": false,
+          "picked": [
+            18,
+            16,
+            13
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b11be917",
+          "q": 35,
+          "t": 29,
+          "age": 5,
+          "target_in_ring": false,
+          "picked": [
+            8,
+            4
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 2
+        },
+        {
+          "sid": "b11be917",
+          "q": 38,
+          "t": 31,
+          "age": 6,
+          "target_in_ring": false,
+          "picked": [
+            10,
+            7,
+            6
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b11be917",
+          "q": 41,
+          "t": 29,
+          "age": 11,
+          "target_in_ring": false,
+          "picked": [
+            10,
+            16,
+            17
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b7d4f2df",
+          "q": 25,
+          "t": 17,
+          "age": 7,
+          "target_in_ring": false,
+          "picked": [
+            22,
+            8,
+            20
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b7d4f2df",
+          "q": 27,
+          "t": 17,
+          "age": 9,
+          "target_in_ring": false,
+          "picked": [
+            7,
+            20,
+            0
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b7d4f2df",
+          "q": 31,
+          "t": 26,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            28,
+            27,
+            26
+          ],
+          "rank": 3,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b7d4f2df",
+          "q": 36,
+          "t": 31,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            34,
+            33,
+            35
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b7d4f2df",
+          "q": 37,
+          "t": 31,
+          "age": 5,
+          "target_in_ring": true,
+          "picked": [
+            33,
+            10,
+            34
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b7d4f2df",
+          "q": 38,
+          "t": 31,
+          "age": 6,
+          "target_in_ring": true,
+          "picked": [
+            17,
+            14,
+            31
+          ],
+          "rank": 3,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 15,
+          "t": 8,
+          "age": 6,
+          "target_in_ring": true,
+          "picked": [
+            11,
+            0,
+            14
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 15,
+          "t": 11,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            11,
+            0,
+            14
+          ],
+          "rank": 1,
+          "top1": true,
+          "in_top3": true,
+          "competitor_beats": false,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 16,
+          "t": 10,
+          "age": 5,
+          "target_in_ring": false,
+          "picked": [
+            11,
+            15,
+            12
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 17,
+          "t": 11,
+          "age": 5,
+          "target_in_ring": true,
+          "picked": [
+            15,
+            11,
+            12
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 25,
+          "t": 15,
+          "age": 9,
+          "target_in_ring": false,
+          "picked": [
+            7,
+            24,
+            23
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 26,
+          "t": 16,
+          "age": 9,
+          "target_in_ring": false,
+          "picked": [
+            25,
+            24,
+            23
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 27,
+          "t": 15,
+          "age": 11,
+          "target_in_ring": false,
+          "picked": [
+            26,
+            25,
+            22
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 28,
+          "t": 15,
+          "age": 12,
+          "target_in_ring": false,
+          "picked": [
+            27,
+            25,
+            26
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 29,
+          "t": 25,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            7,
+            27,
+            25
+          ],
+          "rank": 3,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 38,
+          "t": 28,
+          "age": 9,
+          "target_in_ring": false,
+          "picked": [
+            36,
+            37,
+            0
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "da0964cd",
+          "q": 42,
+          "t": 38,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            40,
+            38,
+            37
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "cad22a81",
+          "q": 29,
+          "t": 25,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            3,
+            27,
+            26
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "cad22a81",
+          "q": 63,
+          "t": 59,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            59,
+            29,
+            10
+          ],
+          "rank": 1,
+          "top1": true,
+          "in_top3": true,
+          "competitor_beats": false,
+          "breadth": 3
+        },
+        {
+          "sid": "cad22a81",
+          "q": 73,
+          "t": 60,
+          "age": 12,
+          "target_in_ring": false,
+          "picked": [
+            0,
+            7,
+            26
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "cad22a81",
+          "q": 90,
+          "t": 83,
+          "age": 6,
+          "target_in_ring": false,
+          "picked": [
+            88,
+            87,
+            45
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "cad22a81",
+          "q": 97,
+          "t": 91,
+          "age": 5,
+          "target_in_ring": false,
+          "picked": [
+            69,
+            14,
+            68
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "cad22a81",
+          "q": 110,
+          "t": 106,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            109,
+            108,
+            107
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "cad22a81",
+          "q": 119,
+          "t": 108,
+          "age": 10,
+          "target_in_ring": true,
+          "picked": [
+            7,
+            27,
+            28
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "cad22a81",
+          "q": 163,
+          "t": 158,
+          "age": 4,
+          "target_in_ring": true,
+          "picked": [
+            10,
+            94,
+            142
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b6dc5776",
+          "q": 12,
+          "t": 6,
+          "age": 5,
+          "target_in_ring": true,
+          "picked": [
+            8,
+            10,
+            6
+          ],
+          "rank": 3,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b6dc5776",
+          "q": 15,
+          "t": 10,
+          "age": 4,
+          "target_in_ring": false,
+          "picked": [
+            9,
+            12,
+            1
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b6dc5776",
+          "q": 21,
+          "t": 17,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            20,
+            17,
+            19
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b6dc5776",
+          "q": 25,
+          "t": 14,
+          "age": 10,
+          "target_in_ring": true,
+          "picked": [
+            21,
+            14,
+            20
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b6dc5776",
+          "q": 28,
+          "t": 14,
+          "age": 13,
+          "target_in_ring": true,
+          "picked": [
+            23,
+            14,
+            25
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b6dc5776",
+          "q": 29,
+          "t": 14,
+          "age": 14,
+          "target_in_ring": true,
+          "picked": [
+            5,
+            12,
+            20
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "b6dc5776",
+          "q": 31,
+          "t": 27,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            27,
+            29,
+            20
+          ],
+          "rank": 1,
+          "top1": true,
+          "in_top3": true,
+          "competitor_beats": false,
+          "breadth": 3
+        },
+        {
+          "sid": "b6dc5776",
+          "q": 34,
+          "t": 29,
+          "age": 4,
+          "target_in_ring": false,
+          "picked": [
+            14,
+            15,
+            16
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "75f12969",
+          "q": 7,
+          "t": 3,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            3,
+            6
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "75f12969",
+          "q": 17,
+          "t": 11,
+          "age": 5,
+          "target_in_ring": true,
+          "picked": [
+            10,
+            0,
+            7
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "75f12969",
+          "q": 24,
+          "t": 17,
+          "age": 6,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            10,
+            7
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "75f12969",
+          "q": 33,
+          "t": 29,
+          "age": 3,
+          "target_in_ring": false,
+          "picked": [
+            20,
+            18,
+            30
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "75f12969",
+          "q": 50,
+          "t": 46,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            47,
+            48,
+            46
+          ],
+          "rank": 3,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "75f12969",
+          "q": 60,
+          "t": 56,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            58,
+            56,
+            59
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "75f12969",
+          "q": 62,
+          "t": 58,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            60,
+            61,
+            59
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "6b152fb5",
+          "q": 4,
+          "t": 0,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            1
+          ],
+          "rank": 1,
+          "top1": true,
+          "in_top3": true,
+          "competitor_beats": false,
+          "breadth": 2
+        },
+        {
+          "sid": "6b152fb5",
+          "q": 6,
+          "t": 0,
+          "age": 5,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            4,
+            1
+          ],
+          "rank": 1,
+          "top1": true,
+          "in_top3": true,
+          "competitor_beats": false,
+          "breadth": 3
+        },
+        {
+          "sid": "6b152fb5",
+          "q": 7,
+          "t": 3,
+          "age": 3,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            4,
+            3
+          ],
+          "rank": 3,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "6b152fb5",
+          "q": 10,
+          "t": 0,
+          "age": 9,
+          "target_in_ring": false,
+          "picked": [
+            3,
+            8,
+            2
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "6b152fb5",
+          "q": 12,
+          "t": 3,
+          "age": 8,
+          "target_in_ring": true,
+          "picked": [
+            0,
+            2,
+            8
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "6b152fb5",
+          "q": 13,
+          "t": 0,
+          "age": 12,
+          "target_in_ring": true,
+          "picked": [
+            7,
+            10,
+            3
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "6b152fb5",
+          "q": 18,
+          "t": 10,
+          "age": 7,
+          "target_in_ring": true,
+          "picked": [
+            8,
+            10,
+            16
+          ],
+          "rank": 2,
+          "top1": false,
+          "in_top3": true,
+          "competitor_beats": true,
+          "breadth": 3
+        },
+        {
+          "sid": "6b152fb5",
+          "q": 26,
+          "t": 18,
+          "age": 7,
+          "target_in_ring": false,
+          "picked": [
+            25,
+            22,
+            24
+          ],
+          "rank": null,
+          "top1": false,
+          "in_top3": false,
+          "competitor_beats": true,
+          "breadth": 3
+        }
+      ]
+    }
+  },
+  "verdict": "FAIL -- heldout-17 in_top3=0.235 <= 0.647. State does not carry anaphora signal at this primitive; faith FALSIFIED. Do NOT expand."
+}

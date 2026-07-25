@@ -1,0 +1,94 @@
+=== DEEPSEEK_CALL_OK ===
+elapsed_seconds=33.92
+attempt=1
+model=deepseek-v4-pro:cloud
+======================================================================
+
+## 1. Read on the result
+
+**Representation-not-readout diagnosis confirmed.**  
+The same readout (#5 sqrt-freq sampler) that previously failed at 6 seeds now passes both buckets. The only change is the backbone’s `flat_last` representation. That is a clean causal confirmation.
+
+**The 4/6 text pass is a yellow flag, not a red one.**  
+- Code is 6/6, text is 4/6. The fine‑tune clearly learned a stronger code‑relevance direction.  
+- s0 text median –0.24 is a hard miss; s2 text 1.27 is a near‑miss. The text bucket is just at the robustness bar.  
+- This pattern is coherent: the fine‑tune data (939 records, user’s private conversational ring) likely skews toward code‑heavy sessions, so text relevance is less reinforced.  
+- The bar was set at ≥4/6, and it is met. The result is a **valid robust pass**, but the text direction is the weakest link and will be the first to break under distribution shift.
+
+**No red flag hiding.** The gate’s purpose is to locate query‑relevant slots; it now does so reliably for both kinds. The asymmetry is a data‑coverage issue, not a fundamental flaw.
+
+---
+
+## 2. The from‑the‑start solid approach
+
+Ranked by pain caused vs. cheapness to design out upfront:
+
+1. **Backbone objective mismatch (highest pain, cheapest to fix upfront).**  
+   The original backbone was trained with a mean‑pool `z_k` objective, never on `flat_last`. The readout consumes `flat_last`, so the representation was never optimized for the readout’s input.  
+   **Fix:** From day 1, include a `flat_last` query‑document relevance loss (e.g., margin loss or InfoNCE) on the real serve ring, **jointly** with the routing objective. The backbone then learns to produce a `flat_last` that is directly useful for relevance. No separate fine‑tune needed.
+
+2. **Injection‑by‑meaning fidelity trap (high pain, trivial to design out).**  
+   Re‑embedding `slot.text` instead of capturing the exact step‑input `u` caused a 20% fidelity break, which would have silently ruined any training.  
+   **Fix:** The trace format must capture the exact step‑input embedding (`slots_step_input`) by construction. This is a one‑line schema change and costs nothing upfront.
+
+3. **Class‑balanced loss weighting vs. sampling (moderate pain, easy to avoid).**  
+   AdamW with per‑kind loss weighting collapsed training; class‑balanced sampling worked cleanly.  
+   **Fix:** Always use class‑balanced sampling (inverse‑frequency, no replacement) for imbalanced relevance data. Never use loss weighting with AdamW for this problem.
+
+4. **3‑seed variance‑luck trap (moderate pain, easy to avoid).**  
+   Multiple 3‑seed passes gave false confidence.  
+   **Fix:** The robustness bar is 6 seeds from the start. No decision is made on <6 seeds.
+
+5. **Per‑kind bodies / MoE (moderate pain, avoidable by design).**  
+   The selectivity gate requires a **single cross‑kind logit space**; any per‑kind decomposition makes logits incomparable.  
+   **Fix:** Use exactly one shared readout head. Never split by kind.
+
+**The right from‑scratch recipe:**  
+- Train the backbone with a multi‑task loss: original ERAG routing (mean‑pool) + `flat_last` contrastive relevance loss on the serve ring.  
+- Capture exact step‑input `u` in the trace format.  
+- Train a single shared readout (e.g., cosine similarity with learned temperature) on top of the frozen backbone’s `flat_last`.  
+- Validate with 6 seeds, class‑balanced sampling, no per‑kind bodies.
+
+---
+
+## 3. Integration
+
+**(a) Which seed(s) to serve:**  
+Serve an **ensemble of the 4 passing seeds** (s1, s3, s4, s5). Average their logits before the gate. s0 and s2 are unreliable on text; including them would inject noise. The ensemble reduces variance and gives a single robust gate.
+
+**(b) One backbone or two?**  
+**Do not ship a two‑backbone split.** It is a maintenance trap: two copies of 19.5M params, drift between them, and every future change must be duplicated.  
+Instead, **re‑validate the fine‑tuned backbone on the original objectives** (2a retrieval gate, DocKindHead, ERAG routing).  
+- If the fine‑tuned backbone **matches or exceeds** the original on these metrics, replace the original backbone entirely. All heads benefit from the improved `flat_last`.  
+- If it **degrades** (catastrophic forgetting), then the fine‑tune is not safe to serve as the sole backbone. In that case, the correct path is a **joint multi‑task fine‑tune** (or from‑scratch retrain) that preserves the original objectives while adding the `flat_last` relevance loss. A temporary two‑backbone split could be used only while that retrain runs, but it must be short‑lived.
+
+**Load‑bearing validation:** Run the original 2a retrieval gate validation, DocKindHead accuracy, and ERAG routing metrics on the fine‑tuned backbone. This is the single gating step before any wiring.
+
+---
+
+## 4. Fragility
+
+**Overfit to 939 records:**  
+Yes, moving 19.5M params on a tiny dataset risks overfitting. The fine‑tune used a low LR (1e‑5) and only 8 epochs, which limits memorization, but the resulting representation may not generalize far beyond the training distribution. The text‑bucket weakness is a symptom. Mitigation: validate on a held‑out set of sessions (you already did within‑corpus held‑out, which passed). Before full trust, test on a small out‑of‑distribution set if available.
+
+**Throwaway readout capacity:**  
+The throwaway readout (Linear→cosine) had low capacity, forcing the backbone to do the work. A different throwaway readout (e.g., a 2‑layer MLP) might have produced a slightly different backbone, but the core direction (query‑relevant `flat_last`) would be the same. The risk is that the backbone over‑adapted to the specific loss formulation (margin loss, hard‑neg mining). This is acceptable for a first working system; a from‑scratch joint training would remove this dependency.
+
+**Truncated‑BPTT‑depth‑1 approximation:**  
+Single‑step replay gradient is a biased estimate of the true multi‑step gradient because it ignores how the current step’s parameter update affects future states. However, for a **slot‑level relevance objective**, the dominant gradient flows through the step that produced that slot’s hidden state. Multi‑step dependencies are second‑order. The smooth loss drop (2.51→0.46) and the strong result confirm the bias is not harmful in practice. No need to quantify further unless you plan to train for many more epochs.
+
+**Catastrophic forgetting of routing objective:**  
+This is the **only fragility that could block shipping**. The shared `W_A`/`W_B` were moved. The original heads read through mean‑pool, which also uses those weights. The fine‑tune targeted an untrained path, but it still modified the shared parameters. You must measure the original metrics. If they hold, the fine‑tune is safe. If they drop, the fine‑tune is not usable as a drop‑in replacement.
+
+---
+
+## 5. Single highest‑leverage next step, and ship‑vs‑continue verdict
+
+**Highest‑leverage next step:**  
+**Run the original validation suite (2a retrieval gate, DocKindHead, ERAG routing) on the fine‑tuned backbone.** This one action determines whether you can ship immediately or must retrain.
+
+**Ship‑vs‑continue verdict:**  
+- **If original metrics are preserved (no degradation):** **Ship.** Wire the fine‑tuned backbone as the single backbone, and serve the STRM readout with the ensemble of s1/s3/s4/s5.  
+- **If original metrics degrade:** **Do not ship.** The fine‑tune caused forgetting. The correct next action is a **joint multi‑task fine‑tune** (or from‑scratch retrain) that adds the `flat_last` relevance loss while keeping the original objectives. A temporary two‑backbone split is acceptable only as a stopgap while that retrain runs, but it must be replaced within one release cycle.
+
+**No further readout‑only experiments. No new architectures. The path is clear: validate, then either ship or retrain with the right joint objective.**

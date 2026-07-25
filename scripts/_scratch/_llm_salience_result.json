@@ -1,0 +1,1357 @@
+{
+  "model": "qwen3:8b",
+  "which": "both",
+  "heldout": {
+    "label": "heldout-17",
+    "n_in_window": 17,
+    "target_top1_rate": 0.2941,
+    "target_in_top3_rate": 0.6471,
+    "competitor_beats_rate": 0.7059,
+    "median_breadth": 3.0,
+    "ship": false,
+    "per_pair": [
+      {
+        "sid": "682afdd9",
+        "q": 6,
+        "t": 2,
+        "age": 3,
+        "picked": [
+          2,
+          0,
+          4
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "C, A, E"
+      },
+      {
+        "sid": "682afdd9",
+        "q": 7,
+        "t": 2,
+        "age": 4,
+        "picked": [
+          6,
+          3,
+          4
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "G,D,E"
+      },
+      {
+        "sid": "682afdd9",
+        "q": 8,
+        "t": 3,
+        "age": 4,
+        "picked": [
+          3,
+          4,
+          7
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "D,E,H"
+      },
+      {
+        "sid": "682afdd9",
+        "q": 9,
+        "t": 4,
+        "age": 4,
+        "picked": [
+          7,
+          4,
+          3
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "H, E, D"
+      },
+      {
+        "sid": "69e17901",
+        "q": 17,
+        "t": 12,
+        "age": 4,
+        "picked": [
+          2,
+          1,
+          13
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "C, B, N"
+      },
+      {
+        "sid": "69e17901",
+        "q": 19,
+        "t": 14,
+        "age": 4,
+        "picked": [
+          11,
+          2,
+          10
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "L, C, K"
+      },
+      {
+        "sid": "69e17901",
+        "q": 21,
+        "t": 7,
+        "age": 13,
+        "picked": [
+          2,
+          5,
+          14
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "C,F,O"
+      },
+      {
+        "sid": "69e17901",
+        "q": 24,
+        "t": 9,
+        "age": 14,
+        "picked": [
+          2,
+          6,
+          4
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "C, G, E"
+      },
+      {
+        "sid": "69e17901",
+        "q": 26,
+        "t": 12,
+        "age": 13,
+        "picked": [
+          2,
+          4,
+          8
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "C, E, I"
+      },
+      {
+        "sid": "69e17901",
+        "q": 32,
+        "t": 17,
+        "age": 14,
+        "picked": [
+          15,
+          12,
+          10
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "P, M, K"
+      },
+      {
+        "sid": "69e17901",
+        "q": 36,
+        "t": 32,
+        "age": 3,
+        "picked": [
+          6,
+          8,
+          12
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "G,I,M"
+      },
+      {
+        "sid": "69e17901",
+        "q": 37,
+        "t": 21,
+        "age": 15,
+        "picked": [
+          3,
+          5,
+          15
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "D,F,P"
+      },
+      {
+        "sid": "69e17901",
+        "q": 52,
+        "t": 40,
+        "age": 11,
+        "picked": [
+          6,
+          3,
+          5
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "G, D, F"
+      },
+      {
+        "sid": "69e17901",
+        "q": 53,
+        "t": 40,
+        "age": 12,
+        "picked": [
+          15,
+          2,
+          3
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "P,C,D"
+      },
+      {
+        "sid": "69e17901",
+        "q": 54,
+        "t": 48,
+        "age": 5,
+        "picked": [
+          15,
+          14,
+          10
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "P,O,K"
+      },
+      {
+        "sid": "69e17901",
+        "q": 57,
+        "t": 53,
+        "age": 3,
+        "picked": [
+          11,
+          12,
+          10
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "L,M,K"
+      },
+      {
+        "sid": "69e17901",
+        "q": 58,
+        "t": 52,
+        "age": 5,
+        "picked": [
+          14,
+          10,
+          6
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "O,K,G"
+      }
+    ]
+  },
+  "loo": {
+    "label": "loo-normal",
+    "n_in_window": 62,
+    "target_top1_rate": 0.4677,
+    "target_in_top3_rate": 0.7097,
+    "competitor_beats_rate": 0.5323,
+    "median_breadth": 3.0,
+    "ship": false,
+    "per_pair": [
+      {
+        "sid": "54bc3670",
+        "q": 5,
+        "t": 0,
+        "age": 4,
+        "picked": [
+          3,
+          0,
+          4
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "D,A,E"
+      },
+      {
+        "sid": "54bc3670",
+        "q": 8,
+        "t": 3,
+        "age": 4,
+        "picked": [
+          0,
+          1,
+          3
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "A,B,D"
+      },
+      {
+        "sid": "54bc3670",
+        "q": 9,
+        "t": 0,
+        "age": 8,
+        "picked": [
+          0,
+          3,
+          1
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "A,D,B"
+      },
+      {
+        "sid": "54bc3670",
+        "q": 10,
+        "t": 5,
+        "age": 4,
+        "picked": [],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 0,
+        "raw": ""
+      },
+      {
+        "sid": "54bc3670",
+        "q": 17,
+        "t": 7,
+        "age": 9,
+        "picked": [
+          6,
+          5,
+          3
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "G,F,D"
+      },
+      {
+        "sid": "54bc3670",
+        "q": 18,
+        "t": 7,
+        "age": 10,
+        "picked": [
+          15,
+          5,
+          4
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "P,F,E"
+      },
+      {
+        "sid": "54bc3670",
+        "q": 19,
+        "t": 6,
+        "age": 12,
+        "picked": [
+          14,
+          15,
+          3
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "O,P,D"
+      },
+      {
+        "sid": "54bc3670",
+        "q": 20,
+        "t": 6,
+        "age": 13,
+        "picked": [
+          0,
+          13,
+          14
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "A,N,O"
+      },
+      {
+        "sid": "6b152fb5",
+        "q": 4,
+        "t": 0,
+        "age": 3,
+        "picked": [
+          0,
+          1,
+          2
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "A,B,C"
+      },
+      {
+        "sid": "6b152fb5",
+        "q": 6,
+        "t": 0,
+        "age": 5,
+        "picked": [
+          0,
+          4,
+          5
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "A,E,F"
+      },
+      {
+        "sid": "6b152fb5",
+        "q": 7,
+        "t": 3,
+        "age": 3,
+        "picked": [
+          3,
+          4,
+          6
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "D,E,G"
+      },
+      {
+        "sid": "6b152fb5",
+        "q": 10,
+        "t": 0,
+        "age": 9,
+        "picked": [
+          6,
+          4,
+          2
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "G, E, C"
+      },
+      {
+        "sid": "6b152fb5",
+        "q": 12,
+        "t": 3,
+        "age": 8,
+        "picked": [
+          0,
+          3,
+          7
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "A,D,H"
+      },
+      {
+        "sid": "6b152fb5",
+        "q": 13,
+        "t": 0,
+        "age": 12,
+        "picked": [
+          0,
+          6,
+          4
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "A,G,E"
+      },
+      {
+        "sid": "6b152fb5",
+        "q": 18,
+        "t": 10,
+        "age": 7,
+        "picked": [
+          8,
+          4,
+          0
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "I,E,A"
+      },
+      {
+        "sid": "6b152fb5",
+        "q": 26,
+        "t": 18,
+        "age": 7,
+        "picked": [],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 0,
+        "raw": ""
+      },
+      {
+        "sid": "75f12969",
+        "q": 7,
+        "t": 3,
+        "age": 3,
+        "picked": [
+          6,
+          5,
+          3
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "G,F,D"
+      },
+      {
+        "sid": "75f12969",
+        "q": 17,
+        "t": 11,
+        "age": 5,
+        "picked": [
+          10,
+          6,
+          2
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "K, G, C"
+      },
+      {
+        "sid": "75f12969",
+        "q": 24,
+        "t": 17,
+        "age": 6,
+        "picked": [
+          15,
+          11,
+          12
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "P,L,M"
+      },
+      {
+        "sid": "75f12969",
+        "q": 33,
+        "t": 29,
+        "age": 3,
+        "picked": [
+          6,
+          7,
+          10
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "G, H, K"
+      },
+      {
+        "sid": "75f12969",
+        "q": 50,
+        "t": 46,
+        "age": 3,
+        "picked": [
+          10,
+          11,
+          8
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "K,L,I"
+      },
+      {
+        "sid": "75f12969",
+        "q": 60,
+        "t": 56,
+        "age": 3,
+        "picked": [
+          12,
+          13,
+          14
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "M,N,O"
+      },
+      {
+        "sid": "75f12969",
+        "q": 62,
+        "t": 58,
+        "age": 3,
+        "picked": [
+          12,
+          13,
+          14
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "M,N,O"
+      },
+      {
+        "sid": "b11be917",
+        "q": 5,
+        "t": 1,
+        "age": 3,
+        "picked": [
+          1,
+          2,
+          3
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "B,C,D"
+      },
+      {
+        "sid": "b11be917",
+        "q": 6,
+        "t": 0,
+        "age": 5,
+        "picked": [
+          0,
+          2,
+          3
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "A,C,D"
+      },
+      {
+        "sid": "b11be917",
+        "q": 20,
+        "t": 6,
+        "age": 13,
+        "picked": [
+          2,
+          6,
+          3
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "C, G, D"
+      },
+      {
+        "sid": "b11be917",
+        "q": 35,
+        "t": 29,
+        "age": 5,
+        "picked": [
+          10,
+          13,
+          15
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "K,N,P"
+      },
+      {
+        "sid": "b11be917",
+        "q": 38,
+        "t": 31,
+        "age": 6,
+        "picked": [
+          1,
+          2,
+          3
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "B,C,D"
+      },
+      {
+        "sid": "b11be917",
+        "q": 41,
+        "t": 29,
+        "age": 11,
+        "picked": [
+          4,
+          6,
+          10
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "E, G, K"
+      },
+      {
+        "sid": "b6dc5776",
+        "q": 12,
+        "t": 6,
+        "age": 5,
+        "picked": [
+          6,
+          5,
+          8
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "G, F, I"
+      },
+      {
+        "sid": "b6dc5776",
+        "q": 15,
+        "t": 10,
+        "age": 4,
+        "picked": [
+          11,
+          8,
+          5
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "L,I,F"
+      },
+      {
+        "sid": "b6dc5776",
+        "q": 21,
+        "t": 17,
+        "age": 3,
+        "picked": [
+          13,
+          15,
+          12
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "N,P,M"
+      },
+      {
+        "sid": "b6dc5776",
+        "q": 25,
+        "t": 14,
+        "age": 10,
+        "picked": [
+          5,
+          6,
+          11
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "F,G,L"
+      },
+      {
+        "sid": "b6dc5776",
+        "q": 28,
+        "t": 14,
+        "age": 13,
+        "picked": [
+          2,
+          15,
+          14
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "C, P, O"
+      },
+      {
+        "sid": "b6dc5776",
+        "q": 29,
+        "t": 14,
+        "age": 14,
+        "picked": [
+          13,
+          2,
+          14
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "N, C, O"
+      },
+      {
+        "sid": "b6dc5776",
+        "q": 31,
+        "t": 27,
+        "age": 3,
+        "picked": [
+          11,
+          14,
+          12
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "L, O, M"
+      },
+      {
+        "sid": "b6dc5776",
+        "q": 34,
+        "t": 29,
+        "age": 4,
+        "picked": [
+          14,
+          15,
+          10
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "O,P,K"
+      },
+      {
+        "sid": "b7d4f2df",
+        "q": 25,
+        "t": 17,
+        "age": 7,
+        "picked": [
+          8,
+          4,
+          5
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "I,E,F"
+      },
+      {
+        "sid": "b7d4f2df",
+        "q": 27,
+        "t": 17,
+        "age": 9,
+        "picked": [
+          6,
+          5,
+          14
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "G,F,O"
+      },
+      {
+        "sid": "b7d4f2df",
+        "q": 31,
+        "t": 26,
+        "age": 4,
+        "picked": [
+          10,
+          2,
+          11
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "K, C, L"
+      },
+      {
+        "sid": "b7d4f2df",
+        "q": 36,
+        "t": 31,
+        "age": 4,
+        "picked": [
+          12,
+          11,
+          6
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "M,L,G"
+      },
+      {
+        "sid": "b7d4f2df",
+        "q": 37,
+        "t": 31,
+        "age": 5,
+        "picked": [],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 0,
+        "raw": ""
+      },
+      {
+        "sid": "b7d4f2df",
+        "q": 38,
+        "t": 31,
+        "age": 6,
+        "picked": [
+          10,
+          11,
+          14
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "K,L,O"
+      },
+      {
+        "sid": "cad22a81",
+        "q": 29,
+        "t": 25,
+        "age": 3,
+        "picked": [
+          11,
+          12,
+          13
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "L,M,N"
+      },
+      {
+        "sid": "cad22a81",
+        "q": 63,
+        "t": 59,
+        "age": 3,
+        "picked": [
+          12,
+          11,
+          13
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "M,L,N"
+      },
+      {
+        "sid": "cad22a81",
+        "q": 73,
+        "t": 60,
+        "age": 12,
+        "picked": [
+          2,
+          3,
+          14
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "C,D,O"
+      },
+      {
+        "sid": "cad22a81",
+        "q": 90,
+        "t": 83,
+        "age": 6,
+        "picked": [
+          14,
+          10,
+          15
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "O,K,P"
+      },
+      {
+        "sid": "cad22a81",
+        "q": 97,
+        "t": 91,
+        "age": 5,
+        "picked": [
+          10,
+          11,
+          7
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "K,L,H"
+      },
+      {
+        "sid": "cad22a81",
+        "q": 110,
+        "t": 106,
+        "age": 3,
+        "picked": [
+          14,
+          12,
+          15
+        ],
+        "rank": 2,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "O,M,P"
+      },
+      {
+        "sid": "cad22a81",
+        "q": 119,
+        "t": 108,
+        "age": 10,
+        "picked": [
+          12,
+          10,
+          15
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "M,K,P"
+      },
+      {
+        "sid": "cad22a81",
+        "q": 163,
+        "t": 158,
+        "age": 4,
+        "picked": [
+          11,
+          14,
+          12
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "L,O,M"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 15,
+        "t": 8,
+        "age": 6,
+        "picked": [
+          14,
+          6,
+          11
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "O,G,L"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 15,
+        "t": 11,
+        "age": 3,
+        "picked": [
+          14,
+          6,
+          11
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "O,G,L"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 16,
+        "t": 10,
+        "age": 5,
+        "picked": [
+          10,
+          15,
+          14
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "K,P,O"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 17,
+        "t": 11,
+        "age": 5,
+        "picked": [
+          10,
+          11,
+          12
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "K, L, M"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 25,
+        "t": 15,
+        "age": 9,
+        "picked": [
+          6,
+          8,
+          9
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "G,I,J"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 26,
+        "t": 16,
+        "age": 9,
+        "picked": [
+          6,
+          7,
+          15
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "G,H,P"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 27,
+        "t": 15,
+        "age": 11,
+        "picked": [
+          4,
+          6,
+          7
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "E,G,H"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 28,
+        "t": 15,
+        "age": 12,
+        "picked": [
+          13,
+          15,
+          14
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "N,P,O"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 29,
+        "t": 25,
+        "age": 3,
+        "picked": [
+          3,
+          15,
+          12
+        ],
+        "rank": 3,
+        "top1": false,
+        "in_top3": true,
+        "beats": true,
+        "breadth": 3,
+        "raw": "D, P, M"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 38,
+        "t": 28,
+        "age": 9,
+        "picked": [
+          15,
+          10,
+          7
+        ],
+        "rank": null,
+        "top1": false,
+        "in_top3": false,
+        "beats": true,
+        "breadth": 3,
+        "raw": "P, K, H"
+      },
+      {
+        "sid": "da0964cd",
+        "q": 42,
+        "t": 38,
+        "age": 3,
+        "picked": [
+          12,
+          13,
+          14
+        ],
+        "rank": 1,
+        "top1": true,
+        "in_top3": true,
+        "beats": false,
+        "breadth": 3,
+        "raw": "M,N,O"
+      }
+    ]
+  }
+}

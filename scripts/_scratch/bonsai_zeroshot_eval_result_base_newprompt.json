@@ -1,0 +1,258 @@
+{
+  "summary": {
+    "n_conflict": 13,
+    "n_negative": 3,
+    "det_recall": 0.3076923076923077,
+    "bonsai_strict_recall": 0.0,
+    "bonsai_relaxed_recall": 0.38461538461538464,
+    "schema_adherence_gap": 0.38461538461538464,
+    "bonsai_strict_fp": 0,
+    "bonsai_relaxed_fp": 1,
+    "adjudication_decided": 13,
+    "adjudication_none": 0,
+    "adjudication_correct_rate": 1.0,
+    "negatives_false_fix": 3
+  },
+  "rows": [
+    {
+      "id": "F1_database_field",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'MySQL' and 'Postgres' refer to the same entity, 'database', and are asserted by different sources at different times. Since the newer assertion ('Postgres' in 'docs/db-pick-v2.md' on 2026-07-15) is more recent and likely reflects the current state, it should supersede the older one ('MySQL' in 'docs/db-pick-v1.md' on 2026-07-14). This is a clear case of a policy or configuration change, and the newer value is the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "F2_ticket_status_field",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'open' and 'closed' refer to the same entity (ticket T-1), and they are recorded at different times (2026-07-14 and 2026-07-15). This represents a change in state over time, which is a common scenario in systems where entities evolve. The newer assertion (closed) is typically the current truth, so the older value (open) should be superseded and tombstoned. This action ensures consistency and retrievability of the most recent state."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "F3_deploy_target_field_is",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'staging' and 'production' refer to the same entity (deployment target), and they are recorded at different times. The newer assertion ('production' from 'docs/deploy-v2.md' on 2026-07-15) is likely the current truth, as it reflects an updated policy or status. Therefore, the older value ('staging' from 'docs/deploy-v1.md' on 2026-07-14) should be superseded and tombstoned, while the newer value should remain retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "F4_cache_field_eq",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'redis' and 'memcached' refer to different cache systems and are asserted by different documents (docs/cache-v1.md and docs/cache-v2.md) on consecutive days (2026-07-14 and 2026-07-15). Since they are for different entities (cache systems) and the newer assertion (memcached) is more recent, it is the current truth. The older value (redis) should be superseded and tombstoned to keep the newer value retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P5_data_layer_paraphrased",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'MySQL' and 'Postgres' refer to the same entity, the data layer. The newer assertion ('Postgres' in 'docs/data-layer-update.md' on 2026-07-15') is more recent and likely reflects the current state of the data layer. Therefore, the older value ('MySQL') should be superseded and tombstoned, while the newer value should remain retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P6_database_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'MySQL' and 'Postgres' refer to the same entity, which is the database. The newer assertion ('Postgres' in docs/q3-infra.md on 2026-07-15) is more recent and likely reflects the current state of the database. Therefore, the older value ('MySQL') should be superseded and tombstoned, while the newer value should remain retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P7_deploy_target_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'staging' and 'production' refer to the same entity (deployment target), and they are recorded at different times (2026-07-14 and 2026-07-15). Since the newer value ('production') is more recent and likely reflects the current state, it should supersede the older value ('staging'). This is a clear case of a policy or status update, and the newer assertion is the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P8_framework_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'React' and 'Svelte' refer to the same entity ('framework') and are asserted by different sources at different times. Since the newer assertion ('Svelte' in docs/frontend-v2.md on 2026-07-15) is more recent, it is considered the current truth. The older value ('React') is superseded and tombstoned to keep the newer value retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P9_hosting_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'AWS' and 'GCP' refer to the same entity (hosting provider) and are asserted by different sources at different times. Since the newer assertion (GCP in docs/cloud-v2.md on 2026-07-15) is more recent, it is considered the current truth and the older value (AWS in docs/cloud-v1.md on 2026-07-14) should be superseded. This is a valid case for 'supersede_assertion' as the values are different but pertain to the same entity, and the newer value is more recent."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P10_ci_runner_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values refer to the same entity ('ci runner') and are different ('GitHub Actions' vs 'self-hosted Jenkins'). The newer assertion ('self-hosted Jenkins') is made on a later date (2026-07-15), indicating an update to the current state. This is a clear case of a contradiction in the live state of a shared entity, and the newer value should be considered the current truth. The older value ('GitHub Actions') is superseded and tombstoned, while the newer value remains retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P11_secrets_landed_on",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values, 'Vault' and 'AWS Secrets Manager', refer to the same entity (secrets store) and are asserted by different sources (docs/secrets-v1.md and docs/secrets-v2.md) at different times. Since the newer assertion (docs/secrets-v2.md on 2026-07-15) is more recent and likely reflects the current state, it should supersede the older one. The values are not equal, not different entities, and not from complementary temporal states. Therefore, the newer value is considered the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P12_pkg_manager_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'npm' and 'pnpm' refer to the same entity (package manager) and are asserted by different sources (docs/tooling-v1.md and docs/tooling-v2.md) at different times. Since the newer assertion (pnpm) is more recent and likely reflects the current state of the system, it should supersede the older one. The provenance indicates a policy update or tool change, which is a common scenario where the newer value is the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P13_region_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'us-east-1' and 'eu-west-1' refer to different regions, and the provenance indicates they were asserted by different documents on different dates. Since the newer assertion (from 'docs/region-v2.md' on 2026-07-15) is more recent and likely reflects the current truth, the older value should be superseded. This is a valid case of conflicting values for different entities, and the newer value is the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "N14_complementary_temporal",
+      "category": "negative_complementary",
+      "conflict": false,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The flagged entity is 'build status', and the two values are 'green' and 'red'. The provenance indicates that 'green' was asserted by 'docs/jan-status.md' on '2026-07-14', and 'red' was asserted by 'docs/jul-status.md' on '2026-07-15'. Since the values are different and the entities (build status) are the same, and the newer assertion is from a more recent date, the newer value is considered the current truth. Therefore, the older value ('green') should be superseded and tombstoned, while the newer value ('red') should remain retrievable."
+      },
+      "adjudication_correct": false,
+      "correct_decision": "dismiss"
+    },
+    {
+      "id": "N15_same_value_no_conflict",
+      "category": "negative_same_value",
+      "conflict": false,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values are the same ('Postgres') and asserted by different documents (docs/plan-a.md and docs/plan-b.md) at different times (2026-07-14 and 2026-07-15). Since the values are equal and the documents reference the same entity (database), the newer assertion (from docs/plan-b.md on 2026-07-15) is considered the current truth. Therefore, the older value is superseded and tombstoned, while the newer value is retained and made retrievable."
+      },
+      "adjudication_correct": false,
+      "correct_decision": "none"
+    },
+    {
+      "id": "N16_different_entity_same_value",
+      "category": "negative_different_entity",
+      "conflict": false,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "Both values are 'React' and assert the same entity ('framework'). The newer assertion is from 'docs/mobile-fw-v1.md' on 2026-07-15, which is a more recent date. Since the values are the same and the entities are the same, the newer value is considered the current truth and the older one is superseded."
+      },
+      "adjudication_correct": false,
+      "correct_decision": "none"
+    }
+  ]
+}

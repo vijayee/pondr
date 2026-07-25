@@ -1,0 +1,413 @@
+{
+  "V1_original": {
+    "strict_recall": 0.0,
+    "relaxed_recall": 0.5384615384615384,
+    "strict_fp_neg": 0,
+    "relaxed_fp_neg": 1,
+    "avg_rels": 1.25,
+    "rows": [
+      {
+        "id": "F1_database_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "F2_ticket_status_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "F3_deploy_target_field_is",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "F4_cache_field_eq",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 2
+      },
+      {
+        "id": "P5_data_layer_paraphrased",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 2,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P6_database_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P7_deploy_target_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 2,
+        "n_rels_new": 2
+      },
+      {
+        "id": "P8_framework_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 2,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P9_hosting_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 2
+      },
+      {
+        "id": "P10_ci_runner_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P11_secrets_landed_on",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 2,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P12_pkg_manager_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P13_region_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 2,
+        "n_rels_new": 1
+      },
+      {
+        "id": "N14_complementary_temporal",
+        "conflict": false,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "N15_same_value_no_conflict",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "N16_different_entity_same_value",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      }
+    ]
+  },
+  "V2_state_first": {
+    "strict_recall": 0.23076923076923078,
+    "relaxed_recall": 0.6153846153846154,
+    "strict_fp_neg": 0,
+    "relaxed_fp_neg": 0,
+    "avg_rels": 1.28125,
+    "rows": [
+      {
+        "id": "F1_database_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "F2_ticket_status_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "F3_deploy_target_field_is",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "F4_cache_field_eq",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P5_data_layer_paraphrased",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 2,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P6_database_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 2,
+        "n_rels_new": 2
+      },
+      {
+        "id": "P7_deploy_target_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 2
+      },
+      {
+        "id": "P8_framework_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 2,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P9_hosting_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 2
+      },
+      {
+        "id": "P10_ci_runner_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_rels_old": 2,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P11_secrets_landed_on",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P12_pkg_manager_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P13_region_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 2,
+        "n_rels_new": 1
+      },
+      {
+        "id": "N14_complementary_temporal",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 2,
+        "n_rels_new": 1
+      },
+      {
+        "id": "N15_same_value_no_conflict",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "N16_different_entity_same_value",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      }
+    ]
+  },
+  "V3_state_only": {
+    "strict_recall": 0.9230769230769231,
+    "relaxed_recall": 0.9230769230769231,
+    "strict_fp_neg": 1,
+    "relaxed_fp_neg": 1,
+    "avg_rels": 1.09375,
+    "rows": [
+      {
+        "id": "F1_database_field",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "F2_ticket_status_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "F3_deploy_target_field_is",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "F4_cache_field_eq",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 2,
+        "n_rels_new": 2
+      },
+      {
+        "id": "P5_data_layer_paraphrased",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P6_database_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P7_deploy_target_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 2
+      },
+      {
+        "id": "P8_framework_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P9_hosting_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P10_ci_runner_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P11_secrets_landed_on",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P12_pkg_manager_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "P13_region_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "N14_complementary_temporal",
+        "conflict": false,
+        "strict": true,
+        "relaxed": true,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "N15_same_value_no_conflict",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      },
+      {
+        "id": "N16_different_entity_same_value",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_rels_old": 1,
+        "n_rels_new": 1
+      }
+    ]
+  }
+}

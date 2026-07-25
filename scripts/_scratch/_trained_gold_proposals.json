@@ -1,0 +1,1086 @@
+{
+  "61c2f257-c31c-4383-91ee-7423c760fc7c": [
+    {
+      "query": 7,
+      "target": 2,
+      "age": 4,
+      "reason": "Query introduces 'variable width trit encoding', building on u02's mention of varint and variable-length encoding.",
+      "window_start": 0
+    },
+    {
+      "query": 8,
+      "target": 2,
+      "age": 5,
+      "reason": "Query asks about cbor and varint, directly referencing u02's discussion of varint.",
+      "window_start": 0
+    },
+    {
+      "query": 9,
+      "target": 4,
+      "age": 4,
+      "reason": "Query refers to 'this hybrid packed approach for the multitrits', which stems from u04's idea of using multiple ternary numbers.",
+      "window_start": 0
+    },
+    {
+      "query": 12,
+      "target": 4,
+      "age": 7,
+      "reason": "Query names the format HPMT, which is based on u04's multi-trit concept.",
+      "window_start": 0
+    }
+  ],
+  "488a5703-8f7a-459a-8193-05a916c5236e": [
+    {
+      "query": 7,
+      "target": 0,
+      "age": 6,
+      "reason": "Query refers to 'the strm design we just added to ponder' which was introduced in u00.",
+      "window_start": 0
+    },
+    {
+      "query": 8,
+      "target": 0,
+      "age": 7,
+      "reason": "Query mentions 'ponder engine' which was first introduced in u00.",
+      "window_start": 0
+    }
+  ],
+  "58566146-8b81-46ee-a23a-b1b760722837": [
+    {
+      "query": 6,
+      "target": 1,
+      "age": 4,
+      "reason": "'vector layer' refers back to the vector db layer mentioned in u01",
+      "window_start": 0
+    },
+    {
+      "query": 9,
+      "target": 4,
+      "age": 4,
+      "reason": "'decode an lmm into a graph database then re encode' refers to the graph encoding/decoding method mentioned in u04",
+      "window_start": 0
+    }
+  ],
+  "54bc3670-1e3a-4f70-ad16-03c168c41fe9": [
+    {
+      "query": 5,
+      "target": 0,
+      "age": 4,
+      "reason": "Refers to 'this' (the raffle system) being available internationally, continuing from initial description.",
+      "window_start": 0
+    },
+    {
+      "query": 8,
+      "target": 3,
+      "age": 4,
+      "reason": "'these' refers to the legal framework documents requested in u03.",
+      "window_start": 0
+    },
+    {
+      "query": 9,
+      "target": 0,
+      "age": 8,
+      "reason": "'This' (the sweepstakes approach) is less fun compared to the original lottery idea from u00.",
+      "window_start": 0
+    },
+    {
+      "query": 10,
+      "target": 5,
+      "age": 4,
+      "reason": "'which states are excluded again' refers back to u05's mention of excluding unfavorable states.",
+      "window_start": 0
+    },
+    {
+      "query": 17,
+      "target": 7,
+      "age": 9,
+      "reason": "Asks about prize pool growth, contrasting with u07's statement that prize pool is fixed.",
+      "window_start": 0
+    },
+    {
+      "query": 18,
+      "target": 7,
+      "age": 10,
+      "reason": "States 'the pool can't grow' referencing the fixed prize pool constraint from u07.",
+      "window_start": 0
+    },
+    {
+      "query": 19,
+      "target": 6,
+      "age": 12,
+      "reason": "'this sweepstakes' refers to the sweepstakes concept first introduced in u06.",
+      "window_start": 0
+    },
+    {
+      "query": 20,
+      "target": 6,
+      "age": 13,
+      "reason": "'this' (the best plan) refers to the sweepstakes plan from u06, and asks about crypto.",
+      "window_start": 0
+    }
+  ],
+  "0a777a15-cd35-4e4e-b4ef-6421a831d2a5": [
+    {
+      "query": 11,
+      "target": 7,
+      "age": 3,
+      "reason": "Refers back to the idea of giving an LLM a self-preservation task with solar panel and battery from u07.",
+      "window_start": 0
+    },
+    {
+      "query": 12,
+      "target": 7,
+      "age": 4,
+      "reason": "Continues the scenario of the solar-powered LLM from u07, humorously comparing it to GLaDOS.",
+      "window_start": 0
+    }
+  ],
+  "64e27cf2-cba7-4049-b463-8143991ec020": [
+    {
+      "query": 6,
+      "target": 0,
+      "age": 5,
+      "reason": "Resumes the topic of neutral jing first introduced in u00, using 'also' to indicate continuation.",
+      "window_start": 0
+    },
+    {
+      "query": 10,
+      "target": 0,
+      "age": 9,
+      "reason": "Asks about other forms of jing, directly referencing the concept of jing from u00.",
+      "window_start": 0
+    },
+    {
+      "query": 22,
+      "target": 9,
+      "age": 12,
+      "reason": "References the 'warm smile' as a weapon, which was introduced in u09 as a smile used before a knife.",
+      "window_start": 0
+    }
+  ],
+  "0acd3d3b-e417-4e4b-b7a4-451da735ad93": [
+    {
+      "query": 10,
+      "target": 0,
+      "age": 9,
+      "reason": "Query refers to 'the business model' introduced in u00.",
+      "window_start": 0
+    },
+    {
+      "query": 8,
+      "target": 3,
+      "age": 4,
+      "reason": "Query continues the feature list with 'also allow', referencing the features started in u03.",
+      "window_start": 0
+    }
+  ],
+  "5cf553c7-eae7-44b6-aa98-dec5866ad135": [
+    {
+      "query": 11,
+      "target": 7,
+      "age": 3,
+      "reason": "Refers to the prospective memory concept mentioned in u07.",
+      "window_start": 0
+    },
+    {
+      "query": 16,
+      "target": 8,
+      "age": 7,
+      "reason": "Refers to the prior cognitive architecture discussed in u08.",
+      "window_start": 0
+    },
+    {
+      "query": 26,
+      "target": 16,
+      "age": 9,
+      "reason": "Refers to the 'cognitive primitive' concept introduced in u16.",
+      "window_start": 0
+    },
+    {
+      "query": 27,
+      "target": 15,
+      "age": 11,
+      "reason": "Refers to the JEPA gated SSM idea first mentioned in u15.",
+      "window_start": 0
+    },
+    {
+      "query": 30,
+      "target": 25,
+      "age": 4,
+      "reason": "u30 asks to summarize what was learned about common sense, which was first mentioned in u25.",
+      "window_start": 25
+    }
+  ],
+  "e97832df-b1dd-475a-91ee-b84a2905001d": [
+    {
+      "query": 4,
+      "target": 0,
+      "age": 3,
+      "reason": "this in u04 refers back to the MINISFORUM AI X1 Pro-470 machine introduced in u00",
+      "window_start": 0
+    }
+  ],
+  "b11be917-6a58-4f9e-8353-c4c94988ae6e": [
+    {
+      "query": 5,
+      "target": 1,
+      "age": 3,
+      "reason": "Refers to earlier discussion about light models (Mamba3, Jepa) with 'this purpose'.",
+      "window_start": 0
+    },
+    {
+      "query": 6,
+      "target": 0,
+      "age": 5,
+      "reason": "Picks up the database concept from u00 with 'the underlying graphdb'.",
+      "window_start": 0
+    },
+    {
+      "query": 20,
+      "target": 6,
+      "age": 13,
+      "reason": "References prior description of chunking (HBTrie, GIT) and 'git like chunking' from u06.",
+      "window_start": 0
+    },
+    {
+      "query": 21,
+      "target": 6,
+      "age": 14,
+      "reason": "Asks about tokenization, referencing u06's mention of tokenizing data.",
+      "window_start": 0
+    },
+    {
+      "query": 29,
+      "target": 0,
+      "age": 28,
+      "reason": "Summarizes the whole architecture introduced in u00 with 'this whole architecture'.",
+      "window_start": 0
+    },
+    {
+      "query": 35,
+      "target": 29,
+      "age": 5,
+      "reason": "this architecture refers back to the architecture described in u29",
+      "window_start": 25
+    },
+    {
+      "query": 41,
+      "target": 29,
+      "age": 11,
+      "reason": "current architectural knowledge refers back to the architecture first described in u29",
+      "window_start": 25
+    },
+    {
+      "query": 38,
+      "target": 31,
+      "age": 6,
+      "reason": "approach B refers back to the choice between GLINER2 and Bonsai Ternary discussed in u31",
+      "window_start": 25
+    }
+  ],
+  "86b1dea4-d319-4c60-9655-67b9a225cdbe": [
+    {
+      "query": 8,
+      "target": 1,
+      "age": 6,
+      "reason": "Resumes the topic of co-op data centers introduced in u01.",
+      "window_start": 0
+    },
+    {
+      "query": 9,
+      "target": 0,
+      "age": 8,
+      "reason": "References 'these private socialist means' from u00.",
+      "window_start": 0
+    },
+    {
+      "query": 9,
+      "target": 4,
+      "age": 4,
+      "reason": "References 'credit unions to assimilate external systems' from u04.",
+      "window_start": 0
+    },
+    {
+      "query": 10,
+      "target": 1,
+      "age": 8,
+      "reason": "Refers back to co-op datacenters from u01.",
+      "window_start": 0
+    },
+    {
+      "query": 12,
+      "target": 2,
+      "age": 9,
+      "reason": "Adds cooperative schools to the list of industries from u02.",
+      "window_start": 0
+    }
+  ],
+  "b7d4f2df-bdb8-423c-9c1d-04616fb6866e": [
+    {
+      "query": 25,
+      "target": 17,
+      "age": 7,
+      "reason": "Refers to the whitepaper linked in u17.",
+      "window_start": 0
+    },
+    {
+      "query": 27,
+      "target": 17,
+      "age": 9,
+      "reason": "Refers to the whitepaper mentioned in u17.",
+      "window_start": 0
+    },
+    {
+      "query": 31,
+      "target": 26,
+      "age": 4,
+      "reason": "Query 'these features' refers back to the skill/cli/keystore concept introduced in u26.",
+      "window_start": 25
+    },
+    {
+      "query": 36,
+      "target": 31,
+      "age": 4,
+      "reason": "Query 'the architecture' refers back to the architecture proposal requested in u31.",
+      "window_start": 25
+    },
+    {
+      "query": 37,
+      "target": 31,
+      "age": 5,
+      "reason": "Query 'this' and 'the proposal' refer back to the architecture proposal from u31.",
+      "window_start": 25
+    },
+    {
+      "query": 38,
+      "target": 31,
+      "age": 6,
+      "reason": "Query 'the Architecture' refers back to the same architecture proposal from u31.",
+      "window_start": 25
+    }
+  ],
+  "6f0260c3-b420-43bd-a640-61e5810f99ec": [],
+  "236ce916-8f6f-40a4-9f97-fba85c0ef7f7": [
+    {
+      "query": 6,
+      "target": 0,
+      "age": 5,
+      "reason": "Refers to the assistant's last response about the calculator idea, continuing the topic from the initial turn.",
+      "window_start": 0
+    },
+    {
+      "query": 10,
+      "target": 6,
+      "age": 3,
+      "reason": "Refers to the HTML document from the previous request, asking to make it interactive.",
+      "window_start": 0
+    },
+    {
+      "query": 16,
+      "target": 10,
+      "age": 5,
+      "reason": "Refers to the interactive web tool as 'current functionality' and asks to amend it with the Wyoming analysis.",
+      "window_start": 0
+    },
+    {
+      "query": 18,
+      "target": 13,
+      "age": 4,
+      "reason": "Refers to the interactive web tool built from the prompt, using 'the tool' and 'this' to indicate the results.",
+      "window_start": 0
+    }
+  ],
+  "865b8052-dbab-4d46-9110-91f1ee50d971": [
+    {
+      "query": 7,
+      "target": 3,
+      "age": 3,
+      "reason": "Continues the 3D vision requirement from u03, suggesting stereo matching.",
+      "window_start": 0
+    },
+    {
+      "query": 20,
+      "target": 4,
+      "age": 15,
+      "reason": "Resumes the crawling up steps topic from u04, using similar phrasing.",
+      "window_start": 0
+    },
+    {
+      "query": 43,
+      "target": 39,
+      "age": 3,
+      "reason": "The user asks 'is this the same as capstan drives?' where 'this' refers to the cycloidal gearbox introduced in turn u39.",
+      "window_start": 25
+    }
+  ],
+  "77b47ef0-7bf4-4048-b090-302072fcf73b": [
+    {
+      "query": 8,
+      "target": 1,
+      "age": 6,
+      "reason": "Refers back to the 'Optimalism Economy Simulation' paper introduced in u01, discussing its content on legacy and death.",
+      "window_start": 0
+    },
+    {
+      "query": 10,
+      "target": 5,
+      "age": 4,
+      "reason": "Refers back to the concept of player talents and abilities (individual statistics) introduced in u05.",
+      "window_start": 0
+    },
+    {
+      "query": 11,
+      "target": 5,
+      "age": 5,
+      "reason": "Refers back to the concept of ages introduced in u05, now proposing a currency system at every age.",
+      "window_start": 0
+    }
+  ],
+  "95dd60ec-8124-4357-bc61-fba856b216b5": [
+    {
+      "query": 4,
+      "target": 0,
+      "age": 3,
+      "reason": "Refers back to the original supernode concept from u00 with 'originally imagining'.",
+      "window_start": 0
+    },
+    {
+      "query": 5,
+      "target": 0,
+      "age": 4,
+      "reason": "Refers to the full vision from u00 with 'this' and 'full vision'.",
+      "window_start": 0
+    },
+    {
+      "query": 10,
+      "target": 0,
+      "age": 9,
+      "reason": "Refers to the whole project from u00 with 'the whole thing'.",
+      "window_start": 0
+    },
+    {
+      "query": 10,
+      "target": 5,
+      "age": 4,
+      "reason": "Refers to the previous phase prompt request from u05 with 'next phase'.",
+      "window_start": 0
+    },
+    {
+      "query": 14,
+      "target": 0,
+      "age": 13,
+      "reason": "Names the project originally proposed in u00 with 'this project'.",
+      "window_start": 0
+    }
+  ],
+  "da0964cd-6f2f-4e0d-a156-dadb578a285f": [
+    {
+      "query": 15,
+      "target": 8,
+      "age": 6,
+      "reason": "References 'forum application' from earlier discussion about forums.",
+      "window_start": 0
+    },
+    {
+      "query": 15,
+      "target": 11,
+      "age": 3,
+      "reason": "References 'train a bitnet ai' from earlier BitNet idea.",
+      "window_start": 0
+    },
+    {
+      "query": 16,
+      "target": 10,
+      "age": 5,
+      "reason": "References 'this kind of content' meaning the -isms from u10.",
+      "window_start": 0
+    },
+    {
+      "query": 17,
+      "target": 11,
+      "age": 5,
+      "reason": "References 'bit distill for this purpose' continuing BitNet idea from u11.",
+      "window_start": 0
+    },
+    {
+      "query": 25,
+      "target": 15,
+      "age": 9,
+      "reason": "References 'these steps' meaning the feasibility discussion in u15.",
+      "window_start": 0
+    },
+    {
+      "query": 26,
+      "target": 16,
+      "age": 9,
+      "reason": "References 'remove sexual content classification' from moderation sets discussion in u16.",
+      "window_start": 0
+    },
+    {
+      "query": 27,
+      "target": 15,
+      "age": 11,
+      "reason": "References 'train this' meaning training a bitnet ai from u15.",
+      "window_start": 0
+    },
+    {
+      "query": 28,
+      "target": 15,
+      "age": 12,
+      "reason": "References 'do this on colab' meaning training from u15.",
+      "window_start": 0
+    },
+    {
+      "query": 29,
+      "target": 25,
+      "age": 3,
+      "reason": "References 'this as output from prepare dataset cell' from steps in u25.",
+      "window_start": 0
+    },
+    {
+      "query": 38,
+      "target": 28,
+      "age": 9,
+      "reason": "User refers to 'the Lora training step' which was set up by instructions requested in u28.",
+      "window_start": 25
+    },
+    {
+      "query": 42,
+      "target": 38,
+      "age": 3,
+      "reason": "User says 'had to use fallback approach' referring back to the failed Lora training step reported in u38.",
+      "window_start": 25
+    }
+  ],
+  "0e4d6b63-c766-4d07-a0b9-69e2cf4e62ec": [
+    {
+      "query": 6,
+      "target": 2,
+      "age": 3,
+      "reason": "Adds another factor (frequency slowing) to the node respiration behavior described in u02.",
+      "window_start": 0
+    },
+    {
+      "query": 24,
+      "target": 7,
+      "age": 16,
+      "reason": "Refers to the gossip of rank upgrades from u07, saying they are not needed.",
+      "window_start": 0
+    },
+    {
+      "query": 25,
+      "target": 18,
+      "age": 6,
+      "reason": "Asks about combining ping for storage capacity, referencing the pingcapacity call from u18.",
+      "window_start": 0
+    },
+    {
+      "query": 26,
+      "target": 0,
+      "age": 25,
+      "reason": "Proposes renaming the RPC messages originally listed in u00.",
+      "window_start": 0
+    },
+    {
+      "query": 37,
+      "target": 26,
+      "age": 10,
+      "reason": "u37 asks to explain FindBlock RPC and StoreBlock algorithm, which were named in u26's list of RPC messages.",
+      "window_start": 25
+    }
+  ],
+  "68c6a242-32c2-44af-8d68-372b0fdebd51": [
+    {
+      "query": 18,
+      "target": 9,
+      "age": 8,
+      "reason": "Query refers to 'the off system' which was introduced in turn u09 as OFFS (Owner Free File System).",
+      "window_start": 0
+    },
+    {
+      "query": 19,
+      "target": 4,
+      "age": 14,
+      "reason": "Query asks about WaveDB, which was first mentioned in turn u04 as 'wavedb'.",
+      "window_start": 0
+    },
+    {
+      "query": 20,
+      "target": 4,
+      "age": 15,
+      "reason": "Query mentions 'wavedb' again, referencing the same database introduced in turn u04.",
+      "window_start": 0
+    }
+  ],
+  "0d2fffc6-fbcf-4b45-a246-556c2fd3106d": [
+    {
+      "query": 18,
+      "target": 6,
+      "age": 11,
+      "reason": "Refers to earlier comparison of M0-M3 to derivatives in calculus.",
+      "window_start": 0
+    },
+    {
+      "query": 17,
+      "target": 8,
+      "age": 8,
+      "reason": "Refers to earlier assertion that fractional reserve banking is a ponzi scheme.",
+      "window_start": 0
+    },
+    {
+      "query": 22,
+      "target": 12,
+      "age": 9,
+      "reason": "Refers to the grand vision of optimalism first introduced in u12.",
+      "window_start": 0
+    },
+    {
+      "query": 19,
+      "target": 12,
+      "age": 6,
+      "reason": "Refers to 'the vision' of optimalism introduced in u12.",
+      "window_start": 0
+    }
+  ],
+  "cad22a81-28b2-4dc3-9c1f-ed9e7e3aeae3": [
+    {
+      "query": 14,
+      "target": 10,
+      "age": 3,
+      "reason": "User refers to 'the basis of training' which continues the mamba topic introduced in u10.",
+      "window_start": 0
+    },
+    {
+      "query": 29,
+      "target": 0,
+      "age": 28,
+      "reason": "User mentions 'JEPA's architecture' and asks for explanation, referencing the initial JEPA topic from u00.",
+      "window_start": 0
+    },
+    {
+      "query": 29,
+      "target": 25,
+      "age": 3,
+      "reason": "Refers to the architecture analogy (left/right brain, conscious/subconscious) introduced in u25.",
+      "window_start": 25
+    },
+    {
+      "query": 35,
+      "target": 29,
+      "age": 5,
+      "reason": "Specifically mentions training the JEPA portion, building on the JEPA introduction in u29.",
+      "window_start": 25
+    },
+    {
+      "query": 37,
+      "target": 29,
+      "age": 7,
+      "reason": "Asks about V-JEPA, directly referencing the JEPA architecture from u29.",
+      "window_start": 25
+    },
+    {
+      "query": 45,
+      "target": 25,
+      "age": 19,
+      "reason": "Explicitly says 'in our earlier discussions of this architecture', pointing back to u25.",
+      "window_start": 25
+    },
+    {
+      "query": 48,
+      "target": 25,
+      "age": 22,
+      "reason": "Continues the architecture discussion with 'this also suggest', referring to u25.",
+      "window_start": 25
+    },
+    {
+      "query": 54,
+      "target": 35,
+      "age": 18,
+      "reason": "Asks for an alternative to BitNet, which was previously discussed in u35.",
+      "window_start": 25
+    },
+    {
+      "query": 63,
+      "target": 59,
+      "age": 3,
+      "reason": "References the 3blue1brown video mentioned in u59.",
+      "window_start": 50
+    },
+    {
+      "query": 67,
+      "target": 63,
+      "age": 3,
+      "reason": "Continues the extradimensional idea from u63 about gravity and higher dimensions.",
+      "window_start": 50
+    },
+    {
+      "query": 72,
+      "target": 50,
+      "age": 21,
+      "reason": "Echoes the curiosity theme from u50 with 'curiosityaholic'.",
+      "window_start": 50
+    },
+    {
+      "query": 73,
+      "target": 60,
+      "age": 12,
+      "reason": "Returns to the derivative insight from u60 about rates of change.",
+      "window_start": 50
+    },
+    {
+      "query": 79,
+      "target": 50,
+      "age": 28,
+      "reason": "Concludes with the curiosity theme from u50.",
+      "window_start": 50
+    },
+    {
+      "query": 90,
+      "target": 83,
+      "age": 6,
+      "reason": "Refers back to the original architecture proposal with JEPA, Mamba, and Transformer.",
+      "window_start": 75
+    },
+    {
+      "query": 97,
+      "target": 91,
+      "age": 5,
+      "reason": "Resumes discussion about using DeepSeek as the oracle, referencing earlier decision.",
+      "window_start": 75
+    },
+    {
+      "query": 110,
+      "target": 106,
+      "age": 3,
+      "reason": "Refers to 'this architecture' which was introduced in u106.",
+      "window_start": 100
+    },
+    {
+      "query": 116,
+      "target": 106,
+      "age": 9,
+      "reason": "Refers to 'this architecture' from earlier discussion in u106.",
+      "window_start": 100
+    },
+    {
+      "query": 117,
+      "target": 106,
+      "age": 10,
+      "reason": "Refers to 'the architecture' previously mentioned in u106.",
+      "window_start": 100
+    },
+    {
+      "query": 119,
+      "target": 108,
+      "age": 10,
+      "reason": "Refers to 'my original selection' of hardware from u108.",
+      "window_start": 100
+    },
+    {
+      "query": 139,
+      "target": 134,
+      "age": 4,
+      "reason": "Query refers back to the feedback loop between transformer and ssm discussed in u134.",
+      "window_start": 125
+    },
+    {
+      "query": 140,
+      "target": 131,
+      "age": 8,
+      "reason": "Query continues the subtopic of the aspirational model introduced in u131 and links it to dream state.",
+      "window_start": 125
+    },
+    {
+      "query": 162,
+      "target": 157,
+      "age": 4,
+      "reason": "Refers to 'the cognitive architecture' previously discussed in u157 about the robot architecture.",
+      "window_start": 150
+    },
+    {
+      "query": 163,
+      "target": 158,
+      "age": 4,
+      "reason": "Questions using both smolM2 and Bonsai, referencing the 'smol' model mentioned in u158.",
+      "window_start": 150
+    },
+    {
+      "query": 165,
+      "target": 158,
+      "age": 6,
+      "reason": "Continues discussion of ternary models from u158, asking about distilling deepseek v4 into ternary.",
+      "window_start": 150
+    },
+    {
+      "query": 168,
+      "target": 157,
+      "age": 10,
+      "reason": "Requests a new V8 document on the cognitive architecture, referencing the architecture from u157.",
+      "window_start": 150
+    },
+    {
+      "query": 171,
+      "target": 159,
+      "age": 11,
+      "reason": "Clarifies that content filter is a use case, referencing the content filter mention in u159.",
+      "window_start": 150
+    }
+  ],
+  "b6dc5776-494c-453a-9371-80211f42f76b": [
+    {
+      "query": 12,
+      "target": 6,
+      "age": 5,
+      "reason": "Refers back to discussion of Walmart's large ledger in u06.",
+      "window_start": 0
+    },
+    {
+      "query": 15,
+      "target": 10,
+      "age": 4,
+      "reason": "Refers back to introduction of Commonomicon in u10.",
+      "window_start": 0
+    },
+    {
+      "query": 21,
+      "target": 17,
+      "age": 3,
+      "reason": "Refers back to explanation of Funds structure in u17.",
+      "window_start": 0
+    },
+    {
+      "query": 25,
+      "target": 14,
+      "age": 10,
+      "reason": "Refers back to introduction of optimalism in u14.",
+      "window_start": 0
+    },
+    {
+      "query": 28,
+      "target": 14,
+      "age": 13,
+      "reason": "Refers back to introduction of Prometheus in u14.",
+      "window_start": 0
+    },
+    {
+      "query": 29,
+      "target": 8,
+      "age": 20,
+      "reason": "Explicitly names 'spark' and 'spark ledger' from u08.",
+      "window_start": 0
+    },
+    {
+      "query": 29,
+      "target": 10,
+      "age": 18,
+      "reason": "Explicitly names 'commonomicon' from u10.",
+      "window_start": 0
+    },
+    {
+      "query": 29,
+      "target": 14,
+      "age": 14,
+      "reason": "Explicitly names 'Prometheus' from u14.",
+      "window_start": 0
+    },
+    {
+      "query": 31,
+      "target": 27,
+      "age": 3,
+      "reason": "Query asks for another pass at writing the article on optimalism, resuming the request from u27.",
+      "window_start": 25
+    },
+    {
+      "query": 34,
+      "target": 29,
+      "age": 4,
+      "reason": "Query asks for a paper on the spark ledger and commonomicon, concepts introduced in u29 where the user discussed avoiding implementation names.",
+      "window_start": 25
+    }
+  ],
+  "75f12969-3a3a-42fe-a3f9-694f81158223": [
+    {
+      "query": 7,
+      "target": 3,
+      "age": 3,
+      "reason": "aforementioned policy limitations refers back to u03's discussion of who can change attributes",
+      "window_start": 0
+    },
+    {
+      "query": 17,
+      "target": 11,
+      "age": 5,
+      "reason": "the state machine refers back to u11's introduction of cryptographic state machine",
+      "window_start": 0
+    },
+    {
+      "query": 24,
+      "target": 17,
+      "age": 6,
+      "reason": "I wanted operations to not be inherently state dependent responds to u17's implication of needing to know all users",
+      "window_start": 0
+    },
+    {
+      "query": 29,
+      "target": 3,
+      "age": 25,
+      "reason": "the problem we discussed earlier of who get's to change the attributes directly references u03",
+      "window_start": 0
+    },
+    {
+      "query": 33,
+      "target": 29,
+      "age": 3,
+      "reason": "The user says 'formalize this' referring back to the concept of attributes as state machine discussed in u29.",
+      "window_start": 25
+    },
+    {
+      "query": 50,
+      "target": 46,
+      "age": 3,
+      "reason": "The user asks about tombstones in state, continuing the discussion of CRDTs and OT from u46.",
+      "window_start": 25
+    },
+    {
+      "query": 60,
+      "target": 56,
+      "age": 3,
+      "reason": "User comments on the lamport clock mechanism explained in u56, referring to 'just taking the max'.",
+      "window_start": 50
+    },
+    {
+      "query": 62,
+      "target": 58,
+      "age": 3,
+      "reason": "User asks to write a spec for the time ordering system described in u58, using 'this time ordering system'.",
+      "window_start": 50
+    }
+  ],
+  "35c9cc55-6f56-4ab1-911b-b087853ae9b0": [
+    {
+      "query": 6,
+      "target": 2,
+      "age": 3,
+      "reason": "this and Approach 2 refer back to the algorithm for approach 2 mentioned in u02",
+      "window_start": 0
+    },
+    {
+      "query": 9,
+      "target": 0,
+      "age": 8,
+      "reason": "this algorithm refers back to the algorithm implemented in u00",
+      "window_start": 0
+    }
+  ],
+  "6ee05428-c60a-455b-81d2-aa6fe45dc745": [
+    {
+      "query": 11,
+      "target": 2,
+      "age": 8,
+      "reason": "Query asks for summary of 'what we discussed here', referring back to the initial app concept introduced in u02.",
+      "window_start": 0
+    },
+    {
+      "query": 12,
+      "target": 8,
+      "age": 3,
+      "reason": "Query says 'these choices' referring to the color scheme first discussed in u08.",
+      "window_start": 0
+    },
+    {
+      "query": 16,
+      "target": 12,
+      "age": 3,
+      "reason": "Query asks to identify font in 'this image', referring to the image described in u12 where user adjusted colors and added text.",
+      "window_start": 0
+    }
+  ],
+  "c4260891-1a0b-477e-8dfd-6ec0bec04b5a": [
+    {
+      "query": 4,
+      "target": 0,
+      "age": 3,
+      "reason": "Asks about installing a system service, referring to the service concept from u00.",
+      "window_start": 0
+    },
+    {
+      "query": 6,
+      "target": 1,
+      "age": 4,
+      "reason": "Refers to 'the pub/sub service' first mentioned in u01.",
+      "window_start": 0
+    },
+    {
+      "query": 7,
+      "target": 0,
+      "age": 6,
+      "reason": "Asks about doing something similar on iOS, referring to the original Android service idea from u00.",
+      "window_start": 0
+    },
+    {
+      "query": 22,
+      "target": 16,
+      "age": 5,
+      "reason": "Asks about mDNS, continuing the DNS topic from u16.",
+      "window_start": 0
+    }
+  ],
+  "6b152fb5-29cb-4879-ae49-ab12d1c13815": [
+    {
+      "query": 4,
+      "target": 0,
+      "age": 3,
+      "reason": "Refers to the app concept from u00 when suggesting a social network approach.",
+      "window_start": 0
+    },
+    {
+      "query": 6,
+      "target": 0,
+      "age": 5,
+      "reason": "Refers to the app concept from u00 when discussing priorities.",
+      "window_start": 0
+    },
+    {
+      "query": 7,
+      "target": 3,
+      "age": 3,
+      "reason": "Refers to the owner free file system introduced in u03.",
+      "window_start": 0
+    },
+    {
+      "query": 10,
+      "target": 0,
+      "age": 9,
+      "reason": "Refers to the app idea from u00 when proposing a summary.",
+      "window_start": 0
+    },
+    {
+      "query": 12,
+      "target": 3,
+      "age": 8,
+      "reason": "Refers to the ONS/OFFS system introduced in u03.",
+      "window_start": 0
+    },
+    {
+      "query": 13,
+      "target": 0,
+      "age": 12,
+      "reason": "Refers to merging YouTube and Windows Media Player functionality from u00.",
+      "window_start": 0
+    },
+    {
+      "query": 18,
+      "target": 10,
+      "age": 7,
+      "reason": "Refers to the earlier suggestion to write a summary document from u10.",
+      "window_start": 0
+    },
+    {
+      "query": 26,
+      "target": 18,
+      "age": 7,
+      "reason": "Refers to the vision document produced in u18 when asking to replace text.",
+      "window_start": 0
+    }
+  ]
+}

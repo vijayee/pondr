@@ -1,0 +1,63 @@
+Phase 1f-7 Stage 3: flat_last backbone fine-tune (PASSES 6-seed live gate)
+
+DeepSeek consult #3 verdict: the readout-only path was exhausted because
+backbone_v2_full.pt's flat_last [6144] is kind-isolated -- no readout (shared
+or decomposed) can hold conv/text/code in one cross-kind logit space. The fix
+is a backbone retrain that teaches flat_last a common cross-kind query-doc
+relevance subspace. This is the CHEAP fine-tune diagnostic: lightly fine-tune
+the existing backbone (8 epochs, all 19.5M params, lr 1e-5) with a margin loss
+on flat_last over the onyx doc ring, via a THROWAWAY slim query-conditioned
+readout (Linear(6144,384) + cos(z,q)/T, discarded after).
+
+Replay strategy: pre-state replay, truncated-BPTT-depth-1. Each kept slot's
+pre-step WM state (slots_pre_state) + EXACT step-input embedding
+(slots_step_input) are captured on the slot; the fine-tune seeds
+states = slots_pre_state[k] (detached) and re-steps ONLY slots_step_input[k]
+WITH grad through layer.step -> reproduces slots_h_raw within fp16 epsilon AND
+backprops into the shared backbone (W_A/W_B). No cross-slot BPTT, no overflow/
+drop-gap (the pre-state encodes all prior history).
+
+The fidelity fix (the key correctness piece): retrieved CODE docs are injected
+"by MEANING" (the orchestrator steps embed(embed_text), not embed(summary)),
+while slot.text stores the summary string. Re-embedding slot.text at trace-build
+diverged from the stepped vector for ~20% of retrieved slots, breaking the
+replay (max-abs-diff 0.2421 > atol 0.15). Capturing the EXACT step-input u on
+the slot (post-pin, pre-SSM) and replaying from it closes the gap: fidelity
+max-abs-diff 0.0002 (essentially exact). Loss dropped smoothly 2.51 -> 0.46
+across 8 epochs (NOT stuck at the 2.49 margin ceiling -- the per_kind_bodies
+collapse signature).
+
+RESULT (6-seed live serve gate, fine-tuned backbone):
+  retrieved_text: median +10.26, 4/6 pass (need 4) -> PASS
+  retrieved_code: median +8.25,  6/6 pass (need 4) -> PASS
+vs #5's 6-seed FAIL (ret_text 3/6, ret_code 2/6). ret_code went 2/6 -> 6/6.
+This is the first readout to clear BOTH buckets at the 6-seed robustness bar.
+The fine-tuned backbone is a NEW file (backbone_v2_full_finetuned.pt); the
+original backbone_v2_full.pt is untouched and remains the live default -- no
+existing functionality changed. Nothing is wired into the live engine.
+
+M1: WorkingMemory opt-in pre-state + step-input capture (capture_pre_state=False
+    default -> byte-identical; RingSlot.u defaults None -> backward-compatible).
+    Threaded through PonderOrchestrator (default-off).
+M2: generate_onyx_doc_ring_traces --capture-pre-state -> slots_pre_state
+    [K,4,16,384] fp16 + slots_step_input [K,384] fp32; default-off emits neither.
+M3: finetune_backbone_flatlast_margin.py (NEW) + _drop_self_slot slices
+    slots_step_input; epoch-0 replay-fidelity gate (aborts if the seed does not
+    reproduce the trace) + silent-skip accounting + vacuous-pass guard.
+M6: _run_1f7_stage1_gate.py gains --backbone (left uncommitted: _-prefix scratch
+    runner; the underlying probe_strm_selectivity_real.py --backbone is already
+    committed, so the gate capability is in-repo).
+
+Also bundles the Stage 2 #6 per_kind_bodies readout arch (state_readout.py +
+probe_head_to_head_onyx.py --per-kind-bodies + tests) as a DOCUMENTED DEAD-END:
+it collapsed maximally on seed 0 (#5's best seed, +23.20/+17.25 -> 0.000/0.000,
+arch-caused, routing verified correct). Default-off + byte-identical + tested,
+committed to preserve the work + tests, NOT wired anywhere.
+
+Tests: tests/test_working_memory_prestate.py (NEW, 18 tests: default-off
+byte-identical, h_pre/u capture shape/dtype/independence, round-trip fidelity
+via both emb and the captured u, _build_mixed_record slots_pre_state +
+slots_step_input alignment + drop-on-missing). Non-regression: 68 green
+(prestate + working_memory + generate_onyx_mixed_ring + state_readout_doc_kinds)
++ 42 green (strm_heads + z_relevance_head). De-wonked (silent-skip count +
+vacuous-pass guard on the fidelity gate).

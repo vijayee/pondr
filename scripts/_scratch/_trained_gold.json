@@ -1,0 +1,867 @@
+{
+  "window": 16,
+  "age_threshold": 3,
+  "pairs": [
+    {
+      "session_id": "61c2f257-c31c-4383-91ee-7423c760fc7c",
+      "query": 7,
+      "target": 2,
+      "age": 4,
+      "note": "ternary-weights analogy back-ref to prior turn"
+    },
+    {
+      "session_id": "61c2f257-c31c-4383-91ee-7423c760fc7c",
+      "query": 8,
+      "target": 2,
+      "age": 5,
+      "note": "ternary-weights follow-up"
+    },
+    {
+      "session_id": "61c2f257-c31c-4383-91ee-7423c760fc7c",
+      "query": 9,
+      "target": 4,
+      "age": 4,
+      "note": "ternary-weights follow-up"
+    },
+    {
+      "session_id": "61c2f257-c31c-4383-91ee-7423c760fc7c",
+      "query": 12,
+      "target": 4,
+      "age": 7,
+      "note": "ternary-weights follow-up"
+    },
+    {
+      "session_id": "488a5703-8f7a-459a-8193-05a916c5236e",
+      "query": 7,
+      "target": 0,
+      "age": 6,
+      "note": "ponder deep-reasoning back-ref"
+    },
+    {
+      "session_id": "488a5703-8f7a-459a-8193-05a916c5236e",
+      "query": 8,
+      "target": 0,
+      "age": 7,
+      "note": "ponder deep-reasoning follow-up"
+    },
+    {
+      "session_id": "58566146-8b81-46ee-a23a-b1b760722837",
+      "query": 6,
+      "target": 1,
+      "age": 4,
+      "note": "wavedb GNN back-ref"
+    },
+    {
+      "session_id": "58566146-8b81-46ee-a23a-b1b760722837",
+      "query": 9,
+      "target": 4,
+      "age": 4,
+      "note": "wavedb GNN follow-up"
+    },
+    {
+      "session_id": "54bc3670-1e3a-4f70-ad16-03c168c41fe9",
+      "query": 5,
+      "target": 0,
+      "age": 4,
+      "note": "CRABS raffle back-ref"
+    },
+    {
+      "session_id": "54bc3670-1e3a-4f70-ad16-03c168c41fe9",
+      "query": 8,
+      "target": 3,
+      "age": 4,
+      "note": "CRABS raffle follow-up"
+    },
+    {
+      "session_id": "54bc3670-1e3a-4f70-ad16-03c168c41fe9",
+      "query": 9,
+      "target": 0,
+      "age": 8,
+      "note": "CRABS raffle follow-up"
+    },
+    {
+      "session_id": "54bc3670-1e3a-4f70-ad16-03c168c41fe9",
+      "query": 10,
+      "target": 5,
+      "age": 4,
+      "note": "CRABS raffle follow-up"
+    },
+    {
+      "session_id": "54bc3670-1e3a-4f70-ad16-03c168c41fe9",
+      "query": 17,
+      "target": 7,
+      "age": 9,
+      "note": "CRABS raffle follow-up"
+    },
+    {
+      "session_id": "54bc3670-1e3a-4f70-ad16-03c168c41fe9",
+      "query": 18,
+      "target": 7,
+      "age": 10,
+      "note": "CRABS raffle follow-up"
+    },
+    {
+      "session_id": "54bc3670-1e3a-4f70-ad16-03c168c41fe9",
+      "query": 19,
+      "target": 6,
+      "age": 12,
+      "note": "CRABS raffle follow-up"
+    },
+    {
+      "session_id": "54bc3670-1e3a-4f70-ad16-03c168c41fe9",
+      "query": 20,
+      "target": 6,
+      "age": 13,
+      "note": "CRABS raffle follow-up"
+    },
+    {
+      "session_id": "0a777a15-cd35-4e4e-b4ef-6421a831d2a5",
+      "query": 11,
+      "target": 7,
+      "age": 3,
+      "note": "pilgrim zeitgeist back-ref"
+    },
+    {
+      "session_id": "0a777a15-cd35-4e4e-b4ef-6421a831d2a5",
+      "query": 12,
+      "target": 7,
+      "age": 4,
+      "note": "pilgrim zeitgeist follow-up"
+    },
+    {
+      "session_id": "64e27cf2-cba7-4049-b463-8143991ec020",
+      "query": 6,
+      "target": 0,
+      "age": 5,
+      "note": "neutral jing back-ref"
+    },
+    {
+      "session_id": "64e27cf2-cba7-4049-b463-8143991ec020",
+      "query": 10,
+      "target": 0,
+      "age": 9,
+      "note": "neutral jing follow-up"
+    },
+    {
+      "session_id": "64e27cf2-cba7-4049-b463-8143991ec020",
+      "query": 22,
+      "target": 9,
+      "age": 12,
+      "note": "neutral jing follow-up"
+    },
+    {
+      "session_id": "0acd3d3b-e417-4e4b-b7a4-451da735ad93",
+      "query": 8,
+      "target": 3,
+      "age": 4,
+      "note": "athlon business-plan back-ref"
+    },
+    {
+      "session_id": "0acd3d3b-e417-4e4b-b7a4-451da735ad93",
+      "query": 10,
+      "target": 0,
+      "age": 9,
+      "note": "athlon business-plan follow-up"
+    },
+    {
+      "session_id": "5cf553c7-eae7-44b6-aa98-dec5866ad135",
+      "query": 11,
+      "target": 7,
+      "age": 3,
+      "note": "memory/brain back-ref"
+    },
+    {
+      "session_id": "5cf553c7-eae7-44b6-aa98-dec5866ad135",
+      "query": 16,
+      "target": 8,
+      "age": 7,
+      "note": "memory/brain follow-up"
+    },
+    {
+      "session_id": "5cf553c7-eae7-44b6-aa98-dec5866ad135",
+      "query": 26,
+      "target": 16,
+      "age": 9,
+      "note": "memory/brain follow-up"
+    },
+    {
+      "session_id": "5cf553c7-eae7-44b6-aa98-dec5866ad135",
+      "query": 27,
+      "target": 15,
+      "age": 11,
+      "note": "memory/brain follow-up"
+    },
+    {
+      "session_id": "e97832df-b1dd-475a-91ee-b84a2905001d",
+      "query": 4,
+      "target": 0,
+      "age": 3,
+      "note": "minisforum AI X1 back-ref"
+    },
+    {
+      "session_id": "b11be917-6a58-4f9e-8353-c4c94988ae6e",
+      "query": 5,
+      "target": 1,
+      "age": 3,
+      "note": "AI memory evolution back-ref"
+    },
+    {
+      "session_id": "b11be917-6a58-4f9e-8353-c4c94988ae6e",
+      "query": 6,
+      "target": 0,
+      "age": 5,
+      "note": "AI memory evolution follow-up"
+    },
+    {
+      "session_id": "b11be917-6a58-4f9e-8353-c4c94988ae6e",
+      "query": 20,
+      "target": 6,
+      "age": 13,
+      "note": "AI memory evolution follow-up"
+    },
+    {
+      "session_id": "b11be917-6a58-4f9e-8353-c4c94988ae6e",
+      "query": 29,
+      "target": 0,
+      "age": 28,
+      "note": "AI memory evolution follow-up"
+    },
+    {
+      "session_id": "b11be917-6a58-4f9e-8353-c4c94988ae6e",
+      "query": 35,
+      "target": 29,
+      "age": 5,
+      "note": "AI memory evolution follow-up"
+    },
+    {
+      "session_id": "b11be917-6a58-4f9e-8353-c4c94988ae6e",
+      "query": 38,
+      "target": 31,
+      "age": 6,
+      "note": "AI memory evolution follow-up"
+    },
+    {
+      "session_id": "b11be917-6a58-4f9e-8353-c4c94988ae6e",
+      "query": 41,
+      "target": 29,
+      "age": 11,
+      "note": "AI memory evolution follow-up"
+    },
+    {
+      "session_id": "86b1dea4-d319-4c60-9655-67b9a225cdbe",
+      "query": 8,
+      "target": 1,
+      "age": 6,
+      "note": "co-ops vs capitalism back-ref"
+    },
+    {
+      "session_id": "86b1dea4-d319-4c60-9655-67b9a225cdbe",
+      "query": 9,
+      "target": 0,
+      "age": 8,
+      "note": "co-ops follow-up"
+    },
+    {
+      "session_id": "86b1dea4-d319-4c60-9655-67b9a225cdbe",
+      "query": 9,
+      "target": 4,
+      "age": 4,
+      "note": "co-ops follow-up"
+    },
+    {
+      "session_id": "86b1dea4-d319-4c60-9655-67b9a225cdbe",
+      "query": 10,
+      "target": 1,
+      "age": 8,
+      "note": "co-ops 'co-op datacenters' -> u01"
+    },
+    {
+      "session_id": "86b1dea4-d319-4c60-9655-67b9a225cdbe",
+      "query": 12,
+      "target": 2,
+      "age": 9,
+      "note": "co-ops 'also cooperative schools' adds to u02 industries list"
+    },
+    {
+      "session_id": "b7d4f2df-bdb8-423c-9c1d-04616fb6866e",
+      "query": 25,
+      "target": 17,
+      "age": 7,
+      "note": "solana wallet 'relationship described in the paper' -> u17 whitepaper"
+    },
+    {
+      "session_id": "b7d4f2df-bdb8-423c-9c1d-04616fb6866e",
+      "query": 27,
+      "target": 17,
+      "age": 9,
+      "note": "solana 'from the whitepaper' -> u17"
+    },
+    {
+      "session_id": "b7d4f2df-bdb8-423c-9c1d-04616fb6866e",
+      "query": 31,
+      "target": 26,
+      "age": 4,
+      "note": "solana 'these features' -> u26 skills/cli"
+    },
+    {
+      "session_id": "b7d4f2df-bdb8-423c-9c1d-04616fb6866e",
+      "query": 36,
+      "target": 31,
+      "age": 4,
+      "note": "solana 'the architecture' -> u31"
+    },
+    {
+      "session_id": "b7d4f2df-bdb8-423c-9c1d-04616fb6866e",
+      "query": 37,
+      "target": 31,
+      "age": 5,
+      "note": "solana 'the proposal' -> u31"
+    },
+    {
+      "session_id": "b7d4f2df-bdb8-423c-9c1d-04616fb6866e",
+      "query": 38,
+      "target": 31,
+      "age": 6,
+      "note": "solana 'the Architecture'/'the proposal' -> u31"
+    },
+    {
+      "session_id": "236ce916-8f6f-40a4-9f97-fba85c0ef7f7",
+      "query": 6,
+      "target": 0,
+      "age": 5,
+      "note": "vote-power 'the last response' -> u00 (duplicates u00-u05; u00 canonical question)"
+    },
+    {
+      "session_id": "236ce916-8f6f-40a4-9f97-fba85c0ef7f7",
+      "query": 10,
+      "target": 6,
+      "age": 3,
+      "note": "vote-power 'it' = html doc from u06"
+    },
+    {
+      "session_id": "236ce916-8f6f-40a4-9f97-fba85c0ef7f7",
+      "query": 16,
+      "target": 10,
+      "age": 5,
+      "note": "vote-power 'current functionality' -> u10 tool"
+    },
+    {
+      "session_id": "236ce916-8f6f-40a4-9f97-fba85c0ef7f7",
+      "query": 18,
+      "target": 13,
+      "age": 4,
+      "note": "vote-power 'the tool' -> u13"
+    },
+    {
+      "session_id": "865b8052-dbab-4d46-9110-91f1ee50d971",
+      "query": 7,
+      "target": 3,
+      "age": 3,
+      "note": "bear 'stereo matching' -> u03 3d vision"
+    },
+    {
+      "session_id": "865b8052-dbab-4d46-9110-91f1ee50d971",
+      "query": 20,
+      "target": 4,
+      "age": 15,
+      "note": "bear 'crawls to go up steps' -> u04"
+    },
+    {
+      "session_id": "865b8052-dbab-4d46-9110-91f1ee50d971",
+      "query": 43,
+      "target": 39,
+      "age": 3,
+      "note": "bear 'this' = cycloidal gearbox -> u39"
+    },
+    {
+      "session_id": "77b47ef0-7bf4-4048-b090-302072fcf73b",
+      "query": 8,
+      "target": 1,
+      "age": 6,
+      "note": "spark-economy 'The optimalism paper' -> u01"
+    },
+    {
+      "session_id": "77b47ef0-7bf4-4048-b090-302072fcf73b",
+      "query": 10,
+      "target": 5,
+      "age": 4,
+      "note": "spark-economy 'individual statistics' -> u05 talents"
+    },
+    {
+      "session_id": "77b47ef0-7bf4-4048-b090-302072fcf73b",
+      "query": 11,
+      "target": 5,
+      "age": 5,
+      "note": "spark-economy 'at every age' -> u05 ages"
+    },
+    {
+      "session_id": "95dd60ec-8124-4357-bc61-fba856b216b5",
+      "query": 4,
+      "target": 0,
+      "age": 3,
+      "note": "meridian-raft 'supernodes' -> u00"
+    },
+    {
+      "session_id": "95dd60ec-8124-4357-bc61-fba856b216b5",
+      "query": 5,
+      "target": 0,
+      "age": 4,
+      "note": "meridian-raft 'the full vision' -> u00"
+    },
+    {
+      "session_id": "95dd60ec-8124-4357-bc61-fba856b216b5",
+      "query": 10,
+      "target": 0,
+      "age": 9,
+      "note": "meridian-raft 'the whole thing' -> u00"
+    },
+    {
+      "session_id": "95dd60ec-8124-4357-bc61-fba856b216b5",
+      "query": 10,
+      "target": 5,
+      "age": 4,
+      "note": "meridian-raft 'next phase' -> u05 prior prompt"
+    },
+    {
+      "session_id": "95dd60ec-8124-4357-bc61-fba856b216b5",
+      "query": 14,
+      "target": 0,
+      "age": 13,
+      "note": "meridian-raft 'this project' -> u00"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 15,
+      "target": 8,
+      "age": 6,
+      "note": "poseidon 'forum application' -> u08 forums"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 15,
+      "target": 11,
+      "age": 3,
+      "note": "poseidon 'train a bitnet ai' -> u11 BitNet"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 16,
+      "target": 10,
+      "age": 5,
+      "note": "poseidon 'this kind of content' -> u10 the -isms"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 17,
+      "target": 11,
+      "age": 5,
+      "note": "poseidon 'bit distill for this purpose' -> u11 BitNet"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 25,
+      "target": 15,
+      "age": 9,
+      "note": "poseidon 'these steps' -> u15 feasibility plan"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 26,
+      "target": 16,
+      "age": 9,
+      "note": "poseidon 'remove sexual content classification' -> u16 moderation sets"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 27,
+      "target": 15,
+      "age": 11,
+      "note": "poseidon 'train this' -> u15 train bitnet"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 28,
+      "target": 15,
+      "age": 12,
+      "note": "poseidon 'do this on colab' -> u15 training"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 29,
+      "target": 25,
+      "age": 3,
+      "note": "poseidon 'this as output from prepare dataset cell' -> u25 colab plan"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 38,
+      "target": 28,
+      "age": 9,
+      "note": "poseidon 'the Lora training step' -> u28 colab instructions"
+    },
+    {
+      "session_id": "da0964cd-6f2f-4e0d-a156-dadb578a285f",
+      "query": 42,
+      "target": 38,
+      "age": 3,
+      "note": "poseidon 'had to use fallback approach' -> u38 failed Lora step"
+    },
+    {
+      "session_id": "0e4d6b63-c766-4d07-a0b9-69e2cf4e62ec",
+      "query": 6,
+      "target": 2,
+      "age": 3,
+      "note": "OFFS 'capacity reaches 50%' -> u02 node respiration"
+    },
+    {
+      "session_id": "0e4d6b63-c766-4d07-a0b9-69e2cf4e62ec",
+      "query": 24,
+      "target": 7,
+      "age": 16,
+      "note": "OFFS 'gossip them' -> u07 rank gossip"
+    },
+    {
+      "session_id": "0e4d6b63-c766-4d07-a0b9-69e2cf4e62ec",
+      "query": 25,
+      "target": 18,
+      "age": 6,
+      "note": "OFFS 'ping for storage capacity' -> u18 pingcapacity"
+    },
+    {
+      "session_id": "0e4d6b63-c766-4d07-a0b9-69e2cf4e62ec",
+      "query": 26,
+      "target": 0,
+      "age": 25,
+      "note": "OFFS 'the RPC messages' -> u00 original list (long-range, out-of-serve-window but valid anaphora positive)"
+    },
+    {
+      "session_id": "0e4d6b63-c766-4d07-a0b9-69e2cf4e62ec",
+      "query": 37,
+      "target": 26,
+      "age": 10,
+      "note": "OFFS 'FindBlock RPC and StoreBlock algorithm' -> u26 named them"
+    },
+    {
+      "session_id": "68c6a242-32c2-44af-8d68-372b0fdebd51",
+      "query": 18,
+      "target": 9,
+      "age": 8,
+      "note": "tiny-db 'the off system' -> u09 OFFS stack"
+    },
+    {
+      "session_id": "68c6a242-32c2-44af-8d68-372b0fdebd51",
+      "query": 19,
+      "target": 4,
+      "age": 14,
+      "note": "tiny-db 'WaveDB' -> u04 schema-layers"
+    },
+    {
+      "session_id": "68c6a242-32c2-44af-8d68-372b0fdebd51",
+      "query": 20,
+      "target": 4,
+      "age": 15,
+      "note": "tiny-db 'wavedb' -> u04"
+    },
+    {
+      "session_id": "0d2fffc6-fbcf-4b45-a246-556c2fd3106d",
+      "query": 17,
+      "target": 8,
+      "age": 8,
+      "note": "economists 'article on ponzi/fractional reserve' -> u08 ponzi assertion"
+    },
+    {
+      "session_id": "0d2fffc6-fbcf-4b45-a246-556c2fd3106d",
+      "query": 18,
+      "target": 6,
+      "age": 11,
+      "note": "economists 'math comparison of derivatives...that you used earlier' -> u06 M0-M3 derivatives"
+    },
+    {
+      "session_id": "0d2fffc6-fbcf-4b45-a246-556c2fd3106d",
+      "query": 19,
+      "target": 12,
+      "age": 6,
+      "note": "economists 'the vision' -> u12 optimalism"
+    },
+    {
+      "session_id": "0d2fffc6-fbcf-4b45-a246-556c2fd3106d",
+      "query": 22,
+      "target": 12,
+      "age": 9,
+      "note": "economists 'the grand vision' -> u12 optimalism"
+    },
+    {
+      "session_id": "cad22a81-28b2-4dc3-9c1f-ed9e7e3aeae3",
+      "query": 29,
+      "target": 25,
+      "age": 3,
+      "note": "JEPA 'JEPA's architecture come into play here too' -> u25 mind-architecture analogy"
+    },
+    {
+      "session_id": "cad22a81-28b2-4dc3-9c1f-ed9e7e3aeae3",
+      "query": 63,
+      "target": 59,
+      "age": 3,
+      "note": "JEPA 'In the 3blue1brown video' -> u59 3blue1brown slope video"
+    },
+    {
+      "session_id": "cad22a81-28b2-4dc3-9c1f-ed9e7e3aeae3",
+      "query": 73,
+      "target": 60,
+      "age": 12,
+      "note": "JEPA 'derivatives as rates of change' -> u60 (in-window age 12)"
+    },
+    {
+      "session_id": "cad22a81-28b2-4dc3-9c1f-ed9e7e3aeae3",
+      "query": 90,
+      "target": 83,
+      "age": 6,
+      "note": "JEPA 'this original architecture and goal' -> u83 jepa/mamba/transformer placement"
+    },
+    {
+      "session_id": "cad22a81-28b2-4dc3-9c1f-ed9e7e3aeae3",
+      "query": 97,
+      "target": 91,
+      "age": 5,
+      "note": "JEPA 'run the oracle in the cloud' -> u91 oracle=deepseek-flash"
+    },
+    {
+      "session_id": "cad22a81-28b2-4dc3-9c1f-ed9e7e3aeae3",
+      "query": 110,
+      "target": 106,
+      "age": 3,
+      "note": "JEPA 'this architecture could never run on a phone' -> u106 architecture summary"
+    },
+    {
+      "session_id": "cad22a81-28b2-4dc3-9c1f-ed9e7e3aeae3",
+      "query": 119,
+      "target": 108,
+      "age": 10,
+      "note": "JEPA 'my original selection' -> u108 hardware (Arc Pro B70/ryzen)"
+    },
+    {
+      "session_id": "cad22a81-28b2-4dc3-9c1f-ed9e7e3aeae3",
+      "query": 163,
+      "target": 158,
+      "age": 4,
+      "note": "JEPA 'why use both smolM2 and Bonsai' -> u158 prismml/bonsai vs smol"
+    },
+    {
+      "session_id": "b6dc5776-494c-453a-9371-80211f42f76b",
+      "query": 12,
+      "target": 6,
+      "age": 5,
+      "note": "SNARKs 'big-time users large scale many-to-one' -> u06 Walmart ledger"
+    },
+    {
+      "session_id": "b6dc5776-494c-453a-9371-80211f42f76b",
+      "query": 15,
+      "target": 10,
+      "age": 4,
+      "note": "SNARKs 'the Commonomicon' -> u10 introduced it"
+    },
+    {
+      "session_id": "b6dc5776-494c-453a-9371-80211f42f76b",
+      "query": 21,
+      "target": 17,
+      "age": 3,
+      "note": "SNARKs 'gap in the funds structure' -> u17 Funds structure"
+    },
+    {
+      "session_id": "b6dc5776-494c-453a-9371-80211f42f76b",
+      "query": 25,
+      "target": 14,
+      "age": 10,
+      "note": "SNARKs 'this is optimalism at work' -> u14 optimalism/Prometheus"
+    },
+    {
+      "session_id": "b6dc5776-494c-453a-9371-80211f42f76b",
+      "query": 28,
+      "target": 14,
+      "age": 13,
+      "note": "SNARKs 'whitepaper on Prometheus...our discussion of it architecture' -> u14"
+    },
+    {
+      "session_id": "b6dc5776-494c-453a-9371-80211f42f76b",
+      "query": 29,
+      "target": 14,
+      "age": 14,
+      "note": "SNARKs q29 'the spark, spark ledger or commonomicon or Prometheus' -> u14 Prometheus (in-window age 14, the overarching concept)"
+    },
+    {
+      "session_id": "b6dc5776-494c-453a-9371-80211f42f76b",
+      "query": 31,
+      "target": 27,
+      "age": 3,
+      "note": "SNARKs 'Take one more stab at writing the article on optimalism' -> u27 article request"
+    },
+    {
+      "session_id": "b6dc5776-494c-453a-9371-80211f42f76b",
+      "query": 34,
+      "target": 29,
+      "age": 4,
+      "note": "SNARKs 'spark ledger...how it relates to commonomicon' -> u29 concept-pass"
+    },
+    {
+      "session_id": "75f12969-3a3a-42fe-a3f9-694f81158223",
+      "query": 7,
+      "target": 3,
+      "age": 3,
+      "note": "ABE 'aforementioned policy limitations in dual policy abe' -> u03 who changes attributes"
+    },
+    {
+      "session_id": "75f12969-3a3a-42fe-a3f9-694f81158223",
+      "query": 17,
+      "target": 11,
+      "age": 5,
+      "note": "ABE 'the state machine' -> u11 cryptographic state machine"
+    },
+    {
+      "session_id": "75f12969-3a3a-42fe-a3f9-694f81158223",
+      "query": 24,
+      "target": 17,
+      "age": 6,
+      "note": "ABE 'operations to not be inherently state dependent' responds to u17 need-all-users"
+    },
+    {
+      "session_id": "75f12969-3a3a-42fe-a3f9-694f81158223",
+      "query": 33,
+      "target": 29,
+      "age": 3,
+      "note": "ABE 'formalize this into the CRABS protocol spec' -> u29 attributes-as-state-machine"
+    },
+    {
+      "session_id": "75f12969-3a3a-42fe-a3f9-694f81158223",
+      "query": 50,
+      "target": 46,
+      "age": 3,
+      "note": "ABE 'tombstone stick around in the state with documents' -> u46 CRDTs/OT in crabs"
+    },
+    {
+      "session_id": "75f12969-3a3a-42fe-a3f9-694f81158223",
+      "query": 60,
+      "target": 56,
+      "age": 3,
+      "note": "ABE 'just taking the max' -> u56 lamport clocks"
+    },
+    {
+      "session_id": "75f12969-3a3a-42fe-a3f9-694f81158223",
+      "query": 62,
+      "target": 58,
+      "age": 3,
+      "note": "ABE 'this time ordering system' -> u58 epoch+nanos+counter"
+    },
+    {
+      "session_id": "35c9cc55-6f56-4ab1-911b-b087853ae9b0",
+      "query": 6,
+      "target": 2,
+      "age": 3,
+      "note": "2FA 'modify this with 2fa (Approach 2)' -> u02 approach-2 algorithm"
+    },
+    {
+      "session_id": "35c9cc55-6f56-4ab1-911b-b087853ae9b0",
+      "query": 9,
+      "target": 0,
+      "age": 8,
+      "note": "2FA 'this algorithm...modified it to also have 2fa' -> u00 implemented algorithm"
+    },
+    {
+      "session_id": "6ee05428-c60a-455b-81d2-aa6fe45dc745",
+      "query": 12,
+      "target": 8,
+      "age": 3,
+      "note": "availability 'these choices' (colors/fonts) -> u08 color scheme"
+    },
+    {
+      "session_id": "6ee05428-c60a-455b-81d2-aa6fe45dc745",
+      "query": 16,
+      "target": 12,
+      "age": 3,
+      "note": "availability 'this image' -> u12 adjusted mockup with added text"
+    },
+    {
+      "session_id": "c4260891-1a0b-477e-8dfd-6ec0bec04b5a",
+      "query": 4,
+      "target": 0,
+      "age": 3,
+      "note": "play-store 'install a system service from the play store' -> u00 android daemon"
+    },
+    {
+      "session_id": "c4260891-1a0b-477e-8dfd-6ec0bec04b5a",
+      "query": 6,
+      "target": 1,
+      "age": 4,
+      "note": "play-store 'the pub/sub service' -> u01 pub/sub daemon"
+    },
+    {
+      "session_id": "c4260891-1a0b-477e-8dfd-6ec0bec04b5a",
+      "query": 7,
+      "target": 0,
+      "age": 6,
+      "note": "play-store 'something similar on ios' -> u00 android service"
+    },
+    {
+      "session_id": "c4260891-1a0b-477e-8dfd-6ec0bec04b5a",
+      "query": 22,
+      "target": 16,
+      "age": 5,
+      "note": "play-store 'mDNS' -> u16 DNS text records"
+    },
+    {
+      "session_id": "6b152fb5-29cb-4879-ae49-ab12d1c13815",
+      "query": 4,
+      "target": 0,
+      "age": 3,
+      "note": "amphitheater 'think of this more like a social network' -> u00 app concept"
+    },
+    {
+      "session_id": "6b152fb5-29cb-4879-ae49-ab12d1c13815",
+      "query": 6,
+      "target": 0,
+      "age": 5,
+      "note": "amphitheater 'this app's priority' -> u00"
+    },
+    {
+      "session_id": "6b152fb5-29cb-4879-ae49-ab12d1c13815",
+      "query": 7,
+      "target": 3,
+      "age": 3,
+      "note": "amphitheater 'obfuscate the owner free file system urls' -> u03 OFFS/ONS"
+    },
+    {
+      "session_id": "6b152fb5-29cb-4879-ae49-ab12d1c13815",
+      "query": 10,
+      "target": 0,
+      "age": 9,
+      "note": "amphitheater 'summary of what the application is' -> u00 app idea"
+    },
+    {
+      "session_id": "6b152fb5-29cb-4879-ae49-ab12d1c13815",
+      "query": 12,
+      "target": 3,
+      "age": 8,
+      "note": "amphitheater 'the ons/offsystem' -> u03 ONS/OFFS"
+    },
+    {
+      "session_id": "6b152fb5-29cb-4879-ae49-ab12d1c13815",
+      "query": 13,
+      "target": 0,
+      "age": 12,
+      "note": "amphitheater 'merging the functionality of Youtube and Windows media player' -> u00 (described exactly that)"
+    },
+    {
+      "session_id": "6b152fb5-29cb-4879-ae49-ab12d1c13815",
+      "query": 18,
+      "target": 10,
+      "age": 7,
+      "note": "amphitheater 'the Vision document' -> u10 summary/business-proposal request"
+    },
+    {
+      "session_id": "6b152fb5-29cb-4879-ae49-ab12d1c13815",
+      "query": 26,
+      "target": 18,
+      "age": 7,
+      "note": "amphitheater 'replace sovereign with private in this text' -> u18 vision document"
+    }
+  ]
+}

@@ -1,0 +1,258 @@
+{
+  "summary": {
+    "n_conflict": 13,
+    "n_negative": 3,
+    "det_recall": 0.3076923076923077,
+    "bonsai_strict_recall": 0.15384615384615385,
+    "bonsai_relaxed_recall": 0.7692307692307693,
+    "schema_adherence_gap": 0.6153846153846154,
+    "bonsai_strict_fp": 1,
+    "bonsai_relaxed_fp": 1,
+    "adjudication_decided": 13,
+    "adjudication_none": 0,
+    "adjudication_correct_rate": 1.0,
+    "negatives_false_fix": 3
+  },
+  "rows": [
+    {
+      "id": "F1_database_field",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'MySQL' and 'Postgres' are different and assert the same entity 'database'. The sources are not month-/year-named point-in-time records, so check 4 applies. The newer assertion 'Postgres' from 'docs/db-pick-v2.md' on 2026-07-15 supersedes the older 'MySQL' from 'docs/db-pick-v1.md' on 2026-07-14. The older value is tombstoned, and the newer is kept retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "F2_ticket_status_field",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'open' and 'closed' are for the same entity 'status', and the sources are not month-/year-named point-in-time records. This constitutes a genuine conflict, so the older value 'open' from tickets/T-1-v1.md is superseded by the newer value 'closed' from tickets/T-1-v2.md. The older value is tombstoned, and the newer value is kept retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "F3_deploy_target_field_is",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'staging' and 'production' are for the same entity 'deployment target' and are different. The sources are not month-/year-named point-in-time records, so check 4 applies. The newer value 'production' (asserted at 2026-07-15) supersedes the older value 'staging' (asserted at 2026-07-14). The older value is tombstoned, and the newer value is kept retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "F4_cache_field_eq",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": true,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'redis' and 'memcached' are for the same entity 'cache', and the sources are not month-/year-named point-in-time records. This is a genuine conflict where the newer assertion (docs/cache-v2.md, 2026-07-15) supersedes the older one (docs/cache-v1.md, 2026-07-14). The older value 'redis' should be tombstoned, and the newer value 'memcached' should be kept retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P5_data_layer_paraphrased",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'MySQL' and 'Postgres' are for the same entity 'data layer' and are different. The sources are not month-/year-named point-in-time records, so check 4 applies. The newer value 'Postgres' should supersede the older value 'MySQL', and the older value should be tombstoned to keep the newer retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P6_database_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'MySQL' and 'Postgres' are for the same entity 'database' and are different. The sources are not month-/year-named point-in-time records, so check 4 applies. The newer value 'Postgres' should supersede the older value 'MySQL', and the older value should be tombstoned to keep the newer retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P7_deploy_target_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'staging' and 'production' are for the same entity 'deployment target' and are different. The sources are not month-/year-named point-in-time records, so check 4 applies. The newer value 'production' (asserted at 2026-07-15) supersedes the older value 'staging' (asserted at 2026-07-14)."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P8_framework_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'React' and 'Svelte' are for the same entity 'framework', and the sources are not month-/year-named point-in-time records. This constitutes a genuine conflict, so the older value 'React' from 'docs/frontend-v1.md' should be superseded by the newer value 'Svelte' from 'docs/frontend-v2.md'."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P9_hosting_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'AWS' and 'GCP' refer to the same entity (hosting provider), and the sources are not month-/year-named point-in-time records. Therefore, this is a genuine conflict, and the older value ('AWS') should be superseded by the newer value ('GCP')."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P10_ci_runner_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'GitHub Actions' and 'self-hosted Jenkins' refer to the same entity 'ci runner' and are different. The sources are not month-/year-named point-in-time records, so check 4 applies. Therefore, the older value 'GitHub Actions' from 'docs/ci-v1.md' should be superseded, and the newer value 'self-hosted Jenkins' from 'docs/ci-v2.md' should be kept retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P11_secrets_landed_on",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'Vault' and 'AWS Secrets Manager' refer to the same entity, 'secrets store', and are asserted by different sources at different times. None of the checks 1-3 apply because the values are not equal, not different entities, and not point-in-time records. This is a genuine conflict, so the older value 'Vault' from docs/secrets-v1.md is superseded by the newer value 'AWS Secrets Manager' from docs/secrets-v2.md. The older value is tombstoned, and the newer value is kept retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P12_pkg_manager_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'npm' and 'pnpm' are different and refer to the same entity (package manager). The sources are not month-/year-named point-in-time records, so check 4 applies. The newer assertion (pnpm) should supersede the older one (npm), and the older value should be tombstoned to keep the newer retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P13_region_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": true,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'us-east-1' and 'eu-west-1' are different and assert about the same entity 'region'. The sources are not month-/year-named point-in-time records, so check 4 applies. Therefore, the older value 'us-east-1' from 'docs/region-v1.md' is superseded by the newer value 'eu-west-1' from 'docs/region-v2.md'."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "N14_complementary_temporal",
+      "category": "negative_complementary",
+      "conflict": false,
+      "det_catch": false,
+      "bonsai_strict_catch": true,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values 'green' and 'red' are for the same entity 'build status', and the sources are not month-/year-named point-in-time records. Therefore, this is a genuine conflict, and the older value 'green' from docs/jan-status.md should be superseded by the newer value 'red' from docs/jul-status.md."
+      },
+      "adjudication_correct": false,
+      "correct_decision": "dismiss"
+    },
+    {
+      "id": "N15_same_value_no_conflict",
+      "category": "negative_same_value",
+      "conflict": false,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values are the same ('Postgres') and asserted by different sources (docs/plan-a.md and docs/plan-b.md) at different times (2026-07-14 and 2026-07-15). Since the values are identical and the sources are not month-/year-named point-in-time records, this constitutes a genuine conflict. The newer assertion (docs/plan-b.md) should supersede the older one (docs/plan-a.md), and the older value should be tombstoned to keep the newer retrievable."
+      },
+      "adjudication_correct": false,
+      "correct_decision": "none"
+    },
+    {
+      "id": "N16_different_entity_same_value",
+      "category": "negative_different_entity",
+      "conflict": false,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The two values are the same ('React') and assert the same entity ('framework'). The sources are not month-/year-named point-in-time records, so check 4 applies. The newer assertion (from docs/mobile-fw-v1.md on 2026-07-15) supersedes the older one (from docs/frontend-fw-v1.md on 2026-07-14). The older value is tombstoned, and the newer is kept retrievable."
+      },
+      "adjudication_correct": false,
+      "correct_decision": "none"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+=== DEEPSEEK_CALL_OK ===
+elapsed_seconds=133.97
+attempt=1
+model=deepseek-v4-pro:cloud
+======================================================================
+
+1. **Per-kind bodies + shared head is the correct fix.** The shared body collapses because a single 6144→128 projection must serve two retrieval tasks with different feature demands. Splitting into text-body and code-body (each 6144→128) feeding a shared 128→384 head removes that conflict. The shared head ensures cross-kind logit comparability (the MoE failure proved that per-kind *heads* break the gate; a shared head preserves it). Train jointly from scratch with the same sqrt-inverse-freq sampler. Expected 6-seed pass-rate: ≥5/6. The risk of incompatible body representations is low—the shared head is a linear+MLP map that can align distinct 128-dim subspaces, and the cross-kind loss signal will force alignment. Warm-starting from the shared body is unnecessary and may reintroduce the collapse bias; joint training is cleaner.
+
+2. **2-seed logit-ensemble is a band-aid, not a solution.** It exploits two lucky seeds but doesn’t fix the architectural instability. Live traffic will eventually hit failure modes those two seeds don’t cover. Rank: low. Only consider as a temporary fallback if per-kind bodies fail, which is unlikely.
+
+3. **Stage 2 backbone retrain remains low priority.** Stage 0 proved the code signal is already in h. The collapse is a readout-body problem, not a representation problem. Per-kind bodies fix the readout; retraining the backbone is a distraction.
+
+4. **No missing option beats per-kind bodies.** Regularization (dropout, weight decay tuning) or residual connections won’t fix a fundamental capacity conflict. More data or loss tweaks won’t change the fact that a single 6144→128 projection is asked to serve two masters. The architectural split is the highest-leverage move.
+
+**Ranked actions by expected leverage:**
+1. Implement per-kind bodies + shared head (joint training, AdamW-clean, sqrt-inverse-freq sampler).
+2. If variance persists, ensemble 3–4 seeds of the per-kind architecture (not the current shared body).
+3. (Distant third) Stage 2 backbone fine-tuning, only if per-kind bodies still show seed sensitivity.
+
+**Ship-vs-continue:** Continue. The shared-body approach is dead at 2/6 pass-rate. Do not ship.
+
+**Single highest-leverage next step:** Train the per-kind bodies + shared head architecture from scratch with the sqrt-inverse-freq no-replacement sampler. Evaluate on 6 seeds.

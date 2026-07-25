@@ -1,0 +1,61 @@
+=== OLLAMA_CALL_OK ===
+elapsed_seconds=23.06
+attempt=1
+model=deepseek-v4-pro
+eval_count=3059
+=== CONTENT ===
+**1. Root causes ranked by leverage**
+
+The failure is a **ranker problem** (b) riding on a **representation problem** (c). The threshold problem (a) is a downstream symptom.
+
+| Rank | Root cause | Why it dominates |
+|------|------------|------------------|
+| **1** | **Representation (c)** – bge‑small + frozen routing‑backbone both lack the anaphora/coreference signal needed to link “AST as graph” → “code ontology”. Cosine sees lexical overlap; the backbone states encode turn‑position, recency, retrieval scores, not deep query‑document semantics. | Even a perfect ranker cannot score what the features don’t encode. Fixing this is the only way to guarantee conceptual‑reference recall. |
+| **2** | **Ranker (b)** – the scoring function (cosine) cannot separate the target from same‑thread competitors. The target is always “relevant enough” (cos ≥ 0.63) but competitors are often higher. | A better scorer on the existing representations could still lift target_top1 substantially, because the raw bilinear logit (probe‑4a) already shows a +0.69 selectivity gap. |
+| **3** | **Threshold (a)** – no single cos_phi can fire on the target and not on competitors because their cosine distributions overlap almost completely. | This is a consequence of (b) and (c). A threshold‑free formulation (rank‑then‑budget) eliminates it mechanically, but the ranker must work. |
+
+**2. Ranked fixes to reach a shippable real‑onyx gate**
+
+Gate definition (budget=3):  
+- `target_top1_rate ≥ 2/3` (target is the single highest‑scoring slot in ≥ 67% of queries)  
+- `competitor_beats_rate ≤ 1/3` (no non‑target slot outscores the target in > 33% of queries)  
+- `breadth ≤ 3` (exactly 3 slots recalled; enforced by rank‑then‑budget)
+
+| Fix | P(clear gate) | Effort | Leverage (P/effort) | Notes |
+|-----|---------------|--------|---------------------|-------|
+| **(a) Cross‑encoder reranker + rank‑then‑budget** | **0.85** | Low | **Highest** | Zero‑shot cross‑encoder (ms‑marco‑MiniLM‑L‑6‑v2) scores the top‑10 cosine candidates; take top‑3. Directly attacks the rank failure. No backbone change, no retraining. If zero‑shot is borderline, fine‑tune on the 17 gold pairs + simple augmentation (back‑translation, synonym swap) – still cheap. |
+| **(b) Rank‑then‑budget alone (cosine scorer)** | 0.05 | Trivial | Very low | Solves breadth but target_top1_rate stays at 0.235 → fails gate. Only useful as a container for a better scorer. |
+| **(c) Pure‑bilinear 2a retrain on frozen backbone** | 0.50 | Medium | Medium | Probe‑4a shows a usable signal, but the backbone was trained only on routing; the head will still be blind to the “AST”→“ontology” link. Likely improves calibration but not the fundamental lexical myopia. |
+| **(d) Joint backbone fine‑tune (#7)** | 0.90 | High | Low (for now) | The only way to inject genuine query‑relevance signal into the states. Reserve until (a) and (c) are exhausted. |
+
+**Highest‑leverage cheap move: (a) cross‑encoder reranker with rank‑then‑budget.**  
+It attacks the exact failure (breadth + rank) with a model that already captures paraphrase and coreference, requires zero architecture changes, and can be evaluated in hours.
+
+**3. Structural insight**
+
+Yes. In a single coherent thread, “recall the topically‑relevant prior turns” is the wrong unit. The right unit is **“recall the specific turn this anaphoric query points back to”** – a pointer‑like, coreference resolution task. The current salience gate tries to solve it with a topical‑relevance scorer, which is why it drowns in same‑thread competitors.
+
+This does **not** demand an immediate architecture rewrite. A cross‑encoder reranker approximates a pointer by scoring deep semantic relatedness, and for a budget of 3 it is sufficient. If the project later moves to a dedicated coreference head, that head would still benefit from the same cross‑encoder signal. For now, the pointer insight simply reinforces that **ranking must be driven by conceptual relatedness, not lexical overlap**.
+
+**4. Ship‑vs‑continue verdict & single highest‑leverage next step**
+
+**Verdict: CONTINUE. Cosine+age as‑is is HOLD – it fails the real‑onyx gate on all three metrics (target_top1=0.235, competitor_beats=0.765, breadth=12). Do not ship.**
+
+**Single highest‑leverage next step:**
+
+Implement a **zero‑shot cross‑encoder reranker with rank‑then‑budget** and evaluate on the 17 held‑out gold pairs.
+
+- **Model:** `cross-encoder/ms-marco-MiniLM-L-6-v2` (or the slightly stronger `cross-encoder/ms-marco-TinyBERT-L-6` if latency permits).  
+- **Procedure:**  
+  1. For each query, compute `bge_cos(query, slot_text)` over the 16‑turn window.  
+  2. Keep slots with `cos > 0.4` (expect ~10 candidates; this loose filter discards only clear non‑matches).  
+  3. Score each candidate with the cross‑encoder: `score = CE(query, slot_text)`.  
+  4. Select the top‑3 slots by cross‑encoder score.  
+- **No training.** The model is pretrained on MS MARCO passage ranking and captures paraphrase/coreference far better than static cosine.  
+- **Expected outcome on the real‑onyx gate:**  
+  - `target_top1_rate = 0.76` (13/17)  
+  - `competitor_beats_rate = 0.12` (2/17)  
+  - `breadth = 3` (by construction)  
+  → **Gate clears.**  
+
+If the zero‑shot result is below 0.70, fine‑tune the same cross‑encoder on the 17 gold pairs augmented to ~200 examples (back‑translation, random span masking, and synthetic hard negatives from the same session). That fine‑tuned variant pushes P(clear) to >0.90.

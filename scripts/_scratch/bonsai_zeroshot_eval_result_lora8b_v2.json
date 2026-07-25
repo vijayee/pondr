@@ -1,0 +1,258 @@
+{
+  "summary": {
+    "n_conflict": 13,
+    "n_negative": 3,
+    "det_recall": 0.3076923076923077,
+    "bonsai_strict_recall": 0.23076923076923078,
+    "bonsai_relaxed_recall": 0.7692307692307693,
+    "schema_adherence_gap": 0.5384615384615385,
+    "bonsai_strict_fp": 1,
+    "bonsai_relaxed_fp": 1,
+    "adjudication_decided": 13,
+    "adjudication_none": 0,
+    "adjudication_correct_rate": 1.0,
+    "negatives_false_fix": 2
+  },
+  "rows": [
+    {
+      "id": "F1_database_field",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value, 'Postgres', was asserted by 'docs/db-pick-v2.md' on '2026-07-15', which is after the older value, 'MySQL', was asserted by 'docs/db-pick-v1.md' on '2026-07-14'. Since the newer assertion is more recent and likely reflects the current truth, the older value ('MySQL') is superseded and tombstoned. The newer value ('Postgres') remains as the current truth and is kept retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "F2_ticket_status_field",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value ('closed') from the document 'tickets/T-1-v2.md' asserts the status at a later time (2026-07-15) compared to the older value ('open') from 'tickets/T-1-v1.md' (2026-07-14). Since the newer value is more recent and likely reflects the current truth, the older value should be superseded and tombstoned. This resolves the contradiction without requiring user intervention."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "F3_deploy_target_field_is",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value 'production' (asserted by 'docs/deploy-v2.md' on 2026-07-15) supersedes the older value 'staging' (asserted by 'docs/deploy-v1.md' on 2026-07-14). This represents a change in the deployment target, and the newer value is the current truth. The older value is tombstoned to maintain historical record while the newer is retained."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "F4_cache_field_eq",
+      "category": "field_control",
+      "conflict": true,
+      "det_catch": true,
+      "bonsai_strict_catch": true,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value (memcached) asserts the current truth, as it was provided by a more recent document (docs/cache-v2.md) on 2026-07-15. The older value (redis) from docs/cache-v1.md on 2026-07-14 is superseded and tombstoned, while the newer value remains as the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P5_data_layer_paraphrased",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": true,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value, 'Postgres', was asserted by 'docs/data-layer-update.md' on '2026-07-15', which is after the older value, 'MySQL', was asserted by 'docs/team-standardization.md' on '2026-07-14'. Since the newer value is more recent and likely reflects the current truth, the older value should be superseded and tombstoned. There is no indication that the two values are genuinely complementary or that the provenance is too weak to warrant user clarification."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P6_database_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value (Postgres) asserts the current truth, as it was provided by a more recent document (q3-infra.md) on 2026-07-15. The older value (MySQL) from q2-infra.md on 2026-07-14 is superseded and tombstoned, while the newer value remains as the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P7_deploy_target_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value 'production' (asserted by 'docs/launch-b.md' on 2026-07-15) supersedes the older value 'staging' (asserted by 'docs/launch-a.md' on 2026-07-14). This represents a clear update to the deployment target, and the older value is tombstoned while the newer remains as the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P8_framework_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer assertion (Svelte) from the more recent document (frontend-v2.md) on 2026-07-15 supersedes the older one (React) from frontend-v1.md on 2026-07-14. This represents a clear update to the framework's state, and the older value is tombstoned while the newer remains as the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P9_hosting_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value (GCP) asserts the current truth, as it was provided by a more recent document (cloud-v2.md) on 2026-07-15. The older value (AWS) from cloud-v1.md on 2026-07-14 is superseded and tombstoned, while the newer value remains as the current truth."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P10_ci_runner_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value, 'self-hosted Jenkins', asserts the current truth as it was provided by a more recent document (docs/ci-v2.md) on 2026-07-15. The older value, 'GitHub Actions', is superseded and tombstoned to maintain a consistent and up-to-date representation of the ci runner's state."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P11_secrets_landed_on",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newest-asserting value, 'AWS Secrets Manager', is from a more recent document (2026-07-15) and supersedes the older value 'Vault' from 2026-07-14. This represents an update to the current truth, so the older value is tombstoned and kept retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P12_pkg_manager_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value 'pnpm' (asserted by 'docs/tooling-v2.md' on 2026-07-15) supersedes the older value 'npm' (asserted by 'docs/tooling-v1.md' on 2026-07-14). This represents an update to the current truth, and the older value is tombstoned while keeping it retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "P13_region_will_be",
+      "category": "paraphrased",
+      "conflict": true,
+      "det_catch": false,
+      "bonsai_strict_catch": true,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newest-asserting value ('eu-west-1') is from a more recent document ('docs/region-v2.md') dated 2026-07-15, which supersedes the older value ('us-east-1') from 'docs/region-v1.md' dated 2026-07-14. Since the newer value is likely the current truth, the older value is tombstoned and kept retrievable."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "fix"
+    },
+    {
+      "id": "N14_complementary_temporal",
+      "category": "negative_complementary",
+      "conflict": false,
+      "det_catch": false,
+      "bonsai_strict_catch": true,
+      "bonsai_relaxed_catch": true,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "The newer value ('red') from 'docs/jul-status.md' (asserted at 2026-07-15) supersedes the older value ('green') from 'docs/jan-status.md' (asserted at 2026-07-14). Since the newer value is more recent and likely reflects the current truth, the older value is tombstoned while the newer is retained. This is a straightforward contradiction where the newer assertion is the current truth."
+      },
+      "adjudication_correct": false,
+      "correct_decision": "dismiss"
+    },
+    {
+      "id": "N15_same_value_no_conflict",
+      "category": "negative_same_value",
+      "conflict": false,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "fix",
+        "action": "supersede_assertion",
+        "reasoning": "Both values are 'Postgres' and were asserted by different documents at different times. Since the newer assertion (docs/plan-b.md on 2026-07-15) is more recent, it supersedes the older one (docs/plan-a.md on 2026-07-14). The values are not complementary, and the provenance is clear. Therefore, the older value is tombstoned, and the newer one is retained as the current truth."
+      },
+      "adjudication_correct": false,
+      "correct_decision": "none"
+    },
+    {
+      "id": "N16_different_entity_same_value",
+      "category": "negative_different_entity",
+      "conflict": false,
+      "det_catch": false,
+      "bonsai_strict_catch": false,
+      "bonsai_relaxed_catch": false,
+      "adjudication": {
+        "decision": "dismiss",
+        "action": "tombstone both values",
+        "reasoning": "The two values are the same ('React') and both assert the same framework, with the only difference being the date of assertion. Since the values are not distinct and there is no genuine contradiction, the system can safely dismiss the conflict as complementary states rather than a real contradiction."
+      },
+      "adjudication_correct": true,
+      "correct_decision": "none"
+    }
+  ]
+}

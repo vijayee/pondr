@@ -1,0 +1,41 @@
+=== OLLAMA_CALL_OK ===
+elapsed_seconds=25.06
+attempt=1
+model=deepseek-v4-pro
+eval_count=3748
+=== CONTENT ===
+Your zero-shot cross-encoder recommendation failed because I underestimated the distribution mismatch between MS MARCO (query→passage) and conversational anaphora (rambling monologue→specific prior turn). The architecture is correct; the training data is wrong. I recalibrate.
+
+## 1. Ranked actions by P(clear) × effort (recalibrated)
+
+| Action | Effort | Predicted target_top1 (17 pairs) | Predicted target_in_top3 | P(clear) | Notes |
+|--------|--------|----------------------------------|--------------------------|----------|-------|
+| **(a) Fine-tune CE on 80–100 new gold pairs from trained sessions** | Medium (4–6 h labeling + 1 h training) | **0.71 (12/17)** | **0.88 (15/17)** | **0.80** | Directly fixes distribution mismatch. Use `cross-encoder/ms-marco-MiniLM-L-6-v2` or `microsoft/deberta-v3-base` with binary head. Augment to ~200 via back-translation. |
+| (d) Joint backbone fine-tune (#7) | High (days) | 0.82 (14/17) | 0.94 (16/17) | 0.90 | Overkill for this gate; keep as fallback. |
+| (c) Step 4 pure-bilinear 2a retrain (frozen backbone) | Medium | 0.47 (8/17) | 0.65 (11/17) | 0.30 | Frozen backbone encodes procedural, not semantic features—will miss AST→ontology links. |
+| (b) Swap zero-shot model (NLI/conversational) | Low (1 h) | 0.35 (6/17) | 0.59 (10/17) | 0.15 | Test `cross-encoder/nli-deberta-v3-base` (entailment score) or `BAAI/bge-reranker-v2-m3`; distribution still not conversational anaphora. |
+
+**Highest leverage: (a).** It attacks the exact failure mode with the right architecture and in-domain data, at moderate cost.
+
+## 2. Cheaper zero-shot signals before labeling
+
+Try **`cross-encoder/nli-deberta-v3-base`** (entailment score: “does this query refer back to this turn?”). I predict **target_top1 = 0.35** (6/17) and **target_in_top3 = 0.59** (10/17). It will reshuffle again—fixing a few cases MS MARCO broke, breaking others—net gain small. Not worth delaying (a). If you must test, run it in 30 minutes, but expect it to fail the gate.
+
+## 3. Does target_in_top3 ≥ 2/3 change the ranking?
+
+If the product can show a shortlist of 3 and let the user pick, then **recall@3 is the gate**, and the current 0.588 is only 0.08 short (2 more correct pairs). That lowers the bar, but (a) still dominates: it lifts recall@3 to 0.88, clearing with margin. A zero-shot NLI model might squeak to 0.65, but I wouldn’t bet on it. The ranking does not change—(a) remains the surest path.
+
+## 4. Ship-vs-continue verdict
+
+**CONTINUE.** The rank-then-budget + zero-shot CE path as-is fails: target_top1=0.294, competitor_beats=0.706. Breadth is solved; ranking is not.
+
+## Single highest-leverage next step
+
+**Fine-tune a cross-encoder on 80–100 new gold anaphora pairs mined from the 51 trained onyx sessions.**  
+- Model: `cross-encoder/ms-marco-MiniLM-L-6-v2` (same architecture, small, fast) or `microsoft/deberta-v3-base` (stronger).  
+- Data: Hand-label 80–100 “query → correct prior turn” pairs from the trained sessions (non-overlapping with the 17 test pairs). Augment to ~200 with back-translation (e.g., German, French) to prevent overfitting.  
+- Training: Binary classification head, 3 epochs, learning rate 2e-5, batch size 16.  
+- Predicted on the 17 held-out: **target_top1 = 0.71 (12/17)**, **target_in_top3 = 0.88 (15/17)**, competitor_beats < 0.2, breadth = 3. **Gate clears.**  
+- Fallback: If target_top1 < 0.65 after fine-tuning, expand gold to 150 pairs and add hard negative mining (the highest-scoring incorrect turn from the zero-shot CE).  
+
+This is the cheapest, fastest, and most direct fix. Start labeling today.

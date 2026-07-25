@@ -1,0 +1,69 @@
+=== DEEPSEEK_CALL_OK ===
+elapsed_seconds=51.70
+attempt=1
+model=deepseek-v4-pro:cloud
+======================================================================
+
+**Verdict:** The text flag is a data-imbalance problem, not a loss-design problem. The cheapest, highest-leverage fix is to duplicate text-gold records and re-fine-tune from the original backbone. Loss-side levers are dangerous and unnecessary. The ensemble already ships green; the single-seed robustness improvement is worth one cheap experiment. **Continue**, don’t ship yet.
+
+---
+
+### 1. Cheap levers, ranked by expected leverage
+
+1. **(a) Duplicate text-gold records (2×, no conv subsampling)**  
+   - **Why:** The only clean way to give text more gradient steps under `replacement=False`. 2× brings text steps from 229 → 458 per epoch, ratio text/conv from 0.41 → 0.81. This directly addresses the step-count deficit without touching the loss, AdamW, or the conv/code data.  
+   - **Risk to conv:** Low. Conv still gets 562 steps; the prose subspace will shift toward text but the model already separates them partially. The one failing conv seed (s1) was text-strong, so a better text direction might actually help conv by disentangling prose more cleanly.  
+   - **Subsampling conv?** No. Conv is 5/6; reducing its steps risks a new failure. Oversample text only.
+
+2. **(e) More seeds + ensemble (ship the current ensemble)**  
+   - **Why:** The serve ensemble (s1/s3/s4/s5) is already 4/4 on text. The 4/6 single-seed gate is met. If the goal is purely operational, this is a zero-cost ship. But it leaves seed variance unresolved; future fine-tunes may regress. Ranked #2 because it’s a valid stop point, not a fix.
+
+3. **(a variant) Text duplication + mild conv subsampling (if 2× alone hurts conv)**  
+   - Fallback only if the first experiment degrades conv. Not ranked as a primary lever.
+
+4. **(b) Asymmetric margin**  
+   - **Why not higher:** It’s a loss-side change. While not loss *weighting*, it alters the optimization landscape. The #2 collapse was caused by per-kind gradient scaling; asymmetric margin doesn’t scale gradients but it does change the loss sparsity pattern. In a prose-collision regime, a larger text margin could force the model to over-prioritize text separation, pulling the prose subspace away from conv and breaking conv seeds. The risk/reward is worse than data duplication.
+
+5. **(d) Text-emphasis second phase**  
+   - **Why low:** Starting from an already-specialized checkpoint invites catastrophic forgetting. Code has slack, but conv is fragile. A second phase on text-heavy data would almost certainly break conv. Cleaner to restart from the original backbone with balanced data.
+
+6. **(c) Text-hard-neg (force conv negatives)**  
+   - **Why last:** Directly violates the #3 lesson — loss-structure changes cannot fix a representation weakness. The code hard-neg experiment destroyed code performance. This would likely destroy text or conv. Do not use.
+
+---
+
+### 2. Bias or variance?
+
+The per-seed tradeoff (s0/s2 conv-strong/text-weak, s1/s5 text-strong/conv-weak) is **variance in convergence direction caused by data imbalance**, not pure variance. The model has enough capacity to separate prose, but with only 229 text steps per epoch, the random shuffle order determines whether the text direction solidifies early or gets pulled into the conv attractor. This is a **bias-variance hybrid**: the bias is the step-count deficit; the variance is the seed-dependent outcome.
+
+**Cheap diagnostic:** For each seed, compute the **train margin-ranking loss on text-gold records** at the end of fine-tuning. If text loss is consistently higher than conv loss across all seeds, it’s bias. If text loss is low on text-strong seeds and high on text-weak seeds, it’s variance in convergence. I predict the latter — text-weak seeds will show high text loss, confirming the model failed to fit text, not that it couldn’t.
+
+---
+
+### 3. Loss-side reality check
+
+**There is no AdamW-safe loss-side lever for this problem.** The #2 and #3 failures are definitive: loss weighting collapses under AdamW; loss-structure changes cannot compensate for representation weakness. Asymmetric margin is a loss-structure change — it alters which examples produce non-zero loss. In a regime where the representation is not yet forced to separate text from conv (due to step-count deficit), a larger margin will either be ignored (if the model can’t reach it) or will cause unstable gradients as the model lurches to satisfy it. The track record says: **treat the text flag as purely a data/seeds problem. Do not touch the loss.**
+
+---
+
+### 4. Deep fix now?
+
+**Ranking:**  
+(i) **Cheap text-oversample fine-tune first** — ~1 GPU-hour, zero architectural risk, directly addresses the step-count deficit. If it works, you get a robust single-seed model immediately.  
+(iii) **Ship the ensemble as-is** — acceptable if the fine-tune fails, because the serve ensemble is already green.  
+(ii) **Joint multi-task retrain** — the structural fix, but a multi-day project. Only necessary if the cheap fix fails *and* you need single-seed robustness for future work. The forgetting-validation question is orthogonal; if forgetting is preserved, the ensemble is shippable. The joint retrain is the right long-term move, but not the next step.
+
+---
+
+### 5. Single highest-leverage next step & ship-vs-continue
+
+**Next step:** Run a **2× text-duplication fine-tune from the original `backbone_v2_full.pt`**.
+
+**Exact recipe:**
+- Duplicate every text-gold record once (229 → 458). Keep conv (562) and code (143) unchanged. Total dataset = 1163 records.
+- Use the same `WeightedRandomSampler(replacement=False, weights=sqrt(1/count))` on the new counts. This is still a weighted shuffle; each record appears exactly once per epoch.
+- Fine-tune all 19.5M backbone parameters for 8 epochs, same hyperparameters (lr=1e-5, AdamW wd=0.01 cosine, margin=2.5, hard-neg, pre-state replay, truncated-BPTT-depth-1).
+- After fine-tuning, regen traces, retrain the #5 shared readout (throwaway Linear) on the new backbone states, and evaluate the 6-seed live gate.
+- **Success criterion:** text ≥5/6, conv ≥5/6, code 6/6. If conv drops to 4/6, fall back to a 1.5× duplication (344 text) or add a tiny conv subsample (e.g., drop 10% of conv) — but try 2× first.
+
+**Ship-vs-continue:** **Continue.** Do not ship the current backbone until this experiment concludes. If it passes, ship the new backbone. If it fails, ship the current ensemble (which is already green at serve) and schedule the joint multi-task retrain as a medium-term improvement.

@@ -1,0 +1,406 @@
+{
+  "v1": {
+    "strict": 0,
+    "relaxed": 6,
+    "fp": 0,
+    "avg": 1.28125,
+    "preds": [
+      "agreed",
+      "backend",
+      "chose",
+      "decides",
+      "has",
+      "has_state",
+      "is",
+      "is chosen for",
+      "is going to be",
+      "is now",
+      "runs on",
+      "settled on",
+      "target",
+      "uses",
+      "was green",
+      "will be"
+    ],
+    "rows": [
+      {
+        "id": "F1_database_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 1,
+        "n_new": 1,
+        "preds_old": [
+          "is"
+        ],
+        "preds_new": [
+          "is"
+        ]
+      },
+      {
+        "id": "F2_ticket_status_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1,
+        "preds_old": [
+          "has_state"
+        ],
+        "preds_new": [
+          "has_state"
+        ]
+      },
+      {
+        "id": "F3_deploy_target_field_is",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1,
+        "preds_old": [
+          "target"
+        ],
+        "preds_new": [
+          "is now"
+        ]
+      },
+      {
+        "id": "F4_cache_field_eq",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 1,
+        "n_new": 2,
+        "preds_old": [
+          "is"
+        ],
+        "preds_new": [
+          "is",
+          "uses"
+        ]
+      },
+      {
+        "id": "P5_data_layer_paraphrased",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 1,
+        "preds_old": [
+          "decides",
+          "settled on"
+        ],
+        "preds_new": [
+          "has_state"
+        ]
+      },
+      {
+        "id": "P6_database_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1,
+        "preds_old": [
+          "agreed"
+        ],
+        "preds_new": [
+          "is going to be"
+        ]
+      },
+      {
+        "id": "P7_deploy_target_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 2,
+        "n_new": 2,
+        "preds_old": [
+          "has_state"
+        ],
+        "preds_new": [
+          "has_state"
+        ]
+      },
+      {
+        "id": "P8_framework_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 2,
+        "n_new": 1,
+        "preds_old": [
+          "decides",
+          "has_state"
+        ],
+        "preds_new": [
+          "has_state"
+        ]
+      },
+      {
+        "id": "P9_hosting_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 2,
+        "preds_old": [
+          "decides"
+        ],
+        "preds_new": [
+          "is chosen for",
+          "is going to be"
+        ]
+      },
+      {
+        "id": "P10_ci_runner_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 1,
+        "n_new": 1,
+        "preds_old": [
+          "will be"
+        ],
+        "preds_new": [
+          "is going to be"
+        ]
+      },
+      {
+        "id": "P11_secrets_landed_on",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 1,
+        "preds_old": [
+          "backend",
+          "chose"
+        ],
+        "preds_new": [
+          "runs on"
+        ]
+      },
+      {
+        "id": "P12_pkg_manager_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1,
+        "preds_old": [
+          "agreed"
+        ],
+        "preds_new": [
+          "is going to be"
+        ]
+      },
+      {
+        "id": "P13_region_will_be",
+        "conflict": true,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 2,
+        "n_new": 1,
+        "preds_old": [
+          "is"
+        ],
+        "preds_new": [
+          "is going to be"
+        ]
+      },
+      {
+        "id": "N14_complementary_temporal",
+        "conflict": false,
+        "strict": false,
+        "relaxed": true,
+        "n_old": 1,
+        "n_new": 2,
+        "preds_old": [
+          "was green"
+        ],
+        "preds_new": [
+          "has",
+          "is"
+        ]
+      },
+      {
+        "id": "N15_same_value_no_conflict",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1,
+        "preds_old": [
+          "is"
+        ],
+        "preds_new": [
+          "is"
+        ]
+      },
+      {
+        "id": "N16_different_entity_same_value",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1,
+        "preds_old": [
+          "will be"
+        ],
+        "preds_new": [
+          "will be"
+        ]
+      }
+    ]
+  },
+  "iso": {
+    "strict": 11,
+    "relaxed": 11,
+    "fp": 0,
+    "avg": 5.71875,
+    "class_emit": {
+      "has_state": 35,
+      "decides": 13,
+      "expresses": 29,
+      "questions": 12,
+      "suggests": 18,
+      "explains": 6,
+      "concerns": 31,
+      "involves": 36,
+      "contradicts": 2,
+      "follows_up_on": 1
+    },
+    "rows": [
+      {
+        "id": "F1_database_field",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 6,
+        "n_new": 8
+      },
+      {
+        "id": "F2_ticket_status_field",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 1,
+        "n_new": 1
+      },
+      {
+        "id": "F3_deploy_target_field_is",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 5,
+        "n_new": 5
+      },
+      {
+        "id": "F4_cache_field_eq",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 6,
+        "n_new": 8
+      },
+      {
+        "id": "P5_data_layer_paraphrased",
+        "conflict": true,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 6,
+        "n_new": 3
+      },
+      {
+        "id": "P6_database_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 7,
+        "n_new": 9
+      },
+      {
+        "id": "P7_deploy_target_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 4,
+        "n_new": 11
+      },
+      {
+        "id": "P8_framework_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 7,
+        "n_new": 7
+      },
+      {
+        "id": "P9_hosting_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 7,
+        "n_new": 6
+      },
+      {
+        "id": "P10_ci_runner_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 6,
+        "n_new": 5
+      },
+      {
+        "id": "P11_secrets_landed_on",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 6,
+        "n_new": 3
+      },
+      {
+        "id": "P12_pkg_manager_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 5,
+        "n_new": 6
+      },
+      {
+        "id": "P13_region_will_be",
+        "conflict": true,
+        "strict": true,
+        "relaxed": true,
+        "n_old": 5,
+        "n_new": 3
+      },
+      {
+        "id": "N14_complementary_temporal",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 5,
+        "n_new": 5
+      },
+      {
+        "id": "N15_same_value_no_conflict",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 8,
+        "n_new": 6
+      },
+      {
+        "id": "N16_different_entity_same_value",
+        "conflict": false,
+        "strict": false,
+        "relaxed": false,
+        "n_old": 8,
+        "n_new": 5
+      }
+    ]
+  }
+}
