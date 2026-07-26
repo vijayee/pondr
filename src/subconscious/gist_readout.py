@@ -224,14 +224,19 @@ class GistReadoutModel(nn.Module):
     projection train.
     """
 
-    def __init__(self, encoder: SSMLanguageModel, gist_cfg: GistConfig):
+    def __init__(self, encoder: SSMLanguageModel, gist_cfg: GistConfig,
+                 freeze_encoder: bool = True):
         super().__init__()
         self.encoder = encoder
         self.gist_cfg = gist_cfg
         self.decoder = GistDecoder(encoder.config, gist_cfg)
-        # Freeze the encoder for real. Asserted again in load_gist_readout; kept
-        # here so a model built in code (tests) is correct without the loader.
-        self._freeze_encoder()
+        # Freeze the encoder unless the caller explicitly opts out. The probe /
+        # eval path keeps the default frozen (asserted again in ``load_gist_readout``);
+        # the retrain path passes ``freeze_encoder=False`` so the summary-CE loss can
+        # flow back through the decoder -> ``state_proj`` -> encoder recurrence and
+        # reshape the continuation-shaped state into a gist-shaped one.
+        if freeze_encoder:
+            self._freeze_encoder()
 
     def _freeze_encoder(self) -> None:
         for p in self.encoder.parameters():
@@ -239,22 +244,38 @@ class GistReadoutModel(nn.Module):
         self.encoder.eval()
 
     # ------------------------------------------------------------------ encode
-    @torch.no_grad()
-    def encode(self, doc_ids: Tensor) -> list[Tensor]:
-        """Run the frozen encoder over ``doc_ids`` -> final per-layer states.
+    def encode(self, doc_ids: Tensor, no_grad: bool = True) -> list[Tensor]:
+        """Run the encoder over ``doc_ids`` -> final per-layer states.
 
         ``doc_ids``: ``[batch, seq]`` long tensor (caller truncates to the
         encoder's ``seq_len``; longer docs are truncated, not chunked, for the
         single-doc probe). Returns a list of ``n_enc`` tensors
         ``[batch, d_state, d_model_enc]`` -- the recurrent state that is the only
         doc-specific signal the decoder sees.
+
+        ``no_grad=True`` (default, the probe / eval path): run under
+        ``torch.no_grad()`` with the encoder in eval mode and return DETACHED
+        states -- the encoder is frozen and we want no graph carried into the
+        decoder backward. ``no_grad=False`` (the retrain path, encoder UNFROZEN):
+        run in the graph with the encoder in train mode and return the LIVE
+        states so gradient from the summary-CE loss flows back through the
+        decoder -> ``state_proj`` -> encoder recurrence and reshapes the state.
+        The encoder's params MUST have ``requires_grad=True`` for this to do
+        anything (the trainer thaws them; the loader always re-freezes for eval).
         """
-        self.encoder.eval()
+        if no_grad:
+            with torch.no_grad():
+                self.encoder.eval()
+                _, states = self.encoder.forward(doc_ids)
+                # Detach so no graph is carried from the frozen encoder into the
+                # decoder backward (the encoder is frozen, but detach makes the
+                # boundary explicit and avoids any accidental grad accumulation
+                # into encoder params).
+                return [s.detach() for s in states]
+        # Grad-flowing path: encoder in train mode, states live in the graph.
+        self.encoder.train()
         _, states = self.encoder.forward(doc_ids)
-        # Detach so no graph is carried from the frozen encoder into the decoder
-        # backward (the encoder is frozen, but detach makes the boundary explicit
-        # and avoids any accidental grad accumulation into encoder params).
-        return [s.detach() for s in states]
+        return states
 
     # ----------------------------------------------------------- decode -> text
     @torch.no_grad()
@@ -284,26 +305,43 @@ class GistReadoutModel(nn.Module):
 # --------------------------------------------------------------------------- load
 def load_gist_readout(
     checkpoint_path: str | Path,
-    encoder_checkpoint: str | Path,
-    tokenizer_path: str | Path,
+    encoder_checkpoint: str | Path | None = None,
+    tokenizer_path: str | Path = "",
     device: str = "auto",
     dtype: str = "bfloat16",
 ) -> tuple[GistReadoutModel, TokenizerWrapper]:
-    """Load a trained gist readout + its frozen encoder + tokenizer.
+    """Load a trained gist readout + its encoder + tokenizer.
 
-    Mirrors ``load_backbone``'s strict-mismatch discipline: the encoder checkpoint
-    and the decoder checkpoint are each loaded strict; any missing/unexpected key
-    raises (never silently train on a partial load). The encoder is moved to the
-    resolved device/dtype and frozen for real (``requires_grad=False`` asserted).
+    Two load paths, selected by the checkpoint contents:
+
+      * **Retrain checkpoint** (contains an ``"encoder"`` key, written with
+        ``save_encoder=True``): the encoder is restored strict from the gist
+        checkpoint itself. ``encoder_checkpoint`` is NOT required and is
+        ignored if passed -- the retrained encoder lives in the gist ckpt.
+      * **Probe checkpoint** (no ``"encoder"`` key): the encoder is loaded
+        strict from the separate ``encoder_checkpoint`` file (the token-LM
+        ckpt), as in the frozen-encoder probe.
+
+    Both paths freeze the encoder for EVAL (eval never trains; training-thaw is
+    the trainer's job, not the loader's). Mirrors ``load_backbone``'s
+    strict-mismatch discipline: each state_dict is loaded strict; any
+    missing/unexpected key raises (never silently eval on a partial load).
 
     Returns ``(model, tokenizer)``. The checkpoint format (written by
-    ``scripts/train_gist_readout.py``) is::
+    ``scripts/train_gist_readout.py``)::
 
         {"decoder": <GistDecoder state_dict>,
          "gist_config": <GistConfig dict>,
          "encoder_config": <LMConfig dict>,
          "encoder_ref": <encoder ckpt basename, provenance only>,
-         "step": <int>}
+         "step": <int>,
+         "encoder": <SSMLanguageModel state_dict>  # ONLY if save_encoder=True
+        }
+
+    The positional argument order (``checkpoint_path, encoder_checkpoint,
+    tokenizer_path``) is preserved from the probe so existing callers (notably
+    ``scripts/eval_gist_readout.py``) are unchanged; the retrain path passes
+    ``tokenizer_path`` by keyword and omits ``encoder_checkpoint``.
     """
     from .tokenizer_ import train_or_load_tokenizer  # local import keeps top clean
 
@@ -313,31 +351,50 @@ def load_gist_readout(
     # ---- tokenizer (the cache is canonical; corpus arg unused on load).
     tok = train_or_load_tokenizer(iter([]), tokenizer_path, vocab_size=4096)
 
-    # ---- encoder: load the token-LM checkpoint strict, freeze for real.
-    enc_ckpt = torch.load(encoder_checkpoint, map_location="cpu", weights_only=False)
-    enc_cfg_dict = enc_ckpt["config"] if isinstance(enc_ckpt, dict) and "config" in enc_ckpt else None
-    if enc_cfg_dict is None:
-        raise RuntimeError(
-            f"encoder checkpoint {encoder_checkpoint} has no 'config'; "
-            f"expected a token-LM checkpoint written by scripts/train_token_lm.py"
-        )
-    encoder_cfg = LMConfig(**enc_cfg_dict)
-    encoder = SSMLanguageModel(encoder_cfg).to(device=dev, dtype=dt)
-    enc_sd = enc_ckpt["model"] if "model" in enc_ckpt else enc_ckpt
-    missing, unexpected = encoder.load_state_dict(enc_sd, strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            f"encoder checkpoint {encoder_checkpoint} mismatch: "
-            f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
-        )
-    for p in encoder.parameters():
-        p.requires_grad = False
-    encoder.eval()
-
-    # ---- decoder + readout: load the gist checkpoint strict.
+    # ---- gist checkpoint (read once; carries the decoder + maybe the encoder).
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     gist_cfg = GistConfig(**ckpt["gist_config"])
-    model = GistReadoutModel(encoder, gist_cfg).to(device=dev, dtype=dt)
+
+    # ---- encoder: from the gist ckpt (retrain) or the separate file (probe).
+    if "encoder" in ckpt:
+        # Retrain path: the retrained encoder is in the gist checkpoint.
+        encoder_cfg = LMConfig(**ckpt["encoder_config"])
+        encoder = SSMLanguageModel(encoder_cfg).to(device=dev, dtype=dt)
+        enc_sd = ckpt["encoder"]
+        missing, unexpected = encoder.load_state_dict(enc_sd, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"gist checkpoint {checkpoint_path} encoder mismatch: "
+                f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+            )
+    else:
+        # Probe path: encoder loaded from the separate token-LM checkpoint.
+        if encoder_checkpoint is None:
+            raise RuntimeError(
+                f"gist checkpoint {checkpoint_path} has no 'encoder' key and no "
+                f"encoder_checkpoint was provided (the probe path needs the "
+                f"token-LM checkpoint)"
+            )
+        enc_ckpt = torch.load(encoder_checkpoint, map_location="cpu",
+                              weights_only=False)
+        enc_cfg_dict = enc_ckpt["config"] if isinstance(enc_ckpt, dict) and "config" in enc_ckpt else None
+        if enc_cfg_dict is None:
+            raise RuntimeError(
+                f"encoder checkpoint {encoder_checkpoint} has no 'config'; "
+                f"expected a token-LM checkpoint written by scripts/train_token_lm.py"
+            )
+        encoder_cfg = LMConfig(**enc_cfg_dict)
+        encoder = SSMLanguageModel(encoder_cfg).to(device=dev, dtype=dt)
+        enc_sd = enc_ckpt["model"] if "model" in enc_ckpt else enc_ckpt
+        missing, unexpected = encoder.load_state_dict(enc_sd, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"encoder checkpoint {encoder_checkpoint} mismatch: "
+                f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+            )
+
+    # ---- decoder + readout: build with the encoder, load the decoder strict.
+    model = GistReadoutModel(encoder, gist_cfg, freeze_encoder=True).to(device=dev, dtype=dt)
     dec_sd = ckpt["decoder"]
     missing, unexpected = model.decoder.load_state_dict(dec_sd, strict=False)
     if missing or unexpected:
@@ -345,9 +402,10 @@ def load_gist_readout(
             f"gist checkpoint {checkpoint_path} decoder mismatch: "
             f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
         )
-    # Re-freeze after .to() (moving a module does not flip requires_grad, but the
-    # decoder load + any future edits should not be able to thaw the encoder; this
-    # is the load-time assertion the plan requires).
+    # Re-freeze after .to() and the decoder load for EVAL (eval never trains;
+    # moving a module does not flip requires_grad, but the load + any future
+    # edits should not be able to thaw the encoder -- this is the load-time
+    # assertion the plan requires).
     model._freeze_encoder()
     assert all(not p.requires_grad for p in model.encoder.parameters()), \
         "encoder must be frozen after load"
@@ -378,15 +436,23 @@ def save_gist_checkpoint(
     model: GistReadoutModel,
     step: int,
     encoder_ref: str,
+    save_encoder: bool = False,
 ) -> None:
-    """Write the gist checkpoint (decoder + configs; encoder referenced, not copied)."""
-    torch.save(
-        {
-            "decoder": model.decoder.state_dict(),
-            "gist_config": asdict(model.gist_cfg),
-            "encoder_config": asdict(model.encoder.config),
-            "encoder_ref": encoder_ref,
-            "step": step,
-        },
-        path,
-    )
+    """Write the gist checkpoint.
+
+    By default (probe / eval path) the decoder + configs are saved and the
+    encoder is referenced by ``encoder_ref`` (loaded separately at eval).
+    ``save_encoder=True`` (the retrain path) ALSO writes the retrained encoder
+    state_dict under ``"encoder"`` so the eval loader can restore the whole
+    retrained model from one checkpoint with no separate encoder file.
+    """
+    payload = {
+        "decoder": model.decoder.state_dict(),
+        "gist_config": asdict(model.gist_cfg),
+        "encoder_config": asdict(model.encoder.config),
+        "encoder_ref": encoder_ref,
+        "step": step,
+    }
+    if save_encoder:
+        payload["encoder"] = model.encoder.state_dict()
+    torch.save(payload, path)

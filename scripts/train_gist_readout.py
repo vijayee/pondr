@@ -39,6 +39,10 @@ import torch.nn.functional as F
 from torch import Tensor
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# scripts/ on the path so the collapse-watchdog helpers can be reused from the
+# token-LM trainer (DRY: the encoder-continuation ppl is exactly train_token_lm's
+# eval_perplexity; no reason to copy it).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.subconscious.gist_readout import (  # noqa: E402
     GistConfig,
@@ -51,6 +55,10 @@ from src.subconscious.tokenizer_ import (  # noqa: E402
     EOS_ID,
     PAD_ID,
     train_or_load_tokenizer,
+)
+from train_token_lm import (  # noqa: E402
+    build_dataset as build_continuation_chunks,
+    eval_perplexity as eval_continuation_perplexity,
 )
 
 ERAG_PATH = "scripts/_scratch/erag/data/documents/test.parquet"
@@ -87,24 +95,28 @@ def _cosine_warmup_lr(step: int, warmup: int, total: int, base_lr: float) -> flo
 
 # ----------------------------------------------------------- flash gist teacher (copied)
 def flash_summarize(content: str, cache: dict, cache_path: Path) -> str | None:
-    """One-sentence gist of ``content`` via local Ollama flash. Cached by sha1.
+    """Variable-length qualitative summary of ``content`` via local Ollama flash.
 
-    Lifted from ``scripts/_scratch/_content_probe_stageB.py`` (the literal §3.3
-    Stage-B teacher) and kept self-contained here so the trainer does not import
-    from ``_scratch/``. Public ERAG content only.
+    Cached by sha1(content). The teacher is explicitly length-agnostic: a short
+    doc gets a short summary, a dense doc gets a longer multi-sentence one. The
+    retrain target is a QUALITATIVE summary, not a fixed-budget one-sentence gist
+    (user directive: do not constrain the size of the summary). The full
+    multi-line response is kept (no ``split("\\n")[0]`` truncation); ``num_predict``
+    is generous so the teacher is not cut off. Public ERAG content only.
     """
     key = hashlib.sha1(content.encode("utf-8")).hexdigest()
     if key in cache:
         return cache[key]
     prompt = (
-        "Summarize the following document in ONE concise sentence. "
-        "Capture the key topic, decision, or content. Reply with only the sentence.\n\n"
+        "Summarize the following document. Capture the key topic, decisions, and "
+        "content at a length appropriate to the document -- a short doc gets a short "
+        "summary, a dense doc gets a longer one. Reply with only the summary.\n\n"
         + content[:4000]
     )
     import urllib.request
     payload = json.dumps({"model": LLM_MODEL, "prompt": prompt,
                           "stream": False, "options": {"temperature": 0.2,
-                                                        "num_predict": 128}}).encode()
+                                                        "num_predict": 256}}).encode()
     try:
         req = urllib.request.Request(OLLAMA_URL, data=payload,
                                      headers={"Content-Type": "application/json"})
@@ -113,7 +125,6 @@ def flash_summarize(content: str, cache: dict, cache_path: Path) -> str | None:
         text = resp.get("response", "").strip()
         if not text:
             return None
-        text = text.split("\n")[0].strip()
         cache[key] = text
         cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
         return text
@@ -177,7 +188,9 @@ def train(args) -> int:
     tok = train_or_load_tokenizer(iter([]), args.tokenizer_cache, vocab_size=args.vocab)
     print(f"[tok] vocab_size={tok.vocab_size} (cache={args.tokenizer_cache})", flush=True)
 
-    # ---- frozen encoder: load the token-LM checkpoint strict.
+    # ---- encoder: load the token-LM checkpoint strict. Frozen for the probe
+    # (--train-encoder off); for the retrain the encoder is thawed by the model
+    # build + warmup logic below (not here), so gradient can reshape the state.
     enc_ckpt = torch.load(args.encoder_checkpoint, map_location="cpu", weights_only=False)
     enc_cfg = LMConfig(**enc_ckpt["config"])
     encoder = SSMLanguageModel(enc_cfg).to(device=device, dtype=dtype)
@@ -188,13 +201,19 @@ def train(args) -> int:
             f"encoder checkpoint mismatch: missing={list(missing)[:8]} "
             f"unexpected={list(unexpected)[:8]}"
         )
-    for p in encoder.parameters():
-        p.requires_grad = False
-    encoder.eval()
-    print(f"[encoder] loaded {args.encoder_checkpoint} "
-          f"({encoder.num_parameters():,} params, FROZEN)", flush=True)
+    if args.train_encoder:
+        print(f"[encoder] loaded {args.encoder_checkpoint} "
+              f"({encoder.num_parameters():,} params, TRAINABLE -- retrain)", flush=True)
+    else:
+        for p in encoder.parameters():
+            p.requires_grad = False
+        encoder.eval()
+        print(f"[encoder] loaded {args.encoder_checkpoint} "
+              f"({encoder.num_parameters():,} params, FROZEN)", flush=True)
 
-    # ---- readout model (decoder + state projection; trainable).
+    # ---- readout model (decoder + state projection; trainable). For the retrain
+    # the encoder is also trainable (freeze_encoder=False); the warmup logic
+    # below freezes it for the decoder-only phase, then thaws it.
     gist_cfg = GistConfig(
         vocab=tok.vocab_size,
         d_model_dec=args.d_model_dec,
@@ -207,11 +226,19 @@ def train(args) -> int:
         bos_token_id=BOS_ID,
         eos_token_id=EOS_ID,
     )
-    model = GistReadoutModel(encoder, gist_cfg).to(device=device, dtype=dtype)
-    # .to() does not flip requires_grad; re-freeze to be safe.
-    model._freeze_encoder()
+    model = GistReadoutModel(encoder, gist_cfg,
+                             freeze_encoder=not args.train_encoder).to(device=device, dtype=dtype)
+    # .to() does not flip requires_grad; re-assert the freeze for the probe path.
+    if not args.train_encoder:
+        model._freeze_encoder()
     n_train = model.trainable_parameters()
-    print(f"[decoder] {n_train:,} trainable params (encoder frozen)", flush=True)
+    n_enc = sum(p.numel() for p in model.encoder.parameters())
+    if args.train_encoder:
+        print(f"[model] decoder+proj {n_train:,} trainable; encoder {n_enc:,} params "
+              f"(thawed after warmup)", flush=True)
+    else:
+        print(f"[model] decoder+proj {n_train:,} trainable params (encoder frozen)",
+              flush=True)
 
     # ---- data: stream ERAG, split DOCS train/val (held-out docs, not tokens).
     print(f"[data] streaming ERAG from {ERAG_PATH} (target={args.target})", flush=True)
@@ -231,7 +258,7 @@ def train(args) -> int:
 
     # ---- targets: title (free) or flash gist (cached teacher).
     if args.target == "gist":
-        cache_path = Path(args.output_dir) / "gist_teacher_cache.json"
+        cache_path = Path(args.output_dir) / "gist_teacher_cache_v2.json"
         cache: dict = {}
         if cache_path.exists():
             cache = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -274,10 +301,25 @@ def train(args) -> int:
     uniform_ce = math.log(tok.vocab_size)
     print(f"[gate] uniform baseline CE = log(vocab) = {uniform_ce:.3f}", flush=True)
 
-    # ---- optimizer (decoder only; encoder frozen out of the optim).
-    optim = torch.optim.AdamW(model.decoder.parameters(),
-                             lr=args.lr, betas=(0.9, 0.95),
-                             weight_decay=args.weight_decay)
+    # ---- optimizer. Probe path: decoder only. Retrain path: two param groups --
+    # decoder at args.lr, encoder at args.lr * args.encoder_lr_scale. The encoder
+    # group's LR is 0 during the decoder-only warmup (and the encoder is
+    # requires_grad=False then, so no grad is computed either); it is restored to
+    # the scaled LR when the encoder thaws.
+    if args.train_encoder:
+        enc_params = list(model.encoder.parameters())
+        dec_params = list(model.decoder.parameters())
+        optim = torch.optim.AdamW(
+            [
+                {"params": dec_params, "lr": args.lr},          # group 0: decoder
+                {"params": enc_params, "lr": 0.0},              # group 1: encoder (0 in warmup)
+            ],
+            betas=(0.9, 0.95), weight_decay=args.weight_decay,
+        )
+    else:
+        optim = torch.optim.AdamW(model.decoder.parameters(),
+                                 lr=args.lr, betas=(0.9, 0.95),
+                                 weight_decay=args.weight_decay)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -288,6 +330,33 @@ def train(args) -> int:
     total_steps = args.steps
     print(f"[train] {n} pairs, batch {batch_size} -> {steps_per_epoch} steps/epoch, "
           f"{total_steps} total steps", flush=True)
+
+    # ---- collapse watchdog (retrain only): encoder continuation val ppl on
+    # held-out ERAG chunks (the val docs -- held-out from gist TRAINING). Reuses
+    # train_token_lm.eval_perplexity on model.encoder. A blow-up vs the frozen
+    # baseline means the language prior was destroyed (the retrain collapsed).
+    enc_val_ppl_start = float("nan")
+    enc_val_ppl_end = float("nan")
+    watchdog_chunks: list[list[int]] | None = None
+    if args.train_encoder:
+        tc = build_continuation_chunks([c for _, c in val_raw], tok, enc_cfg.seq_len)
+        watchdog_chunks = tc.chunks
+        enc_val_ppl_start = eval_continuation_perplexity(
+            model.encoder, watchdog_chunks, batch_size, device, enc_cfg.vocab)
+        print(f"[watchdog] encoder continuation val ppl (start, frozen baseline) = "
+              f"{enc_val_ppl_start:.2f}", flush=True)
+
+    # ---- warmup: freeze the encoder for the first --encoder-warmup-steps so the
+    # decoder learns to read the (insufficient) frozen state first (the probe
+    # setup), THEN thaw so gradient pressure falls on the encoder only where the
+    # readout cannot already solve it.
+    encoder_unfrozen = not (args.train_encoder and args.encoder_warmup_steps > 0)
+    if args.train_encoder and not encoder_unfrozen:
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        model.encoder.eval()
+        print(f"[warmup] encoder FROZEN for first {args.encoder_warmup_steps} steps "
+              f"(decoder-only), then thaws", flush=True)
 
     model.decoder.train()
     step = 0
@@ -302,14 +371,28 @@ def train(args) -> int:
             idx = perm[bi:bi + batch_size]
             if not idx:
                 continue
+            # Thaw the encoder at the end of the decoder-only warmup.
+            if args.train_encoder and not encoder_unfrozen and step >= args.encoder_warmup_steps:
+                for p in model.encoder.parameters():
+                    p.requires_grad = True
+                model.train()
+                encoder_unfrozen = True
+                enc_lr = _cosine_warmup_lr(step, args.warmup, total_steps, args.lr) \
+                         * args.encoder_lr_scale
+                optim.param_groups[1]["lr"] = enc_lr
+                print(f"[warmup] encoder UNFROZEN at step {step}; "
+                      f"enc_lr={enc_lr:.2e}", flush=True)
+
             doc_ids = torch.tensor([train_pairs[i][0] for i in idx],
                                    dtype=torch.long, device=device)
             gist_ids = torch.tensor([train_pairs[i][1] for i in idx],
                                     dtype=torch.long, device=device)
-            # Encode with the frozen encoder (no grad), decode teacher-forced.
+            # Encode: detached (frozen) during warmup; grad-flowing once thawed so
+            # the summary-CE loss reshapes the encoder state end-to-end.
+            no_grad_enc = not (args.train_encoder and encoder_unfrozen)
             with torch.autocast(device_type=device.type, enabled=(dtype != torch.float32),
                                  dtype=dtype):
-                enc_states = model.encode(doc_ids)
+                enc_states = model.encode(doc_ids, no_grad=no_grad_enc)
                 logits = model.decoder.forward(gist_ids, enc_states)
                 logits = logits[:, :-1, :].float().reshape(-1, gist_cfg.vocab)
                 targets = gist_ids[:, 1:].reshape(-1)
@@ -317,10 +400,13 @@ def train(args) -> int:
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), 1.0)
+            clip_params = model.parameters() if (args.train_encoder and encoder_unfrozen) \
+                         else model.decoder.parameters()
+            torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
             lr = _cosine_warmup_lr(step, args.warmup, total_steps, args.lr)
-            for g in optim.param_groups:
-                g["lr"] = lr
+            optim.param_groups[0]["lr"] = lr
+            if args.train_encoder and encoder_unfrozen:
+                optim.param_groups[1]["lr"] = lr * args.encoder_lr_scale
             optim.step()
 
             running += loss.item() * targets.ne(PAD_ID).sum().item()
@@ -330,22 +416,41 @@ def train(args) -> int:
                 mean_ce = running / max(running_n, 1)
                 ppl = math.exp(min(mean_ce, 20.0))
                 rate = step / (time.time() - t_start)
+                watchdog_str = ""
+                if watchdog_chunks is not None:
+                    wd_ppl = eval_continuation_perplexity(
+                        model.encoder, watchdog_chunks, batch_size, device, enc_cfg.vocab)
+                    watchdog_str = f"  enc_val_ppl {wd_ppl:.1f}"
+                    # eval_perplexity set the encoder to eval; restore train mode.
+                    if args.train_encoder and encoder_unfrozen:
+                        model.train()
+                    else:
+                        model.decoder.train()
                 print(f"[step {step:>5}/{total_steps}] train CE {mean_ce:.3f}  "
-                      f"ppl {ppl:.2f}  lr {lr:.2e}  {rate:.2f} step/s", flush=True)
+                      f"ppl {ppl:.2f}  lr {lr:.2e}  {rate:.2f} step/s{watchdog_str}",
+                      flush=True)
                 running = 0.0
                 running_n = 0
             if step % args.checkpoint_every == 0:
                 save_gist_checkpoint(out_dir / f"gist_step{step}.pt", model, step,
-                                     Path(args.encoder_checkpoint).name)
+                                     Path(args.encoder_checkpoint).name,
+                                     save_encoder=args.train_encoder)
 
-    # ---- final checkpoint + val perplexity + a few generations.
+    # ---- final checkpoint + val perplexity + final watchdog.
     final_path = out_dir / "gist_final.pt"
-    save_gist_checkpoint(final_path, model, step, Path(args.encoder_checkpoint).name)
+    save_gist_checkpoint(final_path, model, step, Path(args.encoder_checkpoint).name,
+                         save_encoder=args.train_encoder)
     print(f"[ckpt] saved {final_path}", flush=True)
 
     val_ppl = eval_perplexity(model, val_pairs, args.batch_size, device)
     print(f"[val] held-out-docs gist perplexity = {val_ppl:.2f}  "
           f"(CE {math.log(val_ppl):.3f})", flush=True)
+
+    if watchdog_chunks is not None:
+        enc_val_ppl_end = eval_continuation_perplexity(
+            model.encoder, watchdog_chunks, batch_size, device, enc_cfg.vocab)
+        print(f"[watchdog] encoder continuation val ppl (end) = {enc_val_ppl_end:.2f}  "
+              f"(start {enc_val_ppl_start:.2f}; collapse if >>x baseline)", flush=True)
 
     summary = {
         "target": args.target,
@@ -362,6 +467,12 @@ def train(args) -> int:
         "doc_seq_len": args.doc_seq_len,
         "gist_seq_len": args.gist_seq_len,
         "encoder_ref": Path(args.encoder_checkpoint).name,
+        # Retrain-only fields (NaN for the probe path):
+        "train_encoder": args.train_encoder,
+        "encoder_lr_scale": args.encoder_lr_scale,
+        "encoder_warmup_steps": args.encoder_warmup_steps,
+        "encoder_val_ppl_start": enc_val_ppl_start,
+        "encoder_val_ppl_end": enc_val_ppl_end,
     }
     (out_dir / "run_summary.json").write_text(json.dumps(summary, indent=2),
                                               encoding="utf-8")
@@ -383,7 +494,9 @@ def main() -> int:
     ap.add_argument("--d-model-dec", type=int, default=96)
     ap.add_argument("--n-layers-dec", type=int, default=2)
     ap.add_argument("--doc-seq-len", type=int, default=128)
-    ap.add_argument("--gist-seq-len", type=int, default=48)
+    ap.add_argument("--gist-seq-len", type=int, default=256,
+                    help="variable-length summary MAX (decoder memory budget, NOT a "
+                         "quality cap); targets are EOS-terminated, PAD-filled")
     # training
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--steps", type=int, default=1500)
@@ -391,6 +504,16 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=100)
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=0)
+    # encoder training (the retrain). Default OFF = the frozen-encoder probe.
+    ap.add_argument("--train-encoder", action="store_true",
+                    help="unfreeze the encoder and train end-to-end (the retrain); "
+                         "off = the frozen-encoder probe path")
+    ap.add_argument("--encoder-lr-scale", type=float, default=0.1,
+                    help="encoder LR = this x decoder LR (differential LR; the encoder "
+                         "reshapes slowly, the decoder adapts to read it)")
+    ap.add_argument("--encoder-warmup-steps", type=int, default=0,
+                    help="decoder-only warmup: the encoder is frozen for this many "
+                         "steps then thaws (0 = thaw immediately, no warmup)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--log-every", type=int, default=50)

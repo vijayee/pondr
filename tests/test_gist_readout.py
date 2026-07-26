@@ -188,3 +188,89 @@ def test_swap_control_follows_state():
     # Distinct states produce distinct gists (swapping CHANGES the output): the
     # literal anti-§3.3 property.
     assert out_a != out_b, "swapping states must change the decoded gist (§3.3 failed here)"
+
+
+# --------------------------------------------------- retrain path (encoder thawed)
+def test_encoder_receives_grad_when_unfrozen():
+    """The retrain path: with ``freeze_encoder=False`` and the grad-flowing encode
+    (``no_grad=False``), a backward through the summary-CE loss must reach BOTH the
+    decoder AND the encoder. This is the inverted mirror of
+    ``test_decoder_grad_does_not_reach_encoder`` (the frozen probe path) and is the
+    load-bearing property the retrain depends on: gradient pressure from the
+    summary loss flows back through the decoder -> ``state_proj`` -> encoder
+    recurrence to reshape the continuation-state into a gist-shaped state.
+    """
+    # Construct with freeze_encoder=False (the retrain path); the encoder must
+    # be trainable, NOT frozen by the constructor.
+    enc = SSMLanguageModel(_enc_cfg())
+    m = GistReadoutModel(enc, _gist_cfg(), freeze_encoder=False)
+    assert any(p.requires_grad for p in m.encoder.parameters()), \
+        "encoder must be trainable when freeze_encoder=False"
+
+    doc = torch.randint(3, 32, (2, 5))
+    gist_ids = torch.tensor([[BOS, 5, 6, EOS, PAD, PAD], [BOS, 7, 8, EOS, PAD, PAD]])
+    # Grad-flowing encode: states are LIVE in the graph (not detached).
+    enc_states = m.encode(doc, no_grad=False)
+    logits = m.decoder.forward(gist_ids, enc_states)
+    targets = gist_ids[:, 1:]
+    loss = F.cross_entropy(
+        logits[:, :-1, :].reshape(-1, m.gist_cfg.vocab),
+        targets.reshape(-1),
+        ignore_index=PAD,
+    )
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in m.encoder.parameters()), \
+        "encoder params must receive grad on the retrain path"
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in m.decoder.parameters()), \
+        "decoder params must receive grad on the retrain path"
+
+
+def test_save_load_roundtrips_retrained_encoder(tmp_path):
+    """A retrain checkpoint (``save_encoder=True``) carries the retrained encoder
+    in the gist ckpt, and ``load_gist_readout`` restores it WITHOUT a separate
+    encoder checkpoint (the retrain path). The loaded encoder's state_dict must
+    match what was saved, and the loader must re-freeze the encoder for eval.
+    """
+    import os
+
+    from src.subconscious.gist_readout import (
+        load_gist_readout,
+        save_gist_checkpoint,
+    )
+
+    # Build with freeze_encoder=False (the retrain path) so the encoder is
+    # trainable; save with save_encoder=True (the retrain signature).
+    enc = SSMLanguageModel(_enc_cfg())
+    m = GistReadoutModel(enc, _gist_cfg(), freeze_encoder=False)
+    with torch.no_grad():
+        for p in m.encoder.parameters():
+            p.add_(0.01 * torch.randn_like(p))
+
+    ckpt_path = tmp_path / "gist_retrain.pt"
+    tok_path = tmp_path / "tok.json"
+    save_gist_checkpoint(ckpt_path, m, step=42, encoder_ref="retrained",
+                        save_encoder=True)
+    assert ckpt_path.exists(), "checkpoint must be written"
+    # The retrain checkpoint must carry the encoder key (the retrain signature).
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    assert "encoder" in raw, "retrain checkpoint must contain an 'encoder' key"
+
+    # Load WITHOUT a separate encoder checkpoint (retrain path: the encoder lives
+    # in the gist ckpt). device=cpu, dtype=float32 keeps the test CPU/self-contained.
+    loaded, tok = load_gist_readout(
+        ckpt_path, tokenizer_path=str(tok_path), device="cpu", dtype="float32",
+    )
+    # The loaded encoder must match the saved encoder (the roundtrip).
+    saved_sd = {k: v.clone() for k, v in m.encoder.state_dict().items()}
+    loaded_sd = loaded.encoder.state_dict()
+    assert set(saved_sd.keys()) == set(loaded_sd.keys()), \
+        "encoder state_dict keys must match after roundtrip"
+    for k in saved_sd:
+        assert torch.equal(saved_sd[k], loaded_sd[k]), \
+            f"encoder param '{k}' must roundtrip exactly"
+    # The loader re-freezes the encoder for eval (eval never trains).
+    assert all(not p.requires_grad for p in loaded.encoder.parameters()), \
+        "loaded encoder must be frozen for eval"
+    assert tok is not None
