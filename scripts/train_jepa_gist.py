@@ -64,6 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.subconscious.jepa_gist import (  # noqa: E402
     JEPAGistModel,
     LatentPredictorConfig,
+    jepa_infonce_loss,
     save_jepa_checkpoint,
 )
 from src.subconscious.token_lm import LMConfig, SSMLanguageModel  # noqa: E402
@@ -83,6 +84,31 @@ from train_token_lm import (  # noqa: E402
 DEFAULT_TOK_CACHE = "data/token_lm/tokenizer.json"
 DEFAULT_ENCODER_CKPT = "data/token_lm/token_lm_final.pt"
 DEFAULT_OUTPUT_DIR = "data/jepa_gist"
+
+
+# ----------------------------------------------------------- latent loss choice
+# The OLD ``jepa_contrastive_loss`` (reused from the JEPA backbone pretrain) is
+# DEGENERATE for a tight target cluster: its negative term
+# ``logsumexp(cos(pred,negs)/temp)`` is unbounded below while its positive term
+# ``-cos(pred,actual)`` is bounded [-1,1], so anti-correlating with the cluster
+# (``pred = -actual``) gives a LOWER loss than ``pred = actual`` -- the predictor
+# finds the degenerate optimum and val_latent_cos collapses to ~-0.84 (the
+# measured failure on the first retrain). ``jepa_infonce_loss`` puts the
+# positive in the SAME cross-entropy denominator as the negatives, so the
+# optimum is ``pred = actual``; it is the default. ``contrastive`` is kept
+# only to reproduce the degenerate run.
+_LATENT_LOSSES = {
+    "infonce": jepa_infonce_loss,
+    "contrastive": jepa_contrastive_loss,
+}
+
+
+def _latent_loss_fn(name: str):
+    try:
+        return _LATENT_LOSSES[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown --loss {name!r}; choose one of {sorted(_LATENT_LOSSES)}")
 
 
 # ----------------------------------------------------------- device/dtype (copied)
@@ -169,11 +195,15 @@ def build_latent_cache(gist_cache: dict, out_path: Path, device: torch.device,
 # ----------------------------------------------------------------- val metrics
 @torch.no_grad()
 def eval_val_latent(model: JEPAGistModel, val_batch, latent_targets: torch.Tensor,
-                    negatives: torch.Tensor, temperature: float, device) -> tuple[float, float]:
-    """Val latent-cosine (mean cos(pred, target)) + val contrastive loss.
+                    negatives: torch.Tensor, temperature: float, device,
+                    loss_fn) -> tuple[float, float]:
+    """Val latent-cosine (mean cos(pred, target)) + val latent loss.
 
     ``val_batch``: list of doc-id lists. ``latent_targets``: [b, 384] L2-normed bge
     latents for those docs. ``negatives``: [n, 384] sampled from the full pool.
+    ``loss_fn``: the latent loss (``jepa_infonce_loss`` or
+    ``jepa_contrastive_loss``) -- the same function used in the train loop, so
+    the val loss is comparable to the train loss.
     """
     model.eval()
     doc_ids = torch.tensor(val_batch, dtype=torch.long, device=device)
@@ -182,7 +212,7 @@ def eval_val_latent(model: JEPAGistModel, val_batch, latent_targets: torch.Tenso
     targets = latent_targets.to(device=device, dtype=pred.dtype)
     neg = negatives.to(device=device, dtype=pred.dtype)
     cos = F.cosine_similarity(pred, targets, dim=-1).mean().item()
-    loss = jepa_contrastive_loss(pred, targets, neg, temperature).item()
+    loss = loss_fn(pred, targets, neg, temperature).item()
     # restore train mode if the caller is mid-train (the caller re-asserts).
     return cos, loss
 
@@ -192,7 +222,8 @@ def train(args) -> int:
     torch.manual_seed(args.seed)
     device = _resolve_device(args.device)
     dtype = _resolve_dtype(args.dtype, device)
-    print(f"[device] {device}  [dtype] {dtype}", flush=True)
+    loss_fn = _latent_loss_fn(args.loss)
+    print(f"[device] {device}  [dtype] {dtype}  [loss] {args.loss}", flush=True)
 
     # ---- tokenizer (shared with the encoder).
     tok = train_or_load_tokenizer(iter([]), args.tokenizer_cache, vocab_size=args.vocab)
@@ -446,7 +477,7 @@ def train(args) -> int:
                     lm_logits = lm_logits.detach()
                     enc_states = [s.detach() for s in enc_states]
                     pred = model.predict_latent(enc_states)
-                latent_loss = jepa_contrastive_loss(
+                latent_loss = loss_fn(
                     pred, targets, negatives, args.temperature)
                 # LM-prior auxiliary: next-token CE on the doc (the encoder's own
                 # logits). Anti-collapse: penalizes the continuation-prior blowup.
@@ -524,10 +555,11 @@ def train(args) -> int:
         val_neg = pool_tensor[neg_idx]
         # eval_val_latent handles its own batching for the whole val set at once.
         val_latent_cos, val_contrastive_loss = eval_val_latent(
-            model, val_doc_ids, val_targets, val_neg, args.temperature, device)
+            model, val_doc_ids, val_targets, val_neg, args.temperature, device,
+            loss_fn)
         # restore train mode if retrain mid-train (no-op here -- training is done).
         print(f"[val] held-out-docs latent cosine = {val_latent_cos:.4f}  "
-              f"contrastive loss = {val_contrastive_loss:.3f}", flush=True)
+              f"{args.loss} loss = {val_contrastive_loss:.3f}", flush=True)
 
     if watchdog_chunks is not None:
         enc_val_ppl_end = eval_continuation_perplexity(
@@ -538,6 +570,7 @@ def train(args) -> int:
 
     summary = {
         "objective": "jepa_latent",
+        "loss": args.loss,
         "latent_dim": latent_cfg.latent_dim,
         "hidden": latent_cfg.hidden,
         "n_mlp_layers": latent_cfg.n_mlp_layers,
@@ -599,6 +632,11 @@ def main() -> int:
     ap.add_argument("--num-negatives", type=int, default=16,
                     help="contrastive negatives sampled from the full latent pool per step")
     ap.add_argument("--temperature", type=float, default=0.1)
+    ap.add_argument("--loss", choices=sorted(_LATENT_LOSSES), default="infonce",
+                    help="latent loss: 'infonce' (default, bounded; optimum "
+                         "pred=actual) or 'contrastive' (the reused jepa_contrastive_loss; "
+                         "DEGENERATE for a tight target cluster -- kept only to "
+                         "reproduce the first retrain's anti-correlation collapse)")
     ap.add_argument("--require-cached-gists", action="store_true",
                     help="skip gist-cache misses WITHOUT calling Ollama (CPU grad-flow "
                          "sanity); off = flash_summarize fills misses via Ollama (real run)")

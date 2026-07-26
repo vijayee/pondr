@@ -33,6 +33,8 @@ runs:
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -307,3 +309,76 @@ def test_jepa_contrastive_loss_smoke():
     loss = jepa_contrastive_loss(predicted, actual, negatives, temperature=0.1)
     assert loss.dim() == 0, "loss must be a scalar"
     assert torch.isfinite(loss), f"loss must be finite, got {loss}"
+
+
+# ----------------------------------------------------- infonce loss (the fix)
+def test_jepa_infonce_loss_smoke():
+    """``jepa_infonce_loss`` accepts the predictor's ``[b, dim]`` output, the
+    ``[b, dim]`` target, and ``[n, dim]`` negatives, and returns a finite scalar."""
+    from src.subconscious.jepa_gist import jepa_infonce_loss
+
+    b, dim, n = 4, 8, 16
+    predicted = F.normalize(torch.randn(b, dim), p=2, dim=-1)
+    actual = F.normalize(torch.randn(b, dim), p=2, dim=-1)
+    negatives = F.normalize(torch.randn(n, dim), p=2, dim=-1)
+    loss = jepa_infonce_loss(predicted, actual, negatives, temperature=0.1)
+    assert loss.dim() == 0, "loss must be a scalar"
+    assert torch.isfinite(loss), f"loss must be finite, got {loss}"
+
+
+def test_infonce_prefers_actual_over_anticorrelation():
+    """The load-bearing test that would have caught the degeneracy BEFORE the
+    42-min retrain. On a TIGHT target cluster (bge gist latents of similar docs are
+    all cos ~0.7 -- they cluster), the OLD ``jepa_contrastive_loss`` is minimized by
+    ANTI-correlating with the cluster (``pred = -actual``), not by ``pred = actual``
+    -- its unbounded negative term overwhelms the bounded positive term. The
+    ``jepa_infonce_loss`` fix puts the positive in the same denominator as the
+    negatives, so its optimum is ``pred = actual``: the loss ordering is
+    actual < mean < anti. This test pins both facts (regression guard for the fix).
+    """
+    from src.subconscious.jepa_gist import jepa_infonce_loss
+    from src.subconscious.training.jepa_loss import jepa_contrastive_loss
+
+    torch.manual_seed(42)
+    dim = 64
+    # A tight cluster: one "mean direction" + small random perturbations, all
+    # L2-normalized -- mirrors bge gist latents of semantically-similar docs
+    # (mean-vs-member cos ~0.7, the regime where the real retrain collapsed to
+    # val_latent_cos = -0.84). The noise scale MUST be << 1/sqrt(dim): a flat
+    # 0.5 in dim=64 produces a near-orthogonal (cos~0), unclustered set in which
+    # the loss is NOT degenerate and the assertion below does not hold. We
+    # parametrize as noise = c/sqrt(dim) so the cluster tightness
+    # (cos ~ 1/sqrt(1+c^2)) is dimension-independent: c=1.0 -> cos~0.707.
+    mean_dir = F.normalize(torch.randn(1, dim), p=2, dim=-1)
+    cluster_noise = 1.0 / math.sqrt(dim)
+    def _cluster(n):
+        return F.normalize(mean_dir + cluster_noise * torch.randn(n, dim), p=2,
+                           dim=-1)
+    actual = _cluster(8)                       # [8, dim] -- the per-doc targets
+    negatives = _cluster(32)                  # [32, dim] -- the negative pool
+    temp = 0.1
+    # Three candidate predictions of the same shape as `actual`:
+    pred_actual = actual.clone()              # the correct optimum
+    pred_mean = mean_dir.expand_as(actual)    # cluster-mean collapse (anti-shortcut target)
+    pred_anti = -actual                       # the degenerate anti-correlation optimum
+
+    # InfoNCE (the fix): optimum is pred=actual. Ordering actual < mean < anti.
+    infonce_actual = jepa_infonce_loss(pred_actual, actual, negatives, temp).item()
+    infonce_mean = jepa_infonce_loss(pred_mean, actual, negatives, temp).item()
+    infonce_anti = jepa_infonce_loss(pred_anti, actual, negatives, temp).item()
+    assert infonce_actual < infonce_mean, \
+        f"InfoNCE should prefer pred=actual ({infonce_actual:.3f}) over mean " \
+        f"({infonce_mean:.3f})"
+    assert infonce_mean < infonce_anti, \
+        f"InfoNCE should prefer mean ({infonce_mean:.3f}) over anti-correlation " \
+        f"({infonce_anti:.3f})"
+
+    # The OLD contrastive loss is DEGENERATE here: anti < actual (anti-correlation
+    # is the LOWER loss). This is the regression guard documenting the bug we fixed.
+    con_actual = jepa_contrastive_loss(pred_actual, actual, negatives, temp).item()
+    con_anti = jepa_contrastive_loss(pred_anti, actual, negatives, temp).item()
+    assert con_anti < con_actual, (
+        f"the old contrastive loss should be degenerate (anti {con_anti:.3f} < "
+        f"actual {con_actual:.3f}) -- this assertion documents the bug; if it "
+        f"fails the loss is no longer degenerate and the fix can be reconsidered"
+    )

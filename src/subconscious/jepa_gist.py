@@ -66,6 +66,42 @@ from .token_lm import LMConfig, SSMLanguageModel
 from .tokenizer_ import TokenizerWrapper
 
 
+def jepa_infonce_loss(predicted: Tensor, actual: Tensor, negatives: Tensor,
+                      temperature: float = 0.1) -> Tensor:
+    """InfoNCE loss for the gist-latent objective (the bounded contrastive loss).
+
+    The reused ``jepa_contrastive_loss`` (``training/jepa_loss.py``) is DEGENERATE
+    for this target space: its negative term
+    ``logsumexp(cos(pred, negatives)/temp)`` is unbounded below, so with a tight
+    target cluster (bge gist latents of similar docs are all cos ~0.7) the loss is
+    MINIMIZED by anti-correlating with the whole cluster -- ``pred = -actual`` --
+    not by ``pred = actual``. The negative term (down to ~``-1/temp + log(N)``)
+    overwhelms the bounded positive term (``-cos(pred, actual)`` in [-1, 1]). The
+    predictor correctly finds this degenerate optimum, producing cos(pred, actual)
+    ~ -0.84 (anti-correlated, the measured failure).
+
+    The fix is the standard InfoNCE: put the positive in the SAME denominator as
+    the negatives so the predictor cannot win by running from both. The optimum is
+    ``pred = actual`` (positive beats the negatives), and the loss is bounded
+    below by 0. ``predicted``/``actual`` are ``[b, dim]`` L2-normalized; ``negatives``
+    is ``[n, dim]`` L2-normalized. The positive is index 0 in each row's logits.
+
+    For a tight cluster the margin is small but correct: at ``pred = actual``,
+    ``s_pos = 1/temp`` vs ``s_neg ~ 0.7/temp``, so the positive wins and the loss is
+    ~``-log(1/(1 + N*exp(-3)))`` (~0.55 for N=16, temp=0.1). At ``pred = mean`` (the
+    collapse the anti-shortcut is meant to prevent), ``s_pos = s_neg`` and the loss
+    is ``log(N+1)`` (~2.83) -- so the objective actively rewards doc-specificity.
+    """
+    pos = F.cosine_similarity(predicted, actual, dim=-1) / temperature      # [b]
+    neg = F.cosine_similarity(
+        predicted.unsqueeze(1), negatives.unsqueeze(0), dim=-1,
+    ) / temperature                                                          # [b, n]
+    logits = torch.cat([pos.unsqueeze(1), neg], dim=1)                      # [b, 1+n]
+    targets = torch.zeros(predicted.shape[0], dtype=torch.long,
+                          device=predicted.device)                          # positive @ idx 0
+    return F.cross_entropy(logits, targets)
+
+
 @dataclass
 class LatentPredictorConfig:
     """Architecture hyperparameters for the gist-latent predictor head.
