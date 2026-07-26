@@ -100,7 +100,13 @@ def pool_encoder_states(enc_states: list[Tensor]) -> Tensor:
         raise ValueError("pool_encoder_states called with no state tensors")
     per_layer = []
     for st in enc_states:
-        s = st.to(torch.float32)  # [b, d_state, d_model_enc]
+        # Preserve the input dtype (bf16 on GPU, fp32 on CPU). The mean over
+        # d_state is numerically safe in bf16, and preserving dtype keeps the
+        # pooled tensor compatible with the predictor's MLP weights OUTSIDE
+        # autocast (a forced fp32 cast here would hand a bf16 Linear a fp32
+        # input and raise a dtype-mismatch once autocast is off -- which is
+        # exactly the eval path and the trainer's post-training val).
+        s = st
         if s.dim() == 3:
             per_layer.append(s.mean(dim=1))        # [b, d_model_enc]
         elif s.dim() == 2:
