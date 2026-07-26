@@ -155,7 +155,10 @@ def build_latent_cache(gist_cache: dict, out_path: Path, device: torch.device,
     emb = _build_bge_embedder(device)
     vecs = _bge_encode(emb, texts, batch_size=batch_size)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out_path, keys=np.array(keys, dtype=object),
+    # Fixed-width unicode dtype (sha1 hex = 40 chars) so the npz loads with
+    # allow_pickle=False (an object-array dtype would require allow_pickle=True).
+    key_width = max((len(k) for k in keys), default=1)
+    np.savez(out_path, keys=np.array(keys, dtype=f"U{key_width}"),
              vectors=vecs.astype(np.float32))
     cache = {k: vecs[i] for i, k in enumerate(keys)}
     print(f"[latent] encoded {len(cache)} latents (384-d, L2-norm) in "
