@@ -158,6 +158,41 @@ history but is no longer the served default.
    text-out path. This is the cheapest open question and the one most likely to
    rehabilitate the SSM.
 
+   > **STATUS 2026-07-25: PROBED -- FAIL.** The content probe ran (scripts/_scratch/
+   > _content_probe_stageA.py + _content_probe_traces.py + _content_probe_stageB.py;
+   > full result in memory: pondr-jst-content-probe-result). Two stages, both with
+   > the de-wonk guards the §6.1 probe lacked.
+   >
+   > - **Stage A (per-input identity fidelity + retrieval) -- PASS -> escalate.**
+   >   The state carries per-input identity at low lag: retrieval MRR 0.567 intra /
+   >   0.468 cross, both beat echo-last-input (0.295 / 0.066). Random-anchor
+   >   discrimination 0.69 (above chance), permutation regresses to ~0. Not
+   >   identity-only at recency -- so NOT a blanket "state is useless" result.
+   > - **Stage B (aggregated gist -- the real §3.3 test) -- FAIL.** On ERAG 400
+   >   doc-streams (genuinely diverse targets, cross-chain cosine 0.70). Concat
+   >   target: cos_main 0.848 loses to max-single-turn 0.930, mean-pool 0.962,
+   >   chain-mean 0.922; lift over the permutation null 0.013 (real_signal=False);
+   >   lift over chain-mean -0.073 (negative). LLM-summary target (the primary
+   >   gist, deepseek-flash rewrite): cos_main 0.769 beats max-single 0.742 -- but
+   >   loses to mean-pool 0.774 and chain-mean 0.870, and the permutation guard is
+   >   decisive: perm 0.765 ≈ corpus-mean 0.766 ≈ main 0.769 -> the state->gist map
+   >   is null-level (lift 0.004). The "beat max-single" is because a single chunk
+   >   is a poor rewrite baseline, NOT because the state aggregates content; a
+   >   simple window mean-pool beats the state decoder.
+   >
+   > **Verdict: the state does NOT carry aggregated content (compressed meaning).**
+   > Content -- like relevance 3x before it -- is NOT in the identity-shaped state.
+   > Both halves of "the state carries X" (relevance, content) are now falsified;
+   > the state's viable job is selective buffer + recoverability (probed, AUC 0.81).
+   > "Compressed meaning out of the SSM" requires training a content/token objective
+   > into a NEW backbone (vocab head + token CE) -- a retrain, not a bolt-on
+   > decoder -- consistent with §6 (state shape set by the OBJECTIVE). The shipped
+   > `ssm_chunker` ID-pointer (re-hydrate by ID, not by decoding state) remains the
+   > live text-out mechanism. The JST proposal's text-out / gist heads (gated on
+   > this probe) do NOT proceed; the buffer/recoverability heads are the state's
+   > viable job.
+
+
 4. **Relevance probe (NEW, never run -- should have been).** Before any relevance
    head, probe whether a query-conditioned reader can extract relevance from the
    state at all. The distill WAS this probe retroactively, and it returned 0.235

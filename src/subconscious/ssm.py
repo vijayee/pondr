@@ -122,16 +122,119 @@ class ReferenceSSM(nn.Module):
         return self._step(x, state)
 
 
+class SelectiveSSM(nn.Module):
+    """Mamba1-lineage selective state-space model (pure PyTorch, owned).
+
+    First-principles block for a CONTENT / aggregation objective. Unlike
+    ``ReferenceSSM`` (a dev stand-in whose single sigmoid gate ``g`` COUPLES the
+    write ``g*b`` and the forget ``1-g`` -- writing a lot forces forgetting a lot,
+    which fights accumulation), this block DECOUPLES decay and write:
+
+      Δ   = softplus(W_Δ(x))             # input-dependent step  [b, d_state]
+      Ā   = exp(-Δ · A)                   # input-dependent decay  (A is a
+      #                                 learned per-channel param, NOT tied to the
+      #                                 write gate -> write-and-keep is possible)
+      B   = W_B(x)                       # input-dependent write  [b, d_state, d_model]
+      C   = W_C(x)                       # input-dependent read   [b, d_state, d_model]
+      h_t = Ā · h_{t-1} + Δ · B          # selective retention + write
+      y_t = Σ_channels (C · h_t) + D · x # read + skip
+
+    ``Δ`` modulates BOTH decay and write strength (the Mamba selectivity lever:
+    large Δ = forget-old + write-new; small Δ = keep-old + barely-write), while
+    ``A`` is a separate learned per-channel decay rate. This is the structure a
+    content compressor needs. Same state shape ``[batch, d_state, d_model]`` as
+    ``ReferenceSSM`` -> drop-in to the ``SSMBackend`` protocol and the existing
+    ``JGSBackbone`` / ``JGSInstance`` / ``WorkingMemory`` plumbing.
+
+    Both ``forward()`` (sequence, the pre-training path) and ``step()`` (single
+    token, the live-serve + generation path) are REAL -- no ``NotImplementedError``
+    stub (unlike the community mamba3-pytorch ref at ``ssm.py:185``). The sequence
+    path is a Python loop over timesteps (like ``ReferenceSSM``); correct and
+    owned, not the fastest possible scan. For a small LM this is fine; a chunked
+    parallel scan is a later optimization if training latency demands it.
+    """
+
+    def __init__(self, config: BackboneConfig):
+        super().__init__()
+        self._d_model = config.d_model
+        self._d_state = config.d_state
+        # Input-dependent step size (selectivity lever). softplus keeps Δ > 0.
+        self.W_Δ = nn.Linear(config.d_model, config.d_state)
+        # Learned per-channel decay rate (log space for stable exp). Mamba inits
+        # A = arange(1, d_state+1) so channels span a range of decay rates.
+        A = torch.arange(1, config.d_state + 1, dtype=torch.float32)
+        self.A_log = nn.Parameter(torch.log(A))
+        # Input-dependent write and read (B, C).
+        self.W_B = nn.Linear(config.d_model, config.d_state * config.d_model)
+        self.W_C = nn.Linear(config.d_model, config.d_state * config.d_model)
+        # Skip connection.
+        self.D = nn.Parameter(torch.ones(config.d_model))
+
+    @property
+    def d_model(self) -> int:
+        return self._d_model
+
+    @property
+    def d_state(self) -> int:
+        return self._d_state
+
+    def init_state(self, batch: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        return torch.zeros(batch, self._d_state, self._d_model, device=device, dtype=dtype)
+
+    def _step(self, x: Tensor, state: Tensor) -> tuple[Tensor, Tensor]:
+        # x: [batch, d_model], state: [batch, d_state, d_model]
+        b = x.shape[0]
+        Δ = torch.nn.functional.softplus(self.W_Δ(x))            # [b, d_state]
+        A = self.A_log.exp()                                     # [d_state]
+        Ā = torch.exp(-Δ * A.unsqueeze(0))                      # [b, d_state]
+        B = self.W_B(x).view(b, self._d_state, self._d_model)    # [b, d_state, d_model]
+        C = self.W_C(x).view(b, self._d_state, self._d_model)   # [b, d_state, d_model]
+        new_state = Ā.unsqueeze(-1) * state + Δ.unsqueeze(-1) * B  # [b, d_state, d_model]
+        y = (C * new_state).sum(dim=1) + self.D * x              # [b, d_model]
+        return y, new_state
+
+    def forward(self, x: Tensor, state: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
+        # x: [batch, seq, d_model]. Vectorized: precompute the per-timestep
+        # projections (W_Δ, W_B, W_C) in three batched matmuls over the whole
+        # sequence, then loop ONLY the recurrence (elementwise exp/mul/sum). Same
+        # math as _step() iterated -- moving the heavy Linear projections out of
+        # the per-timestep loop removes ~3*seq kernel launches, a large speedup
+        # for the training path. ``step()`` (single-token, the live/generation
+        # path) still uses ``_step`` unchanged.
+        batch, seq, _ = x.shape
+        if state is None:
+            state = self.init_state(batch, x.device, x.dtype)
+        Δ = torch.nn.functional.softplus(self.W_Δ(x))            # [b, seq, d_state]
+        A = self.A_log.exp()                                     # [d_state]
+        B = self.W_B(x).view(batch, seq, self._d_state, self._d_model)
+        C = self.W_C(x).view(batch, seq, self._d_state, self._d_model)
+        outputs = []
+        for t in range(seq):
+            Ā = torch.exp(-Δ[:, t] * A)                          # [b, d_state]
+            state = Ā.unsqueeze(-1) * state + Δ[:, t].unsqueeze(-1) * B[:, t]
+            y = (C[:, t] * state).sum(dim=1) + self.D * x[:, t]   # [b, d_model]
+            outputs.append(y)
+        out = torch.stack(outputs, dim=1)                         # [batch, seq, d_model]
+        return out, state
+
+    def step(self, x: Tensor, state: Tensor) -> tuple[Tensor, Tensor]:
+        return self._step(x, state)
+
+
 def make_ssm(backend: str, config: BackboneConfig) -> SSMBackend:
     """Factory for an SSM backend by name.
 
-    ``backend``: ``"reference"`` | ``"mamba3-pytorch"`` | ``"mamba3-cuda"``.
-    The Mamba3 variants are lazily imported so this module has no hard
-    dependency on ``mamba_ssm`` or the community reference (neither builds on
-    this Windows dev box).
+    ``backend``: ``"reference"`` | ``"selective"`` | ``"mamba3-pytorch"`` |
+    ``"mamba3-cuda"``. The Mamba3 variants are lazily imported so this module has
+    no hard dependency on ``mamba_ssm`` or the community reference (neither builds
+    on this Windows dev box). ``"selective"`` is the owned first-principles block
+    (``SelectiveSSM``); ``"reference"`` is kept for back-compat with the shipped
+    bge backbone and its tests.
     """
     if backend == "reference":
         return ReferenceSSM(config)
+    if backend == "selective":
+        return SelectiveSSM(config)
     if backend == "mamba3-pytorch":
         return Mamba3PyTorchBackend(config)
     if backend == "mamba3-cuda":

@@ -32,8 +32,10 @@ class BackboneConfig:
     pred_layers: int = 3
     pred_dim: int = 384  # == d_model == bge-small dim: predict next embedding
 
-    # SSM backend selection: "reference" (CPU dev), "mamba3-pytorch" (faithful
-    # CPU reference), "mamba3-cuda" (official mamba_ssm.Mamba3 on the pod).
+    # SSM backend selection: "reference" (CPU dev stand-in, the shipped bge
+    # backbone), "selective" (owned first-principles Mamba1-lineage block, the
+    # token-LM / content-objective path), "mamba3-pytorch" (faithful CPU ref),
+    # "mamba3-cuda" (official mamba_ssm.Mamba3 on the pod).
     ssm_backend: str = "reference"
 
 
