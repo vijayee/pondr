@@ -51,8 +51,14 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# scripts/ on the path so we can reuse the trainer's EXACT teacher prompt (the
+# gold gist for a summary-trained model must come from the same distribution it
+# was trained on -- using the title for a --target gist model would be a false
+# negative: the state carries summary-shaped content, not title-shaped).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.subconscious.gist_readout import load_gist_readout  # noqa: E402
+from train_gist_readout import flash_summarize as _teacher_summarize  # noqa: E402
 
 ERAG_PATH = "scripts/_scratch/erag/data/documents/test.parquet"
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -240,6 +246,35 @@ def run_gate(args) -> int:
         print("[gate] not enough held-out docs; abort.", flush=True)
         return 1
 
+    # ---- gold gist per doc: the doc TITLE (probe --target title) or the deepseek
+    # SUMMARY (retrain --target gist). The likelihood-swap test recovers the SAME
+    # target the model was trained on; a summary-trained model's state carries
+    # summary-shaped content, so the gold gist must be a summary, not the title.
+    # Summaries are generated (and cached) via the trainer's exact flash_summarize
+    # so the gold distribution matches the training distribution.
+    gold_gists: list[str | None] = []
+    if args.target == "gist":
+        cache_path = (Path(args.gist_cache) if args.gist_cache
+                      else Path(args.output_dir) / "gist_teacher_cache_v2.json")
+        cache: dict = {}
+        if cache_path.exists():
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        print(f"[target] gold gist = deepseek summary (cache={cache_path}, "
+              f"{len(cache)} cached); generating for held-out docs...", flush=True)
+        t0 = time.time()
+        for i, (title, content) in enumerate(docs):
+            g = _teacher_summarize(content, cache, cache_path)
+            gold_gists.append(g)
+            if (i + 1) % 10 == 0:
+                print(f"  [gold] {i + 1}/{len(docs)} ({time.time() - t0:.0f}s)",
+                      flush=True)
+        n_valid = sum(1 for g in gold_gists if g)
+        print(f"[target] {n_valid}/{len(docs)} gold summaries ready "
+              f"({time.time() - t0:.0f}s)", flush=True)
+    else:
+        gold_gists = [title for title, _ in docs]
+        print(f"[target] gold gist = doc title (probe --target title)", flush=True)
+
     # ---- 1-3: faithfulness / compression / fluency on each doc.
     print("\n[gate 1-3] per-doc faithfulness / compression / fluency:", flush=True)
     faithful = 0
@@ -285,8 +320,13 @@ def run_gate(args) -> int:
     idxs = list(range(len(docs)))
     rng.shuffle(idxs)
     for k in range(0, min(args.n_swap_pairs * 2, len(idxs) - 1), 2):
-        pairs.append((idxs[k], idxs[k + 1]))
-    pairs = pairs[:args.n_swap_pairs]
+        ia, ib = idxs[k], idxs[k + 1]
+        # Skip a pair if either doc's gold gist is missing (teacher failure) --
+        # mixing a title fallback in here would contaminate the swap target.
+        if gold_gists[ia] and gold_gists[ib]:
+            pairs.append((ia, ib))
+        if len(pairs) >= args.n_swap_pairs:
+            break
     like_correct = 0
     margins: list[float] = []
     state_gaps: list[float] = []     # ||state_A - state_B|| -- do states differ per doc?
@@ -303,8 +343,8 @@ def run_gate(args) -> int:
         tb, cb = docs[ib]
         st_a = encode_doc(model, tok, ca, args, device)
         st_b = encode_doc(model, tok, cb, args, device)
-        ga = _gist_ids(tok, ta, args).to(device)
-        gb = _gist_ids(tok, tb, args).to(device)
+        ga = _gist_ids(tok, gold_gists[ia], args).to(device)
+        gb = _gist_ids(tok, gold_gists[ib], args).to(device)
         nll_a_a = gist_nll(model, ga, st_a)  # own gist, own state
         nll_a_b = gist_nll(model, ga, st_b)  # own gist, OTHER state
         nll_b_b = gist_nll(model, gb, st_b)
@@ -426,6 +466,13 @@ def main() -> int:
     ap.add_argument("--encoder-checkpoint", default="data/token_lm/token_lm_final.pt")
     ap.add_argument("--tokenizer-cache", default="data/token_lm/tokenizer.json")
     ap.add_argument("--output-dir", default="data/gist_readout")
+    ap.add_argument("--target", choices=["title", "gist"], default="title",
+                    help="gold gist to recover in the swap test: the doc title "
+                         "(probe --target title) or the deepseek summary (retrain "
+                         "--target gist). MUST match the model's training target.")
+    ap.add_argument("--gist-cache", default="",
+                    help="path to the teacher gist cache (sha1(content)->summary); "
+                         "used and extended when --target gist")
     ap.add_argument("--max-eval-docs", type=int, default=60)
     ap.add_argument("--n-swap-pairs", type=int, default=25)
     ap.add_argument("--eval-offset", type=int, default=DEFAULT_EVAL_OFFSET)
