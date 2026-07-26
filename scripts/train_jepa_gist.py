@@ -423,12 +423,26 @@ def train(args) -> int:
             neg_idx = torch.randint(0, pool_tensor.shape[0], (args.num_negatives,))
             negatives = pool_tensor[neg_idx].to(device=device, dtype=dtype)  # [n, 384]
 
-            # Encode: detached (frozen) during warmup; grad-flowing once thawed so
-            # the JEPA-latent loss reshapes the encoder state end-to-end.
-            no_grad_enc = not (args.train_encoder and encoder_unfrozen)
+            # Encode: during the predictor-only warmup the encoder is FROZEN, so we
+            # run one no_grad encoder forward (detached states + detached lm_logits)
+            # and the predictor STILL trains -- grad flows through the predictor
+            # weights on the detached states (a backward through pred reaches the
+            # predictor params even when the state input is detached). Once the
+            # encoder is thawed, the full grad-flowing forward reshapes the encoder
+            # state end-to-end. (The no_grad=True path of model.forward is NOT used
+            # here because it detaches pred too, killing the predictor's grad.)
+            thawed = args.train_encoder and encoder_unfrozen
             with torch.autocast(device_type=device.type, enabled=(dtype != torch.float32),
                                  dtype=dtype):
-                pred, lm_logits, _enc_states = model.forward(doc_ids, no_grad=no_grad_enc)
+                if thawed:
+                    pred, lm_logits, _enc_states = model.forward(doc_ids, no_grad=False)
+                else:
+                    with torch.no_grad():
+                        model.encoder.eval()
+                        lm_logits, enc_states = model.encoder.forward(doc_ids)
+                    lm_logits = lm_logits.detach()
+                    enc_states = [s.detach() for s in enc_states]
+                    pred = model.predict_latent(enc_states)
                 latent_loss = jepa_contrastive_loss(
                     pred, targets, negatives, args.temperature)
                 # LM-prior auxiliary: next-token CE on the doc (the encoder's own
