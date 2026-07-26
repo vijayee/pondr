@@ -255,7 +255,7 @@ def test_latent_swap_follows_state():
     """
     torch.manual_seed(0)
     m = _build(latent_dim=8, hidden=16, n_mlp_layers=2)
-    # Doc A and B are distinct token streams (content tokens >= 3,避开 PAD/BOS/EOS).
+    # Doc A and B are distinct token streams (content tokens >= 3, avoid PAD/BOS/EOS).
     doc_a = torch.tensor([[BOS, 3, 3, 3, EOS]])
     doc_b = torch.tensor([[BOS, 4, 4, 4, EOS]])
     # Two DISTINCT target latents (L2-normalized), standing in for the bge gist
