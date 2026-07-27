@@ -71,6 +71,14 @@ def build_ponder(
     context_builder_path: Optional[str] = None,
     strm_salience: bool = False,
     salience_thresholds_path: Optional[str] = None,
+    fade_memory: bool = False,
+    fade_memory_voice_path: Optional[str] = None,
+    fade_memory_tokenizer_path: Optional[str] = None,
+    fade_memory_top_k: int = 5,
+    fade_memory_decay: float = 0.99,
+    fade_memory_cos_gist: float = 0.40,
+    fade_memory_ring_capacity: int = 32,
+    fade_memory_expand_tokens: int = 64,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -153,6 +161,31 @@ def build_ponder(
             falls back to the heuristic PresentationGate on any exception, empty
             ring, or no matching slots, so the turn never crashes. ``None``
             (default) -> heuristic PresentationGate (byte-identical to pre-3).
+        fade_memory: when True, construct a ``FadeMemory`` (the dual-SSM fade,
+            ``src/subconscious/fade.py``) and inject it into the orchestrator. It
+            reuses THIS ``embedder`` (the one bge instance -- no second load) and
+            ingests each (user, assistant) exchange per turn; on each query it
+            routes relevant past anchors to their regime (verbatim / gist /
+            forgotten) and surfaces them as ``result["fade_recalls"]`` for
+            observation. Phase A: observability + ingest only -- the recalls are
+            NOT fed into the LLM context, so the user-facing response is byte-
+            identical to flag-off. Default False (byte-identical to pre-fade).
+        fade_memory_voice_path: optional token-LM checkpoint for the SSM-B voice
+            leg (Regime 3 expands the retrieved blurb via continuation). When
+            ``None`` (default), Regime 3 returns the blurb verbatim (built-in
+            passthrough) -- so Phase A runs WITHOUT loading the token-LM (its ckpt
+            is on HF, not local). Requires ``fade_memory_tokenizer_path`` when set.
+        fade_memory_tokenizer_path: the token-LM tokenizer path (required when
+            ``fade_memory_voice_path`` is set).
+        fade_memory_top_k: how many past anchors to route per query (default 5).
+        fade_memory_decay: SSM-A EWMA decay -- the fade timescale (default 0.99
+            -> ~8-16-turn gist window at one chunk per exchange).
+        fade_memory_cos_gist: the gist/forgotten regime boundary on the free
+            cosine router (default 0.40 -- calibrated for REAL bge-small by the
+            cross-domain eval, ``scripts/eval_fade_cross_domain.py``).
+        fade_memory_ring_capacity: the recency verbatim window (default 32).
+        fade_memory_expand_tokens: SSM-B continuation length for a gist (default
+            64; unused when ``fade_memory_voice_path`` is None).
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -285,6 +318,36 @@ def build_ponder(
         from .subconscious.salience import load_salience_thresholds
         salience_thresholds = load_salience_thresholds(salience_thresholds_path)
 
+    # Fade memory (optional, Phase A). When ``fade_memory`` is set, construct a
+    # ``FadeMemory`` that reuses THIS ``embedder`` (the one bge instance -- no
+    # second load) and an optional token-LM voice. The voice leg loads only when
+    # ``fade_memory_voice_path`` is given; otherwise Regime 3 returns the blurb
+    # verbatim (built-in passthrough), so Phase A runs without the token-LM ckpt
+    # (it is on HF, not local). ``None`` (default) -> no fade memory at serve
+    # (byte-identical to pre-fade). The orchestrator gates every read on
+    # ``self._fade is not None``; recalls are surfaced as ``result["fade_recalls"]``
+    # for observation only -- NOT fed into the LLM context (Phase A scope).
+    fade_mem = None
+    if fade_memory:
+        from .subconscious.fade import FadeConfig, FadeMemory, load_token_lm_voice
+        voice = None
+        if fade_memory_voice_path:
+            if not fade_memory_tokenizer_path:
+                raise ValueError(
+                    "fade_memory_voice_path requires fade_memory_tokenizer_path "
+                    "(the token-LM voice leg needs its tokenizer).")
+            voice = load_token_lm_voice(
+                fade_memory_voice_path, fade_memory_tokenizer_path,
+                device=device)
+        fade_cfg = FadeConfig(
+            decay=fade_memory_decay,
+            cos_gist=fade_memory_cos_gist,
+            ring_capacity=fade_memory_ring_capacity,
+            expand_tokens=fade_memory_expand_tokens,
+            regime2_enabled=False,  # Stage 2 readout is deprioritized (probe #31)
+        )
+        fade_mem = FadeMemory(fade_cfg, embedder, voice, dim=384)
+
     orch = PonderOrchestrator(
         store=store,
         retriever=retriever,
@@ -303,6 +366,8 @@ def build_ponder(
         context_builder=context_builder,
         strm_salience=strm_salience,
         salience_thresholds=salience_thresholds,
+        fade_memory=fade_mem,
+        fade_memory_top_k=fade_memory_top_k,
     )
     return orch
 

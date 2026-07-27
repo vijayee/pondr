@@ -43,10 +43,12 @@ The four regimes (selected per-anchor by ``e(i,t)`` at recall time):
      says "forgotten" rather than confabulating. The graceful floor
      (metacognition / tip-of-tongue).
 
-Isolated module: no orchestrator/runtime/serve changes. The voice (SSM-B) and the
-embedder (bge) are injected (``Voice`` / ``Embedder`` protocols) so the unit test
-runs CPU-only with synthetic vectors and a test-double voice; production wires
-the real token-LM (``load_token_lm_voice``) + bge (``bge_embedder``).
+Isolated module: no orchestrator/runtime/serve IMPORTS (the wiring flows one way --
+``runtime.build_ponder`` constructs and injects a ``FadeMemory``; this module never
+imports the serve path). The voice (SSM-B) and the embedder (bge) are injected
+(``Voice`` / ``Embedder`` protocols) so the unit test runs CPU-only with synthetic
+vectors and a test-double voice; production wires the real token-LM
+(``load_token_lm_voice``) + the shared bge embedder (reused from ``build_ponder``).
 """
 
 from __future__ import annotations
@@ -62,6 +64,16 @@ REGIME_VERBATIM = 1     # ring / state-fresh -> exact text
 REGIME_FILL = 2         # Transformer fill-holes (Stage 2, deprioritized)
 REGIME_GIST = 3         # faded state retrieves a blurb -> SSM-B expands
 REGIME_FORGOTTEN = 4    # tip-of-tongue floor -> "forgotten" marker
+
+# Human-readable regime names (kept here next to the labels so callers -- the
+# orchestrator, the eval scripts -- do not each redefine the mapping; the eval
+# scripts' own ``REGIME_NAME`` mirror this).
+REGIME_NAME: dict[int, str] = {
+    REGIME_VERBATIM: "verbatim",
+    REGIME_FILL: "fill",
+    REGIME_GIST: "gist",
+    REGIME_FORGOTTEN: "forgotten",
+}
 
 
 class Embedder(Protocol):
@@ -328,11 +340,14 @@ class FadeMemory:
     ``e(i,t) = 1 - cos(state_t, bge(anchor_i))`` -- no trained head, no ridge fit
     (the channel is in bge space). ``ingest`` streams a chunk; ``recall_anchor``
     routes one anchor to its regime; ``recall`` routes a query's relevant past
-    anchors.
+    anchors. ``voice`` is optional: when ``None``, Regime 3 returns the retrieved
+    blurb verbatim (the built-in passthrough -- no separate stub voice class), so
+    the memory runs without loading the token-LM; production wires the real
+    token-LM (``load_token_lm_voice``) for continuation expansion.
     """
 
-    def __init__(self, cfg: FadeConfig, embedder: Embedder, voice: Voice,
-                 dim: int = 384) -> None:
+    def __init__(self, cfg: FadeConfig, embedder: Embedder,
+                 voice: Optional[Voice] = None, dim: int = 384) -> None:
         self.cfg = cfg
         self.embedder = embedder
         self.voice = voice
@@ -422,6 +437,11 @@ class FadeMemory:
         if not hits:
             return Recall(anchor_id, REGIME_FORGOTTEN, cos_i, content="[forgotten]")
         _, _, blurb = hits[0]
+        # ``voice is None`` -> the built-in passthrough: return the retrieved blurb
+        # verbatim (no token-LM loaded). Production wires ``TokenLMVoice`` for
+        # continuation expansion; tests + the Phase-A serve path run passthrough.
+        if self.voice is None:
+            return Recall(anchor_id, regime, cos_i, content=blurb, blurb=blurb)
         expanded = self.voice.expand(blurb, self.cfg.expand_tokens)
         return Recall(anchor_id, regime, cos_i, content=expanded, blurb=blurb)
 

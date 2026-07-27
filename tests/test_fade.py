@@ -219,6 +219,28 @@ def test_regime4_forgotten_no_confabulation() -> None:
     assert voice.calls == []
 
 
+def test_voice_none_passes_blurb_verbatim() -> None:
+    # ``voice=None`` (the Phase-A serve path, no token-LM loaded) -> Regime 3
+    # returns the retrieved blurb VERBATIM (the built-in passthrough), with no
+    # ``[expanded]`` suffix. Sweep cross-doc chunks past the anchor (mirrors
+    # test_regime_sweep_hits_all_three_and_voice_for_gist) to land in R3, then
+    # assert the passthrough content.
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.9, cos_ring=0.95, cos_gist=0.20, ring_capacity=4)
+    mem = FadeMemory(cfg, emb, None)           # no voice
+    aid = mem.ingest("docA:0")
+    first_r3: Recall | None = None
+    for i in range(24):
+        mem.ingest(f"doc{i+1}:0")              # cross-doc fades `aid`
+        r = mem.recall_anchor(aid)
+        if r.regime == REGIME_GIST and first_r3 is None:
+            first_r3 = r
+    assert first_r3 is not None, "never reached R3 (gist)"
+    assert first_r3.content == first_r3.blurb   # passthrough: content IS the blurb
+    assert "[expanded]" not in first_r3.content  # no voice was called
+    assert first_r3.blurb is not None            # a blurb was retrieved (the gist)
+
+
 def test_regime2_off_medium_e_is_gist() -> None:
     # Default (regime2_enabled=False): medium-e falls through to R3 (gist).
     emb = _StubEmbedder()

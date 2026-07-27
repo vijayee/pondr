@@ -69,6 +69,7 @@ from .tools import (
 
 if TYPE_CHECKING:
     from .encoding.encoder import HippocampalEncoder
+    from .subconscious.fade import FadeMemory
 
 from .encoding.distill_worker import DistillWorker
 
@@ -183,6 +184,8 @@ class PonderOrchestrator:
         salience_thresholds=None,
         identity_instance: bool = False,
         capture_pre_state: bool = False,
+        fade_memory: "Optional[FadeMemory]" = None,
+        fade_memory_top_k: int = 5,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -313,6 +316,23 @@ class PonderOrchestrator:
         # The gap metric needs a message's source_id to REPEAT across the later
         # turns whose rings it appears in — the prefix+turn id does that.
         self._strm_ring_text_turn_counter: int = 0
+        # Fade memory (Phase A, optional DI like the encoder). When wired it
+        # ingests each (user, assistant) exchange -- building the SSM-A fade
+        # state over a real session -- and on each query runs ``recall``,
+        # surfacing the routed recalls as ``result["fade_recalls"]``. Phase A
+        # is observability + ingest only: the recalls are NOT fed into the
+        # retrieval/presentation/LLM-context flow yet, so the user-facing
+        # response is byte-identical whether the flag is on or off. ``None``
+        # (the default, flag off) -> no fade wiring -> byte-identical to
+        # pre-fade. Sits ALONGSIDE WorkingMemory (not replacing it). Best-
+        # effort: any failure in recall/ingest is swallowed (the turn proceeds
+        # unchanged), mirroring ``_run_salience_hook``.
+        self._fade = fade_memory
+        self._fade_top_k = fade_memory_top_k
+        self._fade_regime_names: dict[int, str] = {}
+        if fade_memory is not None:
+            from src.subconscious.fade import REGIME_NAME  # local, light import
+            self._fade_regime_names = dict(REGIME_NAME)
 
         # The cross-query Working Memory (persistent state). embedder injected so
         # WM can embed episodes/queries on demand. ``ring_capacity`` overrides
@@ -657,6 +677,27 @@ class PonderOrchestrator:
             episodes = fired + [ep for ep in episodes
                                 if ep.get("episode_id") not in salience_fired_ids]
 
+        # Fade memory recall (Phase A observability only -- NOT fed into the
+        # retrieval/presentation/LLM-context flow). Runs on every query when a
+        # FadeMemory is wired, surfaces the routed recalls as
+        # ``result["fade_recalls"]``. Best-effort: swallowed on any failure so
+        # the turn never breaks. Empty when ``self._fade is None`` (flag off).
+        fade_recalls: list = []
+        if self._fade is not None:
+            try:
+                names = self._fade_regime_names
+                for r in self._fade.recall(user_prompt, top_k=self._fade_top_k):
+                    fade_recalls.append({
+                        "anchor_id": r.anchor_id,
+                        "regime": r.regime,
+                        "regime_name": names.get(r.regime, "?"),
+                        "cos": r.cos,
+                        "content": r.content,
+                        "blurb": r.blurb,
+                    })
+            except Exception as e:  # noqa: BLE001 - observability only
+                print(f"[fade-recall-fail] {e}", file=sys.stderr)
+
         # 4. inject each retrieved episode into WM as a gist step.
         if episodes and self.embedder is not None:
             # STRM 1f-6: prefer the prose ``embed_text`` handle (the LLM-written
@@ -871,6 +912,11 @@ class PonderOrchestrator:
         if salience_armed:
             result["salience_signals"] = self._salience_signals or []
             result["salience_gap_text"] = format_salience_gap(self._salience_signals or [])
+        # Fade memory (Phase A): surface the routed recalls for observation. Key
+        # ABSENT when ``self._fade is None`` (flag off) -> byte-identical to
+        # pre-fade. NOT fed into the LLM context this phase.
+        if self._fade is not None:
+            result["fade_recalls"] = fade_recalls
 
         # Phase 3a Task 7: auto-record the presentation outcome with the
         # MEASURED expand_count (the durable salience signal from 2c §15).
@@ -958,11 +1004,22 @@ class PonderOrchestrator:
         return with ``response: None``).
         """
         try:
+            response = result.get("response")
+            has_response = isinstance(response, str) and response.strip()
+            # Fade memory ingest (Phase A): one chunk per exchange, joined user+
+            # assistant. Runs BEFORE the encoder check so the fade advances even
+            # when no HippocampalEncoder is wired (the fade memory is independent
+            # of the episode store). Best-effort, swallowed on any failure so
+            # the turn never breaks. ``None`` (flag off) -> no-op.
+            if self._fade is not None and has_response:
+                try:
+                    self._fade.ingest(f"User: {user_prompt}\nAssistant: {response}")
+                except Exception as fe:  # noqa: BLE001 - never break persist
+                    print(f"[fade-ingest-fail] {fe}", file=sys.stderr)
             encoder = self._get_encoder()
             if encoder is None:
                 return
-            response = result.get("response")
-            if not isinstance(response, str) or not response.strip():
+            if not has_response:
                 return
             if encoder.session_id is None:
                 encoder.start_session()  # one conversation session per instance

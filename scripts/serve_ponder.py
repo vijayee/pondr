@@ -212,6 +212,49 @@ def main() -> int:
                         "surprise_cap percentiles on the 2b/2a/2c val "
                         "distributions). Required when --strm-salience is set; "
                         "without it the trigger disarms (byte-identical).")
+    # ── Fade memory (Phase A: gated, observability + ingest) ──
+    p.add_argument("--fade-memory", action="store_true", default=False,
+                   help="attach a FadeMemory (the dual-SSM fade, "
+                        "src/subconscious/fade.py) alongside WorkingMemory. It "
+                        "reuses the one bge embedder and ingests each (user, "
+                        "assistant) exchange; on each query it routes relevant "
+                        "past anchors to their regime (verbatim / gist / "
+                        "forgotten) and surfaces them as result[\"fade_recalls\"]. "
+                        "PHASE A: observability + ingest only -- the recalls are "
+                        "NOT fed into the LLM context, so the user-facing "
+                        "response is byte-identical to flag-off. DEFAULT OFF.")
+    p.add_argument("--fade-memory-voice-path", default=None,
+                   help="optional token-LM checkpoint for the SSM-B voice leg "
+                        "(Regime 3 expands the retrieved blurb via continuation). "
+                        "When unset (default), Regime 3 returns the blurb "
+                        "verbatim -- so Phase A runs WITHOUT the token-LM (its "
+                        "ckpt is on HF, not local). Requires "
+                        "--fade-memory-tokenizer-path when set.")
+    p.add_argument("--fade-memory-tokenizer-path", default=None,
+                   help="the token-LM tokenizer path (required when "
+                        "--fade-memory-voice-path is set).")
+    p.add_argument("--fade-memory-top-k", type=int, default=5,
+                   help="how many past anchors to route per query (default 5).")
+    p.add_argument("--fade-memory-decay", type=float, default=0.99,
+                   help="SSM-A EWMA decay -- the fade timescale (default 0.99 -> "
+                        "~8-16-turn gist window at one chunk per exchange).")
+    p.add_argument("--fade-memory-cos-gist", type=float, default=0.40,
+                   help="the gist/forgotten regime boundary on the free cosine "
+                        "router (default 0.40 -- calibrated for REAL bge-small by "
+                        "scripts/eval_fade_cross_domain.py: sits between the "
+                        "cross-domain cos floor ~0.37 and the same-domain floor "
+                        "~0.6, so cross-domain anchors reach R4 and same-domain "
+                        "stay R3. 0.30 never reaches R4 on real bge.)")
+    p.add_argument("--fade-memory-ring-capacity", type=int, default=32,
+                   help="the recency verbatim window (default 32).")
+    p.add_argument("--fade-memory-expand-tokens", type=int, default=64,
+                   help="SSM-B continuation length for a gist (default 64; unused "
+                        "when --fade-memory-voice-path is unset).")
+    p.add_argument("--fade-debug", action="store_true", default=False,
+                   help="print result[\"fade_recalls\"] to stderr after each "
+                        "query (the Phase A observability mechanism -- the way to "
+                        "SEE which regimes fire on real serve traffic). DEFAULT "
+                        "OFF.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -285,6 +328,31 @@ def main() -> int:
                   "read-out heads + the thresholds sidecar + the ring ON. The "
                   "trigger stays off this run (byte-identical to flag-off).",
                   file=sys.stderr)
+    # Fade memory (Phase A): EXPERIMENTAL + observability-only this phase. The
+    # recalls are surfaced in result["fade_recalls"] (visible via --fade-debug)
+    # but NOT fed into the LLM context, so the user-facing response is byte-
+    # identical to flag-off. The voice leg (--fade-memory-voice-path) requires a
+    # local token-LM ckpt; without it Regime 3 returns the blurb verbatim.
+    if args.fade_memory:
+        print("NOTE: --fade-memory is EXPERIMENTAL (Phase A). It ingests each "
+              "exchange and routes past anchors to their regime (verbatim / "
+              "gist / forgotten), surfacing result[\"fade_recalls\"] for "
+              "observation only -- the recalls are NOT fed into the LLM context "
+              "yet, so the response is byte-identical to flag-off. Pass "
+              "--fade-debug to see the regimes fire.", file=sys.stderr)
+        if args.fade_memory_voice_path and not args.fade_memory_tokenizer_path:
+            print("ERROR: --fade-memory-voice-path requires "
+                  "--fade-memory-tokenizer-path (the token-LM voice leg needs "
+                  "its tokenizer).", file=sys.stderr)
+            return 1
+        if args.fade_memory_voice_path:
+            vp = Path(args.fade_memory_voice_path)
+            if not vp.exists():
+                print(f"ERROR: --fade-memory-voice-path not found at {vp}. "
+                      f"Either point it at a real token-LM ckpt or drop the flag "
+                      f"(Regime 3 then returns the blurb verbatim, no token-LM "
+                      f"loaded).", file=sys.stderr)
+                return 1
 
     backbone_path = Path(args.backbone)
     if not backbone_path.exists():
@@ -362,6 +430,12 @@ def main() -> int:
           f"strm_salience={args.strm_salience} "
           f"strm_salience_thresholds={salience_thresholds_path or '(off)'}",
           file=sys.stderr)
+    print(f"[load] fade_memory={args.fade_memory} "
+          f"fade_memory_voice_path={args.fade_memory_voice_path or '(off)'} "
+          f"fade_memory_cos_gist={args.fade_memory_cos_gist} "
+          f"fade_memory_decay={args.fade_memory_decay} "
+          f"fade_memory_top_k={args.fade_memory_top_k} "
+          f"fade_debug={args.fade_debug}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -383,12 +457,22 @@ def main() -> int:
         context_builder_path=context_builder_path,
         strm_salience=args.strm_salience,
         salience_thresholds_path=salience_thresholds_path,
+        fade_memory=args.fade_memory,
+        fade_memory_voice_path=args.fade_memory_voice_path,
+        fade_memory_tokenizer_path=args.fade_memory_tokenizer_path,
+        fade_memory_top_k=args.fade_memory_top_k,
+        fade_memory_decay=args.fade_memory_decay,
+        fade_memory_cos_gist=args.fade_memory_cos_gist,
+        fade_memory_ring_capacity=args.fade_memory_ring_capacity,
+        fade_memory_expand_tokens=args.fade_memory_expand_tokens,
     )
 
     try:
         if args.query is not None:
             res = orch.query(args.query)
             _print_result(res)
+            if args.fade_debug:
+                print(f"[fade] {res.get('fade_recalls', [])}", file=sys.stderr)
             return 0
 
         # Interactive REPL. The orchestrator's Working Memory carries cross-query
@@ -405,6 +489,8 @@ def main() -> int:
                 break
             res = orch.query(line, conversation_history=list(history))
             _print_result(res)
+            if args.fade_debug:
+                print(f"[fade] {res.get('fade_recalls', [])}", file=sys.stderr)
             response = res.get("response")
             if isinstance(response, str) and response.strip():
                 history.append({"role": "user", "content": line})
