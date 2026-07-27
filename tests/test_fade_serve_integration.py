@@ -85,6 +85,7 @@ def _orchestrator(
     reply: str = "SYNTH RESPONSE",
     fade_memory=None,
     db_subdir: str = "db",
+    fade_inject: bool = False,
 ) -> PonderOrchestrator:
     store = HippocampalStore(str(tmp_path / db_subdir))
     for ep in (episodes or []):
@@ -100,6 +101,7 @@ def _orchestrator(
         embedder=_StubEmbedder(), mode_a=mode_a, config=cfg,
         user_id="victor",
         fade_memory=fade_memory,
+        fade_inject=fade_inject,
     )
     return orch
 
@@ -118,6 +120,17 @@ def _fade() -> FadeMemory:
 
 
 # ── tests ──
+
+def _user_msg_contents(calls):
+    """Yield the ``content`` of every ``user`` role message across the LLM call
+    list (``mode_a.calls`` is a list of message-lists). Used to scan for the
+    ``[FADE MEMORY]`` block without assuming which call was the synthesize one
+    (the orchestrator may make several LLM calls per query -- tool loop etc.)."""
+    for msgs in calls:
+        for m in msgs:
+            if m.get("role") == "user":
+                yield m["content"]
+
 
 def test_flag_off_no_fade_recalls(tmp_path):
     """``fade_memory=None`` -> ``fade_recalls`` ABSENT (byte-identical to pre-fade)."""
@@ -225,3 +238,113 @@ def test_fade_recall_failure_does_not_break_query(tmp_path):
     # (the result-augment seam fires whenever self._fade is not None).
     assert res.get("fade_recalls") == []
     orch.store.close()
+
+
+# ── Phase B: --fade-inject feeds recalls into the LLM context ──
+
+def test_inject_off_messages_byte_identical_to_off(tmp_path):
+    """``fade_inject=False`` (the default) -> the fade recalls are NOT fed into
+    the LLM context, so ``mode_a.calls`` (the LLM messages) are byte-identical
+    to flag-off. This is the Phase A contract, preserved when --fade-inject is
+    absent. (Compare to ``test_inject_on_messages_contain_fade_block``.)"""
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+    orch_off = _orchestrator(tmp_path, plan, eps, reply="LLM SAID THIS",
+                             db_subdir="off")
+    orch_off.query("Why did we choose Postgres?")
+    off_calls = [c for c in orch_off.mode_a.calls]
+    orch_off.store.close()
+
+    eps2 = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+    orch_on = _orchestrator(tmp_path, plan, eps2, reply="LLM SAID THIS",
+                            fade_memory=_fade(), db_subdir="on",
+                            fade_inject=False)
+    orch_on.query("Why did we choose Postgres?")
+    # The LLM saw the SAME messages with the fade on (inject OFF) as off -- no
+    # fade block leaked into the context.
+    assert orch_on.mode_a.calls == off_calls
+    orch_on.store.close()
+
+
+def test_inject_on_messages_contain_fade_block(tmp_path):
+    """``fade_inject=True`` -> the fade recalls are formatted into a
+    ``[FADE MEMORY]`` block and prepended to the LLM user message on synthesize
+    turns, so ``mode_a.calls`` CONTAIN the block (the LLM saw the fade) and are
+    NOT identical to flag-off. Two queries: the first ingests an anchor (no
+    prior anchors -> empty recalls -> no block); the second recalls that anchor
+    (still in-ring -> R1 verbatim) -> the block is injected."""
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+    orch = _orchestrator(tmp_path, plan, eps, reply="LLM SAID THIS",
+                        fade_memory=_fade(), db_subdir="on",
+                        fade_inject=True)
+    # Query 1: no prior anchors -> empty recalls -> no block yet.
+    orch.query("Why did we choose Postgres for the write-ahead log?")
+    calls_after_q1 = len(orch.mode_a.calls)
+    # Query 2: anchor 0 is now in-ring -> R1 verbatim -> the block is injected.
+    res = orch.query("Why did we choose Postgres?")
+    assert len(orch.mode_a.calls) > calls_after_q1  # query 2 reached the LLM
+    # The recalls were non-empty (R1) and content-bearing.
+    assert isinstance(res.get("fade_recalls"), list)
+    assert any(r["regime"] == 1 for r in res["fade_recalls"])
+    # The LLM user message CONTAINS the [FADE MEMORY] block (find the synthesize
+    # call -- the one whose user message holds the fade block; the orchestrator
+    # may make several LLM calls per query, so scan rather than assume a count).
+    q2_user_msgs = list(_user_msg_contents(orch.mode_a.calls[calls_after_q1:]))
+    assert any("[FADE MEMORY" in c for c in q2_user_msgs)
+    assert any("[verbatim, recent]" in c for c in q2_user_msgs)
+    # Query 1's calls did NOT contain the block (no prior anchors -> empty).
+    q1_user_msgs = list(_user_msg_contents(orch.mode_a.calls[:calls_after_q1]))
+    assert not any("[FADE MEMORY" in c for c in q1_user_msgs)
+    # And query 2 is NOT byte-identical to flag-off (the block changed the msg).
+    orch_off = _orchestrator(tmp_path, plan, eps, reply="LLM SAID THIS",
+                             db_subdir="off2")
+    orch_off.query("Why did we choose Postgres for the write-ahead log?")
+    calls_off_after_q1 = len(orch_off.mode_a.calls)
+    orch_off.query("Why did we choose Postgres?")
+    # The off-run's query-2 user messages have NO fade block (the on-run did --
+    # proven above -- so the two runs are not byte-identical).
+    off_q2 = list(_user_msg_contents(orch_off.mode_a.calls[calls_off_after_q1:]))
+    assert all("[FADE MEMORY" not in c for c in off_q2)
+    orch.store.close()
+    orch_off.store.close()
+
+
+def test_inject_r4_only_no_block(tmp_path):
+    """When every recall is R4 (forgotten), ``format_fade_block`` returns ``""``
+    (R4 is a signal, not LLM content) -> the block is omitted entirely and the
+    LLM messages are byte-identical to flag-off. R4 stays in ``fade_recalls``
+    as the structured signal (the future long-term-memory pull consumes it).
+    Uses a stub FadeMemory whose ``recall`` returns only R4 recalls so the test
+    does not need many cross-domain ingests to drive a real anchor to R4."""
+    from src.subconscious.fade import REGIME_FORGOTTEN, Recall
+
+    class _R4OnlyFade:
+        def ingest(self, chunk_text) -> int:
+            return 0
+
+        def recall(self, query_text, top_k=5):
+            return [Recall(0, REGIME_FORGOTTEN, 0.05,
+                           content="[forgotten]", blurb=None)]
+
+    plan = {"entities": ["Postgres"], "entity_mode": "union"}
+    eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]
+    orch = _orchestrator(tmp_path, plan, eps, reply="LLM SAID THIS",
+                        fade_memory=_R4OnlyFade(), db_subdir="on",
+                        fade_inject=True)
+    res = orch.query("Why did we choose Postgres?")
+    # R4 is present as the structured signal in fade_recalls...
+    assert res.get("fade_recalls")
+    assert all(r["regime"] == REGIME_FORGOTTEN for r in res["fade_recalls"])
+    # ...but NOT injected into the LLM messages (R4 is a signal, not content):
+    # no call's user message contains the block.
+    assert not any("[FADE MEMORY" in c
+                   for c in _user_msg_contents(orch.mode_a.calls))
+    # Byte-identical to flag-off (no block when all recalls are R4): every LLM
+    # call -- not just the last -- matches the off-run's calls.
+    orch_off = _orchestrator(tmp_path, plan, eps, reply="LLM SAID THIS",
+                             db_subdir="off")
+    orch_off.query("Why did we choose Postgres?")
+    assert orch.mode_a.calls == orch_off.mode_a.calls
+    orch.store.close()
+    orch_off.store.close()

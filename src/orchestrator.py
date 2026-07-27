@@ -186,6 +186,7 @@ class PonderOrchestrator:
         capture_pre_state: bool = False,
         fade_memory: "Optional[FadeMemory]" = None,
         fade_memory_top_k: int = 5,
+        fade_inject: bool = False,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -329,10 +330,19 @@ class PonderOrchestrator:
         # unchanged), mirroring ``_run_salience_hook``.
         self._fade = fade_memory
         self._fade_top_k = fade_memory_top_k
+        # Phase B: when True, the fade recalls are formatted into a ``[FADE MEMORY]``
+        # block and prepended to the LLM user message on synthesize turns (the only
+        # end state that calls the LLM). ``False`` (default) -> the recalls stay
+        # observability-only (``result["fade_recalls"]``), byte-identical to Phase A.
+        self._fade_inject = fade_inject
         self._fade_regime_names: dict[int, str] = {}
+        self._format_fade_block = None
         if fade_memory is not None:
-            from src.subconscious.fade import REGIME_NAME  # local, light import
+            from src.subconscious.fade import (  # local, light import
+                REGIME_NAME, format_fade_block,
+            )
             self._fade_regime_names = dict(REGIME_NAME)
+            self._format_fade_block = format_fade_block
 
         # The cross-query Working Memory (persistent state). embedder injected so
         # WM can embed episodes/queries on demand. ``ring_capacity`` overrides
@@ -827,6 +837,21 @@ class PonderOrchestrator:
             user_content = f"Context from past conversations:\n{context}\n\nUser: {user_prompt}"
             if feedback_enabled:
                 user_content += "\n\n" + feedback_instruction(episodes)
+            if self._fade is not None and self._fade_inject:
+                # Phase B: prepend the fade-memory block (the fading working memory
+                # of THIS conversation) ahead of the retrieved cross-session context.
+                # R4 (forgotten) is a signal, not content -- ``format_fade_block``
+                # skips it; the block is omitted entirely when no R1/R3 recalls exist
+                # (so an all-R4 turn stays byte-identical to flag-off). Best-effort:
+                # a render failure leaves ``user_content`` unchanged (the turn
+                # proceeds), mirroring the recall seam's swallow.
+                try:
+                    block = self._format_fade_block(fade_recalls)
+                except Exception as e:  # noqa: BLE001 - never break the turn
+                    print(f"[fade-inject-fail] {e}", file=sys.stderr)
+                    block = ""
+                if block:
+                    user_content = f"{block}\n\n{user_content}"
             messages.append({"role": "user", "content": user_content})
 
             if loop_enabled:

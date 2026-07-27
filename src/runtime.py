@@ -79,6 +79,7 @@ def build_ponder(
     fade_memory_cos_gist: float = 0.40,
     fade_memory_ring_capacity: int = 32,
     fade_memory_expand_tokens: int = 64,
+    fade_inject: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -186,6 +187,11 @@ def build_ponder(
         fade_memory_ring_capacity: the recency verbatim window (default 32).
         fade_memory_expand_tokens: SSM-B continuation length for a gist (default
             64; unused when ``fade_memory_voice_path`` is None).
+        fade_inject: Phase B -- when True, format the fade recalls into a
+            ``[FADE MEMORY]`` block prepended to the LLM user message on synthesize
+            turns (R1 verbatim + R3 gist; R4 forgotten is a signal, not content).
+            ``False`` (default) -> recalls stay observability-only (byte-identical to
+            Phase A). Requires ``fade_memory`` to take effect.
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -368,6 +374,7 @@ def build_ponder(
         salience_thresholds=salience_thresholds,
         fade_memory=fade_mem,
         fade_memory_top_k=fade_memory_top_k,
+        fade_inject=fade_inject,
     )
     return orch
 

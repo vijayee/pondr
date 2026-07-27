@@ -76,6 +76,52 @@ REGIME_NAME: dict[int, str] = {
 }
 
 
+def format_fade_block(recalls: list[dict]) -> str:
+    """Render fade recalls as a ``[FADE MEMORY]`` block for the LLM context.
+
+    Takes the dict shape the orchestrator's RECALL seam builds
+    (``{anchor_id, regime, regime_name, cos, content, blurb}``). Lists only
+    CONTENT-BEARING recalls:
+
+    - R1 (verbatim): the recent exact text.
+    - R3 (gist): the anchor's blurb (verbatim when ``voice is None`` -- Phase B;
+      a paraphrase once the token-LM voice leg is wired).
+
+    R4 (forgotten) is intentionally SKIPPED: it is a SIGNAL for a future long-term-
+    memory pull (mechanism TBD -- explicit tool call vs background fulfillment), not
+    LLM-facing content. The forgotten material is simply absent from the block -- the
+    gradient "exact -> gist -> (gone)" reads naturally, like a human who does not
+    enumerate what they have forgotten. R4 stays in ``fade_recalls`` (observability +
+    the signal the future pull consumes).
+
+    Returns ``""`` when no content-bearing recalls are present (so the block is
+    omitted entirely -- no empty header). Bounded by the seam's ``top_k`` /
+    ``blurb_chars`` caps (the recalls arrive already capped).
+    """
+    lines: list[str] = []
+    for r in recalls:
+        regime = r.get("regime")
+        if regime == REGIME_FORGOTTEN:
+            continue  # R4 is a signal, not LLM content (see docstring).
+        content = (r.get("content") or "").strip()
+        if not content:
+            continue
+        if regime == REGIME_VERBATIM:
+            lines.append(f"[verbatim, recent] {content}")
+        elif regime == REGIME_GIST:
+            lines.append(f"[gist, fading] {content}")
+        elif regime == REGIME_FILL:
+            lines.append(f"[fill, reconstructed] {content}")
+        else:
+            lines.append(f"[{r.get('regime_name') or regime}] {content}")
+    if not lines:
+        return ""
+    header = ("[FADE MEMORY -- your fading working memory of this conversation]\n"
+              "(Recent exchanges are recalled exactly; older ones are given as a "
+              "fading gist. What has fully faded is not listed.)")
+    return header + "\n" + "\n".join(lines)
+
+
 class Embedder(Protocol):
     """``texts -> list of dim-d float vectors`` (bge-small-en-v1.5, 384-d, frozen)."""
 

@@ -24,6 +24,7 @@ from src.subconscious.fade import (
     REGIME_GIST,
     REGIME_VERBATIM,
     VectorCarrySSM,
+    format_fade_block,
 )
 
 
@@ -365,3 +366,46 @@ def test_reset_clears_everything() -> None:
 def test_recall_anchor_unknown_returns_none() -> None:
     mem = FadeMemory(FadeConfig(), _StubEmbedder(), _StubVoice())
     assert mem.recall_anchor(999) is None
+
+
+def test_format_fade_block_renders_r1_r3_skips_r4() -> None:
+    # Phase B: ``format_fade_block`` renders the LLM-facing ``[FADE MEMORY]`` block.
+    # It lists content-bearing recalls (R1 verbatim + R3 gist), regime-framed, and
+    # SKIPS R4 (forgotten is a SIGNAL for a future long-term-memory pull, not LLM
+    # content). Returns ``""`` when no content-bearing recalls are present (so an
+    # all-R4 turn omits the block entirely -- byte-identical to flag-off). Takes the
+    # dict shape the orchestrator RECALL seam builds.
+    recalls = [
+        {"anchor_id": 0, "regime": REGIME_VERBATIM, "regime_name": "verbatim",
+         "cos": 0.99, "content": "postgres WAL tuning notes", "blurb": None},
+        {"anchor_id": 1, "regime": REGIME_GIST, "regime_name": "gist",
+         "cos": 0.55, "content": "learning rate schedule blurb", "blurb": "learning rate schedule blurb"},
+        {"anchor_id": 2, "regime": REGIME_FORGOTTEN, "regime_name": "forgotten",
+         "cos": 0.10, "content": "[forgotten]", "blurb": None},
+    ]
+    block = format_fade_block(recalls)
+    assert "[FADE MEMORY" in block
+    assert "[verbatim, recent] postgres WAL tuning notes" in block
+    assert "[gist, fading] learning rate schedule blurb" in block
+    # R4 is a signal, not content -- it must NOT appear in the LLM block.
+    assert "forgotten" not in block
+    assert "[forgotten]" not in block
+    # R2 (off, but possible) renders under its own label if it ever appears.
+    r2_block = format_fade_block([
+        {"anchor_id": 3, "regime": REGIME_FILL, "regime_name": "fill",
+         "cos": 0.7, "content": "reconstructed fill", "blurb": None},
+    ])
+    assert "[fill, reconstructed] reconstructed fill" in r2_block
+
+    # All-R4 -> no content-bearing recalls -> empty block (omitted entirely).
+    assert format_fade_block([
+        {"anchor_id": 9, "regime": REGIME_FORGOTTEN, "regime_name": "forgotten",
+         "cos": 0.05, "content": "[forgotten]", "blurb": None},
+    ]) == ""
+    # Empty recall list -> empty block.
+    assert format_fade_block([]) == ""
+    # Empty-content R1/R3 are dropped (no bare header line).
+    assert format_fade_block([
+        {"anchor_id": 4, "regime": REGIME_VERBATIM, "regime_name": "verbatim",
+         "cos": 0.99, "content": "   ", "blurb": None},
+    ]) == ""

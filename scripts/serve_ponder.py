@@ -250,6 +250,14 @@ def main() -> int:
     p.add_argument("--fade-memory-expand-tokens", type=int, default=64,
                    help="SSM-B continuation length for a gist (default 64; unused "
                         "when --fade-memory-voice-path is unset).")
+    p.add_argument("--fade-inject", action="store_true", default=False,
+                   help="Phase B: feed the fade recalls into the LLM context. A "
+                        "[FADE MEMORY] block (R1 verbatim + R3 gist; R4 forgotten is "
+                        "a signal, not content) is prepended to the user message on "
+                        "synthesize turns, so the fade reaches the user-facing "
+                        "response. Without it --fade-memory stays observability-only "
+                        "(Phase A, byte-identical to flag-off). Requires --fade-memory. "
+                        "DEFAULT OFF.")
     p.add_argument("--fade-debug", action="store_true", default=False,
                    help="print result[\"fade_recalls\"] to stderr after each "
                         "query (the Phase A observability mechanism -- the way to "
@@ -328,18 +336,29 @@ def main() -> int:
                   "read-out heads + the thresholds sidecar + the ring ON. The "
                   "trigger stays off this run (byte-identical to flag-off).",
                   file=sys.stderr)
-    # Fade memory (Phase A): EXPERIMENTAL + observability-only this phase. The
-    # recalls are surfaced in result["fade_recalls"] (visible via --fade-debug)
-    # but NOT fed into the LLM context, so the user-facing response is byte-
-    # identical to flag-off. The voice leg (--fade-memory-voice-path) requires a
-    # local token-LM ckpt; without it Regime 3 returns the blurb verbatim.
+    # Fade memory: EXPERIMENTAL. Phase A (default) is observability + ingest only
+    # -- the recalls are surfaced in result["fade_recalls"] (visible via
+    # --fade-debug) but NOT fed into the LLM context, so the user-facing response is
+    # byte-identical to flag-off. Phase B (--fade-inject) feeds the recalls into the
+    # LLM context as a [FADE MEMORY] block on synthesize turns, so the response DOES
+    # change (no longer byte-identical). The voice leg (--fade-memory-voice-path)
+    # requires a local token-LM ckpt; without it Regime 3 returns the blurb verbatim.
     if args.fade_memory:
-        print("NOTE: --fade-memory is EXPERIMENTAL (Phase A). It ingests each "
-              "exchange and routes past anchors to their regime (verbatim / "
-              "gist / forgotten), surfacing result[\"fade_recalls\"] for "
-              "observation only -- the recalls are NOT fed into the LLM context "
-              "yet, so the response is byte-identical to flag-off. Pass "
-              "--fade-debug to see the regimes fire.", file=sys.stderr)
+        if args.fade_inject:
+            print("NOTE: --fade-memory --fade-inject is EXPERIMENTAL (Phase B). "
+                  "The fade recalls (R1 verbatim + R3 gist; R4 forgotten is a "
+                  "signal, not content) are prepended to the LLM user message on "
+                  "synthesize turns, so the user-facing response is NO LONGER "
+                  "byte-identical to flag-off. Pass --fade-debug to see the "
+                  "regimes fire.", file=sys.stderr)
+        else:
+            print("NOTE: --fade-memory is EXPERIMENTAL (Phase A). It ingests each "
+                  "exchange and routes past anchors to their regime (verbatim / "
+                  "gist / forgotten), surfacing result[\"fade_recalls\"] for "
+                  "observation only -- the recalls are NOT fed into the LLM context "
+                  "yet, so the response is byte-identical to flag-off. Pass "
+                  "--fade-debug to see the regimes fire, or add --fade-inject "
+                  "(Phase B) to feed them into the response.", file=sys.stderr)
         if args.fade_memory_voice_path and not args.fade_memory_tokenizer_path:
             print("ERROR: --fade-memory-voice-path requires "
                   "--fade-memory-tokenizer-path (the token-LM voice leg needs "
@@ -435,6 +454,7 @@ def main() -> int:
           f"fade_memory_cos_gist={args.fade_memory_cos_gist} "
           f"fade_memory_decay={args.fade_memory_decay} "
           f"fade_memory_top_k={args.fade_memory_top_k} "
+          f"fade_inject={args.fade_inject} "
           f"fade_debug={args.fade_debug}", file=sys.stderr)
 
     orch = build_ponder(
@@ -465,6 +485,7 @@ def main() -> int:
         fade_memory_cos_gist=args.fade_memory_cos_gist,
         fade_memory_ring_capacity=args.fade_memory_ring_capacity,
         fade_memory_expand_tokens=args.fade_memory_expand_tokens,
+        fade_inject=args.fade_inject,
     )
 
     try:
