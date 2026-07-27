@@ -239,6 +239,37 @@ def test_voice_none_passes_blurb_verbatim() -> None:
     assert first_r3.content == first_r3.blurb   # passthrough: content IS the blurb
     assert "[expanded]" not in first_r3.content  # no voice was called
     assert first_r3.blurb is not None            # a blurb was retrieved (the gist)
+    # Anchor-locked (the R3 content-drift fix, docs/fade-serve-validation-result.md):
+    # R3 returns the anchor's OWN blurb ("docA:0"), NOT a state-closest cross-doc
+    # chunk. The state is the recoverability signal, not the retrieval key.
+    assert first_r3.blurb == "docA:0"
+
+
+def test_r3_is_anchor_locked_not_state_closest() -> None:
+    # Regression guard for the R3 content-drift found in the serve REPL
+    # validation (docs/fade-serve-validation-result.md): across a mixed-domain
+    # session the faded state is dominated by the most-recent chunk, so a
+    # state-closest blurb retrieves WRONG-TOPIC content (the most-recent
+    # cross-doc blurb, not the recalled anchor's). The fix makes R3
+    # anchor-locked: retrieve the anchor's OWN blurb. WITHOUT the fix this
+    # test fails -- ``r.blurb`` is the most-recent cross-doc chunk ("doc24:0"
+    # or similar), not "docA:0".
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.9, cos_ring=0.95, cos_gist=0.20, ring_capacity=4)
+    mem = FadeMemory(cfg, emb, _StubVoice())
+    aid = mem.ingest("docA:0")
+    last_cross = ""
+    r3_blurbs: set[str] = set()
+    for i in range(24):
+        last_cross = f"doc{i+1}:0"
+        mem.ingest(last_cross)              # cross-doc fades `aid`, drifts state
+        r = mem.recall_anchor(aid)
+        if r.regime == REGIME_GIST:
+            r3_blurbs.add(r.blurb)
+    assert r3_blurbs, "never reached R3 (gist)"
+    # Every R3 recall returns the anchor's OWN blurb, never a cross-doc chunk.
+    assert all(b == "docA:0" for b in r3_blurbs)
+    assert last_cross != "docA:0"          # sanity: a cross-doc blurb existed to drift to
 
 
 def test_regime2_off_medium_e_is_gist() -> None:

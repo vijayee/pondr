@@ -428,18 +428,27 @@ class FadeMemory:
 
     def _retrieve_and_expand(self, anchor_id: int, cos_i: float,
                              regime: int) -> Recall:
-        # Regime 3 (and the degraded Regime 2): the FADED STATE retrieves the
-        # blurb (fuzzily -> a sibling of the anchor while the state still carries
-        # a trace of it -- probe #32's gist window), and SSM-B expands it. The
-        # query (in ``recall``) picked the anchor (relevance); the state picks
-        # the actual blurb (the fade). If the store is empty, degrade to R4.
-        hits = self.blurbs.retrieve(self.ssm_a.query(), k=1)
-        if not hits:
+        # Regime 3 (and the degraded Regime 2): the anchor's ADDRESS survives
+        # (cos_i >= cos_gist = the state still carries a recoverable trace of
+        # it), so retrieve the anchor's OWN blurb and let SSM-B expand it. The
+        # state's role is the recoverability SIGNAL (cos -> regime), NOT the
+        # retrieval key: a state-closest blurb is dominated by the most-recent
+        # chunk and drifts to wrong-topic content across a mixed-domain
+        # session (the R3 content-drift found in the serve REPL validation --
+        # docs/fade-serve-validation-result.md; the within-domain "state
+        # retrieves a sibling" of probe #32 only holds when the state is still
+        # dominated by the anchor's domain). The fade is expressed through the
+        # SSM-B expansion (paraphrase) + the regime label (lower confidence),
+        # not through retrieving a sibling. If the anchor's blurb is gone,
+        # degrade to R4. (Mirrors ``_verbatim`` -- the blurb store is the source
+        # of truth, addressed by anchor_id.)
+        blurb = self.blurbs.text(anchor_id)
+        if blurb is None:
             return Recall(anchor_id, REGIME_FORGOTTEN, cos_i, content="[forgotten]")
-        _, _, blurb = hits[0]
-        # ``voice is None`` -> the built-in passthrough: return the retrieved blurb
-        # verbatim (no token-LM loaded). Production wires ``TokenLMVoice`` for
-        # continuation expansion; tests + the Phase-A serve path run passthrough.
+        # ``voice is None`` -> the built-in passthrough: return the anchor's
+        # blurb verbatim (no token-LM loaded). Production wires ``TokenLMVoice``
+        # for continuation expansion; tests + the Phase-A serve path run
+        # passthrough.
         if self.voice is None:
             return Recall(anchor_id, regime, cos_i, content=blurb, blurb=blurb)
         expanded = self.voice.expand(blurb, self.cfg.expand_tokens)
