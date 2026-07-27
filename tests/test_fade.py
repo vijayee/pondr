@@ -409,3 +409,53 @@ def test_format_fade_block_renders_r1_r3_skips_r4() -> None:
         {"anchor_id": 4, "regime": REGIME_VERBATIM, "regime_name": "verbatim",
          "cos": 0.99, "content": "   ", "blurb": None},
     ]) == ""
+
+
+# ----------------------------------------------------------- blurb_text override
+def test_ingest_blurb_text_override() -> None:
+    # The embed handle (``chunk_text``) and the recalled blurb (``blurb_text``)
+    # may differ -- the production code-ingestion design: embed a prose summary,
+    # recall the raw source. The bge vector MUST key off ``chunk_text`` (the
+    # handle), and the stored blurb MUST be ``blurb_text[:blurb_chars]``.
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.9, cos_ring=0.95, cos_gist=0.20, ring_capacity=8,
+                     blurb_chars=40)
+    mem = FadeMemory(cfg, emb, _StubVoice())
+    handle = "docA:0"                       # the embed handle (short, distinct doc)
+    raw_src = "x" * 200                     # the recalled content (long, different)
+    aid = mem.ingest(handle, blurb_text=raw_src)
+    # 1. The stored blurb is the raw source, truncated to blurb_chars -- NOT the
+    #    handle. This is what R1/R3 recall returns.
+    assert mem.blurbs.text(aid) == raw_src[: cfg.blurb_chars]
+    assert mem.blurbs.text(aid) != handle
+    # 2. The keyed vector is the embed of the HANDLE (``chunk_text``), not the
+    #    raw source -- the recoverability router keys off the handle's bge.
+    v = mem.blurbs.vector(aid)
+    assert v is not None
+    handle_vec = np.asarray(emb.encode([handle])[0], dtype=np.float32)
+    assert np.allclose(v, handle_vec, atol=1e-5)
+    # 3. R1 recall returns the raw source blurb (the override), verbatim.
+    r = mem.recall_anchor(aid)
+    assert r.regime == REGIME_VERBATIM
+    assert r.content == raw_src[: cfg.blurb_chars]
+
+
+def test_ingest_default_blurb_unchanged() -> None:
+    # Regression guard for the backward-compat: one-arg ingest (the only form
+    # every existing caller uses) stores ``chunk_text[:blurb_chars]`` as the
+    # blurb and keys the vector off ``chunk_text`` -- byte-identical to the
+    # pre-override behavior. The ``blurb_text`` extension must NOT change this.
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.9, cos_ring=0.95, cos_gist=0.20, ring_capacity=8,
+                     blurb_chars=25)
+    mem = FadeMemory(cfg, emb, _StubVoice())
+    chunk = "docA:0 the rest of this chunk is longer than blurb_chars"
+    aid = mem.ingest(chunk)                 # one arg -> blurb_text defaults None
+    assert mem.blurbs.text(aid) == chunk[: cfg.blurb_chars]
+    v = mem.blurbs.vector(aid)
+    assert v is not None
+    chunk_vec = np.asarray(emb.encode([chunk])[0], dtype=np.float32)
+    assert np.allclose(v, chunk_vec, atol=1e-5)
+    r = mem.recall_anchor(aid)
+    assert r.regime == REGIME_VERBATIM
+    assert r.content == chunk[: cfg.blurb_chars]

@@ -412,18 +412,30 @@ class FadeMemory:
         self._next_id = 0
 
     # -- ingestion -----------------------------------------------------
-    def ingest(self, chunk_text: str) -> int:
+    def ingest(self, chunk_text: str, blurb_text: Optional[str] = None) -> int:
         """Encode the chunk, step SSM-A, store the blurb, push to the ring.
 
         Returns the anchor_id (the chunk's position in the stream). The bge
         vector is the chunk's OWN frozen embedding (no teacher LLM -- bge is
-        frozen); it is what SSM-A carries and what the blurb is keyed by."""
+        frozen); it is what SSM-A carries and what the blurb is keyed by.
+
+        ``chunk_text`` is the EMBED HANDLE -- the string the bge vector is
+        computed from (and what SSM-A carries / what the blurb is keyed by).
+        ``blurb_text`` (optional) is the RECALLED CONTENT -- the text stored
+        as the blurb and returned on R1/R3 recall. When ``None`` (the default,
+        and every existing caller) the blurb is ``chunk_text[:blurb_chars]`` --
+        byte-identical to the one-arg path. The split mirrors the production
+        code-ingestion design: embed a prose summary of a function (the handle
+        that ranks against prose queries) but recall the raw source (the thing
+        the user actually wants back). The two must be allowed to differ so a
+        "gist" of code can be a raw excerpt, not a purpose-summary."""
         anchor_id = self._next_id
         self._next_id += 1
         vec = self._encode_one(chunk_text)         # [dim] bge (unnormalized ok)
         self.ssm_a.step(vec)                        # the fade leg advances
-        blurb = chunk_text[: self.cfg.blurb_chars]
-        self.blurbs.add(anchor_id, vec, blurb)      # keyed by bge
+        blurb_src = blurb_text if blurb_text is not None else chunk_text
+        blurb = blurb_src[: self.cfg.blurb_chars]
+        self.blurbs.add(anchor_id, vec, blurb)      # keyed by bge (the handle)
         self.ring.append(anchor_id)                 # recency verbatim window
         return anchor_id
 
