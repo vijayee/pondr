@@ -150,7 +150,7 @@ def build_session(chapters: list[str], translation: str) -> tuple[list[tuple[str
 
 
 # -------------------------------------------------------------- the voice
-class _PassthroughVoice:
+class PassthroughVoice:
     """R3 content = the retrieved blurb (the fade's retrieval quality). The
     SSM-B expansion quality is out of scope for the fade eval (see module
     docstring). ``expand`` returns the blurb unchanged so R3's content IS the
@@ -162,7 +162,7 @@ class _PassthroughVoice:
 
 def make_voice(args):
     if args.voice == "passthrough":
-        return _PassthroughVoice()
+        return PassthroughVoice()
     if args.voice == "token-lm":
         from src.subconscious.fade import load_token_lm_voice
 
@@ -451,7 +451,10 @@ def main() -> int:
                     help="lag grid (steps after the anchor's ingest)")
     ap.add_argument("--decay", type=float, default=0.99)
     ap.add_argument("--cos-ring", type=float, default=0.95)
-    ap.add_argument("--cos-gist", type=float, default=0.30)
+    ap.add_argument("--cos-gist", type=float, default=0.40,
+                    help="gist/forgotten threshold (default 0.40 -- calibrated for "
+                         "real bge by scripts/eval_fade_cross_domain.py; the module "
+                         "FadeConfig default)")
     ap.add_argument("--ring-capacity", type=int, default=32)
     ap.add_argument("--expand-tokens", type=int, default=64)
     ap.add_argument("--regime2-enabled", action="store_true",

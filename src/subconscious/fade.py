@@ -78,7 +78,8 @@ class Voice(Protocol):
 
 @dataclass
 class FadeConfig:
-    """Fade-memory hyperparameters. Defaults calibrated from probe #32.
+    """Fade-memory hyperparameters. Defaults calibrated from probe #32 and the
+    cross-domain eval (``scripts/eval_fade_cross_domain.py``; see ``cos_gist``).
 
     ``decay``: the SSM-A EWMA decay (the fade timescale). 0.99 -> ~8-16-step
     gist window (probe #32). ``cos_ring``/``cos_gist``: the regime boundaries on
@@ -92,7 +93,16 @@ class FadeConfig:
     decay: float = 0.99
     write_gate: float = 1.0
     cos_ring: float = 0.95      # cos >= this (or anchor in ring) -> Regime 1
-    cos_gist: float = 0.30      # cos >= this (and not R1) -> Regime 3 (gist)
+    # cos >= this (and not R1) -> Regime 3 (gist); below it -> Regime 4 (forgotten).
+    # Calibrated for REAL bge-small-en-v1.5 by the cross-domain eval
+    # (scripts/eval_fade_cross_domain.py): bge-small has a HIGH cosine floor --
+    # same-domain ~0.6, cross-domain ~0.37 -- so the threshold must sit BETWEEN
+    # them to separate "same topic -> fuzzy gist (R3)" from "different topic ->
+    # forgotten (R4)". 0.40 (probe #32's 0.30 was calibrated on the synthetic test
+    # embedder whose cross-doc floor is ~0.01, far below real bge's ~0.37, so 0.30
+    # never reached R4 on real bge). The unit tests override this (their synthetic
+    # embedder has a ~0.01 cross-doc floor, so they use 0.15-0.20).
+    cos_gist: float = 0.40
     ring_capacity: int = 32     # recent anchors kept verbatim
     blurb_chars: int = 600      # max chars of chunk text stored as the blurb
     expand_tokens: int = 64     # SSM-B continuation length for a gist
