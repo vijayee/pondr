@@ -343,13 +343,21 @@ def load_token_lm_voice(checkpoint_path: str, tokenizer_path: str,
 
     ``checkpoint_path`` / ``tokenizer_path`` are the token-LM ckpt + tokenizer
     (``data/token_lm/...``; see ``pondr-token-lm-ssm-result``). The model is
-    frozen (``eval()``) -- the voice expands, it does not train."""
+    frozen (``eval()``) -- the voice expands, it does not train.
+
+    ``device`` accepts ``"auto"`` (resolve to cuda if available, else cpu), like
+    the other model loaders. ``torch.load`` and ``Module.to`` do NOT accept
+    ``"auto"``, so it is resolved here and the checkpoint is always restored to
+    CPU first (``map_location="cpu"``) then moved to the resolved device --
+    mirrors ``load_backbone``."""
     import torch
 
     from .token_lm import LMConfig, SSMLanguageModel
     from .tokenizer_ import train_or_load_tokenizer
 
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg = LMConfig(**ckpt["config"])
     model = SSMLanguageModel(cfg).to(device=device, dtype=torch.float32)
     model.load_state_dict(ckpt["model"])
