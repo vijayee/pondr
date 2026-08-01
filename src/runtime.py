@@ -80,6 +80,9 @@ def build_ponder(
     fade_memory_ring_capacity: int = 32,
     fade_memory_expand_tokens: int = 64,
     fade_inject: bool = False,
+    fade_consolidation: bool = False,
+    fade_consolidation_epsilon: float = 0.03,
+    fade_consolidation_max_depth: int = 3,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -354,6 +357,28 @@ def build_ponder(
         )
         fade_mem = FadeMemory(fade_cfg, embedder, voice, dim=384)
 
+    # Gist-on-forgetting consolidation (Phase C, optional). When
+    # ``fade_consolidation`` is set (AND a fade memory is wired), construct a
+    # ``BonsaiGister`` (composing the two existing Bonsai clients -- narrative
+    # via ``BonsaiDecider.consolidate_gist`` + facts via
+    # ``BonsaiRelationExtractor`` / ``extract_state_assertions``) and a
+    # ``ConsolidationWorker`` that gists fading anchors in the background between
+    # turns. ``fact_sink`` is None in v1 (the R4 -> long-term-memory graph write
+    # is a follow-on; the facts are staged as a sidecar on the anchor). No
+    # consolidation worker when the fade is off (``fade_mem is None``) even if
+    # the flag is on -> byte-identical to Phase B. The Bonsai HTTP call is lazy
+    # (one per gist), so this is constructible offline (cold-start: a down
+    # server -> the worker skips, anchors stay R4, retried next sweep).
+    consolidation_worker = None
+    if fade_consolidation and fade_mem is not None:
+        from .subconscious.consolidation_worker import ConsolidationWorker
+        from .subconscious.gister import default_gister
+        consolidation_worker = ConsolidationWorker(
+            fade_mem, default_gister(),
+            epsilon=fade_consolidation_epsilon,
+            max_depth=fade_consolidation_max_depth,
+        )
+
     orch = PonderOrchestrator(
         store=store,
         retriever=retriever,
@@ -375,6 +400,7 @@ def build_ponder(
         fade_memory=fade_mem,
         fade_memory_top_k=fade_memory_top_k,
         fade_inject=fade_inject,
+        consolidation_worker=consolidation_worker,
     )
     return orch
 

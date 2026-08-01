@@ -198,8 +198,10 @@ def test_fade_ingest_failure_does_not_break_query(tmp_path):
     response (best-effort swallow, mirroring _run_salience_hook)."""
 
     class _BrokenIngest:
-        # The orchestrator only calls .ingest() / .recall() and fetches
-        # REGIME_NAME from the module (not the instance), so no other attrs.
+        # The orchestrator calls .ingest() / .recall() (and, when recall returns
+        # non-empty, .consolidation_count() / .prior_gist() per anchor) and fetches
+        # REGIME_NAME from the module (not the instance). This stub's recall
+        # returns [] so the per-anchor seam is never hit -- no other attrs needed.
         def ingest(self, chunk_text) -> int:
             raise RuntimeError("ingest boom")
 
@@ -326,6 +328,15 @@ def test_inject_r4_only_no_block(tmp_path):
         def recall(self, query_text, top_k=5):
             return [Recall(0, REGIME_FORGOTTEN, 0.05,
                            content="[forgotten]", blurb=None)]
+
+        # Phase C observability seam: the orchestrator's recall loop reads
+        # consolidation_count + prior_gist per anchor. A non-consolidated anchor
+        # (this stub) reports 0 / None -- the real FadeMemory does the same.
+        def consolidation_count(self, anchor_id) -> int:
+            return 0
+
+        def prior_gist(self, anchor_id):
+            return None
 
     plan = {"entities": ["Postgres"], "entity_mode": "union"}
     eps = [_ep("ep_001", entities=["Postgres"], summary="We chose Postgres")]

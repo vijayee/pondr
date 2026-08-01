@@ -380,6 +380,48 @@ Return ONLY valid JSON:
 {{"gist": "..."}}"""
 
 
+def bonsai_consolidate_gist_prompt(blurb: str, prior_gist: Optional[str],
+                                   count: int) -> str:
+    """Prompt for the fade consolidation gist (the gist-on-forgetting loop).
+
+    Distinct from ``bonsai_gist_prompt`` (a summary-of-summaries over a DiffPool
+    cluster): this compresses a SINGLE fading blurb in place, and -- on the
+    second+ pass -- feeds the PRIOR gist back in so the compression is
+    fidelity-preserving (the headroom ``learn/analyzer.py`` prior-baseline-merge
+    pattern: emit a COMPLETE replacement, not a delta; preserve accurate facts;
+    drop only when contradicted). ``count`` is the consolidation depth (1 = first
+    gist of verbatim, 2 = gist-of-gist, ...) so the model knows how aggressively
+    to compress. Returns the SAME ``{{"gist": "..."}}`` envelope as
+    ``bonsai_gist_prompt`` so ``BonsaiDecider._parse_json_object`` carves it out.
+    """
+    if prior_gist is None:
+        return f"""You are the subconscious of a memory system. A single memory is
+fading from exact recall and must be compressed into a gist before it is lost.
+Write ONE tight paragraph (3-6 sentences) that captures what this memory is
+ABOUT -- the subject, what was decided or learned -- so a reader who never saw
+the original understands the gist. Do not invent facts not supported by the
+source; synthesize only. This paragraph replaces the verbatim as the memory's
+recalled form, so it must stand alone.
+
+SOURCE MEMORY:
+{blurb}
+
+Return ONLY valid JSON:
+{{"gist": "..."}}"""
+    return f"""You are the subconscious of a memory system. A memory has already been
+compressed once into the gist below, and is fading again -- compress it FURTHER
+(compression level {count}). Emit a COMPLETE new gist (NOT a delta): the full
+paragraph that should replace the current one. Preserve every accurate fact;
+drop a fact ONLY when the source contradicts it; shorten phrasing. Do not invent
+facts. A reader who never saw the original should still understand the memory.
+
+CURRENT GIST (compress this further):
+{prior_gist}
+
+Return ONLY valid JSON:
+{{"gist": "..."}}"""
+
+
 def bonsai_typing_prompt(entity: str, candidate_class: str,
                          retrieved_context: dict) -> str:
     """Prompt for the deploy-time Bonsai ontology-typing decider.

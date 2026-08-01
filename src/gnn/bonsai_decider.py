@@ -37,6 +37,7 @@ import requests
 from ..config import config
 from ..training.prompts import (
     bonsai_anomaly_decision_prompt,
+    bonsai_consolidate_gist_prompt,
     bonsai_contradiction_decision_prompt,
     bonsai_doc_kind_prompt,
     bonsai_gist_prompt,
@@ -149,6 +150,30 @@ class BonsaiDecider:
         if not source_episodes:
             return None
         prompt = bonsai_gist_prompt(source_episodes)
+        data = self._post_json(prompt)
+        if data is None:
+            return None
+        raw = data.get("gist") if isinstance(data, dict) else None
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        return _CTRL_RE.sub("", raw.strip())
+
+    def consolidate_gist(self, blurb: str, prior_gist: Optional[str],
+                         count: int) -> Optional[str]:
+        """Compress ONE fading blurb into a gist (the fade consolidation loop).
+
+        Distinct from ``gist`` (a summary-of-summaries over an episode cluster):
+        this compresses a single blurb in place, and on the second+ pass feeds
+        ``prior_gist`` back in (prior-baseline-merge: emit a complete replacement,
+        preserve accurate facts, drop only when contradicted) so gist-of-gist
+        preserves fidelity. ``count`` is the consolidation depth. Returns the
+        gist string, or ``None`` on HTTP/parse failure (the caller skips the
+        consolidation -- the anchor stays R4, retried next sweep; cold-start
+        honest, no fabricated gist). Control chars stripped (``_CTRL_RE``).
+        """
+        if not isinstance(blurb, str) or not blurb.strip():
+            return None
+        prompt = bonsai_consolidate_gist_prompt(blurb, prior_gist, count)
         data = self._post_json(prompt)
         if data is None:
             return None

@@ -55,9 +55,17 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import TYPE_CHECKING, Optional, Protocol
 
 import numpy as np
+
+if TYPE_CHECKING:
+    # ``StructuredGist`` is defined in ``gister.py`` (a sibling). Imported only
+    # under TYPE_CHECKING so ``fade`` stays import-clean (no Bonsai/HTTP pulled
+    # in at import time -- the unit tests run CPU-only without the Bonsai
+    # server). ``consolidate`` takes it but the annotation is a string (future
+    # annotations), so this never evaluates at runtime.
+    from .gister import StructuredGist
 
 # Regime labels (integers so they serialize trivially).
 REGIME_VERBATIM = 1     # ring / state-fresh -> exact text
@@ -247,6 +255,11 @@ class BlurbStore:
         self._texts: list[str] = []
         self._index: dict[int, int] = {}      # anchor_id -> row
         self._matrix: Optional[np.ndarray] = None  # [N, dim] rebuilt lazily
+        # Structured-gist fact sidecar (the consolidation loop, see
+        # ``FadeMemory.consolidate``). Empty for every non-consolidated anchor;
+        # ``facts(id)`` returns [] when absent. Staged here for the future
+        # R4 -> long-term-memory pull (the ``fact_sink`` consumes it).
+        self._facts: dict[int, list[dict]] = {}
 
     @staticmethod
     def _normalize(v: np.ndarray) -> np.ndarray:
@@ -298,6 +311,32 @@ class BlurbStore:
     def text(self, anchor_id: int) -> Optional[str]:
         i = self._index.get(anchor_id)
         return None if i is None else self._texts[i]
+
+    def facts(self, anchor_id: int) -> list[dict]:
+        """The structured-gist fact sidecar for ``anchor_id`` (relations +
+        state_assertions). Empty list when the anchor has not been consolidated
+        or has no extracted facts."""
+        return self._facts.get(anchor_id, [])
+
+    def update(self, anchor_id: int, new_vec: np.ndarray, new_text: str,
+               facts: Optional[list[dict]] = None) -> None:
+        """Re-key an anchor IN PLACE: replace its bge vector + blurb text (and
+        optionally stage a facts sidecar). Used by ``FadeMemory.consolidate`` to
+        turn a fading verbatim anchor into its structured gist -- the embed
+        handle becomes ``bge(narrative)`` and the recalled blurb becomes the
+        narrative (the maximem_synap_sdk cache-replacement semantics: the new
+        summary REPLACES the cached fields). Invalidates the retrieval matrix so
+        the next ``retrieve`` sees the new vector. Raises ``KeyError`` if the
+        anchor is unknown (consolidation never targets a missing anchor)."""
+        i = self._index[anchor_id]
+        vn = self._normalize(new_vec)
+        if vn.shape[0] != self.dim:
+            raise ValueError(f"new_vec length {vn.shape[0]} != dim {self.dim}")
+        self._vecs[i] = vn
+        self._texts[i] = new_text
+        if facts is not None:
+            self._facts[anchor_id] = facts
+        self._matrix = None  # invalidate the cached retrieval matrix
 
     def __len__(self) -> int:
         return len(self._ids)
@@ -410,6 +449,13 @@ class FadeMemory:
         self.blurbs = BlurbStore(self.dim)
         self.ring: deque[int] = deque(maxlen=cfg.ring_capacity)
         self._next_id = 0
+        # Consolidation state (the gist-on-forgetting loop). ``consolidation_counts``
+        # tracks gist-of-gist depth per anchor (capped by ``max_depth`` in
+        # ``fading_anchors``); ``_prior_gists`` holds the prior narrative fed back
+        # to the gister on the next pass (the prior-baseline-merge that preserves
+        # fidelity across compressions). Empty until a sweep consolidates an anchor.
+        self.consolidation_counts: dict[int, int] = {}
+        self._prior_gists: dict[int, str] = {}
 
     # -- ingestion -----------------------------------------------------
     def ingest(self, chunk_text: str, blurb_text: Optional[str] = None) -> int:
@@ -508,6 +554,12 @@ class FadeMemory:
         # not through retrieving a sibling. If the anchor's blurb is gone,
         # degrade to R4. (Mirrors ``_verbatim`` -- the blurb store is the source
         # of truth, addressed by anchor_id.)
+        #
+        # NOTE: once the consolidation loop (``consolidate``) has gisted this
+        # anchor, the stored blurb IS the narrative gist (not the verbatim), so
+        # R3 returns a REAL gist -- the regime label and the content finally
+        # agree. Before consolidation, R3 returns the verbatim blurb (the label
+        # is aspirational). Either way the anchor's own blurb is the content.
         blurb = self.blurbs.text(anchor_id)
         if blurb is None:
             return Recall(anchor_id, REGIME_FORGOTTEN, cos_i, content="[forgotten]")
@@ -545,3 +597,83 @@ class FadeMemory:
         self.blurbs = BlurbStore(self.dim)
         self.ring.clear()
         self._next_id = 0
+        self.consolidation_counts = {}
+        self._prior_gists = {}
+
+    # -- consolidation (the gist-on-forgetting loop) -------------------
+    def prior_gist(self, anchor_id: int) -> Optional[str]:
+        """The anchor's current consolidated narrative (None until its first
+        consolidation). Fed back to the gister on the next pass so gist-of-gist
+        is fidelity-preserving (prior-baseline-merge)."""
+        return self._prior_gists.get(anchor_id)
+
+    def consolidation_count(self, anchor_id: int) -> int:
+        """How many times this anchor has been consolidated (0 = verbatim)."""
+        return self.consolidation_counts.get(anchor_id, 0)
+
+    def fading_anchors(self, epsilon: float = 0.03, max_depth: int = 3,
+                       max_per_tick: int = 8) -> list[int]:
+        """Anchors a consolidation sweep should gist, most-faded-first.
+
+        The automatic threshold trigger: an anchor is eligible when its
+        recoverability has crossed the R3->R4 boundary -- ``cos < cos_gist +
+        epsilon`` (the ``+epsilon`` hysteresis catches anchors just as they cross
+        -- the user's "reaches the point where it can't be recalled") -- AND it
+        is not in the ring (verbatim window; never consolidate fresh recall),
+        AND it is under the gist-of-gist depth cap (``max_depth``; beyond it the
+        anchor stays R4 -- the real forgotten -> long-term-pull floor), AND its
+        blurb still exists. Capped at ``max_per_tick`` to bound queue growth.
+        Read-only on the memory -- safe for the worker's ``tick`` to call during
+        a foreground query (the mutation happens later in ``consolidate``,
+        gated on the foreground event).
+        """
+        threshold = self.cfg.cos_gist + epsilon
+        out: list[tuple[float, int]] = []
+        for aid in self.blurbs._ids:
+            if aid in self.ring:
+                continue
+            if self.consolidation_counts.get(aid, 0) >= max_depth:
+                continue
+            if self.blurbs.text(aid) is None:
+                continue
+            cos_i = self._recoverability(aid)
+            if cos_i is None or cos_i >= threshold:
+                continue
+            out.append((cos_i, aid))
+        out.sort(key=lambda ca: ca[0])  # most-faded (lowest cos) first
+        return [aid for _, aid in out[:max_per_tick]]
+
+    def consolidate(self, anchor_id: int, gist: "StructuredGist") -> float:
+        """Apply a structured gist IN PLACE -- the compression step.
+
+        The original anchor BECOMES its gist (the user's "update the excerpt"):
+        the blurb is re-keyed to ``bge(narrative)`` and the recalled text becomes
+        the narrative; SSM-A is re-stepped with ``bge(narrative)`` (the "add them
+        to the ssm" step -- fresh recency, the anchor jumps R4 -> R1); the ring
+        position is refreshed (no duplicate); the facts sidecar is staged; the
+        consolidation count + prior-gist are recorded for the next gist-of-gist
+        pass. This is the INVERSE of LRU: the gist REPLACES the verbatim (a
+        compressed form), not a recency refresh of the same text -- so the fade
+        still progresses (fidelity degrades gist-of-gist over sweeps), and R4
+        still fires for anchors the sweep never reaches.
+
+        Returns the new ``cos(state, bge(narrative))`` (for observability -- it
+        should be high, R1, since the gist's vector is now the most-recent SSM
+        write). Raises ``KeyError`` if the anchor is unknown.
+        """
+        vec = self._encode_one(gist.narrative)
+        self.blurbs.update(
+            anchor_id, vec,
+            gist.narrative[: self.cfg.blurb_chars],
+            facts=list(gist.facts) + list(gist.state_assertions),
+        )
+        self.ssm_a.step(vec)  # fresh recency -- the gist is now recallable
+        # Refresh the ring position (no duplicate): the gist is "recent" again.
+        if anchor_id in self.ring:
+            self.ring.remove(anchor_id)
+        self.ring.append(anchor_id)
+        self._prior_gists[anchor_id] = gist.narrative
+        self.consolidation_counts[anchor_id] = (
+            self.consolidation_counts.get(anchor_id, 0) + 1
+        )
+        return self._recoverability(anchor_id) or 0.0

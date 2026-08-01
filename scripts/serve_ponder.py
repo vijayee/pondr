@@ -263,6 +263,34 @@ def main() -> int:
                         "query (the Phase A observability mechanism -- the way to "
                         "SEE which regimes fire on real serve traffic). DEFAULT "
                         "OFF.")
+    p.add_argument("--fade-consolidation", action="store_true", default=False,
+                   help="Phase C: gist fading anchors in the background. When an "
+                        "anchor's recoverability drops below cos_gist+epsilon "
+                        "(it can no longer be recalled verbatim), a background "
+                        "worker composes a STRUCTURED gist (a tight narrative via "
+                        "the local Bonsai LLM + extracted facts) and replaces the "
+                        "verbatim blurb IN PLACE -- the anchor jumps R4 -> R1, "
+                        "recallable again at a compressed level. Gist-of-gist over "
+                        "successive sweeps (fidelity-preserving); at --fade-"
+                        "consolidation-max-depth the anchor stays R4 (the real "
+                        "forgotten -> long-term-pull floor). Runs between turns "
+                        "(non-blocking; shares the foreground gate). result"
+                        "[\"fade_recalls\"] gains consolidation_count + a "
+                        "consolidated flag. Cold-start honest: if the Bonsai "
+                        "server is down the worker skips (anchors stay R4) and "
+                        "serve is byte-identical to --fade-memory alone. Requires "
+                        "--fade-memory. DEFAULT OFF.")
+    p.add_argument("--fade-consolidation-epsilon", type=float, default=0.03,
+                   help="how far BELOW cos_gist an anchor must fade before it is "
+                        "gist-ed (default 0.03 -- the sweep triggers just past the "
+                        "R3/R4 boundary, not the moment it crosses). Larger = "
+                        "consolidates later (more verbatim retained); smaller = "
+                        "consolidates sooner.")
+    p.add_argument("--fade-consolidation-max-depth", type=int, default=3,
+                   help="the gist-of-gist depth cap (default 3). At this depth the "
+                        "anchor is no longer re-gist-ed -- it stays R4, the "
+                        "forgotten -> long-term-memory pull floor (the fact_sink "
+                        "hook for the graph write is a follow-on).")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -359,6 +387,22 @@ def main() -> int:
                   "yet, so the response is byte-identical to flag-off. Pass "
                   "--fade-debug to see the regimes fire, or add --fade-inject "
                   "(Phase B) to feed them into the response.", file=sys.stderr)
+        if args.fade_consolidation:
+            if not args.fade_memory:
+                print("ERROR: --fade-consolidation requires --fade-memory (the "
+                      "consolidation loop gists the FADE's anchors; without a "
+                      "fade memory there is nothing to consolidate).",
+                      file=sys.stderr)
+                return 1
+            print("NOTE: --fade-memory --fade-consolidation is EXPERIMENTAL "
+                  "(Phase C). A background worker gists anchors once they fade "
+                  "past recallability, replacing the verbatim blurb IN PLACE "
+                  "(R4 -> R1 at a compressed level; gist-of-gist over sweeps). "
+                  "It runs between turns (non-blocking) and uses the local Bonsai "
+                  "LLM. If the Bonsai server is down it skips (anchors stay R4) "
+                  "and serve is byte-identical to --fade-memory alone. Pass "
+                  "--fade-debug to watch consolidation_count climb.",
+                  file=sys.stderr)
         if args.fade_memory_voice_path and not args.fade_memory_tokenizer_path:
             print("ERROR: --fade-memory-voice-path requires "
                   "--fade-memory-tokenizer-path (the token-LM voice leg needs "
@@ -455,7 +499,11 @@ def main() -> int:
           f"fade_memory_decay={args.fade_memory_decay} "
           f"fade_memory_top_k={args.fade_memory_top_k} "
           f"fade_inject={args.fade_inject} "
-          f"fade_debug={args.fade_debug}", file=sys.stderr)
+          f"fade_debug={args.fade_debug} "
+          f"fade_consolidation={args.fade_consolidation} "
+          f"fade_consolidation_epsilon={args.fade_consolidation_epsilon} "
+          f"fade_consolidation_max_depth={args.fade_consolidation_max_depth}",
+          file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -486,6 +534,9 @@ def main() -> int:
         fade_memory_ring_capacity=args.fade_memory_ring_capacity,
         fade_memory_expand_tokens=args.fade_memory_expand_tokens,
         fade_inject=args.fade_inject,
+        fade_consolidation=args.fade_consolidation,
+        fade_consolidation_epsilon=args.fade_consolidation_epsilon,
+        fade_consolidation_max_depth=args.fade_consolidation_max_depth,
     )
 
     try:

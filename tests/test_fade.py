@@ -459,3 +459,153 @@ def test_ingest_default_blurb_unchanged() -> None:
     r = mem.recall_anchor(aid)
     assert r.regime == REGIME_VERBATIM
     assert r.content == chunk[: cfg.blurb_chars]
+
+
+# ---------------------------------------------------- gist-on-forgetting (Phase C)
+class _StubGist:
+    """Minimal double for ``StructuredGist`` -- only the three attributes
+    ``consolidate`` reads (``narrative`` / ``facts`` / ``state_assertions``).
+    Keeps test_fade.py from importing the gister's Bonsai-client chain."""
+
+    def __init__(self, narrative: str, facts=None, state_assertions=None) -> None:
+        self.narrative = narrative
+        self.facts = facts or []
+        self.state_assertions = state_assertions or []
+
+
+def _fade_anchor_to_r4(mem: FadeMemory, aid: int, n: int = 24) -> None:
+    """Stream cross-doc chunks past ``aid`` until it routes R4 (forgotten)."""
+    for i in range(n):
+        mem.ingest(f"zz{i}:0")
+        if mem.recall_anchor(aid).regime == REGIME_FORGOTTEN:
+            return
+    # Some seeds need a few more; keep going until R4 or the cap.
+    for i in range(n, n + 24):
+        mem.ingest(f"zz{i}:0")
+
+
+def test_blurb_store_update_rekeys() -> None:
+    # update() replaces the row's vec + text, stores the facts sidecar, and
+    # invalidates the retrieve matrix (the NEW vec is top-1 for the new text).
+    emb = _StubEmbedder()
+    store = BlurbStore(dim=emb.dim)
+    v0 = np.asarray(emb.encode(["docA:0"])[0], dtype=np.float32)
+    store.add(0, v0, "docA:0")
+    new_vec = np.asarray(emb.encode(["docB:9"])[0], dtype=np.float32)
+    store.update(0, new_vec, "docB:9 gist", facts=[{"p": "has_state", "o": "v"}])
+    assert store.text(0) == "docB:9 gist"
+    assert np.allclose(store.vector(0), new_vec / np.linalg.norm(new_vec), atol=1e-5)
+    assert store.facts(0) == [{"p": "has_state", "o": "v"}]
+    # retrieve keyed on the NEW text returns this row top-1 (matrix was rebuilt).
+    q = np.asarray(emb.encode(["docB:9"])[0], dtype=np.float32)
+    hits = store.retrieve(q, k=1)
+    assert hits[0][0] == 0
+
+
+def test_blurb_store_update_unknown_raises() -> None:
+    store = BlurbStore(dim=4)
+    with pytest.raises(KeyError):
+        store.update(999, np.zeros(4, dtype=np.float32), "x")
+
+
+def test_consolidate_jumps_to_r1() -> None:
+    # A faded-to-R4 anchor, consolidated with a same-doc narrative, jumps back
+    # to R1 (verbatim) -- the gist is now the most-recent SSM write. count=1,
+    # prior_gist stored, facts sidecar staged.
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.5, cos_ring=0.95, cos_gist=0.20, ring_capacity=2)
+    mem = FadeMemory(cfg, emb, _StubVoice())
+    aid = mem.ingest("docA:0")
+    _fade_anchor_to_r4(mem, aid)
+    assert mem.recall_anchor(aid).regime == REGIME_FORGOTTEN
+    gist = _StubGist("docA:0 a tight gist of doc a", facts=[{"p": "k", "o": "v"}])
+    cos_new = mem.consolidate(aid, gist)
+    assert cos_new >= cfg.cos_ring or cos_new > 0.6   # back to fresh/recallable
+    r = mem.recall_anchor(aid)
+    assert r.regime == REGIME_VERBATIM
+    assert r.content == gist.narrative[: cfg.blurb_chars]
+    assert mem.consolidation_count(aid) == 1
+    assert mem.prior_gist(aid) == gist.narrative
+    assert mem.blurbs.facts(aid) == [{"p": "k", "o": "v"}]
+
+
+def test_consolidate_refreshes_ring_no_dup() -> None:
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.5, cos_ring=0.95, cos_gist=0.20, ring_capacity=4)
+    mem = FadeMemory(cfg, emb, _StubVoice())
+    aid = mem.ingest("docA:0")
+    _fade_anchor_to_r4(mem, aid)
+    # `aid` was evicted from the ring by the cross-doc flood; consolidate
+    # re-appends it exactly once at the tail.
+    assert aid not in mem.ring
+    mem.consolidate(aid, _StubGist("docA:0 the gist"))
+    assert mem.ring.count(aid) == 1
+    assert mem.ring[-1] == aid
+
+
+def test_fading_anchors_filters() -> None:
+    # Only cos < cos_gist+epsilon, not in ring, under max_depth, blurb present.
+    # Most-faded-first; per-tick cap respected. ``fresh`` is ingested LAST so the
+    # ring (cap 4) holds it -> excluded from the sweep.
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.5, cos_ring=0.95, cos_gist=0.20, ring_capacity=4)
+    mem = FadeMemory(cfg, emb, _StubVoice())
+    a = mem.ingest("docA:0")
+    b = mem.ingest("docB:0")
+    _fade_anchor_to_r4(mem, a)
+    _fade_anchor_to_r4(mem, b)
+    fresh = mem.ingest("docC:0")   # last -> in ring, high cos -> excluded
+    assert fresh in mem.ring
+    ids = mem.fading_anchors(epsilon=0.03, max_depth=3, max_per_tick=8)
+    assert fresh not in ids
+    assert set(ids) <= {a, b}
+    # most-faded-first: sorted ascending by cos; just assert both eligible.
+    assert a in ids and b in ids
+    # cap respected.
+    ids_cap = mem.fading_anchors(epsilon=0.03, max_depth=3, max_per_tick=1)
+    assert len(ids_cap) <= 1
+
+
+def test_consolidate_gist_of_gist() -> None:
+    # Two consolidations: the second's prior_gist is the first narrative; count
+    # climbs to 2; at max_depth the anchor is excluded from fading_anchors
+    # (stays R4 -- the forgotten -> long-term-pull floor).
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.5, cos_ring=0.95, cos_gist=0.20, ring_capacity=2)
+    mem = FadeMemory(cfg, emb, _StubVoice())
+    aid = mem.ingest("docA:0")
+    _fade_anchor_to_r4(mem, aid)
+    g1 = "docA:0 first-level gist"
+    mem.consolidate(aid, _StubGist(g1))
+    assert mem.consolidation_count(aid) == 1
+    assert mem.prior_gist(aid) == g1
+    # Fade it again, then consolidate a second time (gist-of-gist).
+    _fade_anchor_to_r4(mem, aid)
+    g2 = "docA:0 zeroed second-level gist"
+    mem.consolidate(aid, _StubGist(g2))
+    assert mem.consolidation_count(aid) == 2
+    assert mem.prior_gist(aid) == g2
+    # At max_depth=2 the anchor is now excluded from the sweep.
+    _fade_anchor_to_r4(mem, aid)
+    assert aid not in mem.fading_anchors(epsilon=0.03, max_depth=2, max_per_tick=8)
+    # But re-eligible at a higher cap (the cap gates, not blocks forever).
+    assert aid in mem.fading_anchors(epsilon=0.03, max_depth=3, max_per_tick=8)
+
+
+def test_consolidate_skip_when_narrative_none() -> None:
+    # The gister returns None (cold-start: Bonsai down) -> the WORKER skips the
+    # consolidation (the anchor stays R4). Here we assert the memory-level
+    # invariant the worker relies on: a None gist never reaches consolidate, so
+    # the anchor's count/blurb are untouched. (The worker's None-skip is tested
+    # directly in test_consolidation.py.)
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.5, cos_ring=0.95, cos_gist=0.20, ring_capacity=2)
+    mem = FadeMemory(cfg, emb, _StubVoice())
+    aid = mem.ingest("docA:0")
+    _fade_anchor_to_r4(mem, aid)
+    before_text = mem.blurbs.text(aid)
+    before_count = mem.consolidation_count(aid)
+    # Simulate the worker's None-skip: do NOT call consolidate.
+    assert mem.recall_anchor(aid).regime == REGIME_FORGOTTEN
+    assert mem.blurbs.text(aid) == before_text
+    assert mem.consolidation_count(aid) == before_count == 0

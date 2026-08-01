@@ -69,6 +69,7 @@ from .tools import (
 
 if TYPE_CHECKING:
     from .encoding.encoder import HippocampalEncoder
+    from .subconscious.consolidation_worker import ConsolidationWorker
     from .subconscious.fade import FadeMemory
 
 from .encoding.distill_worker import DistillWorker
@@ -187,6 +188,7 @@ class PonderOrchestrator:
         fade_memory: "Optional[FadeMemory]" = None,
         fade_memory_top_k: int = 5,
         fade_inject: bool = False,
+        consolidation_worker: "Optional[ConsolidationWorker]" = None,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -337,6 +339,16 @@ class PonderOrchestrator:
         self._fade_inject = fade_inject
         self._fade_regime_names: dict[int, str] = {}
         self._format_fade_block = None
+        # Gist-on-forgetting consolidation worker (Phase C, optional DI like the
+        # distill worker). When wired, ``tick()`` is called at the query tail
+        # (after the fade ingest) to enqueue fading anchors for background
+        # gist-ing; the worker thread consolidates them BETWEEN turns (it shares
+        # this orchestrator's foreground-busy gate via its own event, set/cleared
+        # alongside the distill worker's below). ``None`` (default, flag off) ->
+        # no consolidation -> byte-identical to Phase B. Best-effort: tick + the
+        # worker's per-job loop swallow all failures (a Bonsai outage leaves
+        # anchors at R4, retried next sweep -- no fabricated gist).
+        self._consolidation_worker = consolidation_worker
         if fade_memory is not None:
             from src.subconscious.fade import (  # local, light import
                 REGIME_NAME, format_fade_block,
@@ -560,6 +572,11 @@ class PonderOrchestrator:
         # there is no worker (the synchronous default).
         if self._distill_worker is not None:
             self._distill_worker.foreground_busy.set()
+        # The consolidation worker mutates ssm_a/blurbs (which Seam-2 recall
+        # reads), so it MUST yield to the foreground too -- gate it on the same
+        # set/clear lifecycle so consolidation runs only between turns.
+        if self._consolidation_worker is not None:
+            self._consolidation_worker.foreground_busy.set()
         # STRM 2a raw-rating tap: remember the current query so the
         # record_feedback tool path (tools.dispatch_tool -> store.record_feedback)
         # can thread it into feedback.jsonl. Cleared on every return path (the
@@ -647,6 +664,8 @@ class PonderOrchestrator:
                 # path tail below, which this return skips).
                 if self._distill_worker is not None:
                     self._distill_worker.foreground_busy.clear()
+                if self._consolidation_worker is not None:
+                    self._consolidation_worker.foreground_busy.clear()
                 self._current_query = None
                 return {
                     "response": None, "route": route, "retrieved_episodes": [],
@@ -697,13 +716,21 @@ class PonderOrchestrator:
             try:
                 names = self._fade_regime_names
                 for r in self._fade.recall(user_prompt, top_k=self._fade_top_k):
+                    aid = r.anchor_id
                     fade_recalls.append({
-                        "anchor_id": r.anchor_id,
+                        "anchor_id": aid,
                         "regime": r.regime,
                         "regime_name": names.get(r.regime, "?"),
                         "cos": r.cos,
                         "content": r.content,
                         "blurb": r.blurb,
+                        # Phase C observability: how many times this anchor has
+                        # been consolidated (gist-of-gist depth; 0 = verbatim,
+                        # never gisted) and whether its blurb is a real gist
+                        # (prior_gist is set the moment ``consolidate`` runs).
+                        # Both 0/False when the consolidation flag is off.
+                        "consolidation_count": self._fade.consolidation_count(aid),
+                        "consolidated": self._fade.prior_gist(aid) is not None,
                     })
             except Exception as e:  # noqa: BLE001 - observability only
                 print(f"[fade-recall-fail] {e}", file=sys.stderr)
@@ -989,6 +1016,8 @@ class PonderOrchestrator:
         # turn's) graph edges in the now-idle GPU gap. No-op without a worker.
         if self._distill_worker is not None:
             self._distill_worker.foreground_busy.clear()
+        if self._consolidation_worker is not None:
+            self._consolidation_worker.foreground_busy.clear()
         self._current_query = None
         return result
 
@@ -1041,6 +1070,16 @@ class PonderOrchestrator:
                     self._fade.ingest(f"User: {user_prompt}\nAssistant: {response}")
                 except Exception as fe:  # noqa: BLE001 - never break persist
                     print(f"[fade-ingest-fail] {fe}", file=sys.stderr)
+                # Phase C: enqueue fading anchors for background gist-ing. Read-
+                # only on the memory (a ``fading_anchors`` sweep + queue puts), so
+                # safe to run here even though the foreground gate is still held
+                # (the worker thread blocks on the gate before any mutation).
+                # Best-effort, swallowed -- a tick failure never breaks the turn.
+                if self._consolidation_worker is not None:
+                    try:
+                        self._consolidation_worker.tick()
+                    except Exception as ce:  # noqa: BLE001 - never break persist
+                        print(f"[consolidation-tick-fail] {ce}", file=sys.stderr)
             encoder = self._get_encoder()
             if encoder is None:
                 return
@@ -1460,18 +1499,24 @@ class PonderOrchestrator:
         encoder.end_session()
 
     def drain(self, timeout: float = 5.0) -> bool:
-        """Teardown: stop the background distill worker, finish in-flight +
-        queued fills, join the worker thread. No-op when async-distill is off.
+        """Teardown: stop the background workers, finish in-flight + queued
+        jobs, join their threads. No-op when both async-distill and fade-
+        consolidation are off.
 
-        This PERMANENTLY stops the worker -- call at process exit / orchestrator
+        This PERMANENTLY stops the workers -- call at process exit / orchestrator
         disposal (``serve_ponder.py`` calls it on shutdown), NOT per
-        conversation (the worker must stay alive across conversations). Returns
-        True if the worker joined within ``timeout``. Best-effort: a hard exit
-        may lose in-flight encodes -- the stub keeps the turn vector-retrievable.
+        conversation (the workers must stay alive across conversations). Returns
+        True if every wired worker joined within ``timeout``. Best-effort: a
+        hard exit may lose in-flight encodes / consolidations -- the stub keeps
+        the turn vector-retrievable and a lost consolidation leaves the anchor
+        at R4 (retried next sweep, no data loss).
         """
-        if self._distill_worker is None:
-            return True
-        return self._distill_worker.drain(timeout=timeout)
+        ok = True
+        if self._distill_worker is not None:
+            ok = self._distill_worker.drain(timeout=timeout) and ok
+        if self._consolidation_worker is not None:
+            ok = self._consolidation_worker.drain(timeout=timeout) and ok
+        return ok
 
     # ── session persistence (reuses the shipped state serializer) ──
 
