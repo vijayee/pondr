@@ -990,12 +990,17 @@ class PonderOrchestrator:
         def _synthesize(context: str, history: Optional[list[dict]]) -> str:
             sys_content = "You are a helpful assistant with access to past conversations."
             if loop_enabled:
-                # Bounds redundant tool calls from the 8B: only call a tool
-                # when the provided context is genuinely insufficient. Loop-
+                # Tools are OPTIONAL -- phrased as guidance, not an order. The
+                # model may answer directly from the context when it suffices,
+                # and reach for a tool only when the context is genuinely
+                # insufficient (this bounds redundant tool calls from the 8B
+                # without forbidding the model from ever calling one). Loop-
                 # path-only so the one-shot path stays byte-identical.
-                sys_content += (" Only call a tool when the provided context is"
-                                " genuinely insufficient; if you can answer"
-                                " from it, do so without calling tools.")
+                sys_content += (" Tools are available if you need them, but"
+                                " optional -- when the provided context already"
+                                " answers the question, just answer directly;"
+                                " reach for a tool only when the context is"
+                                " genuinely insufficient.")
             messages: list[dict] = [{"role": "system", "content": sys_content}]
             if history:
                 messages.extend(history[-10:])
