@@ -122,3 +122,39 @@ def default_gister() -> BonsaiGister:
     import-safe and constructible offline.
     """
     return BonsaiGister(BonsaiRelationExtractor(), BonsaiDecider())
+
+
+class BonsaiSceneAuthor:
+    """The Bonsai scene-block authoring client (B1).
+
+    Thin composition around ``BonsaiDecider.author_scene`` -- the SAME local
+    Bonsai llama-server the gister + consolidation worker use (NOT Ollama /
+    OracleClient). The scene worker (``scene_worker.py``) takes this via DI,
+    mirroring how ``ConsolidationWorker`` takes a ``BonsaiGister``. Cold-start
+    honest: ``author_scene`` returns ``None`` when Bonsai is down / parse fails /
+    the action is unrecognized, and the worker defers (never auto-writes a
+    scene). No fabricated scene.
+    """
+
+    def __init__(self, decider: BonsaiDecider) -> None:
+        self.decider = decider
+
+    def author_scene(self, topic: str, existing_body: Optional[str],
+                     candidate_summaries: list[str], user_id: str,
+                     heat_budget: int,
+                     merge_candidate: Optional[dict] = None) -> Optional[dict]:
+        """Delegate to ``BonsaiDecider.author_scene`` (see its docstring)."""
+        return self.decider.author_scene(
+            topic, existing_body, candidate_summaries, user_id,
+            heat_budget, merge_candidate)
+
+
+def default_scene_author() -> BonsaiSceneAuthor:
+    """Construct a ``BonsaiSceneAuthor`` from ``config.bonsai_*`` defaults.
+
+    Lazy convenience for ``build_ponder`` -- ``BonsaiDecider`` reads
+    ``config.bonsai_endpoint`` / ``bonsai_model`` / ``bonsai_temperature`` in
+    its own ``__init__``; the HTTP call is lazy (one per ``author_scene``), so
+    this is import-safe and constructible offline.
+    """
+    return BonsaiSceneAuthor(BonsaiDecider())

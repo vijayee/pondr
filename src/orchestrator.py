@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from .encoding.encoder import HippocampalEncoder
     from .subconscious.consolidation_worker import ConsolidationWorker
     from .subconscious.fade import FadeMemory
+    from .subconscious.scene_worker import SceneAuthoringWorker
 
 from .encoding.distill_worker import DistillWorker
 
@@ -276,6 +277,8 @@ class PonderOrchestrator:
         fade_inject: bool = False,
         consolidation_worker: "Optional[ConsolidationWorker]" = None,
         tier2_recall_menu: bool = False,
+        scene_blocks: bool = False,
+        scene_worker: "Optional[SceneAuthoringWorker]" = None,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -436,6 +439,17 @@ class PonderOrchestrator:
         # worker's per-job loop swallow all failures (a Bonsai outage leaves
         # anchors at R4, retried next sweep -- no fabricated gist).
         self._consolidation_worker = consolidation_worker
+        # Scene blocks (B1): LLM-authored topic-level macro-memory stored IN
+        # WaveDB (``content/scene/{id}``, NOT files). The worker authors/revises
+        # one scene per ingest BATCH in the background (between turns, sharing
+        # this orchestrator's foreground-busy gate via its own event -- assigned
+        # below alongside the consolidation + distill workers). ``None`` (default,
+        # flag off) -> no scene worker -> no scene writes -> ``default_scene_ids``
+        # is empty -> byte-identical to pre-B1. Best-effort: tick + the worker's
+        # per-job loop swallow all failures (a Bonsai outage leaves the macro
+        # layer untouched, retried next batch -- no fabricated scene).
+        self._scene_blocks = bool(scene_blocks)
+        self._scene_worker = scene_worker
         if fade_memory is not None:
             from src.subconscious.fade import (  # local, light import
                 REGIME_NAME, format_fade_block,
@@ -684,6 +698,11 @@ class PonderOrchestrator:
         # set/clear lifecycle so consolidation runs only between turns.
         if self._consolidation_worker is not None:
             self._consolidation_worker.foreground_busy.set()
+        # The scene authoring worker mutates the store (scene writes) between
+        # turns; gate it on the same set/clear lifecycle so authoring runs only
+        # in the gaps between turns (D3 -- mirrors the consolidation worker).
+        if self._scene_worker is not None:
+            self._scene_worker.foreground_busy.set()
         # Validated compaction: a review-resolution command (keep/accept/edit
         # <i>) is consumed as a meta-command THIS turn -- it resolves a deferred
         # consolidation review instead of running a normal query (so the line
@@ -700,6 +719,8 @@ class PonderOrchestrator:
                     self._distill_worker.foreground_busy.clear()
                 if self._consolidation_worker is not None:
                     self._consolidation_worker.foreground_busy.clear()
+                if self._scene_worker is not None:
+                    self._scene_worker.foreground_busy.clear()
                 self._current_query = None
                 return {
                     "response": ack,
@@ -800,6 +821,8 @@ class PonderOrchestrator:
                     self._distill_worker.foreground_busy.clear()
                 if self._consolidation_worker is not None:
                     self._consolidation_worker.foreground_busy.clear()
+                if self._scene_worker is not None:
+                    self._scene_worker.foreground_busy.clear()
                 self._current_query = None
                 return {
                     "response": None, "route": route, "retrieved_episodes": [],
@@ -1187,6 +1210,19 @@ class PonderOrchestrator:
             self._distill_worker.foreground_busy.clear()
         if self._consolidation_worker is not None:
             self._consolidation_worker.foreground_busy.clear()
+        if self._scene_worker is not None:
+            # B1 macro-forgetting: decay every scene's heat + evict below-floor,
+            # in the foreground-clear window (the worker is STILL blocked on
+            # ``foreground_busy`` here, so this store mutation can't race the
+            # worker's authoring mutation -- the clear below releases it after).
+            # Best-effort, swallowed: a decay failure never breaks the turn.
+            # Runs once per turn -- a scene touched this turn (retrieval boost or
+            # UPDATE) stays warm; an untouched scene decays toward eviction.
+            try:
+                self._scene_worker.decay_tick()
+            except Exception as de:  # noqa: BLE001 - best-effort macro-forgetting
+                print(f"[scene-decay-fail] {de}", file=sys.stderr)
+            self._scene_worker.foreground_busy.clear()
         self._current_query = None
         return result
 
@@ -1333,6 +1369,25 @@ class PonderOrchestrator:
                     degrade_on_extract_fail=True,
                 )
                 result["persisted_episode_id"] = episode.id
+            # B1 scene blocks: enqueue ONE authoring job for the just-persisted
+            # episode. ``topic_hint`` is the union of the episode's topics (the
+            # macro axis the scene lives on); an empty topic list -> the worker's
+            # ``tick`` is a no-op (no topic -> no scene). Read-only on the store
+            # (it builds the job + queues it), so safe here with the foreground
+            # gate still held (the worker thread blocks before any mutation).
+            # Best-effort, swallowed -- a tick failure never breaks the turn.
+            # NB: on the async-distill path the stub episode's topics may not be
+            # filled yet (the 22s extract fills them) -> this tick no-ops and the
+            # scene is authored from a later topic-bearing episode instead.
+            if self._scene_worker is not None and episode is not None:
+                try:
+                    hint_topics = list(getattr(episode, "topics", []) or [])
+                    hint = hint_topics[0] if hint_topics else ""
+                    if hint:
+                        self._scene_worker.tick(
+                            self.user_id, [episode.id], topic_hint=hint)
+                except Exception as se:  # noqa: BLE001 - never break persist
+                    print(f"[scene-tick-fail] {se}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001 - never lose the response
             print(f"[persist-fail] {e}", file=sys.stderr)
 
@@ -1639,6 +1694,29 @@ class PonderOrchestrator:
                     head = sec.heading or "(section)"
                     parts.append(f"\n## {head}\n{sec.content}")
                 return "\n".join(parts)
+            if unit_id.startswith("scene_"):
+                # A scene block (B1): return the topic + heat + cited episodes
+                # + the Markdown body. Drill-down for the expand tool -- the
+                # existing ``expand`` routes ``scene_*`` ids here via
+                # ``dispatch_tool`` -> ``expand_memory`` -> ``expand_unit`` (no
+                # separate ``expand_scene`` tool). Full scene-scene drill-down
+                # (following ``cites`` to the underlying episodes) is a B2
+                # follow-on; this wires expandability of the macro layer.
+                sc = self.store.get_scene(unit_id)
+                if sc is None:
+                    return None
+                parts = [
+                    f"Scene (topic: {sc.get('topic') or ''})",
+                    f"Heat: {float(sc.get('heat') or 0.0):.2f}",
+                    f"Updated: {sc.get('updated_ts') or ''}",
+                ]
+                src = sc.get("source_eps") or []
+                if src:
+                    parts.append("Cites: " + ", ".join(src))
+                body = sc.get("body") or ""
+                if body:
+                    parts.append(body)
+                return "\n".join(parts)
             # Episode: return summary + full text.
             ep = self.store.get_episode(unit_id)
             if ep is None:
@@ -1762,15 +1840,16 @@ class PonderOrchestrator:
                 # Over-fetch when scoped (``_REMEMBER_SCOPE_FETCH_MULT`` mirrors
                 # retriever's ``_USER_SCOPE_FETCH_MULT``) so the tail survives
                 # the filter instead of being starved by it.
-                allowed_ep, allowed_doc = self.retriever._user_scope_sets()
-                scoped = allowed_ep is not None or allowed_doc is not None
+                allowed_ep, allowed_doc, allowed_scene = self.retriever._user_scope_sets()
+                scoped = (allowed_ep is not None or allowed_doc is not None
+                          or allowed_scene is not None)
                 fetch_k = tier1_k + _REMEMBER_TAIL_N
                 if scoped:
                     fetch_k *= _REMEMBER_SCOPE_FETCH_MULT
                 hits = self.retriever.vector_search.search(q, k=fetch_k)
                 if scoped:
                     hits = self.retriever._filter_vector_hits_by_scope(
-                        hits, allowed_ep, allowed_doc)
+                        hits, allowed_ep, allowed_doc, allowed_scene)
                 for eid, sim in hits[tier1_k:]:          # the tail beyond cutoff
                     ep = self.retriever.traversal._hydrate(eid)
                     items.append({
@@ -1821,6 +1900,8 @@ class PonderOrchestrator:
             ok = self._distill_worker.drain(timeout=timeout) and ok
         if self._consolidation_worker is not None:
             ok = self._consolidation_worker.drain(timeout=timeout) and ok
+        if self._scene_worker is not None:
+            ok = self._scene_worker.drain(timeout=timeout) and ok
         return ok
 
     # ── session persistence (reuses the shipped state serializer) ──

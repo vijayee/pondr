@@ -139,52 +139,60 @@ class HippocampalRetriever:
 
     # ── User-scope (retrieval user boundary) ──
 
-    def _user_scope_sets(self) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        """The query user's owned episode + document id sets (strict scope).
+    def _user_scope_sets(
+        self,
+    ) -> tuple[Optional[set[str]], Optional[set[str]], Optional[set[str]]]:
+        """The query user's owned episode + document + scene id sets (strict scope).
 
-        Returns ``(allowed_ep, allowed_doc)``. When :attr:`user_id` is ``None``
-        (user-scope OFF) returns ``(None, None)`` so every retrieve path skips
-        filtering -> byte-identical to the pre-user-scope path. When set, both
-        sets are recomputed per call from the store's SPO indices -- a user who
-        ingests a doc mid-session sees it on the next retrieve (no init-time
-        cache). The two scans are cheap (SPO prefix range reads). Empty for an
-        unknown user (no sessions / no owned docs) -> strict scope returns
-        nothing, the honest result.
+        Returns ``(allowed_ep, allowed_doc, allowed_scene)``. When
+        :attr:`user_id` is ``None`` (user-scope OFF) returns ``(None, None, None)``
+        so every retrieve path skips filtering -> byte-identical to the pre-user-
+        scope path. When set, all three sets are recomputed per call from the
+        store's SPO indices -- a user who ingests a doc mid-session sees it on
+        the next retrieve (no init-time cache). The scans are cheap (SPO prefix
+        range reads). Empty for an unknown user (no sessions / no owned docs /
+        no scenes) -> strict scope returns nothing, the honest result.
         """
         if self.user_id is None:
-            return None, None
+            return None, None, None
         allowed_ep = self.store.episode_ids_for_user(self.user_id)
         allowed_doc = self.store.document_ids_for_user(self.user_id)
-        return allowed_ep, allowed_doc
+        allowed_scene = self.store.scene_ids_for_user(self.user_id)
+        return allowed_ep, allowed_doc, allowed_scene
 
     @staticmethod
     def _filter_vector_hits_by_scope(
         hits: list[tuple[str, float]],
         allowed_episode_ids: Optional[set[str]],
         allowed_document_ids: Optional[set[str]],
+        allowed_scene_ids: Optional[set[str]] = None,
     ) -> list[tuple[str, float]]:
         """Filter vector-search hits by shape against the user's owned ids.
 
         The vector index is ONE flat global layer (``episodes``) holding
-        ``ep_*``, ``{doc_id}_sec_NNN``, and ``M:*`` together -- no user
-        partition, so the boundary is an id-set intersection, not a key-prefix.
-        Each hit is kept iff its kind is owned by the query user:
+        ``ep_*``, ``{doc_id}_sec_NNN``, ``M:*``, and (B1) ``scene_*`` together --
+        no user partition, so the boundary is an id-set intersection, not a
+        key-prefix. Each hit is kept iff its kind is owned by the query user:
 
         * ``ep_*`` -> ``allowed_episode_ids`` (``None`` = pass).
         * ``{doc_id}_sec_NNN`` -> parent ``doc_id`` in ``allowed_document_ids``
           (``None`` = pass). ``_sec_`` check precedes the ``doc_`` check (section
           ids start with ``doc_`` -- mirrors ``_hydrate``).
         * ``doc_*`` (no ``_sec_``) -> ``allowed_document_ids`` (``None`` = pass).
-        * ``M:*`` -> dropped under strict scope (either set not ``None``); kept
-          when user-scope is fully off.
+        * ``scene_*`` -> ``allowed_scene_ids`` (``None`` = pass). Scenes ARE in
+          the vector index (D1 -- bodies are embedded + inserted), so a semantic
+          search can return a ``scene_*`` id; this branch enforces scope on it.
+        * ``M:*`` -> dropped under strict scope (any set not ``None``); kept when
+          user-scope is fully off.
 
-        When both allowed sets are ``None`` returns ``hits`` unchanged
+        When all three allowed sets are ``None`` returns ``hits`` unchanged
         (byte-identical). The caller over-fetches (``k * _USER_SCOPE_FETCH_MULT``)
         before calling this, then takes the top ``k`` of the filtered list. Once
-        we reach the loop the early ``both None`` return means strict scope is on,
+        we reach the loop the early ``all None`` return means strict scope is on,
         so ``M:`` is always dropped here.
         """
-        if allowed_episode_ids is None and allowed_document_ids is None:
+        if (allowed_episode_ids is None and allowed_document_ids is None
+                and allowed_scene_ids is None):
             return hits
         out: list[tuple[str, float]] = []
         for eid, sim in hits:
@@ -200,6 +208,10 @@ class HippocampalRetriever:
                 continue
             if eid.startswith("doc_"):
                 if allowed_document_ids is None or eid in allowed_document_ids:
+                    out.append((eid, sim))
+                continue
+            if eid.startswith("scene_"):
+                if allowed_scene_ids is None or eid in allowed_scene_ids:
                     out.append((eid, sim))
                 continue
             # episode (ep_*)
@@ -234,15 +246,16 @@ class HippocampalRetriever:
             the shape), highest score first.
         """
         query_plan = self.planner.plan(prompt, conversation_history)
-        allowed_ep, allowed_doc = self._user_scope_sets()
+        allowed_ep, allowed_doc, allowed_scene = self._user_scope_sets()
         results = self.traversal.retrieve(
             query_plan, signal=signal,
             allowed_episode_ids=allowed_ep, allowed_document_ids=allowed_doc,
+            allowed_scene_ids=allowed_scene,
         )
 
         if use_semantic and len(results) < 3:
             semantic_results = self._semantic_fallback(
-                prompt, query_plan, allowed_ep, allowed_doc)
+                prompt, query_plan, allowed_ep, allowed_doc, allowed_scene)
             existing_ids = {r["episode_id"] for r in results}
             for sr in semantic_results:
                 if sr["episode_id"] not in existing_ids:
@@ -274,10 +287,11 @@ class HippocampalRetriever:
         scope id sets (computed from :attr:`user_id`) so a scoped retriever
         filters here too; ``user_id=None`` -> ``None`` sets -> byte-identical.
         """
-        allowed_ep, allowed_doc = self._user_scope_sets()
+        allowed_ep, allowed_doc, allowed_scene = self._user_scope_sets()
         return self.traversal.retrieve(
             query_plan, signal=signal,
             allowed_episode_ids=allowed_ep, allowed_document_ids=allowed_doc,
+            allowed_scene_ids=allowed_scene,
         )
 
     def retrieve_by_embedding(
@@ -321,16 +335,18 @@ class HippocampalRetriever:
         if not vec:
             return []
         k = limit if limit is not None else config.default_retrieval_limit
-        allowed_ep, allowed_doc = self._user_scope_sets()
+        allowed_ep, allowed_doc, allowed_scene = self._user_scope_sets()
         # User-scope: over-fetch from the GLOBAL flat vector index, then filter
         # by shape against the user's owned ids, then take the top ``k``. When
-        # user-scope is OFF (allowed sets both ``None``) ``fetch_k == k`` and the
+        # user-scope is OFF (all allowed sets ``None``) ``fetch_k == k`` and the
         # filter is a no-op -> byte-identical.
-        scoped = allowed_ep is not None or allowed_doc is not None
+        scoped = (allowed_ep is not None or allowed_doc is not None
+                  or allowed_scene is not None)
         fetch_k = k * _USER_SCOPE_FETCH_MULT if scoped else k
         hits = self.vector_search.search_by_vector(vec, k=fetch_k)
         if scoped:
-            hits = self._filter_vector_hits_by_scope(hits, allowed_ep, allowed_doc)
+            hits = self._filter_vector_hits_by_scope(
+                hits, allowed_ep, allowed_doc, allowed_scene)
             hits = hits[:k]
         out: list[dict] = []
         for eid, sim in hits:
@@ -444,6 +460,7 @@ class HippocampalRetriever:
         query_plan: dict,
         allowed_episode_ids: Optional[set[str]] = None,
         allowed_document_ids: Optional[set[str]] = None,
+        allowed_scene_ids: Optional[set[str]] = None,
     ) -> list[dict]:
         """Semantic fallback over summary embeddings.
 
@@ -454,7 +471,7 @@ class HippocampalRetriever:
 
         User-scope: when the allowed sets are not ``None``, over-fetch (``k *
         _USER_SCOPE_FETCH_MULT``) then filter hits by shape against the user's
-        owned ids, taking the top ``k`` after filtering. When both ``None``
+        owned ids, taking the top ``k`` after filtering. When all ``None``
         (user-scope OFF) ``fetch_k == k`` and the filter is a no-op ->
         byte-identical. The sets are threaded from :meth:`retrieve` (computed
         once per call) so the graph + semantic paths share one scope read.
@@ -463,12 +480,14 @@ class HippocampalRetriever:
             return []
         k = config.default_retrieval_limit
         scoped = (allowed_episode_ids is not None
-                  or allowed_document_ids is not None)
+                  or allowed_document_ids is not None
+                  or allowed_scene_ids is not None)
         fetch_k = k * _USER_SCOPE_FETCH_MULT if scoped else k
         hits = self.vector_search.search(prompt, k=fetch_k)
         if scoped:
             hits = self._filter_vector_hits_by_scope(
-                hits, allowed_episode_ids, allowed_document_ids)
+                hits, allowed_episode_ids, allowed_document_ids,
+                allowed_scene_ids)
             hits = hits[:k]
         out: list[dict] = []
         for eid, sim in hits:
@@ -615,6 +634,23 @@ class HippocampalRetriever:
                     f"Topics: {', '.join(ep.get('topics', []))}\n"
                     + (f"Section '{matched}': {body}\n" if matched else
                        (f"Section: {body}\n" if body else ""))
+                    + "\n"
+                )
+            elif kind == "scene":
+                # Scene block (B1): the LLM-authored topic-level macro-memory.
+                # ``summary`` is the scene's topic (its handle), ``text`` is the
+                # Markdown body, ``heat`` is the scene-level forgetting signal.
+                # Rendered as a peer of episodes/docs/sections in the SAME context
+                # string -- scenes ride one retrieval pipeline, NOT a separate
+                # [SCENE MEMORY] macro lane. The topic + heat header orients the
+                # LLM; the body is the synthesized understanding.
+                body = ep.get("text", "")
+                chunk = (
+                    f"[{eid} | {ep.get('timestamp', '')}]\n"
+                    f"Scene (topic: {ep.get('summary', '')}, "
+                    f"heat: {ep.get('heat', 0.0):.2f})\n"
+                    f"Topics: {', '.join(ep.get('topics', []))}\n"
+                    + (f"{body}\n" if body else "")
                     + "\n"
                 )
             else:

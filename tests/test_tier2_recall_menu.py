@@ -373,7 +373,7 @@ def test_remember_menu_tail_user_scoped(tmp_path):
 
     # Sanity: the retriever's scope set is alice-only (bob is in the store but
     # not alice's) -- so this is a real exclusion, not an empty corpus.
-    allowed_ep, _ = orch.retriever._user_scope_sets()
+    allowed_ep, _, _ = orch.retriever._user_scope_sets()
     assert "ep_a0" in allowed_ep and "ep_b0" not in allowed_ep
 
     orch.remember_menu()
@@ -386,7 +386,7 @@ def test_remember_menu_tail_user_scoped(tmp_path):
 
 
 def test_remember_menu_tail_scope_off_is_byte_identical(tmp_path):
-    """``retriever_user_id=None`` -> ``_user_scope_sets`` returns ``(None, None)``
+    """``retriever_user_id=None`` -> ``_user_scope_sets`` returns ``(None, None, None)``
     -> no filter, no over-fetch multiplier -> the tail is byte-identical to the
     pre-scope path (bob's hits survive into the tail). Pins the byte-identical-
     off contract for the tail source specifically."""

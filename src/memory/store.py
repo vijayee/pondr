@@ -359,6 +359,220 @@ class HippocampalStore:
         """
         self.db.batch_sync(self._edge_ops(eid, episode))
 
+    # ---- scene blocks (B1: LLM-authored topic-level macro-memory) ----
+    #
+    # A scene block is the system's synthesized understanding of one TOPIC for a
+    # user -- an LLM-authored Markdown summary stored IN WaveDB (not a file on
+    # disk) under ``content/scene/{scene_id}/...``. It is the deployable, no-
+    # training symbolic macro layer tier 1 lacked AND the substrate the trained-
+    # but-unwired GNN scene-ontology head will later write onto. Authored on
+    # ingest by ``SceneAuthoringWorker`` with 4 actions (CREATE/UPDATE/MERGE/
+    # skip); heat decays per tick and cold scenes are evicted = macro-forgetting
+    # (the scene-level analog of fade R4). Retrieved via the SAME graph+vector
+    # pipeline as episodes/docs -- ``has_topic`` surfaces scenes on the topics
+    # axis, and the body embedding is indexed so scenes match semantically too.
+    # Flag-gated (``--scene-blocks``) default OFF, byte-identical when off: no
+    # scene is ever written with the flag off, so ``default_scene_ids()`` is
+    # empty and no ``scene_`` id ever enters the graph or vector index.
+
+    def _scene_content_ops(self, scene_id, body, topic, heat, updated_ts,
+                           user_id, source_eps, body_embedding=None) -> list[dict]:
+        """Content puts under ``content/scene/{scene_id}/...`` -- the stub half
+        of a scene block (no graph edges). Mirrors ``_content_ops``: ``encode_scene``
+        merges these with ``_scene_edge_ops`` into ONE atomic ``batch_sync``. The
+        Markdown body is the VALUE of the ``body`` field, never a file on disk.
+        ``heat`` is a stringified float (the scene-level forgetting signal);
+        ``source_eps`` is a json list of cited episode ids (provenance for
+        drill-down via the ``cites`` edge); ``embedding`` is the body vector
+        (parity with ``content/ep/{id}/embedding``)."""
+        ops: list[dict] = [
+            {"type": "put", "key": f"content/scene/{scene_id}/body", "value": body or ""},
+            {"type": "put", "key": f"content/scene/{scene_id}/topic", "value": topic or ""},
+            {"type": "put", "key": f"content/scene/{scene_id}/heat", "value": str(float(heat))},
+            {"type": "put", "key": f"content/scene/{scene_id}/updated_ts", "value": updated_ts or ""},
+            {"type": "put", "key": f"content/scene/{scene_id}/user_id", "value": user_id or ""},
+            {"type": "put", "key": f"content/scene/{scene_id}/source_eps",
+             "value": json.dumps(list(source_eps or []))},
+        ]
+        if body_embedding:
+            ops.append({"type": "put",
+                        "key": f"content/scene/{scene_id}/embedding",
+                        "value": json.dumps(body_embedding)})
+        return ops
+
+    def _scene_edge_ops(self, scene_id, topic, user_id, source_eps,
+                        delete: bool = False) -> list[dict]:
+        """Graph index ops for a scene block (put or delete). Mirrors
+        ``_document_graph_ops``'s ``emit`` closure + symmetric reversal: a delete
+        emits the SAME ``(s, p, o)`` with ``delete=True`` so SPO/POS/OSP all come
+        out -- no orphan edges. Four edge types:
+
+        * ``(scene, instanceOf, SceneBlock)`` -- typing.
+        * ``(scene, has_topic, T:{topic})`` -- surfaces scenes on the topics axis
+          (``graph.query().vertex(f"T:{topic}").in_("has_topic")``), the SAME axis
+          episodes/docs use; the object is raw ``T:{topic}`` (NOT safe-hashed) so
+          a scene and an episode sharing a topic land on the SAME ``T:`` node.
+        * ``(U:{user}, owns_scene, scene)`` forward + ``(scene, owned_by, U:{user})``
+          reverse -- mirrors doc ownership; the scope scan uses the forward SPO
+          edge ``memory/spo/{user}/owns_scene/`` (see ``scene_ids_for_user``).
+        * ``(scene, cites, ep_id)`` per source episode -- provenance for drill-down.
+        """
+        ops: list[dict] = []
+
+        def emit(s: str, p: str, o: str) -> None:
+            ops.extend(self.graph.expand_triple(s, p, o, delete=delete))
+
+        emit(scene_id, "instanceOf", "SceneBlock")
+        if topic:
+            emit(scene_id, "has_topic", f"T:{topic}")
+        if user_id:
+            user_node = f"U:{user_id}"
+            emit(user_node, "owns_scene", scene_id)
+            emit(scene_id, "owned_by", user_node)
+        for ep_id in (source_eps or []):
+            if ep_id:
+                emit(scene_id, "cites", ep_id)
+        return ops
+
+    def encode_scene(self, scene_id, body, topic, heat, updated_ts, user_id,
+                     source_eps, body_embedding=None) -> None:
+        """Store a scene block's content + graph index in ONE atomic batch, then
+        best-effort upsert the body embedding into the in-DB vector index.
+
+        Mirrors ``encode_episode`` (``store.py:173``): content + edges in one
+        ``batch_sync``; the VectorLayer insert is its own atomic op on the same
+        database_t (can't ride in the content batch), so it happens after, best-
+        effort (a vector-index hiccup must never fail an encode). Idempotent: re-
+        encoding the same ``scene_id`` overwrites in place (``batch_sync`` puts
+        replace); with ``topic`` held stable the ``has_topic``/``owned_by`` edges
+        are unchanged and only ``cites`` churns."""
+        ops = (self._scene_content_ops(scene_id, body, topic, heat, updated_ts,
+                                       user_id, source_eps, body_embedding)
+               + self._scene_edge_ops(scene_id, topic, user_id, source_eps, delete=False))
+        self.db.batch_sync(ops)
+        if body_embedding:
+            self._index_embedding(scene_id, body_embedding, body or "")
+
+    def get_scene(self, scene_id: str) -> "Optional[dict]":
+        """Load a scene block's content fields. Returns ``None`` for an absent
+        scene (detected via the always-written ``heat`` key -- ``get_sync``
+        returns ``None`` for a missing key, distinct from ``_b2s``'s ``""`` for
+        an empty one). Edges (``has_topic``/``owned_by``/``cites``) are NOT read
+        here -- the hydrate scan reads them, mirroring ``get_episode``."""
+        heat_raw = self.db.get_sync(f"content/scene/{scene_id}/heat")
+        if heat_raw is None:
+            return None
+        body = _b2s(self.db.get_sync(f"content/scene/{scene_id}/body"))
+        topic = _b2s(self.db.get_sync(f"content/scene/{scene_id}/topic"))
+        updated_ts = _b2s(self.db.get_sync(f"content/scene/{scene_id}/updated_ts"))
+        user_id = _b2s(self.db.get_sync(f"content/scene/{scene_id}/user_id"))
+        source_eps_raw = _b2s(self.db.get_sync(f"content/scene/{scene_id}/source_eps"))
+        try:
+            heat = float(_b2s(heat_raw))
+        except ValueError:
+            heat = 0.0
+        try:
+            source_eps = json.loads(source_eps_raw) if source_eps_raw else []
+        except (ValueError, TypeError):
+            source_eps = []
+        return {
+            "scene_id": scene_id,
+            "body": body,
+            "topic": topic,
+            "heat": heat,
+            "updated_ts": updated_ts,
+            "user_id": user_id or None,
+            "source_eps": source_eps,
+        }
+
+    def delete_scene(self, scene_id: str) -> None:
+        """Evict a scene block: delete ALL its content keys, its graph edges
+        (symmetric reversal -- no orphan SPO/POS/OSP entries), and its vector
+        index entry, in ONE atomic ``batch_sync`` + a best-effort unindex.
+
+        The eviction chokepoint, called by ``SceneAuthoringWorker`` when
+        ``heat < floor`` (macro-forgetting) and on MERGE (the merged body
+        supersedes the source scene). Mirrors the symmetric delete guarantee at
+        ``_document_graph_ops`` (``store.py:1572``): re-derive the scene's
+        topic/user/source_eps from content, build ``_scene_edge_ops(delete=True)``,
+        plus a content-delete op per ``content/scene/{scene_id}/*`` key (enumerate
+        via a range scan so a future-added field is cleaned up too)."""
+        sc = self.get_scene(scene_id)
+        ops: list[dict] = []
+        # Content deletes: enumerate every field key under the scene's prefix.
+        start = f"content/scene/{scene_id}/"
+        end = f"content/scene/{scene_id}/\x7f"
+        for k, _ in self.db.create_read_stream(start=start, end=end):
+            ops.append({"type": "del", "key": k})
+        # Edge deletes (symmetric reversal) -- only emit if the scene existed
+        # (a delete on an absent scene is a no-op content-wise; edges already gone).
+        if sc is not None:
+            ops += self._scene_edge_ops(
+                scene_id, sc.get("topic") or "", sc.get("user_id"),
+                sc.get("source_eps") or [], delete=True)
+        if ops:
+            self.db.batch_sync(ops)
+        # Best-effort vector-index removal (delete_sync on an absent id is a no-op).
+        self._unindex_embedding(scene_id)
+
+    def touch_scene(self, scene_id: str, delta: float = 0.2) -> None:
+        """Bump a scene's heat by ``delta`` (clamped to [0, 1]) in a single-key
+        RMW. The cheap path the retrieval-boost hook calls -- no full re-encode.
+        A missing scene is a no-op (the retrieval boost can fire on a scene id
+        that was evicted between hydrate and boost). Never raises."""
+        try:
+            cur_raw = self.db.get_sync(f"content/scene/{scene_id}/heat")
+            if cur_raw is None:
+                return
+            try:
+                cur = float(_b2s(cur_raw))
+            except ValueError:
+                return
+            new_heat = max(0.0, min(1.0, cur + delta))
+            self.db.batch_sync([{"type": "put",
+                                 "key": f"content/scene/{scene_id}/heat",
+                                 "value": str(new_heat)}])
+        except Exception:  # noqa: BLE001 - touch is best-effort, never breaks retrieval
+            pass
+
+    def scene_ids_for_user(self, user_id: str) -> set:
+        """All scene ids owned by a user (scan the ``owns_scene`` SPO index).
+
+        EXACT mirror of ``document_ids_for_user`` (``store.py:1312``): scenes
+        have no session axis -- ownership is user-level (a scene is a peer top-
+        level unit like a doc). The forward edge ``(U:{user}, owns_scene, scene)``
+        is written by ``_scene_edge_ops``; this scans the SPO index by
+        subject+predicate. Empty for an unknown user. Scenes with ``user_id=None``
+        are NOT in any user's set -> excluded under strict scope."""
+        user = f"U:{user_id}"
+        start = f"memory/spo/{user}/owns_scene/"
+        end = f"memory/spo/{user}/owns_scene/\x7f"
+        out: set = set()
+        for k, _ in self.db.create_read_stream(start=start, end=end):
+            scene_id = k.rsplit("/", 1)[-1]
+            if scene_id:
+                out.add(scene_id)
+        return out
+
+    def default_scene_ids(self) -> list:
+        """All scene ids (scan ``content/scene/``).
+
+        EXACT mirror of ``default_memory_ids`` (``store.py:922``) /
+        ``default_document_ids`` (``store.py:1979``). Scenes are forgotten by
+        HEAT (the scene-level forgetting signal), not by the episode state/
+        validity axis, so there is no state filter here -- a deleted scene's
+        content is gone, so it simply doesn't appear. Sorted for stable
+        enumeration. Empty when no scenes exist (cold start / flag off) ->
+        byte-identical to pre-B1 retrieval."""
+        ids: set = set()
+        for k, _ in self.db.create_read_stream(
+                start="content/scene/", end="content/scene/\x7f"):
+            parts = k.split("/", 3)
+            if len(parts) < 3 or not parts[2]:
+                continue
+            ids.add(parts[2])
+        return sorted(ids)
+
     # ---- retrieve ----
 
     def get_episode(self, episode_id: str) -> Optional[Episode]:
@@ -1504,6 +1718,17 @@ class HippocampalStore:
         episode/session/memory counters (same RMW caveat as ``next_episode_id``).
         """
         return f"doc_{self._counter_next('document_counter'):06d}"
+
+    def next_scene_id(self) -> str:
+        """Globally-unique, monotonically-increasing scene block id
+        (``scene_NNNNNN``).
+
+        Counter lives under ``content/system/scene_counter`` beside the
+        episode/session/memory/document counters -- a NEW counter key, no
+        collision with any existing one (same RMW caveat as
+        ``next_episode_id``). Mirrors ``next_document_id`` (``store.py:1714``).
+        """
+        return f"scene_{self._counter_next('scene_counter'):06d}"
 
     def document_id_by_source(self, source_path: str) -> Optional[str]:
         """Resolve upsert identity: the doc id for ``source_path``, or ``None``.

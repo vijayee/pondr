@@ -71,6 +71,11 @@ def _strip_prefix(vid: str, prefix: str) -> str:
 class GraphTraversal:
     """Pattern-completion retrieval over the hippocampal graph index."""
 
+    # B1: heat bump applied to a scene block on retrieval (the scene-level
+    # retrieval-strengthening analog of the episode edge boost). Matches the
+    # worker's ``touch_bump`` default so a retrieved scene stays warm.
+    _SCENE_TOUCH_BUMP = 0.2
+
     def __init__(self, store: HippocampalStore) -> None:
         self.store = store
         self.graph = store.graph
@@ -183,6 +188,12 @@ class GraphTraversal:
         eps = set(self.store.default_episode_ids(include_abstracted=False))
         eps |= set(self.store.default_document_ids())
         eps |= set(self.store.default_memory_ids())
+        # Scene blocks (B1): the LLM-authored topic-level macro-memory. Scenes
+        # are forgotten by HEAT (``delete_scene`` removes their content + edges),
+        # so ``default_scene_ids`` enumerates every live scene -- no state filter
+        # applies (heat is the scene forgetting signal). EMPTY when no scenes
+        # exist (flag off / cold start / worker down) -> byte-identical seed.
+        eps |= set(self.store.default_scene_ids())
         return sorted(eps)
 
     # ── candidate-set construction (Python-side set ops) ──
@@ -268,14 +279,15 @@ class GraphTraversal:
         candidates: set[str],
         allowed_episode_ids: Optional[set[str]],
         allowed_document_ids: Optional[set[str]],
+        allowed_scene_ids: Optional[set[str]] = None,
     ) -> set[str]:
         """Intersect candidates with the user's owned ids (strict user-scope).
 
         The candidate set from :meth:`_find_candidates` mixes kinds: ``ep_*``
         (episodes), ``doc_*`` (documents), ``{doc_id}_sec_NNN`` (sections -- they
-        START WITH ``doc_`` and contain ``_sec_``), and ``M:*`` (semantic
-        memories). Under strict user-scope each kind is kept only if owned by
-        the query user:
+        START WITH ``doc_`` and contain ``_sec_``), ``M:*`` (semantic memories),
+        and ``scene_*`` (B1 scene blocks). Under strict user-scope each kind is
+        kept only if owned by the query user:
 
         * ``ep_*`` -> episode, kept iff ``eid in allowed_episode_ids``.
         * ``{doc_id}_sec_NNN`` -> section, kept iff its parent ``doc_id`` (parsed
@@ -284,19 +296,25 @@ class GraphTraversal:
           ``doc_`` check (mirrors ``_hydrate``'s discriminator).
         * ``doc_*`` (no ``_sec_``) -> document, kept iff ``eid in
           allowed_document_ids``.
+        * ``scene_*`` -> scene block, kept iff ``eid in allowed_scene_ids``
+          (scenes are user-owned via the ``owns_scene`` SPO edge; a scene with
+          ``user_id=None`` is in NO user's set -> excluded under strict scope,
+          mirroring unscoped episodes/docs).
         * ``M:*`` -> semantic memory, DROPPED (strict scope; the GNN memory
           layer is unwired with no production data today, so this has no real
           effect -- documented as a deferred follow-on, not a silent cap).
 
-        When an allowed set is ``None`` that kind passes UNFILTERED. Both ``None``
-        (user-scope off) -> the whole set passes -> byte-identical to the pre-
-        user-scope path. ``allowed_episode_ids`` gates episodes only;
-        ``allowed_document_ids`` gates documents + sections only. Memories are
-        dropped the moment EITHER set is not ``None`` (strict scope is on) -- the
-        early ``both None`` return below means once we reach the loop, strict
-        scope is ALWAYS on, so ``M:`` is always dropped here.
+        When an allowed set is ``None`` that kind passes UNFILTERED. All three
+        ``None`` (user-scope off) -> the whole set passes -> byte-identical to
+        the pre-user-scope path. ``allowed_episode_ids`` gates episodes only;
+        ``allowed_document_ids`` gates documents + sections only;
+        ``allowed_scene_ids`` gates scenes only. Memories are dropped the
+        moment ANY set is not ``None`` (strict scope is on) -- the early
+        ``all None`` return below means once we reach the loop, strict scope is
+        ALWAYS on, so ``M:`` is always dropped here.
         """
-        if allowed_episode_ids is None and allowed_document_ids is None:
+        if (allowed_episode_ids is None and allowed_document_ids is None
+                and allowed_scene_ids is None):
             return candidates  # user-scope off -> byte-identical
         out: set[str] = set()
         for eid in candidates:
@@ -317,7 +335,13 @@ class GraphTraversal:
                 elif eid in allowed_document_ids:
                     out.add(eid)
                 continue
-            # episode (ep_*) -- and any other non-doc non-M id
+            if eid.startswith("scene_"):
+                if allowed_scene_ids is None:
+                    out.add(eid)
+                elif eid in allowed_scene_ids:
+                    out.add(eid)
+                continue
+            # episode (ep_*) -- and any other non-doc non-scene non-M id
             if allowed_episode_ids is None:
                 out.add(eid)
             elif eid in allowed_episode_ids:
@@ -449,6 +473,11 @@ class GraphTraversal:
             if doc is None or not doc.ingested_at:
                 return None
             return self._parse_dt(doc.ingested_at)
+        if eid.startswith("scene_"):
+            sc = self.store.get_scene(eid)
+            if sc is None or not sc.get("updated_ts"):
+                return None
+            return self._parse_dt(sc["updated_ts"])
         ep = self.store.get_episode(eid)
         if not ep or not ep.timestamp:
             return None
@@ -532,6 +561,8 @@ class GraphTraversal:
             return self._hydrate_memory(eid)
         if "_sec_" in eid:
             return self._hydrate_section(eid)
+        if eid.startswith("scene_"):
+            return self._hydrate_scene(eid)
         if eid.startswith("doc_"):
             return self._hydrate_document(eid, query_entities, query_topics)
 
@@ -828,6 +859,64 @@ class GraphTraversal:
             "embed_text": section_summary,
         }
 
+    def _hydrate_scene(self, sid: str) -> dict:
+        """Hydrate a scene block result (B1: the LLM-authored topic-level
+        macro-memory stored under ``content/scene/{id}/``).
+
+        Scenes are a FIFTH node type the multi-type retrieve pipeline carries
+        alongside episodes/documents/sections/memories. They surface two ways:
+        the graph topics axis (``graph.query().vertex(f"T:{topic}").in_("has_topic")``
+        -- scenes write the SAME raw ``T:{topic}`` objects episodes do) and the
+        vector index (D1 -- scene bodies are embedded + inserted via the id-
+        agnostic ``_index_embedding``, so a semantic search can return a
+        ``scene_*`` id). Either path lands here.
+
+        Builds the SAME 12-key result dict as an episode PLUS scene extras:
+        ``kind="scene"``, ``heat`` (the scene-level forgetting signal), and
+        ``source_eps`` (the cited episode ids -- provenance for drill-down via
+        the ``cites`` edge). Maps ``summary``=topic (the topic is the scene's
+        handle), ``text``=body (the Markdown), ``timestamp``=updated_ts,
+        ``user_id`` from content, and ``topics`` from a SINGLE scan over
+        ``memory/spo/{sid}/has_topic/`` (mirrors the episode graph-field scan in
+        ``_hydrate``). Entities/tones/decisions are empty -- a scene is a topic
+        summary, not an episodic event. A missing scene returns a 12-key base
+        with empties + ``kind="scene"`` (mirrors ``_hydrate_section``'s
+        missing-doc fallback).
+        """
+        sc = self.store.get_scene(sid)
+        if sc is None:
+            return {
+                "episode_id": sid, "summary": "", "text": "", "timestamp": "",
+                "entities": [], "topics": [], "tones": [], "decisions": [],
+                "session_id": None, "user_id": None, "follows": None,
+                "score": 0.0, "kind": "scene", "heat": 0.0,
+                "source_eps": [],
+            }
+        topics: list[str] = []
+        start = f"memory/spo/{sid}/has_topic/"
+        end = f"memory/spo/{sid}/has_topic/\x7f"
+        for k, _ in self.db.create_read_stream(start=start, end=end):
+            obj = k.rsplit("/", 1)[-1]
+            if obj:
+                topics.append(_strip_prefix(obj, "T:"))
+        return {
+            "episode_id": sid,
+            "kind": "scene",
+            "summary": sc.get("topic") or "",
+            "text": sc.get("body") or "",
+            "timestamp": sc.get("updated_ts") or "",
+            "entities": [],
+            "topics": topics,
+            "tones": [],
+            "decisions": [],
+            "session_id": None,
+            "user_id": sc.get("user_id"),
+            "follows": None,
+            "score": 0.0,
+            "heat": sc.get("heat") or 0.0,
+            "source_eps": list(sc.get("source_eps") or []),
+        }
+
     # ── scoring ──
 
     def _score_candidates(
@@ -920,6 +1009,7 @@ class GraphTraversal:
         signal: Optional[str] = None,
         allowed_episode_ids: Optional[set[str]] = None,
         allowed_document_ids: Optional[set[str]] = None,
+        allowed_scene_ids: Optional[set[str]] = None,
     ) -> list[dict]:
         """Run a query plan against the graph and return ranked episode dicts.
 
@@ -972,7 +1062,8 @@ class GraphTraversal:
         # escape the user's sessions. A no-op (returns the set unchanged) when
         # both allowed sets are ``None`` (user-scope OFF -> byte-identical).
         candidates = self._filter_user_scope(
-            candidates, allowed_episode_ids, allowed_document_ids)
+            candidates, allowed_episode_ids, allowed_document_ids,
+            allowed_scene_ids)
         if not candidates:
             return []
 
@@ -1064,6 +1155,19 @@ class GraphTraversal:
             # (docs are not yet wired through retrieval), so this is defensive
             # for the Phase-2 integration that will mix docs into the results.
             if eid.startswith("doc_"):
+                continue
+            # Scene blocks (B1) are exempt from the EPISODE forgetting sidecar
+            # (they have no has_entity/has_tone/has_decision edges). Instead, a
+            # retrieved scene gets a HEAT bump via ``touch_scene`` -- the scene-
+            # level retrieval-strengthening (the analog of the episode edge
+            # boost, mirrored at the macro layer). Best-effort, never breaks
+            # retrieval. A heat-weighted score boost is a follow-on; this is the
+            # cheap path.
+            if eid.startswith("scene_"):
+                try:
+                    self.store.touch_scene(eid, delta=self._SCENE_TOUCH_BUMP)
+                except Exception:  # noqa: BLE001 - touch is best-effort
+                    pass
                 continue
             # Hydration strips the E:/T:/A: prefix (graph_traversal._hydrate);
             # re-prepend it to recover the graph-triple object the sidecar keys on.

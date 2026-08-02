@@ -354,6 +354,18 @@ def main() -> int:
                         "does NOT auto-enable it). DEFAULT OFF -> the tool is "
                         "absent + the handler short-circuits, byte-identical to "
                         "pre-tier-2. No new training / GPU / GNN.")
+    p.add_argument("--scene-blocks", action="store_true", default=False,
+                   help="Scene blocks (B1): an LLM-authored topic-level macro-memory "
+                        "stored IN WaveDB (not files), authored/revised on ingest by "
+                        "the local Bonsai LLM with 4 actions (CREATE/UPDATE/MERGE/"
+                        "skip). The deployable, no-training symbolic macro layer AND "
+                        "the substrate for the trained-but-unwired GNN scene-ontology "
+                        "head. Scenes retrieve via the SAME graph+vector pipeline as "
+                        "episodes/docs (rendered kind=='scene', NOT a separate lane) "
+                        "and are user-scoped. Heat decays per tick; cold scenes are "
+                        "evicted (macro-forgetting). One LLM call per ingest batch "
+                        "(not per turn). DEFAULT OFF -> no scene worker -> no scene "
+                        "writes -> byte-identical to pre-B1. No new training/GPU/GNN.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -577,6 +589,7 @@ def main() -> int:
           f"claim_docs={args.claim_docs} user_id={args.user_id}",
           file=sys.stderr)
     print(f"[load] tier2_recall_menu={args.tier2_recall_menu}", file=sys.stderr)
+    print(f"[load] scene_blocks={args.scene_blocks}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -613,6 +626,7 @@ def main() -> int:
         fade_consolidation_validate=args.fade_consolidation_validate,
         retrieval_user_scope=args.retrieval_user_scope,
         tier2_recall_menu=args.tier2_recall_menu,
+        scene_blocks=args.scene_blocks,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

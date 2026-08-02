@@ -86,6 +86,7 @@ def build_ponder(
     fade_consolidation_validate: bool = False,
     retrieval_user_scope: bool = False,
     tier2_recall_menu: bool = False,
+    scene_blocks: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -408,6 +409,22 @@ def build_ponder(
             validate=fade_consolidation_validate,
         )
 
+    # B1 scene blocks: the LLM-authored topic-level macro-memory. Constructed
+    # ONLY when ``scene_blocks`` is on (the byte-identical-OFF gate: flag off ->
+    # no worker -> no ``tick()`` -> no scene writes -> ``default_scene_ids()``
+    # empty -> no ``scene_`` id in the graph or vector index -> no ``scene_``
+    # branch matches -> byte-identical to pre-B1). The worker takes the WM
+    # embedder (already built above) to embed scene bodies for the vector index
+    # (D1) + a ``BonsaiDecider`` from ``default_scene_author()``. The Bonsai HTTP
+    # call is lazy (one per ingest batch), so this is constructible offline
+    # (cold-start: a down server -> the worker defers, no fabricated scene).
+    scene_worker = None
+    if scene_blocks:
+        from .subconscious.scene_worker import SceneAuthoringWorker
+        from .subconscious.gister import default_scene_author
+        scene_worker = SceneAuthoringWorker(
+            store, default_scene_author().decider, embedder)
+
     orch = PonderOrchestrator(
         store=store,
         retriever=retriever,
@@ -431,6 +448,8 @@ def build_ponder(
         fade_inject=fade_inject,
         consolidation_worker=consolidation_worker,
         tier2_recall_menu=tier2_recall_menu,
+        scene_blocks=scene_blocks,
+        scene_worker=scene_worker,
     )
     return orch
 

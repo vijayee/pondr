@@ -470,6 +470,99 @@ Return ONLY valid JSON:
 {{"corruption": true|false, "reason": "one short phrase naming the changed fact and how it changed, or empty when clean"}}"""
 
 
+def bonsai_author_scene_prompt(
+    topic: str,
+    existing_body: Optional[str],
+    candidate_summaries: list[str],
+    user_id: str,
+    heat_budget: int,
+    merge_candidate: Optional[dict],
+) -> str:
+    """Prompt for the Bonsai scene-block AUTHORING decider (B1).
+
+    The scene worker (``scene_worker.py``) calls this ONCE per ingest batch with
+    the batch's candidate episode summaries + the topic's existing scene body
+    (if any) + ONE pre-filtered merge candidate (D7). The 8B picks one of four
+    actions:
+
+    * ``CREATE`` -- no existing scene; write a fresh Markdown scene from the
+      candidate episodes.
+    * ``UPDATE`` -- an existing scene exists; emit a COMPLETE replacement body
+      that folds in the new episodes (NOT a delta). ``topic`` MUST stay stable on
+      UPDATE (the worker relies on it -- ``has_topic``/``owned_by`` edges don't
+      shift, only ``cites`` churns).
+    * ``MERGE`` -- the pre-filtered ``merge_candidate`` (a DIFFERENT topic's
+      scene) overlaps enough to fold together; emit ONE merged body whose
+      ``topic`` is the merged topic. The worker deletes the source scene (D5).
+    * ``skip`` -- the candidates add nothing new; write nothing.
+
+    Returns the ``{{"action", "topic", "body", "merge_with", "reason"}}``
+    envelope so ``BonsaiDecider._parse_json_object`` carves it out (same path as
+    the other deciders). Wording is OPTIONAL guidance ("you may", "if useful"),
+    never imperative (per [[llm-tool-use-prompts-optional]] -- imperative wording
+    suppresses small-model tool/decision chains).
+    """
+    import json as _json
+    cand_block = "\n".join(
+        f"- ({i + 1}) {s}" for i, s in enumerate(candidate_summaries)
+    ) or "(none)"
+    if existing_body is None:
+        existing_block = "(no scene exists yet for this topic)"
+    else:
+        existing_block = existing_body
+    if merge_candidate is None:
+        merge_block = "(no merge candidate offered this round)"
+    else:
+        merge_block = (
+            f"scene_id={merge_candidate.get('scene_id', '')}  "
+            f"topic={merge_candidate.get('topic', '')}\n"
+            f"{merge_candidate.get('body', '')}"
+        )
+    return f"""You are the macro-memory author of a personal memory system. For one
+user ({user_id}) you maintain a "scene block" per topic -- a short Markdown
+summary of the system's synthesized understanding of that topic, cited to the
+episodes it draws from. The scene is the user's macro picture; episodes are the
+raw events underneath it.
+
+New candidate episodes have just been ingested for the topic "{topic}". You may
+author or revise the scene so it reflects them. You may also fold the scene into
+a pre-filtered MERGE candidate if the two topics overlap enough to be one
+scene. If the candidates add nothing new, you may skip.
+
+Choose ONE action:
+  CREATE  -- no scene exists yet; write a fresh Markdown scene (4-10 lines)
+           synthesizing the candidate episodes for this topic.
+  UPDATE  -- a scene exists; emit a COMPLETE replacement body folding in the new
+           candidates (NOT a delta). Keep the SAME topic "{topic}".
+  MERGE   -- fold this topic's scene into the merge candidate below; emit ONE
+           merged body whose topic names the combined topic, and set
+           "merge_with" to that candidate's scene_id.
+  skip    -- the candidates add nothing new; write nothing (body empty).
+
+Rules: synthesize only from the episodes shown; do not invent facts. Keep it
+tight and useful -- a later retrieval surfaces this to the user as context.
+There is room for roughly {heat_budget} scene(s) of heat budget for this user
+near this topic; if you are at the cap, prefer MERGE or skip over CREATE.
+
+TOPIC: {topic}
+
+EXISTING SCENE BODY:
+{existing_block}
+
+NEW CANDIDATE EPISODES:
+{cand_block}
+
+MERGE CANDIDATE (consider for MERGE only; ignore for CREATE/UPDATE):
+{merge_block}
+
+Return ONLY valid JSON:
+{{"action": "CREATE"|"UPDATE"|"MERGE"|"skip",
+  "topic": "the scene's topic (stable on UPDATE; the merged topic on MERGE)",
+  "body": "the Markdown scene body, or empty when skip",
+  "merge_with": "the merge candidate's scene_id, or empty",
+  "reason": "one short phrase"}}"""
+
+
 def bonsai_typing_prompt(entity: str, candidate_class: str,
                          retrieved_context: dict) -> str:
     """Prompt for the deploy-time Bonsai ontology-typing decider.

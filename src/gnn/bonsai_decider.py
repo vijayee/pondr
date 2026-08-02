@@ -37,6 +37,7 @@ import requests
 from ..config import config
 from ..training.prompts import (
     bonsai_anomaly_decision_prompt,
+    bonsai_author_scene_prompt,
     bonsai_consolidate_gist_prompt,
     bonsai_contradiction_decision_prompt,
     bonsai_doc_kind_prompt,
@@ -182,6 +183,56 @@ class BonsaiDecider:
         if not isinstance(raw, str) or not raw.strip():
             return None
         return _CTRL_RE.sub("", raw.strip())
+
+    def author_scene(
+        self,
+        topic: str,
+        existing_body: Optional[str],
+        candidate_summaries: list[str],
+        user_id: str,
+        heat_budget: int,
+        merge_candidate: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """Author or revise a scene block (B1: the LLM-authored macro-memory).
+
+        Called ONCE per ingest batch by ``SceneAuthoringWorker`` with the batch's
+        candidate episode summaries + the topic's existing scene body (if any) +
+        ONE pre-filtered merge candidate (D7). The 8B picks one of four actions:
+        ``CREATE`` / ``UPDATE`` / ``MERGE`` / ``skip``.
+
+        Returns ``{action, topic, body, merge_with, reason}`` or ``None`` on
+        HTTP/parse failure OR an unrecognized action (the worker treats ``None``
+        and ``skip`` the same: defer, never auto-write -- the four-action gate
+        mirrors the Phase C three-state gate's "never a silent auto-write").
+        ``body`` + ``merge_with`` control chars stripped via ``_CTRL_RE`` (they
+        become stored content values + a graph object). Reuses ``_post_json``
+        (already sets ``response_format: json_object``, never raises) -- NO new
+        HTTP code. Modeled on ``consolidate_gist`` (``bonsai_decider.py:162``).
+        """
+        if not candidate_summaries and existing_body is None and merge_candidate is None:
+            return None
+        prompt = bonsai_author_scene_prompt(
+            topic, existing_body, candidate_summaries, user_id,
+            heat_budget, merge_candidate)
+        data = self._post_json(prompt)
+        if data is None or not isinstance(data, dict):
+            return None
+        action = data.get("action")
+        if action not in ("CREATE", "UPDATE", "MERGE", "skip"):
+            return None
+        body = data.get("body")
+        if isinstance(body, str):
+            body = _CTRL_RE.sub("", body.strip())
+        merge_with = data.get("merge_with")
+        if isinstance(merge_with, str):
+            merge_with = _CTRL_RE.sub("", merge_with.strip())
+        return {
+            "action": action,
+            "topic": data.get("topic") or topic,
+            "body": body if isinstance(body, str) else "",
+            "merge_with": merge_with if isinstance(merge_with, str) else "",
+            "reason": data.get("reason") or "",
+        }
 
     def verify_fidelity(self, blurb: str, narrative: str) -> Optional[dict]:
         """Judge whether a consolidation gist CORRUPTED the source (validated compaction).

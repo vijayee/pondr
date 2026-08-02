@@ -165,6 +165,21 @@ class ChunkedContextFormatter:
                 else:
                     lines.append(f"Section: {text}")
             return "\n".join(lines)
+        if kind == "scene":
+            # Scene block (B1): the LLM-authored topic-level macro-memory. The
+            # Markdown body (``text``) is the system's synthesized understanding
+            # of one topic for a user; ``summary`` is the topic (the scene's
+            # handle), ``heat`` is the scene-level forgetting signal. Scenes
+            # ride the SAME ChunkedContext as episodes/docs/sections -- one
+            # retrieval pipeline, NOT a separate [SCENE MEMORY] macro lane (the
+            # fade-inject path owns macro lanes; scene blocks are retrieved).
+            lines = [f"--- Scene {eid} (topic: {summary}, heat: "
+                     f"{ep.get('heat', 0.0):.2f}) ---"]
+            if topics:
+                lines.append(f"Topics: {', '.join(topics)}")
+            if text:
+                lines.append(text)
+            return "\n".join(lines)
         lines = [f"--- Episode {eid} ({ts}) ---"]
         if entities:
             lines.append(f"Entities: {', '.join(entities)}")
