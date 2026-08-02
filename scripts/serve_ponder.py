@@ -343,6 +343,17 @@ def main() -> int:
                         "to run repeatedly. No effect with --retrieval-user-scope "
                         "off, but harmless (the ownership edges are written "
                         "regardless; they are just never consulted).")
+    p.add_argument("--tier2-recall-menu", action="store_true", default=False,
+                   help="Tier-2 recall menu: a system-proposed 'remember' tool the "
+                        "LLM calls mid-generation when it senses a gap. The system "
+                        "builds a candidate menu of maybes (R4 fade-forgotten "
+                        "anchors from this session + WaveDB-tail hits beyond the "
+                        "tier-1 top-k cutoff) and the LLM filters it by using the "
+                        "relevant ones in its answer -- one round-trip. Loop-path-"
+                        "only (requires the tool loop, on by default; this flag "
+                        "does NOT auto-enable it). DEFAULT OFF -> the tool is "
+                        "absent + the handler short-circuits, byte-identical to "
+                        "pre-tier-2. No new training / GPU / GNN.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -565,6 +576,7 @@ def main() -> int:
     print(f"[load] retrieval_user_scope={args.retrieval_user_scope} "
           f"claim_docs={args.claim_docs} user_id={args.user_id}",
           file=sys.stderr)
+    print(f"[load] tier2_recall_menu={args.tier2_recall_menu}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -600,6 +612,7 @@ def main() -> int:
         fade_consolidation_max_depth=args.fade_consolidation_max_depth,
         fade_consolidation_validate=args.fade_consolidation_validate,
         retrieval_user_scope=args.retrieval_user_scope,
+        tier2_recall_menu=args.tier2_recall_menu,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

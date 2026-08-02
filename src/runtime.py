@@ -85,6 +85,7 @@ def build_ponder(
     fade_consolidation_max_depth: int = 3,
     fade_consolidation_validate: bool = False,
     retrieval_user_scope: bool = False,
+    tier2_recall_menu: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -207,6 +208,17 @@ def build_ponder(
             The fade is untouched (already implicitly one-user-per-serve). Run
             ``serve_ponder --claim-docs`` once before enabling so existing
             unscoped docs are stamped to this user (else they vanish under strict).
+        tier2_recall_menu: when True, the loop-path synthesize appends the
+            ``remember`` tool to the tool set the consumer sees (the one-shot
+            path never gets it). The LLM calls ``remember`` mid-generation when
+            it senses a gap; ``remember_menu`` builds a system-proposed menu of
+            maybes (R4 fade-forgotten anchors from this session ∪ WaveDB-tail
+            hits beyond the tier-1 top-k cutoff) and the LLM filters it -- one
+            round-trip. ``False`` (default) -> the schema is absent + the handler
+            short-circuits to "" -> byte-identical to pre-tier-2. Loop-path-only:
+            requires the tool loop (``self_chat_tool_loop_enabled``, ON by
+            default); the flag does NOT auto-enable the loop (that would be a
+            behavior change). No new training / GPU / GNN.
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -418,6 +430,7 @@ def build_ponder(
         fade_memory_top_k=fade_memory_top_k,
         fade_inject=fade_inject,
         consolidation_worker=consolidation_worker,
+        tier2_recall_menu=tier2_recall_menu,
     )
     return orch
 

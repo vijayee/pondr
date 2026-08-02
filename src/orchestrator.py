@@ -63,7 +63,7 @@ from .subconscious.relevance_score import (
 )
 from .subconscious.working_memory import WorkingMemory, WorkingMemoryState
 from .tools import (
-    LOOP_TOOLS, SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
+    LOOP_TOOLS, REMEMBER_SCHEMA, SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
     feedback_instruction, run_tool_loop,
 )
 
@@ -88,6 +88,34 @@ _SIGNAL_PROFILES = {
     "correction":  {"salience": 0.6, "decay_rate": 0.008},
     "frustration": {"salience": 0.3, "decay_rate": 0.03},    # fades fastest
 }
+
+# ── Tier-2 recall menu (the on-demand ``remember`` tool) ──
+# The candidate set is SYSTEM-PROPOSED (the LLM names nothing) and LLM-FILTERED
+# (the LLM reads the menu tool-result and uses the relevant items). Two sources:
+#   * R4 -- fade-forgotten anchors from THIS session (``cos < cos_gist``, the
+#     signal ``format_fade_block`` skips); a fresh strict enumerator (not
+#     ``fading_anchors`` -- that one keeps the ``+epsilon`` R3 band + a
+#     ``max_depth`` cap, neither of which belong in a recall candidate set).
+#   * WaveDB-tail -- vector hits beyond the tier-1 top-k cutoff
+#     (``config.default_retrieval_limit``); over-fetch ``tier1_k + _REMEMBER_TAIL_N``
+#     via the SAME ``vector_search.search(prompt)`` the tier-1 semantic fallback
+#     uses (NOT ``search_by_vector`` -- that would re-embed with a different
+#     embedder and not reproduce tier-1's ranking), then take ``hits[tier1_k:]``.
+# No cross-tier cosine dedup (the search return carries no episode vector; dedup
+# would need re-embedding every hit -- expensive + fiddly, and the menu is LLM-
+# filtered anyway). Per-source caps bound the redundancy instead.
+_BLURB_CHARS = 240            # max chars of blurb/summary shown per menu item
+_REMEMBER_TAIL_N = 8          # extra WaveDB hits beyond the tier-1 cutoff to fetch
+_REMEMBER_R4_CAP = 4          # max R4 items in the menu
+_REMEMBER_TAIL_CAP = 4       # max WaveDB-tail items in the menu
+_REMEMBER_TOTAL_CAP = 8       # max items total (R4 + tail)
+_REMEMBER_MENU_MAX_TOKENS = 512  # soft cap on the rendered menu (~4 chars/token)
+# Over-fetch multiplier when user-scope is on (mirrors retriever's
+# ``_USER_SCOPE_FETCH_MULT``): the vector index is one flat global layer, so the
+# tail hits are over-fetched then filtered by the query user's owned ids -- the
+# tail would be starved by the filter otherwise (and, without the filter, cross-
+# user content would leak into the menu under ``--retrieval-user-scope``).
+_REMEMBER_SCOPE_FETCH_MULT = 3
 
 
 def _parse_json_array(text: str) -> list[dict]:
@@ -164,6 +192,54 @@ _REVIEW_RE = re.compile(
 )
 
 
+def _format_remember_menu(items: list[dict]) -> str:
+    """Render the tier-2 recall menu as a labeled text block for the LLM.
+
+    Two sections -- ``[FADE R4 -- fading from this session]`` (the R4 fade-
+    forgotten anchors, most-faded-first) and ``[LONG AGO -- recalled from
+    WaveDB tail]`` (vector hits beyond the tier-1 cutoff, score-desc). Each
+    item is one short labeled line. A ``len // 4``-char soft cap (≈4 chars/token)
+    is applied DROP-not-truncate against ``_REMEMBER_MENU_MAX_TOKENS``: once the
+    running char budget is spent, the remaining items are dropped (the menu is a
+    maybe-list, not a must-include -- truncating a line mid-fact would be worse
+    than omitting it). Returns ``""`` when ``items`` is empty (the dispatch
+    branch turns that into an honest "nothing to recall" error string).
+    """
+    if not items:
+        return ""
+    r4 = [i for i in items if i.get("source") == "fade_r4"]
+    tail = [i for i in items if i.get("source") == "wavedb_tail"]
+    lines: list[str] = [
+        "[REMEMBER MENU -- system-flagged maybes; use the relevant ones in your answer]",
+    ]
+    if r4:
+        lines.append("[FADE R4 -- fading from this session]")
+        for i in r4:
+            cos = i.get("cos")
+            tag = f" (cos {cos:.2f})" if isinstance(cos, (int, float)) else ""
+            lines.append(f"- [fading{tag}] {i.get('blurb', '')}")
+    if tail:
+        lines.append("[LONG AGO -- recalled from WaveDB tail]")
+        for i in tail:
+            lines.append(f"- [long ago] {i.get('summary', '')}")
+    text = "\n".join(lines)
+    cap_chars = _REMEMBER_MENU_MAX_TOKENS * 4
+    if len(text) <= cap_chars:
+        return text
+    # Drop-not-truncate: keep whole lines until the budget is spent. The header
+    # always survives (it is short + orients the LLM); subsequent lines are added
+    # only while they fit. The last line kept may straddle the budget by one
+    # line -- acceptable (a maybe-list, not a verbatim quote).
+    kept = [lines[0]]
+    used = len(lines[0])
+    for line in lines[1:]:
+        if used + 1 + len(line) > cap_chars:
+            break
+        kept.append(line)
+        used += 1 + len(line)
+    return "\n".join(kept)
+
+
 class PonderOrchestrator:
     """Compose the Phase 2c pipeline. Owns the cross-query Working Memory.
 
@@ -199,6 +275,7 @@ class PonderOrchestrator:
         fade_memory_top_k: int = 5,
         fade_inject: bool = False,
         consolidation_worker: "Optional[ConsolidationWorker]" = None,
+        tier2_recall_menu: bool = False,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -365,6 +442,26 @@ class PonderOrchestrator:
             )
             self._fade_regime_names = dict(REGIME_NAME)
             self._format_fade_block = format_fade_block
+
+        # Tier-2 recall menu (the on-demand ``remember`` tool). When True, the
+        # loop-path synthesize appends ``REMEMBER_SCHEMA`` to the tool set the
+        # consumer sees (a NEW list -- the module-level lists are never mutated,
+        # so the flag-off path hands the consumer the exact prior tool objects,
+        # byte-identical). The LLM calls ``remember`` mid-generation when it
+        # senses a gap; ``remember_menu`` builds a SYSTEM-PROPOSED candidate set
+        # (R4 fade-forgotten anchors from this session ∪ WaveDB-tail hits beyond
+        # the tier-1 top-k cutoff) and the LLM FILTERS it by using the relevant
+        # items in its answer -- one round-trip. ``False`` (default) -> the
+        # schema is absent, ``remember_menu`` short-circuits to "" -> byte-
+        # identical to pre-tier-2. Loop-path-only: the one-shot path (loop off)
+        # never gets the schema and cannot dispatch ``remember``.
+        self._tier2_recall_menu = bool(tier2_recall_menu)
+        # The structured menu from the last ``remember`` call, surfaced on the
+        # result dict for observation (``result["remember_menu"]``). Reset per
+        # query; set only when ``remember_menu`` actually ran. None when the
+        # flag is off / the LLM never called ``remember`` -> key ABSENT ->
+        # byte-identical.
+        self._last_remember_menu: Optional[list] = None
 
         # The cross-query Working Memory (persistent state). embedder injected so
         # WM can embed episodes/queries on demand. ``ring_capacity`` overrides
@@ -885,6 +982,10 @@ class PonderOrchestrator:
         # Loop transcript surfaced onto the result dict by query() (D6). Reset
         # per query; set to the loop dict only when the loop path ran.
         self._last_loop = None
+        # Tier-2 recall menu: reset the per-query structured-menu stash so a
+        # skipped / no-``remember``-call turn never leaks the previous turn's
+        # menu (the key is ABSENT on the result when this stays None).
+        self._last_remember_menu = None
 
         def _synthesize(context: str, history: Optional[list[dict]]) -> str:
             sys_content = "You are a helpful assistant with access to past conversations."
@@ -927,6 +1028,13 @@ class PonderOrchestrator:
                 # when off -- dispatch_tool does not re-check
                 # feedback_salience_enabled, so the set must.
                 loop_tools = TOOL_SCHEMAS if feedback_enabled else LOOP_TOOLS
+                # Tier-2 recall menu: append the ``remember`` schema to a NEW
+                # list (never mutate the module-level lists -- that would leak
+                # the schema into the flag-off path and break byte-identity).
+                # Loop-path-only: the one-shot path below never sees it, so
+                # ``remember`` cannot be dispatched when the loop is off.
+                if self._tier2_recall_menu:
+                    loop_tools = [*loop_tools, REMEMBER_SCHEMA]
                 dispatch_fn = lambda name, args: dispatch_tool(self, name, args)
                 try:
                     loop = run_tool_loop(
@@ -1052,6 +1160,14 @@ class PonderOrchestrator:
             result["loop_collected"] = self._last_loop.get("collected")
             result["loop_exhausted"] = self._last_loop.get("exhausted", False)
             self._last_loop = None
+        # Tier-2 recall menu: surface the structured menu the LLM's ``remember``
+        # call produced (R4 fade-forgotten ∪ WaveDB-tail items) for observation.
+        # Key ABSENT when the flag is off, the loop is off, or the LLM never
+        # called ``remember`` this turn (``_last_remember_menu`` stays None) ->
+        # byte-identical to pre-tier-2.
+        if self._last_remember_menu is not None:
+            result["remember_menu"] = self._last_remember_menu
+            self._last_remember_menu = None
 
         # 2026-07-14: close the runtime gap -- persist the (prompt, response)
         # exchange as a new episode so the system learns from use. Always-encode
@@ -1563,6 +1679,111 @@ class PonderOrchestrator:
         except Exception as e:  # noqa: BLE001 - search is best-effort
             print(f"[search_memory-fail] {e}", file=sys.stderr)
             return ""
+
+    def remember_menu(self) -> str:
+        """Tier-2 recall menu -- the on-demand ``remember`` tool's handler.
+
+        Builds a SYSTEM-PROPOSED candidate set of "maybes" -- things NOT in
+        context that might be worth recalling -- and returns it as a labeled
+        text block the LLM FILTERS (it reads the tool-result and uses the
+        relevant items in its answer, one round-trip). Two sources:
+
+        * **R4** -- fade-forgotten anchors from THIS session: anchors whose
+          ``cos(state_t, bge(anchor))`` has crossed below ``cos_gist`` (the
+          signal ``format_fade_block`` skips on the inject path). A fresh
+          strict enumerator (``cos < cos_gist``, not in the recency ring) --
+          NOT ``FadeMemory.fading_anchors`` (that keeps the ``+epsilon`` R3
+          band + a ``max_depth`` cap; a gisted-then-faded anchor with a real
+          gist blurb is good recall content, so neither filter belongs here).
+        * **WaveDB-tail** -- vector-index hits beyond the tier-1 top-k cutoff
+          (``config.default_retrieval_limit``). Over-fetch
+          ``tier1_k + _REMEMBER_TAIL_N`` via the SAME
+          ``vector_search.search(prompt)`` the tier-1 semantic fallback uses
+          (NOT ``search_by_vector`` -- the WM embedder is not guaranteed to be
+          the same object as the vector-search embedder, so re-embedding would
+          not reproduce tier-1's ranking), then take ``hits[tier1_k:]``. The
+          flat global vector index is then filtered by the query user's owned
+          ids (``_user_scope_sets`` + ``_filter_vector_hits_by_scope`` -- the
+          same boundary the tier-1 semantic fallback applies) so cross-user
+          content cannot leak into the menu under ``--retrieval-user-scope``;
+          over-fetched by ``_REMEMBER_SCOPE_FETCH_MULT`` when scoped so the tail
+          survives the filter. ``user_id is None`` -> no filter, no over-fetch
+          -> byte-identical to the pre-scope path.
+
+        Lazy -- computed only when the LLM calls ``remember``, zero cost on
+        turns that do not. Best-effort at EVERY stage: an R4 failure and a tail
+        failure are each logged and the partial menu returned (never raises;
+        ``dispatch_tool``'s outer ``except`` is the final net). Returns ``""``
+        when the flag is off or no maybes exist (the dispatch branch turns that
+        into an honest "nothing to recall" error string). The structured items
+        are stashed on ``self._last_remember_menu`` and surfaced on the result
+        dict by ``query`` for observation.
+        """
+        if not self._tier2_recall_menu:
+            return ""
+        items: list[dict] = []
+        # R4 source -- fade-forgotten anchors (this session).
+        if self._fade is not None:
+            try:
+                cos_gist = self._fade.cfg.cos_gist
+                for aid in self._fade.blurbs._ids:
+                    if aid in self._fade.ring:           # recency verbatim window
+                        continue
+                    blurb = self._fade.blurbs.text(aid)
+                    if blurb is None:
+                        continue
+                    cos = self._fade._recoverability(aid)
+                    if cos is None or cos >= cos_gist:    # strict R4 only
+                        continue
+                    items.append({
+                        "source": "fade_r4", "anchor_id": aid,
+                        "cos": cos, "blurb": blurb[:_BLURB_CHARS],
+                    })
+            except Exception as e:  # noqa: BLE001 - R4 is best-effort
+                print(f"[remember-r4-fail] {e}", file=sys.stderr)
+        # WaveDB-tail source -- vector hits beyond the tier-1 top-k cutoff.
+        q = getattr(self, "_current_query", "") or ""
+        if (q and self.retriever is not None
+                and self.retriever.vector_search is not None):
+            try:
+                tier1_k = _runtime_config.default_retrieval_limit
+                # User-scope: the vector index is one flat GLOBAL layer, so the
+                # tail hits must be filtered by the query user's owned ids --
+                # the SAME ``_user_scope_sets`` / ``_filter_vector_hits_by_scope``
+                # the tier-1 semantic fallback uses -- else cross-user content
+                # leaks into the menu under ``--retrieval-user-scope`` (the
+                # boundary shipped in 339cdb9). When ``user_id is None`` (scope
+                # off) both helpers are no-ops -> byte-identical to the off path.
+                # Over-fetch when scoped (``_REMEMBER_SCOPE_FETCH_MULT`` mirrors
+                # retriever's ``_USER_SCOPE_FETCH_MULT``) so the tail survives
+                # the filter instead of being starved by it.
+                allowed_ep, allowed_doc = self.retriever._user_scope_sets()
+                scoped = allowed_ep is not None or allowed_doc is not None
+                fetch_k = tier1_k + _REMEMBER_TAIL_N
+                if scoped:
+                    fetch_k *= _REMEMBER_SCOPE_FETCH_MULT
+                hits = self.retriever.vector_search.search(q, k=fetch_k)
+                if scoped:
+                    hits = self.retriever._filter_vector_hits_by_scope(
+                        hits, allowed_ep, allowed_doc)
+                for eid, sim in hits[tier1_k:]:          # the tail beyond cutoff
+                    ep = self.retriever.traversal._hydrate(eid)
+                    items.append({
+                        "source": "wavedb_tail", "episode_id": eid,
+                        "score": float(sim),
+                        "summary": (ep.get("summary") or "")[:_BLURB_CHARS],
+                    })
+            except Exception as e:  # noqa: BLE001 - tail is best-effort
+                print(f"[remember-tail-fail] {e}", file=sys.stderr)
+        # Sort: R4 most-faded-first (lowest cos), tail by score desc; cap total.
+        r4 = sorted([i for i in items if i["source"] == "fade_r4"],
+                    key=lambda i: i["cos"])
+        tail = sorted([i for i in items if i["source"] == "wavedb_tail"],
+                      key=lambda i: -i["score"])
+        items = (r4[:_REMEMBER_R4_CAP] + tail[:_REMEMBER_TAIL_CAP])[:_REMEMBER_TOTAL_CAP]
+        text = _format_remember_menu(items)
+        self._last_remember_menu = items  # structured observability (surfaces on result)
+        return text
 
     def end_conversation(self) -> None:
         """Close the live-encode conversation session.

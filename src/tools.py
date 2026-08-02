@@ -18,8 +18,9 @@ Two consumers share this ONE interface:
 
 ``dispatch_tool`` is the single seam a consumer host calls: it routes by name
 to the method that owns the capability (``record_feedback`` on the store -- it
-owns the boost store; ``expand_unit`` / ``search_memory`` on the orchestrator
--- it owns the retriever + expand handler). It is best-effort and NEVER raises:
+owns the boost store; ``expand_unit`` / ``search_memory`` / ``remember_menu`` on
+the orchestrator -- it owns the retriever + expand handler + the fade memory).
+It is best-effort and NEVER raises:
 an unknown tool or malformed args returns a short error string so a tool
 failure can't break the consumer's agent loop.
 
@@ -126,6 +127,33 @@ TOOL_SCHEMAS: list[dict] = [
     },
 ]
 
+# Tier-2 recall menu (the on-demand ``remember`` tool). A STANDALONE schema --
+# NOT appended to ``TOOL_SCHEMAS``/``LOOP_TOOLS``/``SELF_CHAT_TOOLS`` -- so the
+# flag-off path hands the consumer the exact prior tool lists (byte-identical).
+# The orchestrator conditionally appends it to the loop-path tool set ONLY when
+# ``--tier2-recall-menu`` is on (see ``orchestrator._synthesize``). System-
+# proposed: the LLM takes NO arguments -- the system builds the candidate menu
+# (R4 fade-forgotten anchors from this session + WaveDB-tail hits beyond the
+# tier-1 cutoff); the LLM filters it by using the relevant items in its answer
+# (one round-trip, ``dispatch_tool`` -> ``orchestrator.remember_menu``).
+REMEMBER_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "remember",
+        "description": (
+            "Call when the context seems to be missing something from earlier "
+            "this session or from long ago. Returns a system-proposed menu of "
+            "forgotten / long-ago items the system flagged as maybes; use the "
+            "relevant ones in your answer."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+}
+
 
 def _err(msg: str) -> str:
     """A short tool-result error string (never raises)."""
@@ -180,6 +208,15 @@ def dispatch_tool(orchestrator, name: str, args: Any) -> str:
                 topics=args.get("topics"),
             )
             return context if isinstance(context, str) else _err("search_memory returned nothing")
+
+        if name == "remember":
+            # Tier-2 recall menu (system-proposed; the LLM passes no args). The
+            # orchestrator builds the menu (R4 fade-forgotten ∪ WaveDB-tail) and
+            # returns a labeled text block; the LLM filters it by using the
+            # relevant items in its answer. ``remember_menu`` is best-effort and
+            # never raises -- but the outer ``except`` below is the final net.
+            result = orchestrator.remember_menu()
+            return result if isinstance(result, str) and result else _err("remember returned nothing")
 
         return _err(f"unknown tool: {name}")
     except Exception as e:  # noqa: BLE001 - never break the consumer's loop
