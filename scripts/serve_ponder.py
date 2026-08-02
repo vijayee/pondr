@@ -92,6 +92,18 @@ def _print_result(res: dict) -> None:
     pid = res.get("persisted_episode_id")
     if pid:
         print(f"[live-encode] persisted episode {pid}", file=sys.stderr)
+    # Validated compaction: surface deferred consolidation reviews (a gist the
+    # fidelity judge flagged as corrupt, or held unvalidated). The user resolves
+    # one on the NEXT line: ``keep <i>`` / ``accept <i>`` / ``edit <i>: <gist>``.
+    reviews = res.get("pending_consolidation_reviews")
+    if reviews:
+        for i, r in enumerate(reviews, start=1):
+            print(f"\n[REVIEW #{i}] held off compressing "
+                  f"\"{r.get('excerpt', '')}\" -- {r.get('reason', '')}",
+                  file=sys.stderr)
+            print(f"  proposed gist: {r.get('narrative', '')}", file=sys.stderr)
+        print("[REVIEW] reply: keep <i> | accept <i> | "
+              "edit <i>: <new gist>", file=sys.stderr)
     # Per-stage GLiNER timing is already logged to stderr by the extractor when
     # --gliner-timing is on (the flag is passed through to build_ponder), so
     # nothing extra is printed here.
@@ -291,6 +303,20 @@ def main() -> int:
                         "anchor is no longer re-gist-ed -- it stays R4, the "
                         "forgotten -> long-term-memory pull floor (the fact_sink "
                         "hook for the graph write is a follow-on).")
+    p.add_argument("--fade-consolidation-validate", action="store_true",
+                   default=False,
+                   help="Validated compaction: a Bonsai fidelity judge checks each "
+                        "gist for CORRUPTION (a changed fact's meaning, not just a "
+                        "dropped detail) before the in-place write. A clean gist is "
+                        "applied silently; a corrupted gist is HELD for your review "
+                        "and surfaced as a [REVIEW #i] block next turn -- reply "
+                        "'keep i' (leave verbatim, anchor stays forgotten), "
+                        "'accept i' (apply the gist despite the flag), or "
+                        "'edit i: <new gist>' (correct it). If the judge is "
+                        "unreachable (Bonsai down) the gist is held unvalidated, "
+                        "never silently applied. The user is the corruption "
+                        "verifier (human-in-the-loop). Requires --fade-consolidation. "
+                        "DEFAULT OFF.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -403,6 +429,11 @@ def main() -> int:
                   "and serve is byte-identical to --fade-memory alone. Pass "
                   "--fade-debug to watch consolidation_count climb.",
                   file=sys.stderr)
+        if args.fade_consolidation_validate and not args.fade_consolidation:
+            print("NOTE: --fade-consolidation-validate ignored (requires "
+                  "--fade-consolidation; the judge only validates gists the "
+                  "consolidation loop produces).", file=sys.stderr)
+            args.fade_consolidation_validate = False
         if args.fade_memory_voice_path and not args.fade_memory_tokenizer_path:
             print("ERROR: --fade-memory-voice-path requires "
                   "--fade-memory-tokenizer-path (the token-LM voice leg needs "
@@ -502,7 +533,8 @@ def main() -> int:
           f"fade_debug={args.fade_debug} "
           f"fade_consolidation={args.fade_consolidation} "
           f"fade_consolidation_epsilon={args.fade_consolidation_epsilon} "
-          f"fade_consolidation_max_depth={args.fade_consolidation_max_depth}",
+          f"fade_consolidation_max_depth={args.fade_consolidation_max_depth} "
+          f"fade_consolidation_validate={args.fade_consolidation_validate}",
           file=sys.stderr)
 
     orch = build_ponder(
@@ -537,6 +569,7 @@ def main() -> int:
         fade_consolidation=args.fade_consolidation,
         fade_consolidation_epsilon=args.fade_consolidation_epsilon,
         fade_consolidation_max_depth=args.fade_consolidation_max_depth,
+        fade_consolidation_validate=args.fade_consolidation_validate,
     )
 
     try:

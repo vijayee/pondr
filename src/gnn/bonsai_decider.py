@@ -42,6 +42,7 @@ from ..training.prompts import (
     bonsai_doc_kind_prompt,
     bonsai_gist_prompt,
     bonsai_typing_prompt,
+    bonsai_verify_fidelity_prompt,
 )
 
 __all__ = ["BonsaiDecider"]
@@ -181,6 +182,36 @@ class BonsaiDecider:
         if not isinstance(raw, str) or not raw.strip():
             return None
         return _CTRL_RE.sub("", raw.strip())
+
+    def verify_fidelity(self, blurb: str, narrative: str) -> Optional[dict]:
+        """Judge whether a consolidation gist CORRUPTED the source (validated compaction).
+
+        The fade consolidation loop (``consolidation_worker.py``) calls this AFTER
+        ``consolidate_gist`` produces a candidate narrative, BEFORE applying it in
+        place. Returns ``{"corruption": bool, "reason": str}``, or ``None`` on
+        HTTP/parse failure. ``corruption=False`` -> the gist only compressed
+        (paraphrase / dropped detail) and the worker applies it silently.
+        ``corruption=True`` -> the gist changed a fact's MEANING (inverted /
+        swapped / fabricated) and the worker DEFERS, escalating the gist to the
+        user for review instead of overwriting the verbatim with a corrupted
+        memory. ``None`` (cold-start: Bonsai down / parse fail) -> the worker
+        ALSO defers, never auto-consolidating an unvalidated gist (honest, not
+        faked) -- the anchor stays R4 and is retried next sweep. Mirrors
+        ``verify_typing`` (``:185``): same ``_post_json`` + envelope-parse path,
+        same cold-start contract (caller records without writing on None).
+        """
+        if not isinstance(blurb, str) or not blurb.strip():
+            return None
+        if not isinstance(narrative, str) or not narrative.strip():
+            return None
+        prompt = bonsai_verify_fidelity_prompt(blurb, narrative)
+        data = self._post_json(prompt)
+        if not isinstance(data, dict) or "corruption" not in data:
+            return None
+        return {
+            "corruption": bool(data.get("corruption")),
+            "reason": str(data.get("reason", ""))[:1000],
+        }
 
     def verify_typing(
         self, entity: str, candidate_class: str, retrieved_context: dict

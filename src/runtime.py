@@ -83,6 +83,7 @@ def build_ponder(
     fade_consolidation: bool = False,
     fade_consolidation_epsilon: float = 0.03,
     fade_consolidation_max_depth: int = 3,
+    fade_consolidation_validate: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -377,6 +378,7 @@ def build_ponder(
             fade_mem, default_gister(),
             epsilon=fade_consolidation_epsilon,
             max_depth=fade_consolidation_max_depth,
+            validate=fade_consolidation_validate,
         )
 
     orch = PonderOrchestrator(

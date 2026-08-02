@@ -422,6 +422,54 @@ Return ONLY valid JSON:
 {{"gist": "..."}}"""
 
 
+def bonsai_verify_fidelity_prompt(blurb: str, narrative: str) -> str:
+    """Prompt for the fade consolidation FIDELITY JUDGE (validated compaction).
+
+    Given the original fading blurb + a gist that the consolidator produced from
+    it, decide whether the gist CORRUPTED the memory -- changed a fact's
+    MEANING (inverted, swapped, or fabricated a fact) -- vs only DROPPED detail
+    (paraphrase / compression, which is the intended behavior and NOT
+    corruption). This is the human-in-the-loop gate: a ``corruption=true``
+    verdict DEFERS the consolidation and escalates the gist to the user for
+    review; ``corruption=false`` accepts it silently. ``reason`` is a short
+    phrase the user sees next to the held review, so keep it concrete and
+    brief. Returns the ``{{"corruption": bool, "reason": "..."}}`` envelope so
+    ``BonsaiDecider._parse_json_object`` carves it out (same path as the other
+    deciders).
+    """
+    return f"""You are the fidelity judge of a memory system. A fading memory was compressed
+into the gist below. Decide whether the gist CORRUPTED the memory or only
+compressed it.
+
+Corruption = the gist changes a fact's MEANING. Check each of these, because
+they are corruption even when the gist otherwise reads similarly:
+  - INVERSION: a fact says the OPPOSITE of the source (e.g. source "X is
+    larger" -> gist "X is smaller"; source "Alice approved" -> gist "Alice
+    rejected").
+  - SWAP: an attribute that belonged to one entity is reassigned to a
+    DIFFERENT entity. Example -- source "Alice owns the Subaru; Bob owns the
+    Toyota" -> gist "Bob owns the Subaru; Alice owns the Toyota" is
+    CORRUPTION, not compression, even though the same two entities and two
+    cars appear. Compare EACH named entity's attributes one by one: for every
+    entity the source mentions, does the gist give it the SAME attributes, or
+    did an attribute migrate to another entity?
+  - FABRICATION: the gist states a specific fact (a number, name, date,
+    relation) the source does not support.
+
+Dropping detail, shortening, or paraphrasing the SAME facts is NOT corruption
+-- that is the intended compression, answer corruption=false. A gist that
+keeps every named fact's meaning intact, even if terser, is clean.
+
+SOURCE MEMORY (the fading original):
+{blurb}
+
+PROPOSED GIST (the compression to judge):
+{narrative}
+
+Return ONLY valid JSON:
+{{"corruption": true|false, "reason": "one short phrase naming the changed fact and how it changed, or empty when clean"}}"""
+
+
 def bonsai_typing_prompt(entity: str, candidate_class: str,
                          retrieved_context: dict) -> str:
     """Prompt for the deploy-time Bonsai ontology-typing decider.

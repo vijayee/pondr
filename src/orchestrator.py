@@ -154,6 +154,16 @@ def _sum_record_feedback_applied(collected: Optional[list[dict]]) -> int:
     return total
 
 
+# Validated-compaction review resolution command (the serve REPL): ``keep <i>`` /
+# ``accept <i>`` / ``edit <i>: <new gist>`` (1-indexed against the worker's
+# ``pending_reviews``). A line that does not match falls through to a normal
+# query (reviews stay pending). Only honored when the consolidation worker is
+# present AND validate is on (gated default OFF).
+_REVIEW_RE = re.compile(
+    r"^\s*(keep|accept|edit)\s+(\d+)\s*(?::\s*(.+?))?\s*$", re.IGNORECASE
+)
+
+
 class PonderOrchestrator:
     """Compose the Phase 2c pipeline. Owns the cross-query Working Memory.
 
@@ -577,6 +587,33 @@ class PonderOrchestrator:
         # set/clear lifecycle so consolidation runs only between turns.
         if self._consolidation_worker is not None:
             self._consolidation_worker.foreground_busy.set()
+        # Validated compaction: a review-resolution command (keep/accept/edit
+        # <i>) is consumed as a meta-command THIS turn -- it resolves a deferred
+        # consolidation review instead of running a normal query (so the line
+        # "keep 1" is not sent to Bonsai as a prompt). The worker is blocked for
+        # the whole query (foreground_busy set above), so ``resolve``'s
+        # ``consolidate`` call is race-free. A non-matching line falls through to
+        # the normal query; pending reviews then surface in the result. Only when
+        # the worker is present AND validate is on (gated default OFF).
+        if (self._consolidation_worker is not None
+                and self._consolidation_worker.validate):
+            ack = self._try_resolve_review(user_prompt)
+            if ack is not None:
+                if self._distill_worker is not None:
+                    self._distill_worker.foreground_busy.clear()
+                if self._consolidation_worker is not None:
+                    self._consolidation_worker.foreground_busy.clear()
+                self._current_query = None
+                return {
+                    "response": ack,
+                    "pending_consolidation_reviews":
+                        self._consolidation_worker.pending_reviews(),
+                    "retrieved_episodes": [], "context_used": None,
+                    "chunked": None,
+                    "working_memory_state": self.working_memory.snapshot(),
+                    "presentation_plan": None, "end_state_plan": None,
+                    "supported": True,
+                }
         # STRM 2a raw-rating tap: remember the current query so the
         # record_feedback tool path (tools.dispatch_tool -> store.record_feedback)
         # can thread it into feedback.jsonl. Cleared on every return path (the
@@ -969,6 +1006,17 @@ class PonderOrchestrator:
         # pre-fade. NOT fed into the LLM context this phase.
         if self._fade is not None:
             result["fade_recalls"] = fade_recalls
+        # Validated compaction: surface deferred consolidation reviews (gists the
+        # fidelity judge flagged as corrupt, or held unvalidated). Key ABSENT
+        # when there is no validating worker or no pending reviews -> byte-
+        # identical to the non-validating path. NOT a resolution turn (those
+        # returned above); this just attaches the question for the user to answer
+        # on the NEXT line.
+        if (self._consolidation_worker is not None
+                and self._consolidation_worker.validate):
+            pending = self._consolidation_worker.pending_reviews()
+            if pending:
+                result["pending_consolidation_reviews"] = pending
 
         # Phase 3a Task 7: auto-record the presentation outcome with the
         # MEASURED expand_count (the durable salience signal from 2c §15).
@@ -1020,6 +1068,37 @@ class PonderOrchestrator:
             self._consolidation_worker.foreground_busy.clear()
         self._current_query = None
         return result
+
+    def _try_resolve_review(self, user_prompt: str) -> Optional[str]:
+        """Parse + apply a deferred-review resolution command, or fall through.
+
+        Returns an ack message when ``user_prompt`` matches ``keep <i>`` /
+        ``accept <i>`` / ``edit <i>: <text>`` (applied, or failed-stale), so the
+        caller short-circuits the normal query and surfaces the ack + remaining
+        reviews. Returns ``None`` when the line is not a resolution command ->
+        the caller runs a normal query (reviews stay pending). Only meaningful
+        when the consolidation worker is present and validating; the caller
+        gates on that before calling. ``resolve`` runs in the foreground (worker
+        blocked on the gate), so its ``consolidate`` call is race-free.
+        """
+        if self._consolidation_worker is None:
+            return None
+        m = _REVIEW_RE.match(user_prompt or "")
+        if not m:
+            return None
+        action = m.group(1).lower()
+        idx_str = m.group(2)
+        text = m.group(3)
+        idx = int(idx_str) - 1
+        if action == "edit":
+            if not text or not text.strip():
+                return f"[review #{idx_str}: edit needs new gist text]"
+            ok = self._consolidation_worker.resolve(idx, "edit", text.strip())
+        else:
+            ok = self._consolidation_worker.resolve(idx, action)
+        if ok:
+            return f"[resolved review #{idx_str}: {action}]"
+        return f"[review #{idx_str} not found / invalid]"
 
     def _classify_query(self, prompt: str) -> str:
         """Cheap query-type tag for the WM metadata (the WM preamble)."""

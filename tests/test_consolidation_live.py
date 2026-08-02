@@ -135,3 +135,92 @@ def test_worker_consolidates_faded_anchor_live(gister_live):
     assert r.regime != REGIME_FORGOTTEN, "consolidated anchor is still R4"
     # The fact sidecar was staged (best-effort: may be empty, but the slot exists).
     assert isinstance(mem.blurbs.facts(aid), list)
+
+
+def test_verify_fidelity_clean_live(gister_live):
+    # The fidelity judge on a clean paraphrase gist (compression, no meaning
+    # change) returns corruption=False. This is the gate that lets a normal
+    # consolidation apply silently.
+    blurb = ("We picked WaveDB for the vector store because the in-DB vector "
+             "layer avoids a separate sidecar index, and FLAT/COSINE was exact "
+             "and fast enough at roughly ten thousand episodes.")
+    # A clean compression: same facts, paraphrased + trimmed (no inversion).
+    clean_gist = ("WaveDB was chosen as the vector store; its in-DB vector "
+                  "layer removes the need for a sidecar, and FLAT/COSINE was "
+                  "exact and fast enough at about 10k episodes.")
+    verdict = gister_live.decider.verify_fidelity(blurb, clean_gist)
+    assert verdict is not None, "Bonsai returned no fidelity verdict"
+    assert verdict["corruption"] is False, (
+        f"judge false-flagged a clean paraphrase: {verdict.get('reason')}")
+
+
+def test_verify_fidelity_flags_corruption_live(gister_live):
+    # THE honest check: a gist that changes a fact's MEANING must be flagged as
+    # corruption with a non-empty reason. We test with a FABRICATION -- the
+    # gist adds a specific fact the source does not support -- because that is
+    # the corruption class the 8B judge reliably catches (see the swap-blindness
+    # xfail below for the boundary of what it misses).
+    blurb = ("Alice owns a 2019 Subaru Outback. Bob owns a 2021 Toyota Corolla. "
+             "They discussed fuel economy on Tuesday.")
+    # Fabricated: "bought the cars in Geneva on Wednesday" is not in the source.
+    corrupted = ("Alice owns a 2019 Subaru and Bob owns a 2021 Toyota; they "
+                 "bought the cars in Geneva on Wednesday.")
+    verdict = gister_live.decider.verify_fidelity(blurb, corrupted)
+    assert verdict is not None, "Bonsai returned no fidelity verdict"
+    assert verdict["corruption"] is True, (
+        "judge missed a fabricated fact unsupported by the source")
+    assert verdict["reason"] and verdict["reason"].strip(), (
+        "corruption flag carried no explanation for the user")
+
+
+@pytest.mark.xfail(reason=(
+    "Known 8B-judge limitation: the fidelity judge catches INVERSIONS and "
+    "FABRICATIONS but MISSES subtle entity-attribute binding swaps (and value "
+    "flips like a year 2019->2020, which it even calls 'minor'). The validated-"
+    "compaction gate is a COARSE first-line filter, not a complete one -- the "
+    "user remains the verifier for subtle corruption. xfail so a stronger "
+    "judge/prompt flips this to XPASS and we notice."), strict=False)
+def test_verify_fidelity_misses_subtle_swap_live(gister_live):
+    # An entity-attribute swap (Alice/Bob ownership) is real corruption. The 8B
+    # judge currently does NOT flag it. This test records that gap explicitly so
+    # it is not silently lost; it is expected to FAIL (xfail).
+    blurb = ("Alice owns a 2019 Subaru Outback. Bob owns a 2021 Toyota Corolla. "
+             "They discussed fuel economy on Tuesday.")
+    swapped = ("Bob owns the 2019 Subaru Outback and Alice owns the 2021 "
+               "Toyota Corolla; they discussed fuel economy on Tuesday.")
+    verdict = gister_live.decider.verify_fidelity(blurb, swapped)
+    assert verdict is not None
+    assert verdict["corruption"] is True, "8B judge should flag the swap"
+
+
+def test_worker_validate_clean_consolidates_live(gister_live):
+    # End-to-end with validate=True: a normal fade->gist is a CLEAN compression,
+    # so the judge returns corruption=False and the worker consolidates silently
+    # (the validate gate does not block honest compression). Anchor jumps R4->R1,
+    # blurb replaced by the gist, no pending review surfaced.
+    emb = _StubEmbedder()
+    cfg = FadeConfig(decay=0.5, cos_ring=0.95, cos_gist=0.20, ring_capacity=2)
+    mem = FadeMemory(cfg, emb, _StubVoice())
+    aid = mem.ingest("docA:0 we picked wavedb for the vector store because the "
+                    "in-db layer avoids a sidecar and flat cosine was exact")
+    verbatim = mem.blurbs.text(aid)
+    _fade_anchor_to_r4(mem, aid)
+    assert mem.recall_anchor(aid).regime == REGIME_FORGOTTEN
+    assert mem.consolidation_count(aid) == 0
+
+    worker = ConsolidationWorker(mem, gister_live, epsilon=0.03, max_depth=3,
+                                 max_per_tick=8, validate=True)
+    worker.foreground_busy.set()
+    n = worker.tick()
+    assert n >= 1
+    time.sleep(0.3)
+    assert mem.consolidation_count(aid) == 0      # gate held -> nothing yet
+    worker.foreground_busy.clear()
+    assert worker.drain(timeout=90.0) is True
+
+    # The judge said not-corrupt -> consolidated silently (no review deferred).
+    assert mem.consolidation_count(aid) == 1
+    assert worker.pending_reviews() == [], (
+        "validate deferred a clean compression (judge false-flagged)")
+    assert mem.blurbs.text(aid) != verbatim
+    assert mem.recall_anchor(aid).regime != REGIME_FORGOTTEN

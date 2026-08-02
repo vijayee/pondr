@@ -80,16 +80,29 @@ class BonsaiGister:
         narrative = self.decider.consolidate_gist(blurb, prior_gist, count)
         if narrative is None:
             return None
-        # Fact extraction: the relation extractor raises on HTTP failure (not
-        # cold-start safe at this layer); mirror the encoder's try/except -> [].
+        # Facts are carried from the SOURCE blurb (richer signal than the
+        # compressed narrative) -- the long-term-memory pull sidecar.
+        return self.shape(narrative, blurb, count)
+
+    def shape(self, narrative: str, fact_source: str,
+              count: int) -> StructuredGist:
+        """Build a ``StructuredGist`` from a given narrative (fact-extraction half).
+
+        Used by ``gist`` (facts from the source blurb) AND by
+        ``ConsolidationWorker.resolve("edit")`` to rebuild a gist from the user's
+        corrected narrative with facts extracted from that corrected text (the
+        new truth). ``resolve("accept")`` does NOT call this -- it reuses the
+        stored gist directly (already shaped with facts from the original blurb
+        at defer time). Pure composition -- no LLM call (narrative in hand).
+        """
         try:
-            relations = self.extractor.extract(blurb, isolated=False)
+            relations = self.extractor.extract(fact_source, isolated=False)
         except Exception:  # noqa: BLE001 - cold-start: facts degrade to []
             relations = []
         if not isinstance(relations, list):
             relations = []
         try:
-            state_assertions = extract_state_assertions(blurb, [], relations)
+            state_assertions = extract_state_assertions(fact_source, [], relations)
         except Exception:  # noqa: BLE001 - pure fn, but guard anyway
             state_assertions = []
         return StructuredGist(
