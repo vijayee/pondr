@@ -1284,6 +1284,96 @@ class HippocampalStore:
         keys = [k for k, _ in self.db.create_read_stream(start=start, end=end)]
         return [k.rsplit("/", 1)[-1] for k in keys]
 
+    # ---- Retrieval user-scope primitives (the read-side of the user boundary) ----
+    # The encoder writes ``(U:{user}, has_session, S)`` + ``(S, has_episode, eid)``
+    # at encode (``_edge_ops``); the document write path adds
+    # ``(U:{user}, owns_document, doc_id)`` (``_document_graph_ops``). These
+    # methods enumerate the user's owned ids so the retriever can intersect its
+    # candidate set with them. They are the ONLY user-scoped reads the retriever
+    # consults; everything else (``default_*_ids``) is across-all-users.
+
+    def episode_ids_for_user(self, user_id: str) -> set[str]:
+        """All episode ids owned by a user (the union of their sessions).
+
+        Reuses :meth:`list_sessions` + :meth:`list_session_episodes` -- no new
+        key scans, just the two-level walk over the existing ``has_session`` /
+        ``has_episode`` SPO index. Empty for an unknown user (no sessions). The
+        retriever intersects its candidate set with this; episodes NOT in this
+        set are excluded under strict user-scope. Episodes ingested with
+        ``user_id=None`` (pre-provenance / unscoped) are NOT in any user's set,
+        so they are excluded too (the deliberate strict-ness; see
+        ``claim_unscoped_documents`` for the docs-side backfill).
+        """
+        out: set[str] = set()
+        for sess in self.list_sessions(user_id):
+            out.update(self.list_session_episodes(sess))
+        return out
+
+    def document_ids_for_user(self, user_id: str) -> set[str]:
+        """All document ids owned by a user (scan the ``owns_document`` SPO index).
+
+        Documents have no session axis -- ownership is user-level only (a doc
+        is a peer top-level unit, not a chat turn). The forward edge
+        ``(U:{user}, owns_document, doc_id)`` is written by
+        ``_document_graph_ops`` when ``doc.user_id`` is set; this scans the SPO
+        index by subject+predicate (the same pattern as :meth:`list_sessions`).
+        Empty for an unknown user. Docs with ``user_id=None`` (pre-user-scope /
+        unscoped) are NOT in any user's set -> excluded under strict scope until
+        :meth:`claim_unscoped_documents` stamps them.
+
+        (The POS index orders object-before-subject, so it cannot be prefix-
+        scanned by user -- the SPO index is the right one here.)
+        """
+        user = f"U:{user_id}"
+        start = f"memory/spo/{user}/owns_document/"
+        end = f"memory/spo/{user}/owns_document/\x7f"
+        out: set[str] = set()
+        for k, _ in self.db.create_read_stream(start=start, end=end):
+            # k = memory/spo/{user}/owns_document/{doc_id}
+            doc_id = k.rsplit("/", 1)[-1]
+            if doc_id:
+                out.add(doc_id)
+        return out
+
+    def claim_unscoped_documents(self, user_id: str) -> int:
+        """One-time backfill: stamp ``user_id`` on every unscoped document.
+
+        Strict user-scope EXCLUDES unscoped content, so existing docs (encoded
+        before the ``user_id`` field / with no owner) would vanish the moment
+        ``--retrieval-user-scope`` turns on. This walks ``default_document_ids``,
+        skips docs that already have an owner (``content/doc/{id}/user`` present
+        or an ``owned_by`` edge -- the cheap content-key check first, the graph
+        check as a backstop), and stamps ``user_id`` on the rest (content key +
+        the two ownership graph edges). Idempotent: a second call is a no-op
+        (every doc is now owned). Never clobbers an existing owner. Returns the
+        number of docs claimed. Run via ``serve_ponder --claim-docs`` or once
+        per store before enabling user-scope.
+        """
+        user_node = f"U:{user_id}"
+        claimed = 0
+        for doc_id in self.default_document_ids():
+            # Cheap already-owned check: the content key (one get_sync).
+            if _b2s(self.db.get_sync(f"content/doc/{doc_id}/user")):
+                continue
+            # Backstop: an owner edge without the content key (shouldn't happen
+            # in normal encode, but a partial write could leave one). Skip if any
+            # user already owns this doc. The ``owned_by`` edge is
+            # ``(doc_id, owned_by, U:{user})`` -> SPO scan by subject+predicate.
+            owner_start = f"memory/spo/{doc_id}/owned_by/"
+            owner_end = f"memory/spo/{doc_id}/owned_by/\x7f"
+            if any(True for _ in self.db.create_read_stream(
+                    start=owner_start, end=owner_end)):
+                continue
+            ops: list[dict] = [
+                {"type": "put", "key": f"content/doc/{doc_id}/user",
+                 "value": user_id},
+            ]
+            ops += self.graph.expand_triple(user_node, "owns_document", doc_id)
+            ops += self.graph.expand_triple(doc_id, "owned_by", user_node)
+            self.db.batch_sync(ops)
+            claimed += 1
+        return claimed
+
     # ---- JGS recurrent-state persistence (Phase 2c plumbing) ----
 
     def save_jgs_state(self, user_id: str, blob: str, scope: str = "working_memory") -> None:
@@ -1386,6 +1476,10 @@ class HippocampalStore:
         "resolved_citations", "state_assertions",
         # Phase 3c Sec 7.11: semantic doc-kind tag (zero-shot at ingest).
         "doc_kind",
+        # User scope (retrieval boundary): conditional at encode, so a delete
+        # no-ops on a pre-user-scope doc (WaveDB ``del_sync`` ignores absent
+        # keys -- mirrors the conditional ``embedding``/``summary`` deletes).
+        "user",
     )
     _SEC_FIELDS = (
         "heading", "level", "parent", "blob_hash", "entities", "topics",
@@ -1486,6 +1580,17 @@ class HippocampalStore:
             ops.extend(self.graph.expand_triple(s, p, o, delete=delete))
 
         emit(doc.id, "instanceOf", "Document")
+        # User scope (retrieval boundary): when the doc carries a ``user_id``,
+        # own it in the graph so ``document_ids_for_user`` can scope retrieval.
+        # Both the forward edge (user -> doc, the scoping scan) and the reverse
+        # (doc -> user, a cheap per-doc owner lookup) are emitted; ``emit`` uses
+        # the SAME ``(s, p, o)`` with ``delete=True`` on the delete path, so a
+        # doc update/delete retracts both symmetrically (no orphans). Gated on
+        # ``doc.user_id`` -> byte-identical for pre-user-scope docs.
+        if doc.user_id:
+            user_node = f"U:{doc.user_id}"
+            emit(user_node, "owns_document", doc.id)
+            emit(doc.id, "owned_by", user_node)
         for e in doc.entities:
             emit(doc.id, "has_entity", f"E:{e}")
             emit(f"E:{e}", "appears_in_doc", doc.id)
@@ -1604,6 +1709,13 @@ class HippocampalStore:
         # literal ``citations`` (byte-identical to pre-Phase-3c).
         put(f"{d}/resolved_citations", json.dumps(doc.resolved_citations))
         put(f"{d}/state_assertions", json.dumps(doc.state_assertions))
+        # User scope (retrieval boundary): written ONLY when set (conditional,
+        # like ``created_at``/``embedding``) so a pre-user-scope / unscoped doc
+        # is byte-identical. The graph carries the scoping edge; this content
+        # key is the cheap per-doc owner read (avoids a graph scan in
+        # ``claim_unscoped_documents``'s already-owned check).
+        if doc.user_id:
+            put(f"{d}/user", doc.user_id)
         for sec in doc.sections:
             s = f"{d}/sec/{sec.id}"
             put(f"{s}/heading", sec.heading)
@@ -1785,6 +1897,9 @@ class HippocampalStore:
             f"content/doc/{doc_id}/resolved_citations"))
         state_assertions_raw = _b2s(self.db.get_sync(
             f"content/doc/{doc_id}/state_assertions"))
+        # User scope (retrieval boundary): absent key -> ``None`` (byte-identical
+        # for a pre-user-scope / unscoped doc).
+        user_id = _b2s(self.db.get_sync(f"content/doc/{doc_id}/user")) or None
 
         def _loads(raw, default):
             try:
@@ -1839,6 +1954,7 @@ class HippocampalStore:
             citations=_loads(citations_raw, []),
             resolved_citations=_loads(resolved_citations_raw, []),
             state_assertions=_loads(state_assertions_raw, []),
+            user_id=user_id,
         )
 
     def get_section_body(self, doc_id: str, section_id: str) -> Optional[str]:

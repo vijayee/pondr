@@ -40,6 +40,18 @@ if TYPE_CHECKING:  # torch/subconscious only needed for type hints, not at runti
     from .document_retriever import DocumentRetriever
 
 
+# User-scope vector over-fetch factor. When user-scope is ON, the semantic /
+# embedding paths over-fetch by this multiple of ``k`` THEN filter the hits by
+# shape (ep_*/doc_*/section) against the user's owned id sets, taking the top
+# ``k`` after filtering. The over-fetch compensates for the global flat vector
+# index returning other users' content (which gets filtered out) so a user's
+# own k results still surface. 3x is an honest, documented knob, not a silent
+# cap: if a user owns a small fraction of the corpus, the post-filter can still
+# come up short (raise this); if the corpus is single-user it's pure overhead
+# (leave user-scope OFF -- the default). See ``_filter_vector_hits_by_scope``.
+_USER_SCOPE_FETCH_MULT = 3
+
+
 class HippocampalRetriever:
     """Full retrieval pipeline: plan → traverse → (semantic fallback) → context.
 
@@ -56,10 +68,21 @@ class HippocampalRetriever:
         auto_load_index: bool = False,
         retrieval_gate: "Optional[RetrievalGate]" = None,
         embedder: Optional[object] = None,
+        user_id: Optional[str] = None,
     ) -> None:
         self.store = store
         self.planner = planner or BonsaiQueryPlanner()
         self.traversal = GraphTraversal(store)
+        # User-scope (retrieval user boundary): when set, every retrieve path
+        # intersects its candidate set with this user's owned episode + document
+        # id sets (strict scope -- no cross-user, no unscoped, no memories).
+        # ``None`` = unscoped (the pre-user-scope global path, byte-identical).
+        # The retriever is constructed ONCE in ``runtime.build_ponder`` and
+        # injected into the orchestrator, so holding ``user_id`` here covers all
+        # orchestrator call sites without per-call threading. Computed per call
+        # (not cached at init) so episodes/docs ingested during the session are
+        # visible to later retrieves.
+        self.user_id = user_id
         # Phase F: VectorSearch over summary embeddings. Auto-loaded from
         # {db}/vector_index_ids.json when auto_load_index is set (the live pod
         # pipeline); tests pass a stub VectorSearch or leave it None.
@@ -114,6 +137,76 @@ class HippocampalRetriever:
             return
         self.vector_search = vs
 
+    # ── User-scope (retrieval user boundary) ──
+
+    def _user_scope_sets(self) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        """The query user's owned episode + document id sets (strict scope).
+
+        Returns ``(allowed_ep, allowed_doc)``. When :attr:`user_id` is ``None``
+        (user-scope OFF) returns ``(None, None)`` so every retrieve path skips
+        filtering -> byte-identical to the pre-user-scope path. When set, both
+        sets are recomputed per call from the store's SPO indices -- a user who
+        ingests a doc mid-session sees it on the next retrieve (no init-time
+        cache). The two scans are cheap (SPO prefix range reads). Empty for an
+        unknown user (no sessions / no owned docs) -> strict scope returns
+        nothing, the honest result.
+        """
+        if self.user_id is None:
+            return None, None
+        allowed_ep = self.store.episode_ids_for_user(self.user_id)
+        allowed_doc = self.store.document_ids_for_user(self.user_id)
+        return allowed_ep, allowed_doc
+
+    @staticmethod
+    def _filter_vector_hits_by_scope(
+        hits: list[tuple[str, float]],
+        allowed_episode_ids: Optional[set[str]],
+        allowed_document_ids: Optional[set[str]],
+    ) -> list[tuple[str, float]]:
+        """Filter vector-search hits by shape against the user's owned ids.
+
+        The vector index is ONE flat global layer (``episodes``) holding
+        ``ep_*``, ``{doc_id}_sec_NNN``, and ``M:*`` together -- no user
+        partition, so the boundary is an id-set intersection, not a key-prefix.
+        Each hit is kept iff its kind is owned by the query user:
+
+        * ``ep_*`` -> ``allowed_episode_ids`` (``None`` = pass).
+        * ``{doc_id}_sec_NNN`` -> parent ``doc_id`` in ``allowed_document_ids``
+          (``None`` = pass). ``_sec_`` check precedes the ``doc_`` check (section
+          ids start with ``doc_`` -- mirrors ``_hydrate``).
+        * ``doc_*`` (no ``_sec_``) -> ``allowed_document_ids`` (``None`` = pass).
+        * ``M:*`` -> dropped under strict scope (either set not ``None``); kept
+          when user-scope is fully off.
+
+        When both allowed sets are ``None`` returns ``hits`` unchanged
+        (byte-identical). The caller over-fetches (``k * _USER_SCOPE_FETCH_MULT``)
+        before calling this, then takes the top ``k`` of the filtered list. Once
+        we reach the loop the early ``both None`` return means strict scope is on,
+        so ``M:`` is always dropped here.
+        """
+        if allowed_episode_ids is None and allowed_document_ids is None:
+            return hits
+        out: list[tuple[str, float]] = []
+        for eid, sim in hits:
+            if eid.startswith("M:"):
+                continue  # memories dropped under strict scope (unwired, no data)
+            if "_sec_" in eid:
+                if allowed_document_ids is None:
+                    out.append((eid, sim))
+                else:
+                    doc_id = eid.rsplit("_sec_", 1)[0]
+                    if doc_id in allowed_document_ids:
+                        out.append((eid, sim))
+                continue
+            if eid.startswith("doc_"):
+                if allowed_document_ids is None or eid in allowed_document_ids:
+                    out.append((eid, sim))
+                continue
+            # episode (ep_*)
+            if allowed_episode_ids is None or eid in allowed_episode_ids:
+                out.append((eid, sim))
+        return out
+
     def retrieve(
         self,
         prompt: str,
@@ -141,10 +234,15 @@ class HippocampalRetriever:
             the shape), highest score first.
         """
         query_plan = self.planner.plan(prompt, conversation_history)
-        results = self.traversal.retrieve(query_plan, signal=signal)
+        allowed_ep, allowed_doc = self._user_scope_sets()
+        results = self.traversal.retrieve(
+            query_plan, signal=signal,
+            allowed_episode_ids=allowed_ep, allowed_document_ids=allowed_doc,
+        )
 
         if use_semantic and len(results) < 3:
-            semantic_results = self._semantic_fallback(prompt, query_plan)
+            semantic_results = self._semantic_fallback(
+                prompt, query_plan, allowed_ep, allowed_doc)
             existing_ids = {r["episode_id"] for r in results}
             for sr in semantic_results:
                 if sr["episode_id"] not in existing_ids:
@@ -172,9 +270,15 @@ class HippocampalRetriever:
         """Traverse directly with a caller-supplied plan (skips the planner).
 
         Lets tests exercise the traverse→load path deterministically without
-        the planner (or its server fallback) in the loop.
+        the planner (or its server fallback) in the loop. Threads the user-
+        scope id sets (computed from :attr:`user_id`) so a scoped retriever
+        filters here too; ``user_id=None`` -> ``None`` sets -> byte-identical.
         """
-        return self.traversal.retrieve(query_plan, signal=signal)
+        allowed_ep, allowed_doc = self._user_scope_sets()
+        return self.traversal.retrieve(
+            query_plan, signal=signal,
+            allowed_episode_ids=allowed_ep, allowed_document_ids=allowed_doc,
+        )
 
     def retrieve_by_embedding(
         self,
@@ -217,7 +321,17 @@ class HippocampalRetriever:
         if not vec:
             return []
         k = limit if limit is not None else config.default_retrieval_limit
-        hits = self.vector_search.search_by_vector(vec, k=k)
+        allowed_ep, allowed_doc = self._user_scope_sets()
+        # User-scope: over-fetch from the GLOBAL flat vector index, then filter
+        # by shape against the user's owned ids, then take the top ``k``. When
+        # user-scope is OFF (allowed sets both ``None``) ``fetch_k == k`` and the
+        # filter is a no-op -> byte-identical.
+        scoped = allowed_ep is not None or allowed_doc is not None
+        fetch_k = k * _USER_SCOPE_FETCH_MULT if scoped else k
+        hits = self.vector_search.search_by_vector(vec, k=fetch_k)
+        if scoped:
+            hits = self._filter_vector_hits_by_scope(hits, allowed_ep, allowed_doc)
+            hits = hits[:k]
         out: list[dict] = []
         for eid, sim in hits:
             ep = self.traversal._hydrate(eid)
@@ -324,17 +438,38 @@ class HippocampalRetriever:
         self._outcome_trainer.record_outcome(emb, context=None,
                                              decision=route, outcome=outcome)
 
-    def _semantic_fallback(self, prompt: str, query_plan: dict) -> list[dict]:
+    def _semantic_fallback(
+        self,
+        prompt: str,
+        query_plan: dict,
+        allowed_episode_ids: Optional[set[str]] = None,
+        allowed_document_ids: Optional[set[str]] = None,
+    ) -> list[dict]:
         """Semantic fallback over summary embeddings.
 
         Embed ``prompt`` with the local sentence-transformers model, run
         ``self.vector_search.search``, and hydrate hits into episode dicts with
         a discounted score (×0.5) so graph-traversal matches rank higher.
         Returns ``[]`` when no vector index is configured.
+
+        User-scope: when the allowed sets are not ``None``, over-fetch (``k *
+        _USER_SCOPE_FETCH_MULT``) then filter hits by shape against the user's
+        owned ids, taking the top ``k`` after filtering. When both ``None``
+        (user-scope OFF) ``fetch_k == k`` and the filter is a no-op ->
+        byte-identical. The sets are threaded from :meth:`retrieve` (computed
+        once per call) so the graph + semantic paths share one scope read.
         """
         if self.vector_search is None:
             return []
-        hits = self.vector_search.search(prompt, k=config.default_retrieval_limit)
+        k = config.default_retrieval_limit
+        scoped = (allowed_episode_ids is not None
+                  or allowed_document_ids is not None)
+        fetch_k = k * _USER_SCOPE_FETCH_MULT if scoped else k
+        hits = self.vector_search.search(prompt, k=fetch_k)
+        if scoped:
+            hits = self._filter_vector_hits_by_scope(
+                hits, allowed_episode_ids, allowed_document_ids)
+            hits = hits[:k]
         out: list[dict] = []
         for eid, sim in hits:
             ep = self.traversal._hydrate(eid)

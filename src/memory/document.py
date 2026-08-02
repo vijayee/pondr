@@ -139,6 +139,15 @@ class Document:
     # ``(E:entity, state, value)`` edges with sidecar ``asserted_by=section``.
     # Empty for structure-only ingests + docs with no explicit state claims.
     state_assertions: list[dict] = field(default_factory=list)
+    # ── User scope (retrieval boundary) ──
+    # ``None`` = unscoped (backward-compatible: a doc ingested without a user
+    # boundary, byte-identical to pre-user-scope). When set, the store writes
+    # ``(U:{user}, owns_document, {doc_id})`` + the reverse ``owned_by`` edge so
+    # ``document_ids_for_user`` can scope retrieval to a user's docs. Mirrors
+    # ``Episode.user_id`` (provenance at encode, filter at retrieve). Documents
+    # have no session axis -- ownership is user-level only (a doc is a peer
+    # top-level unit, not a chat turn).
+    user_id: Optional[str] = None
 
     @classmethod
     def from_parse(
@@ -148,6 +157,7 @@ class Document:
         extracted: dict,
         relations: list[dict],
         ingested_at: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> "Document":
         """Build a ``Document`` from a parser + chunker + extraction pass.
 
@@ -227,4 +237,5 @@ class Document:
             topics=topics,
             relations=relations,
             citations=citations,
+            user_id=user_id,
         )

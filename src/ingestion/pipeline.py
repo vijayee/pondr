@@ -55,6 +55,7 @@ class UnifiedIngestionPipeline:
         doc_kind_tagger=None,
         summarizer=None,
         state_assertions: bool = True,
+        user_id: Optional[str] = None,
     ) -> tuple[str, bool]:
         """Ingest (or re-ingest) a source. Returns ``(doc_id, created)``.
 
@@ -217,7 +218,8 @@ class UnifiedIngestionPipeline:
             doc_id = existing
             created = False
 
-        doc = Document.from_parse(doc_id, parsed, extracted, relations)
+        doc = Document.from_parse(doc_id, parsed, extracted, relations,
+                                  user_id=user_id)
 
         # Phase 3c (D1): per-section state assertions -- the deterministic
         # normalizer over each section's content (catches explicit ``key:

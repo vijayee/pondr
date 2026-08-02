@@ -22,7 +22,13 @@ Flags:
     --gliner-timing        log per-stage GLiNER extraction timing (DEFAULT ON;
                           --no-gliner-timing to disable)
     --no-live-encode       do not persist exchanges (skip the encoder + GLiNER)
-    --user-id ID           user the encoder attributes episodes to
+    --user-id ID           user the encoder attributes episodes to (also the
+                          retrieval user-scope boundary when --retrieval-user-scope)
+    --retrieval-user-scope scope retrieval to THIS --user-id (strict: unscoped,
+                          cross-user, and M: memories excluded; fade untouched).
+                          DEFAULT OFF (global across-all-users path).
+    --claim-docs           one-time backfill: stamp --user-id onto every ownerless
+                          doc so it survives --retrieval-user-scope (idempotent).
     --query TEXT           one-shot query; omit for the interactive REPL
     --bonsai-endpoint URL  override the Bonsai LLM endpoint
     --async-distill        background episode distillation (response returns
@@ -317,6 +323,26 @@ def main() -> int:
                         "never silently applied. The user is the corruption "
                         "verifier (human-in-the-loop). Requires --fade-consolidation. "
                         "DEFAULT OFF.")
+    p.add_argument("--retrieval-user-scope", action="store_true", default=False,
+                   help="Scope retrieval to THIS --user-id: every retrieve path "
+                        "(graph traversal, semantic fallback, embedding search) "
+                        "intersects its candidate set with the user's owned "
+                        "episode + document ids -- tier-1 becomes YOUR long-ago, "
+                        "not the whole corpus's. STRICT scope: unscoped, cross-"
+                        "user, and M: memories are excluded. The fade is untouched "
+                        "(already one-user-per-serve). DEFAULT OFF -> the global "
+                        "across-all-users path (byte-identical to pre-user-scope). "
+                        "Run --claim-docs once before enabling so existing unscoped "
+                        "docs are stamped to this user (else they vanish).")
+    p.add_argument("--claim-docs", action="store_true", default=False,
+                   help="One-time backfill BEFORE serving: stamp --user-id onto "
+                        "every unscoped document (no owner content key, no owned_by "
+                        "edge) so it survives --retrieval-user-scope. Idempotent "
+                        "(skips already-owned docs, never clobbers an owner). Logs "
+                        "the count claimed and continues into the serve/REPL. Safe "
+                        "to run repeatedly. No effect with --retrieval-user-scope "
+                        "off, but harmless (the ownership edges are written "
+                        "regardless; they are just never consulted).")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -536,6 +562,9 @@ def main() -> int:
           f"fade_consolidation_max_depth={args.fade_consolidation_max_depth} "
           f"fade_consolidation_validate={args.fade_consolidation_validate}",
           file=sys.stderr)
+    print(f"[load] retrieval_user_scope={args.retrieval_user_scope} "
+          f"claim_docs={args.claim_docs} user_id={args.user_id}",
+          file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -570,7 +599,17 @@ def main() -> int:
         fade_consolidation_epsilon=args.fade_consolidation_epsilon,
         fade_consolidation_max_depth=args.fade_consolidation_max_depth,
         fade_consolidation_validate=args.fade_consolidation_validate,
+        retrieval_user_scope=args.retrieval_user_scope,
     )
+
+    # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc
+    # so it survives --retrieval-user-scope. Idempotent; runs AFTER build_ponder
+    # opened the store (the orchestrator holds it as ``orch.store``). Safe with
+    # --retrieval-user-scope off too (the edges are written but never consulted).
+    if args.claim_docs:
+        claimed = orch.store.claim_unscoped_documents(args.user_id)
+        print(f"[claim-docs] stamped {claimed} unscoped document(s) to user "
+              f"'{args.user_id}' (idempotent; rerun anytime).", file=sys.stderr)
 
     try:
         if args.query is not None:

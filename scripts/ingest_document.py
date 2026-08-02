@@ -137,6 +137,7 @@ def _ingest(args) -> int:
             relation_extractor=bonsai,
             embedder=embedder,
             doc_kind_tagger=doc_kind_tagger,
+            user_id=args.user_id,
         )
         print(f"{'created' if created else 'updated'} {doc_id}")
         return 0
@@ -199,6 +200,11 @@ def main() -> int:
                     help="Phase 2a backbone checkpoint the doc-kind head runs on (frozen)")
     ap.add_argument("--device", default="auto",
                     help="device for the doc-kind head backbone (auto|cpu|cuda; default auto)")
+    ap.add_argument("--user-id", default="ponder",
+                    help="user the ingested doc is owned by (the retrieval user-scope boundary; "
+                         "default ponder). Docs owned by a user are retrievable only under that "
+                         "user's --retrieval-user-scope; None/omitted = unscoped (global, the pre-"
+                         "user-scope behavior)")
     args = ap.parse_args()
 
     if args.gc_blobs:

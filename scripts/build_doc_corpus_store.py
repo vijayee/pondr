@@ -224,6 +224,10 @@ def main() -> int:
                         "findable via GLiNER + the semantic embedder), so this is a "
                         "safe corpus-build workaround -- production ingest keeps "
                         "them on. Combine with --no-gliner for the smallest batch.")
+    p.add_argument("--user-id", default="ponder",
+                   help="user the corpus docs are owned by (the retrieval user-scope "
+                        "boundary; default ponder -- matches serve_ponder --user-id so a "
+                        "corpus built here is scoped to the same default user).")
     p.add_argument("--summarize-code", action="store_true",
                    help="STRM 1f-6: generate a 1-2 sentence LLM prose summary per "
                         "CODE section and use it as the *embedding handle* so code "
@@ -322,6 +326,7 @@ def main() -> int:
                     doc_kind_tagger=doc_kind_tagger,
                     summarizer=summarizer,
                     state_assertions=not args.no_state_assertions,
+                    user_id=args.user_id,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad doc must not kill the build
                 print(f"  [{i}/{len(files)}] SKIP {fpath}: {exc}", file=sys.stderr)

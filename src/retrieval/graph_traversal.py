@@ -261,6 +261,69 @@ class GraphTraversal:
         return {eid for eid in episode_ids
                 if eid.startswith("doc_") or self.store.is_episode_active(eid)}
 
+    # ── User-scope filter (the retrieval user boundary) ──
+
+    @staticmethod
+    def _filter_user_scope(
+        candidates: set[str],
+        allowed_episode_ids: Optional[set[str]],
+        allowed_document_ids: Optional[set[str]],
+    ) -> set[str]:
+        """Intersect candidates with the user's owned ids (strict user-scope).
+
+        The candidate set from :meth:`_find_candidates` mixes kinds: ``ep_*``
+        (episodes), ``doc_*`` (documents), ``{doc_id}_sec_NNN`` (sections -- they
+        START WITH ``doc_`` and contain ``_sec_``), and ``M:*`` (semantic
+        memories). Under strict user-scope each kind is kept only if owned by
+        the query user:
+
+        * ``ep_*`` -> episode, kept iff ``eid in allowed_episode_ids``.
+        * ``{doc_id}_sec_NNN`` -> section, kept iff its parent ``doc_id`` (parsed
+          with ``rsplit("_sec_", 1)[0]``) is in ``allowed_document_ids``. Section
+          ids start with ``doc_``, so the ``_sec_`` check MUST precede the
+          ``doc_`` check (mirrors ``_hydrate``'s discriminator).
+        * ``doc_*`` (no ``_sec_``) -> document, kept iff ``eid in
+          allowed_document_ids``.
+        * ``M:*`` -> semantic memory, DROPPED (strict scope; the GNN memory
+          layer is unwired with no production data today, so this has no real
+          effect -- documented as a deferred follow-on, not a silent cap).
+
+        When an allowed set is ``None`` that kind passes UNFILTERED. Both ``None``
+        (user-scope off) -> the whole set passes -> byte-identical to the pre-
+        user-scope path. ``allowed_episode_ids`` gates episodes only;
+        ``allowed_document_ids`` gates documents + sections only. Memories are
+        dropped the moment EITHER set is not ``None`` (strict scope is on) -- the
+        early ``both None`` return below means once we reach the loop, strict
+        scope is ALWAYS on, so ``M:`` is always dropped here.
+        """
+        if allowed_episode_ids is None and allowed_document_ids is None:
+            return candidates  # user-scope off -> byte-identical
+        out: set[str] = set()
+        for eid in candidates:
+            if eid.startswith("M:"):
+                continue  # memories dropped under strict scope (unwired, no data)
+            if "_sec_" in eid:
+                # section -> gate on the parent doc's owner
+                if allowed_document_ids is None:
+                    out.add(eid)
+                else:
+                    doc_id = eid.rsplit("_sec_", 1)[0]
+                    if doc_id in allowed_document_ids:
+                        out.add(eid)
+                continue
+            if eid.startswith("doc_"):
+                if allowed_document_ids is None:
+                    out.add(eid)
+                elif eid in allowed_document_ids:
+                    out.add(eid)
+                continue
+            # episode (ep_*) -- and any other non-doc non-M id
+            if allowed_episode_ids is None:
+                out.add(eid)
+            elif eid in allowed_episode_ids:
+                out.add(eid)
+        return out
+
     # ── follows chain (temporal order) ──
 
     def _follows_neighbors(self, episode_id: str, direction: str) -> list[str]:
@@ -850,7 +913,14 @@ class GraphTraversal:
 
     # ── public entry point ──
 
-    def retrieve(self, query_plan: dict, limit: Optional[int] = None, signal: Optional[str] = None) -> list[dict]:
+    def retrieve(
+        self,
+        query_plan: dict,
+        limit: Optional[int] = None,
+        signal: Optional[str] = None,
+        allowed_episode_ids: Optional[set[str]] = None,
+        allowed_document_ids: Optional[set[str]] = None,
+    ) -> list[dict]:
         """Run a query plan against the graph and return ranked episode dicts.
 
         The plan is the output of the query planner (or a literal dict in tests):
@@ -868,6 +938,16 @@ class GraphTraversal:
         /``correction``) used by the retrieval-time boost hook. Defaults to the
         plan's ``signal`` field, then ``"routine"``. The boost is NON-BLOCKING:
         a sidecar write failure is logged and never breaks retrieval.
+
+        ``allowed_episode_ids`` / ``allowed_document_ids`` (user-scope) are the
+        user's owned id sets from :meth:`HippocampalStore.episode_ids_for_user` /
+        :meth:`HippocampalStore.document_ids_for_user`. When both ``None`` (user-
+        scope OFF) the path is byte-identical to the pre-user-scope path. When
+        set, :meth:`_filter_user_scope` intersects the candidate set with them
+        RIGHT AFTER candidate construction (before temporal / follows-chain
+        re-anchoring), so the boundary is a hard, first-pass filter: a ``follows``
+        chain can never pull in another user's episodes. Both default ``None`` so
+        existing callers (tests, ``retrieve_with_plan``) stay byte-identical.
         """
         entities = query_plan.get("entities") or []
         topics = query_plan.get("topics") or []
@@ -884,6 +964,15 @@ class GraphTraversal:
             limit = query_plan.get("limit") or _config.default_retrieval_limit
 
         candidates = self._find_candidates(entities, topics, tones, entity_mode)
+        if not candidates:
+            return []
+
+        # User-scope boundary: intersect with the query user's owned ids BEFORE
+        # temporal / follows-chain re-anchoring, so a follows walk can never
+        # escape the user's sessions. A no-op (returns the set unchanged) when
+        # both allowed sets are ``None`` (user-scope OFF -> byte-identical).
+        candidates = self._filter_user_scope(
+            candidates, allowed_episode_ids, allowed_document_ids)
         if not candidates:
             return []
 

@@ -84,6 +84,7 @@ def build_ponder(
     fade_consolidation_epsilon: float = 0.03,
     fade_consolidation_max_depth: int = 3,
     fade_consolidation_validate: bool = False,
+    retrieval_user_scope: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -196,6 +197,16 @@ def build_ponder(
             turns (R1 verbatim + R3 gist; R4 forgotten is a signal, not content).
             ``False`` (default) -> recalls stay observability-only (byte-identical to
             Phase A). Requires ``fade_memory`` to take effect.
+        retrieval_user_scope: when True, the retriever is constructed with
+            ``user_id=user_id`` so every retrieve path (graph traversal, semantic
+            fallback, embedding search) intersects its candidate set with THIS
+            user's owned episode + document ids -- tier-1 becomes YOUR long-ago,
+            not the corpus's. Strict scope: unscoped + cross-user + ``M:``
+            memories are excluded. ``False`` (default) -> ``user_id=None`` ->
+            the global across-all-users path, byte-identical to pre-user-scope.
+            The fade is untouched (already implicitly one-user-per-serve). Run
+            ``serve_ponder --claim-docs`` once before enabling so existing
+            unscoped docs are stamped to this user (else they vanish under strict).
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -222,6 +233,10 @@ def build_ponder(
         auto_load_index=True,
         retrieval_gate=gate,
         embedder=embedder,
+        # User-scope: the retriever holds the user_id internally and threads the
+        # owned-id sets to every retrieve path. ``None`` (default, flag OFF) ->
+        # the global across-all-users path, byte-identical to pre-user-scope.
+        user_id=user_id if retrieval_user_scope else None,
     )
 
     # Phase 1c Refinement 1: attach the document-aware aggregator so multi-
