@@ -380,6 +380,19 @@ def main() -> int:
                         "-> no content/idx/ keys written + retrieve takes the "
                         "existing graph+vector-fallback path -> byte-identical "
                         "to pre-A2. No new training/GPU/GNN/LLM-call.")
+    p.add_argument("--dedup", action="store_true", default=False,
+                   help="A1 LLM-judged 4-action dedup: after each new episode is "
+                        "fully encoded, vector-recall the user's active corpus "
+                        "for near-duplicates and ONE BATCHED Bonsai call judges "
+                        "every new-vs-existing pair (store/update/merge/skip), "
+                        "applied via MVCC supersession (supersede, never delete -- "
+                        "content preserved, recoverable). Closes the documented "
+                        "no-cross-episode-dedup gap. Cold-start-safe: Bonsai "
+                        "down / no candidates -> defer -> store unchanged. "
+                        "DEFAULT OFF -> encoder _maybe_dedup early-returns (no "
+                        "judge call, no supersede) -> byte-identical to pre-A1. "
+                        "One extra Bonsai HTTP call per episode. No new "
+                        "training/GPU/GNN.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -395,6 +408,11 @@ def main() -> int:
     # build_ponder (build_ponder also sets it from its param, covering direct
     # callers). Default OFF -> no content/idx/ writes + retrieve off-path.
     _config.hybrid_retrieval = args.hybrid_retrieval
+    # A1: dedup_enabled is read at call time by the encoder's ``_maybe_dedup``
+    # (the master-config convention), so set the global BEFORE build_ponder
+    # (build_ponder also sets it from its param, covering direct callers).
+    # Default OFF -> no judge injected + early-return -> byte-identical.
+    _config.dedup_enabled = args.dedup
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
@@ -610,6 +628,7 @@ def main() -> int:
     print(f"[load] tier2_recall_menu={args.tier2_recall_menu}", file=sys.stderr)
     print(f"[load] scene_blocks={args.scene_blocks}", file=sys.stderr)
     print(f"[load] hybrid_retrieval={args.hybrid_retrieval}", file=sys.stderr)
+    print(f"[load] dedup={args.dedup}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -648,6 +667,7 @@ def main() -> int:
         tier2_recall_menu=args.tier2_recall_menu,
         scene_blocks=args.scene_blocks,
         hybrid_retrieval=args.hybrid_retrieval,
+        dedup=args.dedup,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

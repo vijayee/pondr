@@ -88,6 +88,7 @@ def build_ponder(
     tier2_recall_menu: bool = False,
     scene_blocks: bool = False,
     hybrid_retrieval: bool = False,
+    dedup: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -237,6 +238,13 @@ def build_ponder(
     # entry points agree; setting it here too covers direct ``build_ponder``
     # callers (tests, scripts) that pass the param without going through serve.
     config.hybrid_retrieval = hybrid_retrieval
+    # A1: set the master-config flag before the store + encoder ctor so the
+    # encoder's call-time gate (``_maybe_dedup`` reads ``config.dedup_enabled``)
+    # sees a consistent value (same convention as ``hybrid_retrieval`` above).
+    # ``serve_ponder`` sets the same global before build_ponder; setting it here
+    # too covers direct ``build_ponder`` callers (tests, scripts) that pass the
+    # param without going through serve.
+    config.dedup_enabled = dedup
     store = HippocampalStore(db_path or config.db_path)
 
     # Trained backbone (frozen) + trained gate on that shared backbone. The
@@ -300,6 +308,24 @@ def build_ponder(
             gliner_device=gliner_device,
             gliner_timing=gliner_timing,
         )
+
+    # A1: inject the post-commit dedup reconcile onto the encoder when the flag
+    # is on. The judge needs the retriever's ``vector_search`` (built above) to
+    # recall candidates + a ``BonsaiDecider`` for the batched judge call. Set as
+    # an attr AFTER the ctor (which takes ``dedup_judge=None`` for the OFF path)
+    # so we don't have to thread the retriever/vector_search into the encoder
+    # ctor. Off -> ``encoder._dedup_judge`` stays ``None`` -> ``_maybe_dedup``
+    # early-returns -> byte-identical to pre-A1. The judge's decider is a fresh
+    # ``BonsaiDecider()`` (reads endpoint/model from config); its HTTP call is
+    # lazy (one per encoded episode), and it carries the foreground ``pause_gate``
+    # the DistillWorker installs so a background dedup call yields to queries.
+    if dedup and encoder is not None and retriever is not None:
+        vs = getattr(retriever, "vector_search", None)
+        if vs is not None:
+            from .gnn.bonsai_decider import BonsaiDecider
+            from .encoding.dedup import DedupJudge
+            encoder._dedup_judge = DedupJudge(
+                BonsaiDecider(), vs, store)
 
     cfg = config_override or Phase2cConfig()
     if config_override is None:

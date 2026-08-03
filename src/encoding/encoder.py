@@ -52,9 +52,18 @@ class HippocampalEncoder:
         bonsai_endpoint: Optional[str] = None,
         gliner_device: str = "cpu",
         gliner_timing: bool = False,
+        dedup_judge=None,
     ):
         self.store = store
         self.user_id = user_id
+        # A1 post-commit dedup reconcile. Injected by ``build_ponder`` when the
+        # ``dedup`` flag is on (DI so tests inject a subclass overriding ``judge``
+        # while inheriting the real ``apply``). ``None`` (default / flag off) ->
+        # ``_maybe_dedup`` early-returns -> byte-identical to pre-A1. The flag
+        # itself (``config.dedup_enabled``) is read at call time inside
+        # ``_maybe_dedup`` (the master-config convention), so this attr is just
+        # the capability gate; both must be true to run.
+        self._dedup_judge = dedup_judge
         # Model selection defaults come from config via the extractors; pass
         # overrides through only when provided. gliner_device/gliner_timing
         # thread through to GLiNERExtractor so the live-encode path can run
@@ -202,6 +211,37 @@ class HippocampalEncoder:
             summary_embedding=summary_embedding, embedder=embedder,
         )
         self.store.encode_episode(episode)
+        # A1: post-commit dedup reconcile. Runs AFTER the new episode is fully
+        # encoded + indexed, so ``search_by_vector`` can find candidates (and the
+        # new's own eid, which ``DedupJudge.judge`` excludes). The async-distill
+        # path hooks this in ``distill_worker._run`` instead; this call covers the
+        # synchronous corpus/live path (``encode_turn`` + ``encode_messages``).
+        self._maybe_dedup(episode)
+
+    def _maybe_dedup(self, episode: Episode) -> None:
+        """A1 post-commit dedup reconcile (best-effort, never raises).
+
+        Gated on the master-config flag (``config.dedup_enabled``, read at call
+        time -- the codebase convention, same pattern as ``hybrid_retrieval``) AND
+        a non-None ``self._dedup_judge`` (injected by ``build_ponder`` when the
+        flag is on). Both must be true to run; either false -> early return ->
+        byte-identical to pre-A1 (no judge call, no supersede, no new keys). The
+        whole body is wrapped in try/except + logged (mirrors
+        ``distill_worker``'s failure semantics): a dedup hiccup never loses the
+        episode -- the new episode is already committed; dedup only decides what
+        to supersede afterward.
+        """
+        if self._dedup_judge is None:
+            return
+        from ..config import config as _master_config
+        if not _master_config.dedup_enabled:
+            return
+        try:
+            verdicts = self._dedup_judge.judge(episode)
+            if verdicts:
+                self._dedup_judge.apply(episode, verdicts)
+        except Exception as e:  # noqa: BLE001 - never lose the episode
+            print(f"[dedup-fail] {episode.id}: {e}", file=sys.stderr)
 
     def encode_turn(
         self,

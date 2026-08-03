@@ -563,6 +563,82 @@ Return ONLY valid JSON:
   "reason": "one short phrase"}}"""
 
 
+def bonsai_dedup_prompt(
+    new_summary: str,
+    new_entities: list[str],
+    new_topics: list[str],
+    candidates: list[dict],
+) -> str:
+    """Prompt for the Bonsai DEDUP judge (A1: the post-commit 4-action dedup gate).
+
+    The dedup reconcile (``src/encoding/dedup.py``) calls this ONCE per encoded
+    episode with the vector-recalled candidate pool (the user's active episodes
+    nearest the new one's summary embedding). The 8B judges the new episode vs
+    EACH existing one and picks one of four actions:
+
+    * ``store`` -- the new is a genuinely NEW fact; keep both, change nothing.
+    * ``update`` -- the new is a NEWER/BETTER version of the SAME fact as this
+      existing episode; the new should replace the old (``supersede(new, old)``).
+    * ``merge`` -- the new is COMPLEMENTARY to this existing episode (together a
+      fuller picture of one fact); the new stands for the merged fact
+      (``supersede(new, old)``). v1 does NOT text-fold the old's content into the
+      new -- that is a deferred refinement; the old is superseded (content
+      preserved, recoverable, never deleted).
+    * ``skip`` -- the new is a DUPLICATE of this existing episode; discard the
+      new (``supersede(existing, new)``).
+
+    Returns the ``{{"verdicts": [...]}}`` envelope so
+    ``BonsaiDecider._parse_json_object`` carves it out (it returns dict-only; a
+    top-level array would return None). Each verdict carries ``pair_id`` (the
+    0-based index into ``candidates``) which the caller resolves to an eid.
+    Wording is OPTIONAL guidance ("you may", "if unsure prefer store"), never
+    imperative (per [[llm-tool-use-prompts-optional]] -- imperative wording
+    suppresses small-model decision chains). The prompt biases to ``store`` when
+    unsure: a wrong ``skip`` discards the new (recoverable via MVCC, but a
+    graph-thin episode); a wrong ``store`` only leaves a harmless near-dup.
+    """
+    import json as _json
+    lines = []
+    for i, c in enumerate(candidates):
+        lines.append(
+            f"- (pair_id={i}) summary: {c.get('summary', '')}\n"
+            f"  entities: {_json.dumps(c.get('entities', []), ensure_ascii=False)}\n"
+            f"  topics: {_json.dumps(c.get('topics', []), ensure_ascii=False)}"
+        )
+    cand_block = "\n".join(lines) if lines else "(none)"
+    return f"""You are the dedup judge of a memory system. A new episode was just stored.
+For each EXISTING episode below, decide whether the new one is a duplicate, a
+newer version of the same fact, a complementary part of the same fact, or
+unrelated.
+
+For each pair, choose ONE action:
+  store  -- the new episode is a genuinely NEW fact (no existing episode it
+            duplicates or complements). Keep both; change nothing.
+  update -- the new is a NEWER or BETTER version of the SAME fact as this
+            existing episode. The new should replace the old.
+  merge  -- the new is COMPLEMENTARY to this existing episode (together they
+            describe one fact more fully). The new stands for the merged fact.
+  skip   -- the new is a DUPLICATE of this existing episode (same fact, same
+            vintage). Discard the new.
+
+Rules: judge on FACT identity, not wording -- a paraphrase of the same fact is
+skip/update, not store. Two facts about the same entity that differ in detail
+are merge, not skip. If unsure, prefer store (keep both) -- a wrong skip loses
+data. You may judge multiple pairs; give one verdict per pair.
+
+NEW EPISODE:
+  summary: {new_summary}
+  entities: {_json.dumps(new_entities, ensure_ascii=False)}
+  topics: {_json.dumps(new_topics, ensure_ascii=False)}
+
+EXISTING EPISODES (one verdict each, by pair_id):
+{cand_block}
+
+Return ONLY valid JSON:
+{{"verdicts": [{{"pair_id": 0, "action": "store"|"update"|"merge"|"skip",
+   "reason": "one short phrase"}}, ...]}}"""
+
+
 def bonsai_typing_prompt(entity: str, candidate_class: str,
                          retrieved_context: dict) -> str:
     """Prompt for the deploy-time Bonsai ontology-typing decider.

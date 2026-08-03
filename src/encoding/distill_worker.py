@@ -102,19 +102,41 @@ class DistillWorker:
                 # The fill calls encoder._extract (GLiNER) and bonsai.extract
                 # -> extract_isolated (10 Bonsai calls); both check the gate
                 # before each GPU call and block while the foreground is busy.
+                # The A1 dedup reconcile (``_maybe_dedup``) runs a Bonsai
+                # ``judge_dedup_pairs`` call via the decider, which also checks
+                # ``pause_gate`` -- so install the gate on the dedup decider too
+                # and keep it installed THROUGH the dedup call (the gate clears in
+                # the ``finally`` below, AFTER ``_maybe_dedup``). Without this a
+                # background dedup Bonsai call would contend with a foreground
+                # query for the one 8B on :8080 (de-wonk #4).
                 self._encoder.pause_gate = self._wait_foreground
                 bonsai = getattr(self._encoder, "bonsai", None)
                 if bonsai is not None:
                     bonsai.pause_gate = self._wait_foreground
+                dedup_decider = None
+                dedup_judge = getattr(self._encoder, "_dedup_judge", None)
+                if dedup_judge is not None:
+                    dedup_decider = getattr(dedup_judge, "_decider", None)
+                    if dedup_decider is not None and hasattr(
+                            dedup_decider, "pause_gate"):
+                        dedup_decider.pause_gate = self._wait_foreground
                 try:
                     self._encoder.encode_messages_fill(episode, episode_id)
                     self._store.encode_episode_edges(episode_id, episode)
+                    # A1: post-commit dedup reconcile on the async path too. Runs
+                    # AFTER edges are written, with the gate still installed so the
+                    # Bonsai judge call yields to a foreground query(). Gated on
+                    # ``config.dedup_enabled`` + a non-None ``_dedup_judge`` inside
+                    # ``_maybe_dedup`` -> flag off / no judge = byte-identical no-op.
+                    self._encoder._maybe_dedup(episode)
                 finally:
                     # Clear the gate so any synchronous path reusing the
                     # encoder stays byte-identical (no stray blocking).
                     self._encoder.pause_gate = None
                     if bonsai is not None:
                         bonsai.pause_gate = None
+                    if dedup_decider is not None:
+                        dedup_decider.pause_gate = None
             except Exception as e:  # noqa: BLE001 - never kill the queue
                 # Best-effort memory: the stub (content + embedding) is already
                 # stored; a fill failure leaves the episode graph-thin but

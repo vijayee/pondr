@@ -210,6 +210,22 @@ class Config:
     # ``assertion_extraction_enabled`` / ``forgetting_enabled``).
     hybrid_retrieval: bool = False
 
+    # ── A1: LLM-judged 4-action dedup (Tencent-survey Phase 1 item 4) ──
+    # When True, the encoder runs a post-commit dedup reconcile after each new
+    # episode is fully encoded: vector-recall the user's active corpus for near-
+    # duplicates, ONE BATCHED Bonsai ``judge_dedup_pairs`` call (store/update/
+    # merge/skip), apply via ``SemanticMemoryWriter.supersede_episode`` (MVCC --
+    # old content preserved, recoverable, never deleted). Closes the documented
+    # no-cross-episode-dedup gap (``orchestrator.py:105-107``). Cold-start-safe:
+    # Bonsai down / no candidates / no embedding -> defer -> store unchanged.
+    # Default False: with the flag off ``HippocampalEncoder._maybe_dedup`` early-
+    # returns (no judge call, no supersede, no new keys) so encode is byte-
+    # identical to pre-A1. Read at call time via
+    # ``from ..config import config as _master_config`` (the codebase convention
+    # for behavioral flags read in the encoder -- same pattern as
+    # ``hybrid_retrieval`` / ``assertion_extraction_enabled``).
+    dedup_enabled: bool = False
+
     # ── Phase 2c+: self-chat full agent loop ──
     # When True, the Bonsai self-chat synthesize path runs a multi-turn tool
     # loop (``run_tool_loop``): the model may call ``expand`` / ``search_memory``

@@ -40,6 +40,7 @@ from ..training.prompts import (
     bonsai_author_scene_prompt,
     bonsai_consolidate_gist_prompt,
     bonsai_contradiction_decision_prompt,
+    bonsai_dedup_prompt,
     bonsai_doc_kind_prompt,
     bonsai_gist_prompt,
     bonsai_typing_prompt,
@@ -100,7 +101,7 @@ class BonsaiDecider:
     Talks to an OpenAI-compatible ``llama-server`` (Bonsai) over HTTP. Plain
     ``response_format: {"type": "json_object"}`` chat completions -- NO
     tool-calling dependency. Constructible offline (the HTTP call is lazy, one
-    per ``gist``/``verify_typing``/``decide_anomaly`` call).
+    per ``gist``/``verify_typing``/``decide_anomaly``/``judge_dedup_pairs`` call).
 
     Each decision method returns ``None`` / a rejected verdict on HTTP or
     parse failure rather than raising, so the consolidator can fall back to
@@ -109,6 +110,16 @@ class BonsaiDecider:
     ``_post_json`` itself (unexpected server state) and is caught by the
     caller's best-effort contract.
     """
+
+    # Foreground-priority yielding hook (Phase 3c async-distill). Class-level
+    # default so any instance (incl. ``default_scene_author()`` / build_ponder's
+    # A1 ``DedupJudge`` decider) has the attribute without setting it in the
+    # ctor; ``_post_json`` checks it before the HTTP call. The DistillWorker sets
+    # it to its ``_wait_foreground`` callable so a background dedup/scene/
+    # consolidation Bonsai call yields to a foreground query(); ``None`` (sync
+    # path / offline tests) is a no-op. Mirrors ``HippocampalEncoder.pause_gate``
+    # + ``BonsaiRelationExtractor.pause_gate``.
+    pause_gate: Optional[object] = None
 
     def __init__(
         self,
@@ -263,6 +274,62 @@ class BonsaiDecider:
             "corruption": bool(data.get("corruption")),
             "reason": str(data.get("reason", ""))[:1000],
         }
+
+    def judge_dedup_pairs(
+        self,
+        new_episode_summary: str,
+        new_entities: list,
+        new_topics: list,
+        candidates: list[dict],
+    ) -> Optional[list[dict]]:
+        """Judge a new episode vs each candidate for the A1 4-action dedup gate.
+
+        Called ONCE per encoded episode by ``DedupJudge.judge``
+        (``src/encoding/dedup.py``) with the vector-recalled candidate pool (the
+        user's active episodes nearest the new one). ``candidates`` is a list of
+        ``{"eid", "summary", "entities", "topics"}``. The 8B returns one verdict
+        per pair: ``store`` (keep both) / ``update`` (new replaces old) / ``merge``
+        (new stands for the merged fact) / ``skip`` (discard the new).
+
+        Returns a list of ``{"eid", "action", "reason"}`` (the ``pair_id`` the
+        model emits is resolved to the candidate's ``eid`` here), or ``None`` on
+        HTTP/parse failure (the caller treats ``None`` as cold-start and defers --
+        the episode stays as-encoded, the four-action gate's "never a silent
+        auto-write" contract). Each verdict's ``action`` is validated against the
+        4-vocab (mirrors ``author_scene``'s gate at :221); an unknown action drops
+        that verdict (defensive). Reuses ``_post_json`` + ``_parse_json_object``
+        (no new HTTP/parse code). The ``{"verdicts": [...]}`` envelope keeps
+        ``_parse_json_object`` happy (it returns dict-only; a bare array would
+        return None). ``reason`` is capped at 1000 chars (mirrors
+        ``verify_fidelity``); no ``_CTRL_RE`` strip -- verdicts carry only action +
+        reason, never stored content.
+        """
+        if not candidates:
+            return None
+        prompt = bonsai_dedup_prompt(
+            new_episode_summary, new_entities, new_topics, candidates)
+        data = self._post_json(prompt)
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("verdicts")
+        if not isinstance(raw, list):
+            return None
+        out: list[dict] = []
+        for v in raw:
+            if not isinstance(v, dict):
+                continue
+            action = v.get("action")
+            if action not in ("store", "update", "merge", "skip"):
+                continue
+            pid = v.get("pair_id")
+            if not isinstance(pid, int) or pid < 0 or pid >= len(candidates):
+                continue
+            out.append({
+                "eid": candidates[pid]["eid"],
+                "action": action,
+                "reason": str(v.get("reason", ""))[:1000],
+            })
+        return out
 
     def verify_typing(
         self, entity: str, candidate_class: str, retrieved_context: dict
@@ -426,6 +493,13 @@ class BonsaiDecider:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+        # Yield to a foreground query() before the HTTP call (async-distill path
+        # only): a background dedup/scene/consolidation Bonsai call that lands
+        # while the foreground is busy would queue behind it on the shared 8B.
+        # ``pause_gate`` blocks while the foreground is busy; ``None`` (sync path
+        # / offline tests) is a no-op. Mirrors BonsaiRelationExtractor's gate.
+        if self.pause_gate is not None:
+            self.pause_gate()
         try:
             resp = requests.post(url, json=payload, timeout=self.timeout)
         except requests.RequestException:
