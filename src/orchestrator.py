@@ -429,6 +429,11 @@ class PonderOrchestrator:
         self._fade_inject = fade_inject
         self._fade_regime_names: dict[int, str] = {}
         self._format_fade_block = None
+        # A3 (corrected): scene-block -> system-prompt-suffix formatter. ``None``
+        # (default, flag off) -> no system-prompt append -> byte-identical to
+        # pre-A3. Set below when ``self._scene_blocks`` is on (lazy import, like
+        # the fade-block seam).
+        self._format_scene_block = None
         # Gist-on-forgetting consolidation worker (Phase C, optional DI like the
         # distill worker). When wired, ``tick()`` is called at the query tail
         # (after the fade ingest) to enqueue fading anchors for background
@@ -456,6 +461,15 @@ class PonderOrchestrator:
             )
             self._fade_regime_names = dict(REGIME_NAME)
             self._format_fade_block = format_fade_block
+        # A3 (corrected): scene blocks are session-stable macro memory -> render
+        # in the system-prompt suffix (cache-friendly), NOT the user message.
+        # Lazy import mirrors the fade-block seam above; the ``= None`` default
+        # is set beside ``self._format_fade_block`` above.
+        if self._scene_blocks:
+            from src.subconscious.scene_format import (  # local, light import
+                format_scene_block,
+            )
+            self._format_scene_block = format_scene_block
 
         # Tier-2 recall menu (the on-demand ``remember`` tool). When True, the
         # loop-path synthesize appends ``REMEMBER_SCHEMA`` to the tool set the
@@ -943,6 +957,22 @@ class PonderOrchestrator:
             except Exception as e:  # noqa: BLE001 - logging is best-effort
                 print(f"[graduation-replay-fail] {e}", file=sys.stderr)
 
+        # A3 (corrected): scene blocks are session-stable macro memory -> render
+        # in the system-prompt suffix (cache-friendly), NOT the user-message
+        # context. Pull them out of the episode set here, AFTER the salience merge
+        # + WM-ring injects above and BEFORE the context builder / presentation
+        # gate / chunker, so they never enter ChunkedContext -> never in the
+        # user-message ``context`` string. ``scene_results`` is closed over by
+        # ``_synthesize`` below for system-prompt injection. Gated on
+        # ``self._scene_blocks``: flag off -> no filter -> scenes (if any) stay in
+        # the user context via ``_format_episode``'s ``kind == "scene"`` branch
+        # -> byte-identical to pre-A3. Empty when no scenes retrieved -> no
+        # system append -> byte-identical to flag-off.
+        scene_results: list = []
+        if self._scene_blocks:
+            scene_results = [ep for ep in episodes if ep.get("kind") == "scene"]
+            episodes = [ep for ep in episodes if ep.get("kind") != "scene"]
+
         # 5. Presentation Gate axis (a): chunking strategy.
         # STRM Phase 3: when the context-builder is wired AND the ring is on AND
         # a 2a relevance head is loaded, attend over the WM ring with r_i as a
@@ -1024,6 +1054,20 @@ class PonderOrchestrator:
                                 " answers the question, just answer directly;"
                                 " reach for a tool only when the context is"
                                 " genuinely insufficient.")
+            # A3 (corrected): inject the session-stable scene blocks into the
+            # system-prompt SUFFIX (NOT the user message). ``scene_results`` is
+            # the per-query retrieved scene subset pulled out of ``episodes``
+            # before chunking (closed over here). Mirrors the fade-inject
+            # best-effort swallow below. Empty / ``None`` / flag off -> no
+            # append -> byte-identical to pre-A3.
+            if scene_results and self._format_scene_block is not None:
+                try:
+                    scene_block = self._format_scene_block(scene_results)
+                except Exception as e:  # noqa: BLE001 - never break the turn
+                    print(f"[scene-inject-fail] {e}", file=sys.stderr)
+                    scene_block = ""
+                if scene_block:
+                    sys_content = f"{sys_content}\n\n{scene_block}"
             messages: list[dict] = [{"role": "system", "content": sys_content}]
             if history:
                 messages.extend(history[-10:])
