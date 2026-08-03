@@ -93,6 +93,7 @@ def build_ponder(
     llm_telemetry_path: Optional[str] = None,
     fade_drift_defer_threshold: Optional[float] = None,
     drill_down: bool = False,
+    reclaim: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -267,6 +268,15 @@ def build_ponder(
     # identical. No constructor threading: the retriever + orchestrator read
     # ``config.drill_down_enabled`` directly.
     config.drill_down_enabled = drill_down
+    # B3: reclaim master flag (read at call time by the formatter's PRIMARY
+    # band -- same master-config convention as ``hybrid_retrieval`` / ``dedup``
+    # / ``drill_down``). Set before the store/encoder ctor so call-time reads
+    # see a consistent value. ``serve_ponder`` sets the same global before
+    # build_ponder; setting it here too covers direct build_ponder callers
+    # (tests, scripts). Default OFF -> the formatter takes the exact break-on-
+    # overflow path -> byte-identical. No constructor threading: the formatter
+    # reads ``config.reclaim_enabled`` + the three tunables directly.
+    config.reclaim_enabled = reclaim
     if llm_telemetry:
         # Swap the module sink to a path-backed JSONL writer. The null sink
         # (default) records nothing, so flag-on-without-configure is a silent

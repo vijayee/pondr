@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from src.config import Phase2cConfig
+from src.config import Phase2cConfig, config
 from src.retrieval.chunked_context import ChunkedContextFormatter
 from src.retrieval.expand_handler import ExpandHandler
 from src.subconscious.backbone import JGSBackbone
@@ -159,6 +159,98 @@ def test_format_respects_token_cap():
     # Hard cap at 300 tokens → only ~2 primary episodes fit.
     assert "e0" in out  # at least the first fits
     assert "e19" not in out  # the last is dropped (not truncated)
+
+
+# ── B3: active token-reclamation cascade (config.reclaim_enabled) ──
+
+
+def test_reclaim_off_break_on_overflow_unchanged(monkeypatch):
+    """Flag OFF (default) -> the exact break-on-overflow path (regression guard)."""
+    monkeypatch.setattr(config, "reclaim_enabled", False)
+    chunker = _chunker(max_primary_tokens=100000, max_primary_chunks=20)
+    eps = [_ep(f"e{i}", text="word " * 100) for i in range(20)]
+    ctx = chunker.chunk(eps, _plan(strategy=DIRECT, primary_chunk_count=20))
+    out = ChunkedContextFormatter().format_for_llm(ctx, max_tokens=300)
+    assert "e0" in out
+    assert "e19" not in out  # dropped by break-on-overflow, not truncated
+
+
+def test_reclaim_on_keeps_tail_in_summary_where_off_drops(monkeypatch):
+    """ON over budget: the lowest-SCORE tail demotes FULL -> SUMMARY instead of
+    being dropped entirely, so MORE episodes stay in context (degraded)."""
+    eps = [_ep(f"e{i}", text="word " * 100, summary=f"sum {i}") for i in range(5)]
+    chunker = _chunker(max_primary_tokens=100000, max_primary_chunks=20)
+    ctx = chunker.chunk(eps, _plan(strategy=DIRECT, primary_chunk_count=5))
+
+    monkeypatch.setattr(config, "reclaim_enabled", False)
+    out_off = ChunkedContextFormatter().format_for_llm(ctx, max_tokens=300)
+    monkeypatch.setattr(config, "reclaim_enabled", True)
+    out_on = ChunkedContextFormatter().format_for_llm(ctx, max_tokens=300)
+
+    # OFF break-on-overflow drops the tail; ON keeps it in summary form.
+    assert "e4" not in out_off
+    assert "e4" in out_on
+    assert "Summary: sum 4" in out_on
+    # Every kept episode renders a `Summary:` line, so its count == # kept.
+    # ON keeps more episodes (degraded) than OFF's break-on-overflow.
+    assert out_on.count("Summary:") > out_off.count("Summary:")
+
+
+def test_reclaim_on_under_budget_byte_identical(monkeypatch):
+    """ON under budget -> no demotion -> byte-identical to OFF (both all FULL)."""
+    eps = [_ep(f"e{i}", text="word " * 20, summary=f"sum {i}") for i in range(3)]
+    chunker = _chunker(max_primary_tokens=100000, max_primary_chunks=20)
+    ctx = chunker.chunk(eps, _plan(strategy=DIRECT, primary_chunk_count=3))
+
+    monkeypatch.setattr(config, "reclaim_enabled", False)
+    out_off = ChunkedContextFormatter().format_for_llm(ctx, max_tokens=10_000)
+    monkeypatch.setattr(config, "reclaim_enabled", True)
+    out_on = ChunkedContextFormatter().format_for_llm(ctx, max_tokens=10_000)
+    assert out_on == out_off
+
+
+def test_reclaim_on_emergency_truncates_oversized_section(monkeypatch):
+    """A single oversized SECTION (no summary form -> mild skips; min_keep
+    blocks aggressive) -> emergency truncates its body. OFF drops it."""
+    sec = {
+        "episode_id": "sec0", "kind": "section", "text": "body " * 2000,
+        "timestamp": "2026-01-01", "topics": [], "entities": [],
+        "summary": "sec title", "score": 1.0,
+    }
+    chunker = _chunker(max_primary_tokens=100000, max_primary_chunks=20)
+    ctx = chunker.chunk([sec], _plan(strategy=DIRECT, primary_chunk_count=1))
+
+    monkeypatch.setattr(config, "reclaim_enabled", False)
+    out_off = ChunkedContextFormatter().format_for_llm(ctx, max_tokens=300)
+    monkeypatch.setattr(config, "reclaim_enabled", True)
+    out_on = ChunkedContextFormatter().format_for_llm(ctx, max_tokens=300)
+
+    assert "sec0" not in out_off  # OFF break-on-overflow drops the oversized body
+    assert "sec0" in out_on  # ON keeps it (truncated, not dropped)
+    assert "[... truncated ...]" in out_on  # emergency body-truncation marker
+
+
+def test_reclaim_mild_demotes_episode_not_section(monkeypatch):
+    """mild demotes EPISODES (have a summary form) but NOT sections (no summary
+    form) -- the section stays FULL (its only reclamation rung is DROP/truncate)."""
+    ep = _ep("e0", text="word " * 200, summary="sum 0", score=0.9)  # ~250 tok
+    sec = {
+        "episode_id": "sec0", "kind": "section", "text": "body " * 20,
+        "timestamp": "2026-01-01", "topics": [], "entities": [],
+        "summary": "sec title", "score": 0.5,  # ~32 tok
+    }
+    chunker = _chunker(max_primary_tokens=100000, max_primary_chunks=20)
+    ctx = chunker.chunk([ep, sec], _plan(strategy=DIRECT, primary_chunk_count=2))
+
+    monkeypatch.setattr(config, "reclaim_enabled", True)
+    out = ChunkedContextFormatter().format_for_llm(ctx, max_tokens=300)
+
+    # The episode demoted: its summary is present, its full text is gone.
+    assert "Summary: sum 0" in out
+    assert "Full text: word" not in out
+    # The section unaffected by mild: its body still present in full.
+    assert "Section:" in out
+    assert "body " in out
 
 
 # ── ExpandHandler ──

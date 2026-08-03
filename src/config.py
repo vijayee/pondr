@@ -277,6 +277,29 @@ class Config:
     # threading).
     drill_down_enabled: bool = False
 
+    # ── B3: active token-reclamation cascade ──
+    # Tencent-survey Phase 2 item 8 (pairs with A4; closes no-active-reclamation).
+    # When True, ``ChunkedContextFormatter.format_for_llm``'s PRIMARY band
+    # replaces break-on-overflow (drop the lowest-SCORE tail entirely) with a
+    # demotion cascade on the lowest-SCORE primary items: FULL -> SUMMARY (drop
+    # the ``Full text:`` line, keep ``Summary:``; episodes only -- sections/docs
+    # /scenes have no separate summary form) -> DROP, then emergency body-
+    # truncation, re-measuring after each step until the budget fits (mirrors
+    # A4's ``format_fade_block`` cascade). More episodes stay in context (in
+    # degraded form) than drop-the-tail preserves -- the reverse of B2's
+    # ``verbatim`` (summary->full), here full->summary under pressure. Default
+    # False: the formatter takes the EXACT break-on-overflow path -> byte-
+    # identical. Under budget ON -> no demotion needed -> also byte-identical.
+    # Only over-budget ON changes behavior. Read at CALL TIME by the formatter
+    # via ``from ..config import config`` (master-config style, mirrors
+    # ``dedup_enabled`` / ``hybrid_retrieval`` / ``drill_down_enabled``; set in
+    # ``build_ponder`` -- NO constructor threading). The three tunables below
+    # are read the same way.
+    reclaim_enabled: bool = False
+    reclaim_headroom: float = 0.9       # aggressive DROP target (fraction of max_tokens)
+    reclaim_min_keep: int = 3           # never DROP below this at the aggressive step
+    reclaim_truncate_chars: int = 800   # emergency body-truncation cap (chars; ~200 tok)
+
     # ── Phase 2c+: self-chat full agent loop ──
     # When True, the Bonsai self-chat synthesize path runs a multi-turn tool
     # loop (``run_tool_loop``): the model may call ``expand`` / ``search_memory``

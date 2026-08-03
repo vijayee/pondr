@@ -13,6 +13,14 @@ The hard cap at ``max_context_tokens`` (len(text)//4 estimate) matches
 ``HippocampalRetriever.build_context_string``; episodes beyond the cap are
 dropped, not truncated, so a half-episode never enters context.
 
+B3 (``config.reclaim_enabled``, default OFF): when ON, the PRIMARY band
+replaces that break-on-overflow with a demotion cascade -- lowest-SCORE
+episodes demote FULL -> SUMMARY -> DROP, then emergency body-truncation,
+re-measuring after each step until the budget fits (mirrors A4's
+``format_fade_block``). Under budget ON -> all items render at FULL unchanged
+(byte-identical to OFF). Only over-budget ON changes behavior. See
+``src/retrieval/reclaim.py``.
+
 This module imports torch only for the type hint (the formatter consumes the
 ChunkedContext which holds a WorkingMemoryState). The actual formatting is
 text-only — no model call.
@@ -22,12 +30,20 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ..config import config
 from ..subconscious.ssm_chunker import ChunkedContext
 from ..subconscious.working_memory import WorkingMemoryState
+from .reclaim import ReclaimItem, reclaim_to_budget
 
 
 def _estimate_tokens(text: str) -> int:
     return len(text) // 4
+
+
+# B3 emergency body-truncation marker (ASCII; appended after the sliced body so
+# a truncated chunk is still recognizable -- the LLM sees it kept its id +
+# metadata, only the body is shortened).
+_TRUNCATED_MARKER = " [... truncated ...]"
 
 
 class ChunkedContextFormatter:
@@ -63,13 +79,41 @@ class ChunkedContextFormatter:
 
         # ── PRIMARY (full text) ──
         primary_lines: list[str] = ["[RETRIEVED CONTEXT — PRIMARY]"]
-        for ep in chunked.primary_chunks:
-            chunk = self._format_episode(ep)
-            chunk_tokens = len(chunk) // 4
-            if token_count + chunk_tokens > max_tokens:
-                break  # drop, don't truncate
-            primary_lines.append(chunk)
-            token_count += chunk_tokens
+        if config.reclaim_enabled:
+            # B3: replace break-on-overflow (drop the lowest-SCORE tail
+            # entirely) with a demotion cascade on the lowest-SCORE primary
+            # items: FULL -> SUMMARY (episodes only) -> DROP, then emergency
+            # body-truncation, re-measuring after each step until the budget
+            # fits (mirrors A4's ``format_fade_block`` cascade). The cascade
+            # operates on the PRIMARY band only; its budget is ``max_tokens``
+            # MINUS the prelude tokens already counted (apples-to-apples with
+            # the off loop, which starts ``token_count`` at the prelude) so
+            # under-budget ON returns all ``full_text`` unchanged -> byte-
+            # identical to off, and over-budget ON is the only behavioral
+            # delta. ``build_context_string`` (the search_memory renderer) is
+            # deferred (it renders ``Summary:`` by default so mild is a no-op
+            # there except under B2 ``verbatim``; ``reclaim_to_budget`` is
+            # reusable for that follow-on).
+            primary_budget = max_tokens - token_count
+            if primary_budget > 0 and chunked.primary_chunks:
+                items = [self._reclaim_item(ep) for ep in chunked.primary_chunks]
+                kept = reclaim_to_budget(
+                    items,
+                    primary_budget,
+                    headroom=config.reclaim_headroom,
+                    min_keep=config.reclaim_min_keep,
+                    truncate_chars=config.reclaim_truncate_chars,
+                )
+                primary_lines.extend(kept)
+                token_count += sum(len(c) // 4 for c in kept)
+        else:
+            for ep in chunked.primary_chunks:
+                chunk = self._format_episode(ep)
+                chunk_tokens = len(chunk) // 4
+                if token_count + chunk_tokens > max_tokens:
+                    break  # drop, don't truncate
+                primary_lines.append(chunk)
+                token_count += chunk_tokens
         parts.append("\n".join(primary_lines))
 
         # ── COMPRESSED (topic union from secondary episodes — NOT the state vector) ──
@@ -101,7 +145,23 @@ class ChunkedContextFormatter:
 
         return "\n\n".join(parts)
 
-    def _format_episode(self, ep: dict) -> str:
+    def _format_episode(
+        self,
+        ep: dict,
+        *,
+        summary_only: bool = False,
+        truncate_chars: Optional[int] = None,
+    ) -> str:
+        """Render one PRIMARY-band item to text.
+
+        ``summary_only`` (B3 mild rung, episodes only) omits the ``Full text:``
+        line, keeping ``Summary:`` + the entities/topics/tones header -- a
+        content-preserving demotion (the reverse of B2 ``verbatim``). Ignored
+        for section/document/scene (no separate summary form). ``truncate_chars``
+        (B3 emergency rung) slices the body to ``chars`` + a marker, reusing
+        the SAME header/metadata so a truncated chunk is still recognizable.
+        Both default off -> byte-identical to the pre-B3 render.
+        """
         eid = ep.get("episode_id", "")
         ts = ep.get("timestamp", "")
         entities = ep.get("entities", [])
@@ -133,10 +193,11 @@ class ChunkedContextFormatter:
                 lines.append(f"Topics: {', '.join(topics)}")
             heading = ep.get("section_heading", "")
             if text:
+                body = self._truncate_body(text, truncate_chars)
                 if heading:
-                    lines.append(f"Section '{heading}': {text}")
+                    lines.append(f"Section '{heading}': {body}")
                 else:
-                    lines.append(f"Section: {text}")
+                    lines.append(f"Section: {body}")
             return "\n".join(lines)
         if kind == "document":
             # Document result (graph-path hit): the matched section body is in
@@ -160,10 +221,11 @@ class ChunkedContextFormatter:
                 lines.append(f"Topics: {', '.join(topics)}")
             matched = ep.get("matched_section", "")
             if text:
+                body = self._truncate_body(text, truncate_chars)
                 if matched:
-                    lines.append(f"Section '{matched}': {text}")
+                    lines.append(f"Section '{matched}': {body}")
                 else:
-                    lines.append(f"Section: {text}")
+                    lines.append(f"Section: {body}")
             return "\n".join(lines)
         if kind == "scene":
             # Scene block (B1): the LLM-authored topic-level macro-memory. The
@@ -178,7 +240,7 @@ class ChunkedContextFormatter:
             if topics:
                 lines.append(f"Topics: {', '.join(topics)}")
             if text:
-                lines.append(text)
+                lines.append(self._truncate_body(text, truncate_chars))
             return "\n".join(lines)
         lines = [f"--- Episode {eid} ({ts}) ---"]
         if entities:
@@ -189,6 +251,62 @@ class ChunkedContextFormatter:
             lines.append(f"Tone: {', '.join(tones)}")
         if summary:
             lines.append(f"Summary: {summary}")
-        if text:
-            lines.append(f"Full text: {text}")
+        if text and not summary_only:
+            body = self._truncate_body(text, truncate_chars)
+            lines.append(f"Full text: {body}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _truncate_body(text: str, truncate_chars: Optional[int]) -> str:
+        """B3 emergency body-truncation: slice ``text`` to ``truncate_chars`` +
+        a marker. ``None`` or a body already shorter than the cap -> unchanged
+        (byte-identical). The marker is appended only when slicing occurs so
+        non-truncated renders are untouched.
+        """
+        if truncate_chars is None or len(text) <= truncate_chars:
+            return text
+        return text[:truncate_chars] + _TRUNCATED_MARKER
+
+    def _render_truncated(self, ep: dict, chars: int) -> tuple[str, int]:
+        """B3 emergency-truncation callback for a ``ReclaimItem``: re-render the
+        item with its body sliced to ``chars`` (same header/metadata), return
+        ``(text, tokens)``. Used by ``reclaim_to_budget`` only when the cascade
+        reaches the emergency rung.
+        """
+        s = self._format_episode(ep, truncate_chars=chars)
+        return s, len(s) // 4
+
+    def _reclaim_item(self, ep: dict) -> ReclaimItem:
+        """Build the ``ReclaimItem`` view of one primary chunk for the cascade.
+
+        Episodes (no ``kind`` / kind not section/document/scene) carry a
+        SUMMARY rung (``summary_only=True``); sections/docs/scenes do not
+        (``summary_text=None`` -> mild skips them). The mild rung is offered
+        only when it actually saves tokens (the episode has a ``text`` body to
+        drop -> ``summary_tokens < full_tokens``); a textless episode has no
+        shorter form and goes straight to aggressive DROP. ``score`` drives
+        demote/drop order (lowest first); unscored items default to 0.0
+        (demoted first -- the conservative "least confident" choice).
+        """
+        full = self._format_episode(ep)
+        full_tokens = len(full) // 4
+        kind = ep.get("kind")
+        if kind in ("section", "document", "scene"):
+            summary_text: Optional[str] = None
+            summary_tokens: Optional[int] = None
+        else:
+            summary = self._format_episode(ep, summary_only=True)
+            summary_tokens = len(summary) // 4
+            if summary_tokens < full_tokens:
+                summary_text = summary
+            else:
+                summary_text = None
+                summary_tokens = None
+        return ReclaimItem(
+            score=float(ep.get("score", 0.0)),
+            full_text=full,
+            full_tokens=full_tokens,
+            summary_text=summary_text,
+            summary_tokens=summary_tokens,
+            truncate=lambda chars, ep=ep: self._render_truncated(ep, chars),
+        )

@@ -424,6 +424,19 @@ def main() -> int:
                         "units show a [strategy:graph|vector|hybrid] tag when "
                         "found via the tool. DEFAULT OFF -> no schema/stamp/"
                         "surface, old Cites: line -> byte-identical.")
+    p.add_argument("--reclaim", action="store_true", default=False,
+                   help="B3: active 4-level token-reclamation cascade on the "
+                        "PRIMARY context band (pairs with A4; closes no-active-"
+                        "reclamation). When the PRIMARY band overflows "
+                        "max_context_tokens, the lowest-SCORE episodes demote "
+                        "FULL -> SUMMARY (drop `Full text:`, keep `Summary:`) "
+                        "-> DROP, then emergency body-truncation, re-measuring "
+                        "after each step until the budget fits -- instead of "
+                        "dropping the tail entirely. More episodes stay in "
+                        "context (in degraded form) than drop-the-tail "
+                        "preserves. DEFAULT OFF -> the formatter takes the "
+                        "exact break-on-overflow path -> byte-identical. Under "
+                        "budget ON -> no demotion -> also byte-identical.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -461,6 +474,11 @@ def main() -> int:
               "(component a) is inert (no scene_ ids); the search_memory "
               "`verbatim` param + [strategy:...] tags still work.",
               file=sys.stderr)
+    # B3: reclaim_enabled is read at call time by the formatter's PRIMARY band
+    # (master-config convention), so set the global BEFORE build_ponder
+    # (build_ponder also sets it from its param, covering direct callers).
+    # Default OFF -> break-on-overflow -> byte-identical.
+    _config.reclaim_enabled = args.reclaim
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
@@ -685,6 +703,7 @@ def main() -> int:
     print(f"[load] dedup={args.dedup}", file=sys.stderr)
     print(f"[load] llm_telemetry={args.llm_telemetry}", file=sys.stderr)
     print(f"[load] drill_down={args.drill_down}", file=sys.stderr)
+    print(f"[load] reclaim={args.reclaim}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -728,6 +747,7 @@ def main() -> int:
         llm_telemetry_path=args.llm_telemetry_path,
         fade_drift_defer_threshold=args.fade_drift_defer_threshold,
         drill_down=args.drill_down,
+        reclaim=args.reclaim,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc
