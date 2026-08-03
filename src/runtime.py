@@ -87,6 +87,7 @@ def build_ponder(
     retrieval_user_scope: bool = False,
     tier2_recall_menu: bool = False,
     scene_blocks: bool = False,
+    hybrid_retrieval: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -225,6 +226,17 @@ def build_ponder(
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
         gate on the TRAINED frozen backbone. The caller closes the store.
     """
+    # A2: mirror the ``hybrid_retrieval`` param onto the master-config singleton
+    # so the store's encode-time BM25-index hook and the retriever's query-time
+    # RRF fusion path -- both read ``config.hybrid_retrieval`` at CALL time (the
+    # codebase convention for behavioral flags, same pattern as
+    # ``assertion_extraction_enabled`` / ``forgetting_enabled``) -- see a
+    # consistent value. The store ctor takes no config dict for this: it is a
+    # call-time gate, not an open-time decision like ``vector_index_enabled``.
+    # ``serve_ponder`` sets the same global before calling build_ponder, so both
+    # entry points agree; setting it here too covers direct ``build_ponder``
+    # callers (tests, scripts) that pass the param without going through serve.
+    config.hybrid_retrieval = hybrid_retrieval
     store = HippocampalStore(db_path or config.db_path)
 
     # Trained backbone (frozen) + trained gate on that shared backbone. The
@@ -260,6 +272,19 @@ def build_ponder(
     from .retrieval.document_retriever import DocumentRetriever, store_has_documents
     if store_has_documents(store):
         retriever.document_retriever = DocumentRetriever(store)
+
+    # A2 RRF hybrid retrieval: attach a BM25Search (read-only over the in-DB
+    # inverted index the store writes under ``content/idx/``) and flip the
+    # retriever's hybrid flag so ``retrieve`` early-returns through
+    # ``_retrieve_hybrid``. ``hybrid_retrieval`` already set the master-config
+    # singleton above, so the store is indexing at encode time; this wires the
+    # query side. Off -> neither attr is set -> ``retrieve`` takes the existing
+    # graph+vector-fallback path (byte-identical). The BM25Search holds only the
+    # ``db`` ref; it is cheap to construct and reads committed index state.
+    if hybrid_retrieval:
+        from .retrieval.bm25 import BM25Search
+        retriever.bm25 = BM25Search(store.db)
+        retriever.hybrid_retrieval = True
 
     gen = mode_a if mode_a is not None else ModeAGenerator(retriever, endpoint=endpoint)
 

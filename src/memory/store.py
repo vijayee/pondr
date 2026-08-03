@@ -24,6 +24,7 @@ from typing import Optional
 from wavedb import GraphLayer, WaveDB, WaveDBConfig
 
 from .blob_store import BlobStore, blob_hash
+from .bm25_index import bm25_index_ops, bm25_unindex_ops
 from .document import Document, DocumentSection
 from .episode import Episode
 from .ontology import SEED_ONTOLOGY
@@ -236,6 +237,20 @@ class HippocampalStore:
             ops.append({"type": "put", "key": f"content/ep/{eid}/embedding", "value": json.dumps(episode.summary_embedding)})
         if episode.messages:
             ops.append({"type": "put", "key": f"content/ep/{eid}/messages", "value": json.dumps(episode.messages, ensure_ascii=False)})
+        # A2 BM25 inverted index (Tencent-survey item 3): lexical postings over
+        # ``full_text`` hosted INSIDE WaveDB via HBTrie range scan (NO SQLite/FTS5).
+        # Gated on the master-config flag (read at call time, the codebase
+        # convention -- same pattern as ``assertion_extraction_enabled`` /
+        # ``forgetting_enabled``). The index ops ride the SAME atomic
+        # ``batch_sync`` as the content puts, so the index can't drift from the
+        # content it indexes. Episodes-only for A2 (scenes use
+        # ``_scene_content_ops``; the ``content/idx/`` key layout is generic so
+        # docs/sections extend later without a schema change). ``bm25_index_ops``
+        # is idempotent (``docterms``-exists guard) -> a re-encode is a skip, not a
+        # double-count. Flag off -> appends nothing -> byte-identical.
+        from ..config import config as _master_config
+        if _master_config.hybrid_retrieval and episode.full_text:
+            ops += bm25_index_ops(self.db, eid, episode.full_text)
         return ops
 
     def _edge_ops(self, eid: str, episode) -> list[dict]:
@@ -1170,14 +1185,31 @@ class HippocampalStore:
         ``state="superseded"`` directly (NOT via this method), so it calls this
         helper itself; hooking only ``set_episode_state`` would miss
         reconsolidation/anomaly-driven supersession.
+
+        A2 BM25 unindex rides this SAME chokepoint (not a separate mirror at
+        each call site) so no deprecate/supersede path can orphan the lexical
+        index. UNCONDITIONAL on the flag: ``bm25_unindex_ops`` is self-gating
+        (reads ``content/idx/docterms/{eid}``; absent -> ``[]``), so it is a
+        no-op for never-indexed ids (flag was off at encode, or a scene/section
+        id) AND it cleans orphan postings from a prior flag-ON period even when
+        the flag is now off -- the index stays consistent with episode lifecycle
+        regardless of flag flips. For non-episode ids (scenes/docs/sections)
+        ``docterms`` is absent -> no-op. Best-effort + never raises, mirroring
+        the vector path.
         """
         import sys
-        if self.vector_layer is None:
-            return
+        if self.vector_layer is not None:
+            try:
+                self.vector_layer.delete_sync(eid)
+            except Exception as e:  # noqa: BLE001 - vector index is best-effort
+                print(f"[vector-index-fail] delete {eid}: {e}", file=sys.stderr)
+        # A2 BM25 unindex (same chokepoint as the vector delete; see above).
         try:
-            self.vector_layer.delete_sync(eid)
-        except Exception as e:  # noqa: BLE001 - vector index is best-effort
-            print(f"[vector-index-fail] delete {eid}: {e}", file=sys.stderr)
+            unindex_ops = bm25_unindex_ops(self.db, eid)
+            if unindex_ops:
+                self.db.batch_sync(unindex_ops)
+        except Exception as e:  # noqa: BLE001 - lexical index is best-effort
+            print(f"[bm25-index-fail] unindex {eid}: {e}", file=sys.stderr)
 
     def set_episode_state(
         self, episode_id: str, state: str, validity_end: "str | None" = None

@@ -37,6 +37,7 @@ from .query_planner import BonsaiQueryPlanner
 if TYPE_CHECKING:  # torch/subconscious only needed for type hints, not at runtime
     from ..subconscious.retrieval_gate import RetrievalGate
     from ..subconscious.routing import RoutingDecision, RoutingOutcome
+    from .bm25 import BM25Search
     from .document_retriever import DocumentRetriever
 
 
@@ -108,6 +109,18 @@ class HippocampalRetriever:
         # through ``DocumentRetriever.aggregate_results`` so multi-section hits
         # surface as one document result.
         self.document_retriever: Optional["DocumentRetriever"] = None
+
+        # A2 RRF hybrid retrieval (Tencent-survey item 3): when
+        # ``hybrid_retrieval`` is set AND a ``BM25Search`` is attached (both by
+        # ``runtime.build_ponder`` when ``--hybrid-retrieval`` is on),
+        # :meth:`retrieve` early-returns through :meth:`_retrieve_hybrid`, which
+        # fuses THREE ranked id-lists (graph, vector, BM25) via Reciprocal Rank
+        # Fusion. The existing graph+vector-fallback body is byte-identical when
+        # the flag is off (the early-return branch is not entered). ``bm25`` is
+        # lazy-built in ``_retrieve_hybrid`` if a caller sets ``hybrid_retrieval``
+        # without attaching one (e.g. a test that toggles the global directly).
+        self.hybrid_retrieval = False
+        self.bm25: "Optional[BM25Search]" = None
 
     def _try_load_vector_index(self) -> None:
         """Attach a vector backend for the semantic fallback.
@@ -247,6 +260,17 @@ class HippocampalRetriever:
         """
         query_plan = self.planner.plan(prompt, conversation_history)
         allowed_ep, allowed_doc, allowed_scene = self._user_scope_sets()
+        # A2: when hybrid retrieval is on AND a BM25Search is attached (both set
+        # by ``runtime.build_ponder`` under ``--hybrid-retrieval``), take the
+        # RRF fusion path -- graph + vector + BM25 ranked lists fused by
+        # Reciprocal Rank Fusion. The existing graph+vector-fallback body below
+        # is byte-identical when the flag is off (this branch is not entered:
+        # ``hybrid_retrieval`` defaults False, ``bm25`` defaults None).
+        if self.hybrid_retrieval and self.bm25 is not None:
+            return self._retrieve_hybrid(
+                prompt, query_plan, signal,
+                allowed_ep, allowed_doc, allowed_scene,
+            )
         results = self.traversal.retrieve(
             query_plan, signal=signal,
             allowed_episode_ids=allowed_ep, allowed_document_ids=allowed_doc,
@@ -277,6 +301,115 @@ class HippocampalRetriever:
         if self.document_retriever is not None:
             results = self.document_retriever.aggregate_results(results)
 
+        return results
+
+    def _retrieve_hybrid(
+        self,
+        prompt: str,
+        query_plan: dict,
+        signal: str,
+        allowed_ep: "Optional[set[str]]",
+        allowed_doc: "Optional[set[str]]",
+        allowed_scene: "Optional[set[str]]",
+    ) -> list[dict]:
+        """RRF hybrid retrieval -- fuse graph + vector + BM25 ranked lists.
+
+        Tencent-survey A2: the graph-walk ranking, the vector-similarity
+        ranking, and the BM25 lexical ranking are each turned into an ordered
+        id-list, then fused by Reciprocal Rank Fusion (parameter-free
+        ``score = sum 1/(k + rank + 1)``, ``k=60``). RRF uses only RANK
+        positions, so the three lists' wildly different score scales (graph
+        heuristic ~10, vector cosine ~0.5, BM25 ~5) never collide -- no weight
+        tuning, no normalization. This one-ups Tencent (which fuses only
+        BM25+vector) by folding the graph-walk in as a third RRF list with zero
+        formula change.
+
+        The lexical list is the NEW component: an episode whose ``full_text``
+        contains the query words but whose entities/topics the planner didn't
+        surface (graph miss) and whose summary embedding doesn't cosine-rank
+        (vector miss) was invisible to the pre-A2 path -- BM25 finds it.
+
+        User-scope: the vector + BM25 lists over-fetch (``k *
+        _USER_SCOPE_FETCH_MULT``) when scoped, then filter by the user's owned
+        id sets; the graph list is already scoped by ``traversal.retrieve``.
+        ``allowed_ep`` (episode ids) is the BM25 filter; the vector filter reuses
+        ``_filter_vector_hits_by_scope`` (ep/doc/scene shapes).
+
+        RRF score replaces the per-list score on every hydrated result; the
+        per-unit feedback boost is NOT re-applied here (it is incompatible with
+        RRF's rank semantics -- a 0.25..4.0 score multiplier would swamp a
+        ~0.02 RRF score). The boost IS honored: it shaped the graph list's
+        internal sort (``traversal.retrieve`` applies it), which shaped the
+        graph ranks, which shaped the RRF contribution. ``strategy="hybrid"`` is
+        stamped on every result as additive provenance (the context builder
+        ignores unknown dict keys, so it is NOT LLM-facing -- matches Tencent's
+        ``strategy`` field, B2-steal).
+        """
+        # Lazy imports so the OFF path (the common case) never imports the
+        # hybrid modules, and a test that toggles the global without a
+        # build_ponder-attached BM25Search still works.
+        from .bm25 import BM25Search, rrf_fuse
+        from ..memory.bm25_index import tokenize
+
+        k = config.default_retrieval_limit
+        scoped = (allowed_ep is not None or allowed_doc is not None
+                  or allowed_scene is not None)
+        fetch_k = k * _USER_SCOPE_FETCH_MULT if scoped else k
+
+        # 1. Graph list (ranked hydrated dicts; already scoped + boost-scored).
+        graph_results = self.traversal.retrieve(
+            query_plan, signal=signal,
+            allowed_episode_ids=allowed_ep, allowed_document_ids=allowed_doc,
+            allowed_scene_ids=allowed_scene,
+        )
+        graph_rank = [r["episode_id"] for r in graph_results]
+        graph_by_id = {r["episode_id"]: r for r in graph_results}
+
+        # 2. Vector list (cosine over summary embeddings). Over-fetch + scope-
+        # filter when scoped, take top-k. Empty when no vector index configured.
+        vector_rank: list[str] = []
+        if self.vector_search is not None:
+            hits = self.vector_search.search(prompt, k=fetch_k)
+            if scoped:
+                hits = self._filter_vector_hits_by_scope(
+                    hits, allowed_ep, allowed_doc, allowed_scene)
+                hits = hits[:k]
+            vector_rank = [eid for eid, _ in hits]
+
+        # 3. BM25 list (lexical over full_text). Over-fetch via fetch_k; the
+        # ``allowed_ep`` set is the user-scope filter (episodes-only for A2).
+        bm25_search = self.bm25
+        if bm25_search is None:
+            bm25_search = BM25Search(self.store.db)
+            self.bm25 = bm25_search  # cache so later calls reuse it
+        bm25_hits = bm25_search.search(
+            tokenize(prompt), k=fetch_k, allowed_episode_ids=allowed_ep)
+        bm25_rank = [eid for eid, _ in bm25_hits]
+
+        # 4. Fuse the three ranked id-lists (RRF, rank-only -- no score-scale
+        # normalization needed). Empty lists contribute nothing.
+        fused = rrf_fuse([graph_rank, vector_rank, bm25_rank])
+        fused = fused[:k]
+
+        # 5. Hydrate: reuse the graph dict when the eid was a graph hit (its
+        # text/salience/etc are already loaded), else read content/ep/{eid}/.
+        # RRF score replaces the per-list score; ``strategy`` is additive.
+        results: list[dict] = []
+        for eid, rrf_score in fused:
+            d = graph_by_id.get(eid)
+            if d is None:
+                d = self.traversal._hydrate(eid)
+            d["score"] = rrf_score
+            d["strategy"] = "hybrid"
+            results.append(d)
+
+        # 6. Same tail as the off path: kind-aware diversity rerank (sorts by
+        # the RRF score, which preserves fused order), then optional document
+        # aggregation. ``_apply_unit_boost`` is intentionally NOT called (see
+        # the docstring: RRF rank semantics vs score-multiplier boost).
+        results = self._kind_aware_rerank(results)
+        if self.document_retriever is not None:
+            results = self.document_retriever.aggregate_results(results)
         return results
 
     def retrieve_with_plan(self, query_plan: dict, signal: str = "routine") -> list[dict]:

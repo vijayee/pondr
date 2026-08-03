@@ -366,6 +366,20 @@ def main() -> int:
                         "evicted (macro-forgetting). One LLM call per ingest batch "
                         "(not per turn). DEFAULT OFF -> no scene worker -> no scene "
                         "writes -> byte-identical to pre-B1. No new training/GPU/GNN.")
+    p.add_argument("--hybrid-retrieval", action="store_true", default=False,
+                   help="A2 RRF hybrid retrieval: a BM25 inverted index over "
+                        "episode full_text hosted INSIDE WaveDB (HBTrie range "
+                        "scan, NO SQLite/FTS5), written in the same atomic "
+                        "batch_sync as encode + deleted on forget/supersede. At "
+                        "query time the graph + vector + BM25 ranked id-lists "
+                        "fuse via Reciprocal Rank Fusion (k=60, parameter-free). "
+                        "Surfaces the lexical-miss episode (query words in "
+                        "full_text but graph+vector both miss) -- the one path "
+                        "Pondr lacked. One-ups Tencent (BM25+vector only) by "
+                        "folding the graph in as a third RRF list. DEFAULT OFF "
+                        "-> no content/idx/ keys written + retrieve takes the "
+                        "existing graph+vector-fallback path -> byte-identical "
+                        "to pre-A2. No new training/GPU/GNN/LLM-call.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -376,6 +390,11 @@ def main() -> int:
     _config.bonsai_isolation_extraction = args.bonsai_isolation
     _config.strm_relevance_logging = args.strm_relevance_logging
     _config.strm_graduation_logging = args.strm_graduation_logging
+    # A2: hybrid_retrieval is read at call time by the store (encode-time index
+    # hook) AND the retriever (query-time RRF fusion), so set the global BEFORE
+    # build_ponder (build_ponder also sets it from its param, covering direct
+    # callers). Default OFF -> no content/idx/ writes + retrieve off-path.
+    _config.hybrid_retrieval = args.hybrid_retrieval
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
@@ -590,6 +609,7 @@ def main() -> int:
           file=sys.stderr)
     print(f"[load] tier2_recall_menu={args.tier2_recall_menu}", file=sys.stderr)
     print(f"[load] scene_blocks={args.scene_blocks}", file=sys.stderr)
+    print(f"[load] hybrid_retrieval={args.hybrid_retrieval}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -627,6 +647,7 @@ def main() -> int:
         retrieval_user_scope=args.retrieval_user_scope,
         tier2_recall_menu=args.tier2_recall_menu,
         scene_blocks=args.scene_blocks,
+        hybrid_retrieval=args.hybrid_retrieval,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

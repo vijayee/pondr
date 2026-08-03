@@ -193,6 +193,23 @@ class Config:
     # sort -- the pre-2c+ behavior). Independent of feedback_salience_enabled.
     kind_diversity_cap: int = 3
 
+    # ── A2: RRF hybrid retrieval (Tencent-survey item 3) ──
+    # When True, ``HippocampalStore._content_ops`` writes a BM25 inverted index
+    # over episode ``full_text`` INSIDE WaveDB (HBTrie range scan, NO SQLite/FTS5)
+    # in the same atomic ``batch_sync`` as the content, and
+    # ``HippocampalRetriever.retrieve`` early-returns through
+    # ``_retrieve_hybrid`` which fuses the graph + vector + BM25 ranked id-lists
+    # via Reciprocal Rank Fusion (``k=60``). The BM25 unindex rides the store's
+    # single ``_unindex_embedding`` chokepoint, so deprecate/supersede keep the
+    # index consistent regardless of flag state. Default False: with the flag
+    # off NO ``content/idx/`` keys are written (the index hook appends nothing)
+    # and the ``retrieve`` early-return branch is not entered, so encode + query
+    # are byte-identical to pre-A2. Read at call time via
+    # ``from ..config import config as _master_config`` (the codebase convention
+    # for behavioral flags read in the store -- same pattern as
+    # ``assertion_extraction_enabled`` / ``forgetting_enabled``).
+    hybrid_retrieval: bool = False
+
     # ── Phase 2c+: self-chat full agent loop ──
     # When True, the Bonsai self-chat synthesize path runs a multi-turn tool
     # loop (``run_tool_loop``): the model may call ``expand`` / ``search_memory``
