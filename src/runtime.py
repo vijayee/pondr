@@ -89,6 +89,9 @@ def build_ponder(
     scene_blocks: bool = False,
     hybrid_retrieval: bool = False,
     dedup: bool = False,
+    llm_telemetry: bool = False,
+    llm_telemetry_path: Optional[str] = None,
+    fade_drift_defer_threshold: Optional[float] = None,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -245,6 +248,20 @@ def build_ponder(
     # too covers direct ``build_ponder`` callers (tests, scripts) that pass the
     # param without going through serve.
     config.dedup_enabled = dedup
+    # A5: master-config flags for the LLM-call telemetry decorator + the
+    # compaction drift-DEFER threshold. Set before the store/encoder ctor (same
+    # convention as ``hybrid_retrieval`` / ``dedup``) so call-time reads see a
+    # consistent value. The decorator reads ``config.llm_telemetry_enabled`` at
+    # CALL TIME -> off = direct passthrough, zero overhead, byte-identical.
+    config.llm_telemetry_enabled = llm_telemetry
+    config.llm_telemetry_path = llm_telemetry_path or config.llm_telemetry_path
+    config.fade_drift_defer_threshold = fade_drift_defer_threshold
+    if llm_telemetry:
+        # Swap the module sink to a path-backed JSONL writer. The null sink
+        # (default) records nothing, so flag-on-without-configure is a silent
+        # no-op; ``build_ponder`` is the one place configure happens.
+        from .observability.llm_telemetry import configure_telemetry
+        configure_telemetry(config.llm_telemetry_path)
     store = HippocampalStore(db_path or config.db_path)
 
     # Trained backbone (frozen) + trained gate on that shared backbone. The
@@ -458,6 +475,7 @@ def build_ponder(
             epsilon=fade_consolidation_epsilon,
             max_depth=fade_consolidation_max_depth,
             validate=fade_consolidation_validate,
+            drift_defer_threshold=fade_drift_defer_threshold,
         )
 
     # B1 scene blocks: the LLM-authored topic-level macro-memory. Constructed

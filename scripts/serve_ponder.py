@@ -393,6 +393,27 @@ def main() -> int:
                         "judge call, no supersede) -> byte-identical to pre-A1. "
                         "One extra Bonsai HTTP call per episode. No new "
                         "training/GPU/GNN.")
+    p.add_argument("--llm-telemetry", action="store_true", default=False,
+                   help="A5: append one JSONL line per Bonsai judge call "
+                        "(task / latency_ms / in_tok / out_tok / ok) to "
+                        "--llm-telemetry-path. Wraps the 9 BonsaiDecider judge "
+                        "methods; the OpenAI-compatible usage block is surfaced "
+                        "via a _last_usage side-channel (was discarded). Never "
+                        "raises, never changes behavior. DEFAULT OFF -> the "
+                        "decorator early-returns before timing -> zero overhead, "
+                        "no file, byte-identical.")
+    p.add_argument("--llm-telemetry-path", default=None,
+                   help="JSONL path for --llm-telemetry (default "
+                        "data/llm_telemetry.jsonl, under gitignored data/).")
+    p.add_argument("--fade-drift-defer-threshold", type=float, default=None,
+                   help="A5: opt-in compaction-stability DEFER. When set, a "
+                        "CLEAN-verdict consolidation gist whose drift"
+                        "(prior_gist, new_gist) exceeds this value is DEFERRED "
+                        "for review (the 8B fidelity judge's blind spot: entity-"
+                        "attr swaps / value flips). Requires "
+                        "--fade-consolidation-validate. DEFAULT None -> drift "
+                        "is still computed + recorded to telemetry but never "
+                        "auto-DEFERs (observe-only).")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -413,6 +434,13 @@ def main() -> int:
     # (build_ponder also sets it from its param, covering direct callers).
     # Default OFF -> no judge injected + early-return -> byte-identical.
     _config.dedup_enabled = args.dedup
+    # A5: telemetry + drift-DEFER (read at call time by the decorator /
+    # ConsolidationWorker; build_ponder also sets these from its params).
+    # Default OFF / None -> byte-identical.
+    _config.llm_telemetry_enabled = args.llm_telemetry
+    if args.llm_telemetry_path:
+        _config.llm_telemetry_path = args.llm_telemetry_path
+    _config.fade_drift_defer_threshold = args.fade_drift_defer_threshold
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
@@ -520,6 +548,12 @@ def main() -> int:
                   "--fade-consolidation; the judge only validates gists the "
                   "consolidation loop produces).", file=sys.stderr)
             args.fade_consolidation_validate = False
+        if (args.fade_drift_defer_threshold is not None
+                and not args.fade_consolidation_validate):
+            print("NOTE: --fade-drift-defer-threshold ignored (requires "
+                  "--fade-consolidation-validate; drift is computed inside the "
+                  "validate gate). Drift stays observe-only.", file=sys.stderr)
+            args.fade_drift_defer_threshold = None
         if args.fade_memory_voice_path and not args.fade_memory_tokenizer_path:
             print("ERROR: --fade-memory-voice-path requires "
                   "--fade-memory-tokenizer-path (the token-LM voice leg needs "
@@ -629,6 +663,7 @@ def main() -> int:
     print(f"[load] scene_blocks={args.scene_blocks}", file=sys.stderr)
     print(f"[load] hybrid_retrieval={args.hybrid_retrieval}", file=sys.stderr)
     print(f"[load] dedup={args.dedup}", file=sys.stderr)
+    print(f"[load] llm_telemetry={args.llm_telemetry}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -668,6 +703,9 @@ def main() -> int:
         scene_blocks=args.scene_blocks,
         hybrid_retrieval=args.hybrid_retrieval,
         dedup=args.dedup,
+        llm_telemetry=args.llm_telemetry,
+        llm_telemetry_path=args.llm_telemetry_path,
+        fade_drift_defer_threshold=args.fade_drift_defer_threshold,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

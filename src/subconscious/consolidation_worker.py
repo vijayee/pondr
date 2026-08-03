@@ -32,6 +32,7 @@ import sys
 import threading
 from typing import Optional, Protocol
 
+from .drift import compute_line_drift_ratio
 from .fade import FadeMemory
 from .gister import BonsaiGister, StructuredGist
 
@@ -67,7 +68,8 @@ class ConsolidationWorker:
     def __init__(self, fade_mem: FadeMemory, gister: BonsaiGister,
                  fact_sink: Optional[FactSink] = None,
                  epsilon: float = 0.03, max_depth: int = 3,
-                 max_per_tick: int = 8, validate: bool = False) -> None:
+                 max_per_tick: int = 8, validate: bool = False,
+                 drift_defer_threshold: Optional[float] = None) -> None:
         self._fade = fade_mem
         self._gister = gister
         self._fact_sink = fact_sink
@@ -75,14 +77,26 @@ class ConsolidationWorker:
         self.max_depth = int(max_depth)
         self.max_per_tick = int(max_per_tick)
         self.validate = bool(validate)
+        # A5: drift-DEFER threshold (opt-in, default None = observe-only).
+        # When set, a clean fidelity verdict with drift(prior_gist, new_gist)
+        # above this value is DEFERRED for human review -- the deterministic
+        # compaction-stability signal catches the thrashing the 8B judge
+        # misses (entity-attr swaps / value flips). None -> drift is still
+        # COMPUTED + recorded to telemetry inside the validate gate, but never
+        # auto-DEFERs (the validate path's behavior is unchanged in v1).
+        self._drift_defer_threshold = (
+            float(drift_defer_threshold) if drift_defer_threshold is not None
+            else None)
         # Deferred consolidation reviews (validated-compaction escalation). The
         # worker appends here ONLY from its own thread, in the foreground-clear
         # windows between turns; the orchestrator reads + resolves ONLY during a
         # foreground query (foreground_busy set, worker blocked in
         # ``_wait_foreground``). The gate already serializes the two sides against
         # ``ssm_a``/``blurbs`` mutation, so it serializes this list too -- no lock.
-        # Each entry: ``{"anchor_id", "gist", "reason", "blurb"}`` (``gist`` is the
-        # ``StructuredGist`` the judge flagged or that was held unvalidated).
+        # Each entry: ``{"anchor_id", "gist", "reason", "blurb", "drift"}``
+        # (``gist`` is the ``StructuredGist`` the judge flagged or that was held
+        # unvalidated; ``drift`` is the A5 compaction-stability signal, None on
+        # the 1st pass or when validate is off).
         self._pending: list[dict] = []
         self._q: "queue.Queue[int]" = queue.Queue()
         # Set by the orchestrator while a foreground query() is building a
@@ -157,6 +171,17 @@ class ConsolidationWorker:
                     # Cold-start: Bonsai down / parse fail -- skip, leave R4,
                     # retry next sweep. No fabricated gist.
                     continue
+                # A5: compaction-stability signal. drift over (prior_gist,
+                # new_gist) -- a stable memory changes little between
+                # consolidation passes; high drift flags thrashing (subtle
+                # corruption the 8B fidelity judge misses). 1st pass (no prior)
+                # -> drift stays None (no baseline). Computed only inside the
+                # validate gate (drift rides ``--fade-consolidation-validate``;
+                # no new ON/OFF flag). Carried on every DEFER reason + the clean
+                # path so all reviews + telemetry show it.
+                drift = None
+                if prior and self.validate:
+                    drift = compute_line_drift_ratio(prior, gist.narrative)
                 if self.validate:
                     # Validated compaction: a Bonsai fidelity judge gates the
                     # in-place write. ``corruption=False`` -> clean compression,
@@ -169,14 +194,40 @@ class ConsolidationWorker:
                         blurb, gist.narrative)
                     if verdict is None:
                         self._defer(anchor_id, gist, blurb,
-                                    _REASON_JUDGE_UNAVAILABLE)
+                                    _REASON_JUDGE_UNAVAILABLE, drift=drift)
                         continue
                     if verdict.get("corruption"):
                         self._defer(anchor_id, gist, blurb,
-                                    verdict.get("reason") or "gist changed a fact")
+                                    verdict.get("reason") or "gist changed a fact",
+                                    drift=drift)
+                        continue
+                    # Clean verdict. A5 drift-DEFER (opt-in): high drift on a
+                    # clean verdict is the 8B's blind spot -- surface it for
+                    # human review instead of silently applying a thrashing
+                    # rewrite. threshold None (default) -> observe-only (drift
+                    # is recorded below but never auto-DEFERs).
+                    if (self._drift_defer_threshold is not None
+                            and drift is not None
+                            and drift > self._drift_defer_threshold):
+                        self._defer(
+                            anchor_id, gist, blurb,
+                            f"high drift {drift:.2f} across consolidation passes",
+                            drift=drift)
                         continue
                     # clean -- fall through to consolidate.
                 self._fade.consolidate(anchor_id, gist)
+                # A5: record the compaction-stability drift to telemetry (when
+                # present) so STABLE compactions are observable too, not just
+                # deferred ones. Best-effort -- a telemetry hiccup never breaks
+                # the consolidation (the write above already succeeded).
+                if drift is not None:
+                    try:
+                        from ..observability.llm_telemetry import _telemetry
+                        _telemetry.record(
+                            "compaction_drift", None, None, None, True,
+                            anchor_id=anchor_id, drift=drift, count=count + 1)
+                    except Exception:  # noqa: BLE001 - best-effort observability
+                        pass
                 if self._fact_sink is not None and (gist.facts or
                                                     gist.state_assertions):
                     try:
@@ -192,20 +243,24 @@ class ConsolidationWorker:
                 self._q.task_done()
 
     def _defer(self, anchor_id: int, gist: StructuredGist, blurb: str,
-               reason: str) -> None:
+               reason: str, *, drift: Optional[float] = None) -> None:
         """Hold a candidate gist for user review instead of applying it.
 
-        Appends ``{anchor_id, gist, reason, blurb}`` to ``self._pending``. The
-        anchor is NOT consolidated (stays R4); ``tick`` skips already-pending
+        Appends ``{anchor_id, gist, reason, blurb, drift}`` to ``self._pending``.
+        The anchor is NOT consolidated (stays R4); ``tick`` skips already-pending
         anchors so it is not re-gisted next sweep. The orchestrator surfaces the
         review on the next turn and the user resolves it via ``resolve`` (keep /
         accept / edit), which runs in the foreground (worker blocked, race-free).
+        ``drift`` is the A5 compaction-stability signal (None on the 1st pass or
+        when validate is off) -- surfaced on the review so the user can see WHY a
+        clean-verdict gist was deferred (high drift = the 8B's blind spot).
         """
         self._pending.append({
             "anchor_id": anchor_id,
             "gist": gist,
             "reason": reason,
             "blurb": blurb,
+            "drift": drift,
         })
 
     # -- validated-compaction escalation (foreground side; worker is blocked) --
@@ -228,6 +283,7 @@ class ConsolidationWorker:
                 "reason": r["reason"],
                 "narrative": r["gist"].narrative,
                 "excerpt": excerpt,
+                "drift": r.get("drift"),
             })
         return out
 

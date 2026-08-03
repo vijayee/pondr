@@ -226,6 +226,34 @@ class Config:
     # ``hybrid_retrieval`` / ``assertion_extraction_enabled``).
     dedup_enabled: bool = False
 
+    # ── A5: LLM-call telemetry + compaction drift (Tencent-survey Phase 1 item 5) ──
+    # When True, ``@record_llm_call`` (``src/observability/llm_telemetry.py``)
+    # wraps the 9 BonsaiDecider judge methods (verify_fidelity, author_scene,
+    # judge_dedup_pairs, verify_typing, decide_anomaly, decide_contradiction,
+    # classify_doc_kind, gist, consolidate_gist) and appends one JSONL line per
+    # call -- task / latency_ms / in_tok / out_tok / ok -- to
+    # ``llm_telemetry_path``. The decorator reads this flag at CALL TIME
+    # (master-config style 1, mirrors ``dedup_enabled`` / ``hybrid_retrieval``):
+    # off -> direct ``return fn(...)`` before timing, zero overhead, no file,
+    # byte-identical. The ``outer["usage"]`` the OpenAI-compatible llama-server
+    # returns is surfaced via a ``self._last_usage`` side-channel in
+    # ``_post_json`` (was DISCARDED). Never raises, never changes the return /
+    # signature. Tencent's Kafka/OTel sink is SKIPPED (~1500 lines); Pondr uses
+    # a JSONL file sink under gitignored ``data/``. Default False.
+    llm_telemetry_enabled: bool = False
+    llm_telemetry_path: str = "data/llm_telemetry.jsonl"
+    # A5 drift-DEFER threshold (opt-in, default None = observe-only). When set,
+    # the Phase C validated-compaction gate DEFERs a CLEAN-verdict gist whose
+    # ``compute_line_drift_ratio(prior_gist, new_gist)`` exceeds this value --
+    # the deterministic compaction-stability signal catches the thrashing the 8B
+    # fidelity judge misses (entity-attr swaps / value flips). None -> drift is
+    # still COMPUTED + recorded to telemetry inside ``--fade-consolidation-
+    # validate``, but never auto-DEFERs (the validate path's behavior is
+    # unchanged in v1; drift is additive observability, not a new auto-DEFER).
+    # Read by ``ConsolidationWorker`` (set via ``build_ponder`` /
+    # ``--fade-drift-defer-threshold``).
+    fade_drift_defer_threshold: Optional[float] = None
+
     # ── Phase 2c+: self-chat full agent loop ──
     # When True, the Bonsai self-chat synthesize path runs a multi-turn tool
     # loop (``run_tool_loop``): the model may call ``expand`` / ``search_memory``

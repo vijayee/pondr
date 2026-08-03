@@ -35,6 +35,7 @@ from typing import Optional
 import requests
 
 from ..config import config
+from ..observability.llm_telemetry import record_llm_call
 from ..training.prompts import (
     bonsai_anomaly_decision_prompt,
     bonsai_author_scene_prompt,
@@ -136,6 +137,15 @@ class BonsaiDecider:
         )
         self.timeout = timeout
         self.max_tokens = max_tokens
+        # A5: usage side-channel for ``@record_llm_call``. Reset to None at the
+        # top of every ``_post_json`` call + set to ``outer["usage"]`` on its
+        # success path; the decorator on each judge method reads it in ``finally``
+        # to emit per-call token telemetry. Declared here (not just set in
+        # ``_post_json``) so the attr is explicit, not magical -- though the
+        # decorator also guards with ``getattr(self, "_last_usage", None)`` so a
+        # subclass/decider that never hits ``_post_json`` still records null
+        # tokens, never ``AttributeError``. Single-threaded per instance.
+        self._last_usage: Optional[dict] = None
 
     # ---- public decisions ------------------------------------------------
 
@@ -151,6 +161,7 @@ class BonsaiDecider:
         except requests.RequestException:
             return False
 
+    @record_llm_call("gist")
     def gist(self, source_episodes: list[dict]) -> Optional[str]:
         """Synthesize one paragraph abstracting ``source_episodes``.
 
@@ -171,6 +182,7 @@ class BonsaiDecider:
             return None
         return _CTRL_RE.sub("", raw.strip())
 
+    @record_llm_call("consolidate_gist")
     def consolidate_gist(self, blurb: str, prior_gist: Optional[str],
                          count: int) -> Optional[str]:
         """Compress ONE fading blurb into a gist (the fade consolidation loop).
@@ -195,6 +207,7 @@ class BonsaiDecider:
             return None
         return _CTRL_RE.sub("", raw.strip())
 
+    @record_llm_call("author_scene")
     def author_scene(
         self,
         topic: str,
@@ -245,6 +258,7 @@ class BonsaiDecider:
             "reason": data.get("reason") or "",
         }
 
+    @record_llm_call("verify_fidelity")
     def verify_fidelity(self, blurb: str, narrative: str) -> Optional[dict]:
         """Judge whether a consolidation gist CORRUPTED the source (validated compaction).
 
@@ -275,6 +289,7 @@ class BonsaiDecider:
             "reason": str(data.get("reason", ""))[:1000],
         }
 
+    @record_llm_call("judge_dedup_pairs")
     def judge_dedup_pairs(
         self,
         new_episode_summary: str,
@@ -331,6 +346,7 @@ class BonsaiDecider:
             })
         return out
 
+    @record_llm_call("verify_typing")
     def verify_typing(
         self, entity: str, candidate_class: str, retrieved_context: dict
     ) -> Optional[dict]:
@@ -361,6 +377,7 @@ class BonsaiDecider:
             "reasoning": str(data.get("reasoning", ""))[:1000],
         }
 
+    @record_llm_call("decide_anomaly")
     def decide_anomaly(self, flag: dict, retrieved_context: dict) -> Optional[dict]:
         """Decide what to DO about an identity-drift flag.
 
@@ -389,6 +406,7 @@ class BonsaiDecider:
             "reasoning": str(data.get("reasoning", ""))[:1000],
         }
 
+    @record_llm_call("decide_contradiction")
     def decide_contradiction(self, flag: dict, retrieved_context: dict) -> Optional[dict]:
         """Decide what to DO about a ``contradictory_state`` flag (Phase 3c D3).
 
@@ -439,6 +457,7 @@ class BonsaiDecider:
             "reasoning": str(data.get("reasoning", ""))[:1000],
         }
 
+    @record_llm_call("classify_doc_kind")
     def classify_doc_kind(self, doc_text: str) -> Optional[str]:
         """Zero-shot doc-kind tag (Phase 3c Sec 7.11).
 
@@ -500,6 +519,14 @@ class BonsaiDecider:
         # / offline tests) is a no-op. Mirrors BonsaiRelationExtractor's gate.
         if self.pause_gate is not None:
             self.pause_gate()
+        # A5: reset the usage side-channel at entry. On the success path below
+        # ``self._last_usage = outer.get("usage")`` stashes the OpenAI-style
+        # ``{prompt_tokens, completion_tokens, total_tokens}`` for the
+        # ``@record_llm_call`` decorator on the calling judge method to emit as
+        # telemetry. None on any failure path (HTTP/parse/cold-start) so the
+        # decorator records null tokens, never crashes. Single-threaded per
+        # decider instance -> no race on this attr.
+        self._last_usage = None
         try:
             resp = requests.post(url, json=payload, timeout=self.timeout)
         except requests.RequestException:
@@ -510,6 +537,7 @@ class BonsaiDecider:
             outer = resp.json()
         except json.JSONDecodeError:
             return None
+        self._last_usage = outer.get("usage")
         try:
             content = outer["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
