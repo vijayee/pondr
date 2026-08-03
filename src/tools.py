@@ -154,6 +154,54 @@ REMEMBER_SCHEMA: dict = {
     },
 }
 
+# B2 conversation-vs-memory split: a ``search_memory`` variant WITH the optional
+# ``verbatim`` param. STANDALONE (NOT appended to ``TOOL_SCHEMAS`` /
+# ``LOOP_TOOLS`` / ``SELF_CHAT_TOOLS``) so the flag-off path hands the consumer
+# the exact prior tool lists (byte-identical). The orchestrator's loop path
+# SWAPS the base ``search_memory`` entry for this variant ONLY when
+# ``--drill-down`` is on (see ``orchestrator._synthesize`` -- new list, no
+# mutation of the module-level lists). The handler (``dispatch_tool``) +
+# ``orchestrator.search_memory`` ALWAYS accept ``verbatim`` (default false), so
+# only the LLM-VISIBLE schema is gated; a caller that passes ``verbatim`` with
+# the flag off gets it honored (forward-compat, no extra cost).
+SEARCH_MEMORY_DRILLDOWN_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "search_memory",
+        "description": (
+            "Re-search memory mid-generation with a refined query and/or "
+            "explicit entities/topics. Use when the initial context was "
+            "insufficient and you can phrase a better retrieval. Returns "
+            "fresh ranked context units. Set verbatim=true when you need the "
+            "user's literal words (what was actually said) rather than the "
+            "compressed summary."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "entities": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Optional entity axes to bias the retrieval.",
+                },
+                "topics": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Optional topic axes to bias the retrieval.",
+                },
+                "verbatim": {
+                    "type": "boolean", "default": False,
+                    "description": (
+                        "If true, return the user's literal words (full text) "
+                        "for each episode instead of a summary -- use when you "
+                        "need what was actually said, not the compressed memory."
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
 
 def _err(msg: str) -> str:
     """A short tool-result error string (never raises)."""
@@ -202,10 +250,16 @@ def dispatch_tool(orchestrator, name: str, args: Any) -> str:
             query = args.get("query")
             if not isinstance(query, str) or not query.strip():
                 return _err("search_memory requires a 'query' string")
+            # B2: forward the optional ``verbatim`` flag (conversation-vs-memory
+            # split). Always accepted (default false); the LLM-visible schema
+            # param is gated by ``--drill-down`` in ``orchestrator._synthesize``,
+            # but the handler honors it whenever a caller passes it.
+            verbatim = bool(args.get("verbatim"))
             context = orchestrator.search_memory(
                 query,
                 entities=args.get("entities"),
                 topics=args.get("topics"),
+                verbatim=verbatim,
             )
             return context if isinstance(context, str) else _err("search_memory returned nothing")
 

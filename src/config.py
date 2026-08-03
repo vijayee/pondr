@@ -254,6 +254,29 @@ class Config:
     # ``--fade-drift-defer-threshold``).
     fade_drift_defer_threshold: Optional[float] = None
 
+    # ── B2: drill-down chain + conversation-vs-memory tool split + strategy ──
+    # Tencent-survey Phase 2 item 7 (depends on B1 scene blocks, SHIPPED 16905a2).
+    # One master flag for three components, all read at CALL TIME (master-config
+    # style, mirrors ``dedup_enabled`` / ``hybrid_retrieval`` /
+    # ``llm_telemetry_enabled``):
+    #  (a) Scene drill-down: ``expand_unit``'s scene branch follows ``cites``
+    #      edges ONE HOP -- each cited episode's one-line summary -- so the LLM
+    #      picks which to ``expand(ep_id)`` for verbatim (scene -> cited-ep
+    #      summary -> verbatim). Rides ``--scene-blocks`` (inert without it).
+    #  (b) Conversation-vs-memory split: ONE ``search_memory`` tool with an
+    #      optional ``verbatim`` param (default false=summary, true=full text).
+    #      The param is added to the LLM-visible schema ONLY when this flag is on
+    #      (gated, byte-identical off); the handler always accepts it.
+    #  (c) ``strategy`` field: stamp ``graph``/``vector`` on the graph + semantic
+    #      paths (the existing ``hybrid`` stamp stays UNCONDITIONAL) and surface
+    #      ``[strategy:...]`` in ``build_context_string`` (the search_memory
+    #      renderer) so the LLM sees HOW each result was found.
+    # Default False: no schema change, no stamp, no surface, scene expand returns
+    # the old ``Cites:`` id list -> byte-identical. Read by the retriever stamps +
+    # the orchestrator expand/search/synthesize seams directly (NO constructor
+    # threading).
+    drill_down_enabled: bool = False
+
     # ── Phase 2c+: self-chat full agent loop ──
     # When True, the Bonsai self-chat synthesize path runs a multi-turn tool
     # loop (``run_tool_loop``): the model may call ``expand`` / ``search_memory``

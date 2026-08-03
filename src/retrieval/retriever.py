@@ -341,9 +341,14 @@ class HippocampalRetriever:
         ~0.02 RRF score). The boost IS honored: it shaped the graph list's
         internal sort (``traversal.retrieve`` applies it), which shaped the
         graph ranks, which shaped the RRF contribution. ``strategy="hybrid"`` is
-        stamped on every result as additive provenance (the context builder
-        ignores unknown dict keys, so it is NOT LLM-facing -- matches Tencent's
-        ``strategy`` field, B2-steal).
+        stamped UNCONDITIONALLY on every result as additive provenance -- the
+        Tencent ``strategy`` field (B2-steal). It is surfaced (LLM-facing
+        ``[strategy:hybrid]`` prefix) ONLY when ``config.drill_down_enabled`` is
+        on (see ``build_context_string``); OFF -> the key is set but the
+        renderer ignores it -> byte-identical. The graph + vector paths stamp
+        ``graph``/``vector`` (also gated); ``hybrid`` stays unconditional so the
+        existing assertion (``test_hybrid_retrieval``) holds regardless of the
+        flag.
         """
         # Lazy imports so the OFF path (the common case) never imports the
         # hybrid modules, and a test that toggles the global without a
@@ -626,6 +631,13 @@ class HippocampalRetriever:
         for eid, sim in hits:
             ep = self.traversal._hydrate(eid)
             ep["score"] = sim * 0.5  # discount so graph matches rank higher
+            # B2: stamp the retrieval-path provenance. ``strategy`` is
+            # additive; surfaced in ``build_context_string`` ONLY when
+            # ``--drill-down`` is on. OFF -> the key is still set here but the
+            # renderer ignores it (no prefix). The hybrid stamp (in
+            # ``_retrieve_hybrid``) stays UNCONDITIONAL.
+            if config.drill_down_enabled:
+                ep["strategy"] = "vector"
             out.append(ep)
         # Phase 2c+: semantic-fallback hits are boost-aware too (one shared
         # helper with the graph score site so no scored result bypasses the
@@ -715,7 +727,9 @@ class HippocampalRetriever:
                                            working_memory=working_memory)
         return context, chunked
 
-    def build_context_string(self, episodes: list[dict], max_tokens: Optional[int] = None) -> str:
+    def build_context_string(self, episodes: list[dict],
+                             max_tokens: Optional[int] = None,
+                             verbatim: bool = False) -> str:
         """Build a structured context string for Mode A generation.
 
         Each episode is formatted as ``[id | date]`` + entities/topics/tones +
@@ -723,6 +737,21 @@ class HippocampalRetriever:
         is a person or that the tone was frustrated. Hard cutoff at
         ``max_tokens`` (chars//4 estimate); episodes beyond the cutoff are
         dropped, not truncated, so a half-episode never enters context.
+
+        ``verbatim`` (B2, default False): when True, each EPISODE chunk also
+        appends ``Full text: {text}`` (the user's literal words) after the
+        summary -- the "what did the user literally say" intent vs the default
+        "what do I remember" (summary) intent. Sections/documents/scenes
+        already render their body as ``text`` (they have no separate gist
+        form), so verbatim does NOT change them. Default False -> no
+        ``Full text`` line -> byte-identical to pre-B2.
+
+        ``strategy`` (B2): when ``config.drill_down_enabled`` is on, each chunk
+        is prefixed ``[strategy:graph|vector|hybrid]`` from the result's
+        additive ``strategy`` field so the LLM sees HOW each unit was found
+        (retrieval self-awareness). OFF -> no prefix -> byte-identical (even
+        for hybrid results, which carry ``strategy="hybrid"`` unconditionally
+        but are NOT surfaced when the flag is off).
         """
         if max_tokens is None:
             max_tokens = config.max_context_tokens
@@ -739,6 +768,13 @@ class HippocampalRetriever:
         for ep in episodes:
             eid = ep.get("episode_id", "")
             kind = ep.get("kind")
+            # B2: retrieval-self-awareness prefix. ``strategy`` is additive
+            # provenance stamped by each retrieval path (graph / vector /
+            # hybrid). Surfaced (LLM-facing) ONLY when ``--drill-down`` is on;
+            # OFF -> ``strat`` is None -> no prefix -> byte-identical (even for
+            # hybrid results, which carry ``strategy="hybrid"`` unconditionally
+            # but are not surfaced when the flag is off).
+            strat = ep.get("strategy") if config.drill_down_enabled else None
             if kind == "section":
                 # Section (per-chunk) result: the matched chunk body is in
                 # ``text`` (materialized at hydrate), so no store/cold pull here.
@@ -793,8 +829,16 @@ class HippocampalRetriever:
                     f"Topics: {', '.join(ep.get('topics', []))}\n"
                     f"Tone: {', '.join(ep.get('tones', []))}\n"
                     f"Summary: {ep.get('summary', '')}\n"
-                    "\n"
+                    + (f"Full text: {ep.get('text', '')}\n"
+                       if verbatim and ep.get('text') else "")
+                    + "\n"
                 )
+            # B2: surface the retrieval strategy as a one-line prefix above
+            # the chunk (LLM-facing only when ``--drill-down`` is on). The
+            # prefix is part of ``chunk`` so the token-count check below counts
+            # it (no budget bypass).
+            if strat:
+                chunk = f"[strategy:{strat}]\n" + chunk
             chunk_tokens = len(chunk) // 4
             if token_count + chunk_tokens > max_tokens:
                 break

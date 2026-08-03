@@ -63,7 +63,8 @@ from .subconscious.relevance_score import (
 )
 from .subconscious.working_memory import WorkingMemory, WorkingMemoryState
 from .tools import (
-    LOOP_TOOLS, REMEMBER_SCHEMA, SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
+    LOOP_TOOLS, REMEMBER_SCHEMA, SEARCH_MEMORY_DRILLDOWN_SCHEMA,
+    SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
     feedback_instruction, run_tool_loop,
 )
 
@@ -1061,6 +1062,18 @@ class PonderOrchestrator:
                                 " answers the question, just answer directly;"
                                 " reach for a tool only when the context is"
                                 " genuinely insufficient.")
+                # B2: drill-down self-awareness (loop-path-only, MAY-phrased --
+                # never imperative per [[llm-tool-use-prompts-optional]]). When
+                # ``--drill-down`` is on, the search_memory tool accepts a
+                # ``verbatim`` option (the user's literal words vs a summary)
+                # and context units may show a ``[strategy:...]`` tag for how
+                # they were found. OFF -> no note -> byte-identical.
+                if _runtime_config.drill_down_enabled:
+                    sys_content += (" The search_memory tool accepts a `verbatim`"
+                                    " option when you need the user's literal"
+                                    " words rather than a summary; context units"
+                                    " may show a `[strategy:...]` tag indicating"
+                                    " how they were found.")
             # A3 (corrected): inject the session-stable scene blocks into the
             # system-prompt SUFFIX (NOT the user message). ``scene_results`` is
             # the per-query retrieved scene subset pulled out of ``episodes``
@@ -1121,6 +1134,21 @@ class PonderOrchestrator:
                 # ``remember`` cannot be dispatched when the loop is off.
                 if self._tier2_recall_menu:
                     loop_tools = [*loop_tools, REMEMBER_SCHEMA]
+                # B2: when ``--drill-down`` is on, swap the ``search_memory``
+                # entry for the variant WITH the ``verbatim`` param (the
+                # conversation-vs-memory split). Build a NEW list -- never
+                # mutate the module-level ``TOOL_SCHEMAS``/``LOOP_TOOLS`` (same
+                # discipline as the ``remember`` append above) so the flag-off
+                # path hands the model the exact prior tool set. Loop-path-only
+                # (the one-shot path's ``SELF_CHAT_TOOLS`` has no
+                # ``search_memory``) -> byte-identical when the loop is off.
+                if _runtime_config.drill_down_enabled:
+                    loop_tools = [
+                        (SEARCH_MEMORY_DRILLDOWN_SCHEMA
+                         if t.get("function", {}).get("name") == "search_memory"
+                         else t)
+                        for t in loop_tools
+                    ]
                 dispatch_fn = lambda name, args: dispatch_tool(self, name, args)
                 try:
                     loop = run_tool_loop(
@@ -1770,7 +1798,33 @@ class PonderOrchestrator:
                 ]
                 src = sc.get("source_eps") or []
                 if src:
-                    parts.append("Cites: " + ", ".join(src))
+                    if _runtime_config.drill_down_enabled:
+                        # B2 drill-down: follow ``cites`` ONE HOP -- each cited
+                        # episode's one-line summary, so the LLM picks which to
+                        # ``expand(ep_id)`` for verbatim (the scene -> cited-ep
+                        # summary -> verbatim chain = "every symbol a path back
+                        # to ground truth"). Capped at 12 (a scene citing many
+                        # eps shows the first dozen); best-effort per cited ep --
+                        # a missing/unreadable one is skipped, no crash. Falls
+                        # back to the bare id list when NONE hydrate (keeps the
+                        # expand contract: the cited ids are always visible).
+                        cited = []
+                        for ep_id in src[:12]:
+                            try:
+                                epc = self.store.get_episode(ep_id)
+                                if epc is not None:
+                                    cited.append(
+                                        f"  - {ep_id}: "
+                                        f"{epc.summary or '(no summary)'}")
+                            except Exception:  # noqa: BLE001 - best-effort per ep
+                                pass
+                        if cited:
+                            parts.append("Cites:")
+                            parts.extend(cited)
+                        else:
+                            parts.append("Cites: " + ", ".join(src))
+                    else:
+                        parts.append("Cites: " + ", ".join(src))
                 body = sc.get("body") or ""
                 if body:
                     parts.append(body)
@@ -1794,6 +1848,7 @@ class PonderOrchestrator:
         query: str,
         entities: Optional[list[str]] = None,
         topics: Optional[list[str]] = None,
+        verbatim: bool = False,
     ) -> str:
         """Consumer tool: re-retrieve mid-generation with a refined query/axes.
 
@@ -1802,6 +1857,14 @@ class PonderOrchestrator:
         calls this via ``dispatch_tool("search_memory", ...)`` when the initial
         context was insufficient. Returns the formatted context (empty string
         when nothing is found).
+
+        ``verbatim`` (B2 conversation-vs-memory split, default False): when True,
+        the context string renders each episode's FULL TEXT (the user's literal
+        words) alongside the summary -- the "what did the user literally say"
+        intent vs the default "what do I remember" (summary) intent. The param
+        is added to the LLM-visible schema ONLY when ``--drill-down`` is on
+        (gated); the handler always accepts it, defaulting to summary. Flag off
+        + ``verbatim=False`` -> byte-identical to pre-B2.
         """
         if self.retriever is None or not query:
             return ""
@@ -1816,7 +1879,7 @@ class PonderOrchestrator:
             results = self.retriever.retrieve_with_plan(plan)
             if not results:
                 return ""
-            return self.retriever.build_context_string(results)
+            return self.retriever.build_context_string(results, verbatim=verbatim)
         except Exception as e:  # noqa: BLE001 - search is best-effort
             print(f"[search_memory-fail] {e}", file=sys.stderr)
             return ""

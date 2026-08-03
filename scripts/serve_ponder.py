@@ -414,6 +414,16 @@ def main() -> int:
                         "--fade-consolidation-validate. DEFAULT None -> drift "
                         "is still computed + recorded to telemetry but never "
                         "auto-DEFERs (observe-only).")
+    p.add_argument("--drill-down", action="store_true", default=False,
+                   help="B2: drill-down chain + conversation-vs-memory tool "
+                        "split + retrieval strategy field. (a) scene expand "
+                        "follows `cites` one hop (each cited episode's summary "
+                        "-> expand(ep_id) for verbatim; rides --scene-blocks, "
+                        "inert without it). (b) search_memory gains an optional "
+                        "`verbatim` param (full text vs summary). (c) context "
+                        "units show a [strategy:graph|vector|hybrid] tag when "
+                        "found via the tool. DEFAULT OFF -> no schema/stamp/"
+                        "surface, old Cites: line -> byte-identical.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -441,6 +451,16 @@ def main() -> int:
     if args.llm_telemetry_path:
         _config.llm_telemetry_path = args.llm_telemetry_path
     _config.fade_drift_defer_threshold = args.fade_drift_defer_threshold
+    # B2: drill_down_enabled is read at call time by the retriever stamps +
+    # the orchestrator expand/search/synthesize seams (master-config
+    # convention), so set the global BEFORE build_ponder (build_ponder also
+    # sets it from its param, covering direct callers). Default OFF.
+    _config.drill_down_enabled = args.drill_down
+    if args.drill_down and not args.scene_blocks:
+        print("NOTE: --drill-down without --scene-blocks: the scene drill-down "
+              "(component a) is inert (no scene_ ids); the search_memory "
+              "`verbatim` param + [strategy:...] tags still work.",
+              file=sys.stderr)
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
@@ -664,6 +684,7 @@ def main() -> int:
     print(f"[load] hybrid_retrieval={args.hybrid_retrieval}", file=sys.stderr)
     print(f"[load] dedup={args.dedup}", file=sys.stderr)
     print(f"[load] llm_telemetry={args.llm_telemetry}", file=sys.stderr)
+    print(f"[load] drill_down={args.drill_down}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -706,6 +727,7 @@ def main() -> int:
         llm_telemetry=args.llm_telemetry,
         llm_telemetry_path=args.llm_telemetry_path,
         fade_drift_defer_threshold=args.fade_drift_defer_threshold,
+        drill_down=args.drill_down,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

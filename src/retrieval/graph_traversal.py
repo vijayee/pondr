@@ -1100,6 +1100,16 @@ class GraphTraversal:
         scored.sort(key=lambda r: r["score"], reverse=True)
         results = scored[:limit]
 
+        # B2: stamp the retrieval-path provenance. ``strategy="graph"`` is
+        # additive; surfaced in ``build_context_string`` ONLY when
+        # ``--drill-down`` is on. OFF -> no stamp -> byte-identical (the dict
+        # lacks the key, so the renderer's ``strat`` is None). Gated here (not
+        # unconditional like the hybrid stamp) so graph-only dict assertions in
+        # the flag-off regression stay byte-identical.
+        if _config.drill_down_enabled:
+            for r in results:
+                r["strategy"] = "graph"
+
         # Phase 3b: strengthen the edges this retrieval actually matched. The
         # data is cleanest here -- results are scored, limited, and hydrated with
         # the matched entities/topics/tones. Fire AFTER results are in hand so a

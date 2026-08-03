@@ -92,6 +92,7 @@ def build_ponder(
     llm_telemetry: bool = False,
     llm_telemetry_path: Optional[str] = None,
     fade_drift_defer_threshold: Optional[float] = None,
+    drill_down: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -256,6 +257,16 @@ def build_ponder(
     config.llm_telemetry_enabled = llm_telemetry
     config.llm_telemetry_path = llm_telemetry_path or config.llm_telemetry_path
     config.fade_drift_defer_threshold = fade_drift_defer_threshold
+    # B2: drill-down master flag (read at call time by the retriever stamps +
+    # the orchestrator expand/search/synthesize seams -- same master-config
+    # convention as ``hybrid_retrieval`` / ``dedup`` / ``llm_telemetry``). Set
+    # before the store/encoder ctor so call-time reads see a consistent value.
+    # ``serve_ponder`` sets the same global before build_ponder; setting it here
+    # too covers direct build_ponder callers (tests, scripts). Default OFF ->
+    # no schema change, no stamp, no surface, old ``Cites:`` line -> byte-
+    # identical. No constructor threading: the retriever + orchestrator read
+    # ``config.drill_down_enabled`` directly.
+    config.drill_down_enabled = drill_down
     if llm_telemetry:
         # Swap the module sink to a path-backed JSONL writer. The null sink
         # (default) records nothing, so flag-on-without-configure is a silent
