@@ -437,6 +437,20 @@ def main() -> int:
                         "preserves. DEFAULT OFF -> the formatter takes the "
                         "exact break-on-overflow path -> byte-identical. Under "
                         "budget ON -> no demotion -> also byte-identical.")
+    p.add_argument("--task-canvas", action="store_true", default=False,
+                   help="B4: Mermaid task canvas -- a structural short-term "
+                        "task-state axis the fade cannot provide (fade is prose-"
+                        "only; R4 never fires on code). A per-task Mermaid "
+                        "flowchart (nodes carry phase/status done|doing|paused|"
+                        "blocked) the LLM authors + reads each turn. The L1.5 "
+                        "lifecycle gate (a per-turn Bonsai call) creates/resumes/"
+                        "clears the ONE active per-user canvas in WaveDB; the "
+                        "active canvas's Mermaid is injected into the USER message "
+                        "(per-turn dynamic, like the fade block) and the LLM "
+                        "revises it via the update_canvas tool in the loop. "
+                        "Historical canvases are reclaimed (never delete active, "
+                        "floor 15, oldest-by-mtime). DEFAULT OFF -> no gate call / "
+                        "tool / injection / reclaim -> byte-identical.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -479,6 +493,11 @@ def main() -> int:
     # (build_ponder also sets it from its param, covering direct callers).
     # Default OFF -> break-on-overflow -> byte-identical.
     _config.reclaim_enabled = args.reclaim
+    # B4: task_canvas_enabled is read at call time by the orchestrator L1.5
+    # gate + injection + loop_tools append + reclaim (master-config convention),
+    # so set the global BEFORE build_ponder (build_ponder also sets it from its
+    # param, covering direct callers). Default OFF -> byte-identical.
+    _config.task_canvas_enabled = args.task_canvas
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
@@ -704,6 +723,7 @@ def main() -> int:
     print(f"[load] llm_telemetry={args.llm_telemetry}", file=sys.stderr)
     print(f"[load] drill_down={args.drill_down}", file=sys.stderr)
     print(f"[load] reclaim={args.reclaim}", file=sys.stderr)
+    print(f"[load] task_canvas={args.task_canvas}", file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -748,6 +768,7 @@ def main() -> int:
         fade_drift_defer_threshold=args.fade_drift_defer_threshold,
         drill_down=args.drill_down,
         reclaim=args.reclaim,
+        task_canvas=args.task_canvas,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

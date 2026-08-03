@@ -300,6 +300,26 @@ class Config:
     reclaim_min_keep: int = 3           # never DROP below this at the aggressive step
     reclaim_truncate_chars: int = 800   # emergency body-truncation cap (chars; ~200 tok)
 
+    # ── B4: Mermaid task canvas (WaveDB-persistent) ──
+    # Tencent-survey Phase 2 item 9 (the last Phase 2 steal). A structural
+    # short-term task-state axis the fade cannot provide (fade is prose-only --
+    # R4 never fires on code; the canvas is a per-task phase flowchart that does
+    # NOT depend on cosine similarity). ONE master flag ``--task-canvas`` (master-
+    # config style, mirrors ``reclaim``/``dedup``/``drill_down``; set in
+    # ``build_ponder`` -- NO constructor threading). When ON: a synchronous L1.5
+    # lifecycle gate (one per-turn Bonsai call) decides create/switch/clear/keep;
+    # the active canvas's Mermaid is injected into the USER message each turn
+    # (per-turn dynamic -- like the fade block, NOT the cache-stable scene
+    # suffix); the LLM authors it via the ``update_canvas`` Bonsai-loop tool; a
+    # reclaim pass in the persist tail keeps a per-user floor of historical
+    # canvases. Default False -> no gate call, no tool, no injection, no reclaim
+    # -> byte-identical. The canvas is structural -> NO vector index. Stored IN
+    # the DB (WaveDB ``content/canvas/{id}/``), not as ``.mmd`` files.
+    task_canvas_enabled: bool = False
+    canvas_min_keep: int = 15           # per-user historical-canvas floor (reclaim)
+    canvas_block_max_tokens: int = 1024 # injection-block budget (truncate the Mermaid)
+    canvas_max_mermaid_chars: int = 4000 # stored-Mermaid size cap (write/replace guard)
+
     # ── Phase 2c+: self-chat full agent loop ──
     # When True, the Bonsai self-chat synthesize path runs a multi-turn tool
     # loop (``run_tool_loop``): the model may call ``expand`` / ``search_memory``

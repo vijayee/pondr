@@ -202,6 +202,72 @@ SEARCH_MEMORY_DRILLDOWN_SCHEMA: dict = {
     },
 }
 
+# B4 task canvas (the Bonsai-loop ``update_canvas`` tool). A STANDALONE schema --
+# NOT appended to ``TOOL_SCHEMAS``/``LOOP_TOOLS``/``SELF_CHAT_TOOLS`` -- so the
+# flag-off path hands the consumer the exact prior tool lists (byte-identical).
+# The orchestrator conditionally appends it to the loop-path tool set ONLY when
+# ``--task-canvas`` is on (see ``orchestrator._synthesize`` -- new list, no
+# mutation of the module-level lists). Loop-path-only: the one-shot path never
+# sees it. The LLM authors the active task canvas's Mermaid (the structural
+# short-term task-state flowchart) -- full-rewrite by default (``file_action`` =
+# "write" + ``mmd_content``) OR a node splice (``file_action`` = "replace" +
+# ``replace_blocks``). ``dispatch_tool`` -> ``orchestrator.update_canvas`` (which
+# validates, splices, stores via ``touch_canvas``). MAY-phrased (optional, never
+# imperative -- per [[llm-tool-use-prompts-optional]]).
+UPDATE_CANVAS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "update_canvas",
+        "description": (
+            "Revise the active task canvas -- the Mermaid flowchart of the task "
+            "in progress (phases: done|doing|paused|blocked). You MAY call this "
+            "to record progress, add a phase, or mark a phase blocked. By "
+            "default pass the COMPLETE updated Mermaid in mmd_content "
+            "(file_action='write'). For a small node edit you may instead pass "
+            "file_action='replace' with replace_blocks, one per node to splice. "
+            "The first line is the %%{taskGoal, progress, createdTime, "
+            "updatedTime}%% header; each node is N<id>[\"phase: ...<br/>status: "
+            "...<br/>summary: ...<br/>Timestamp: ...\"]."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "mmd_content": {
+                    "type": "string",
+                    "description": (
+                        "The full Mermaid for file_action='write' (a COMPLETE "
+                        "rewrite, not a delta). Omit for 'replace'."
+                    ),
+                },
+                "file_action": {
+                    "type": "string", "enum": ["write", "replace"], "default": "write",
+                    "description": "'write' replaces the whole canvas; 'replace' splices the listed node lines.",
+                },
+                "replace_blocks": {
+                    "type": "array",
+                    "description": "For 'replace': one entry per node to splice.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "node_id": {"type": "string", "description": "The node id (e.g. N1)."},
+                            "new_block": {"type": "string", "description": "The replacement node line."},
+                        },
+                        "required": ["node_id", "new_block"],
+                    },
+                },
+                "node_mapping": {
+                    "type": "object",
+                    "description": (
+                        "Optional provenance: {node_id: source_id} mapping from "
+                        "canvas nodes to the turns/tool-calls that produced them."
+                    ),
+                },
+            },
+            "required": ["file_action"],
+        },
+    },
+}
+
 
 def _err(msg: str) -> str:
     """A short tool-result error string (never raises)."""
@@ -271,6 +337,31 @@ def dispatch_tool(orchestrator, name: str, args: Any) -> str:
             # never raises -- but the outer ``except`` below is the final net.
             result = orchestrator.remember_menu()
             return result if isinstance(result, str) and result else _err("remember returned nothing")
+
+        if name == "update_canvas":
+            # B4 task canvas (Bonsai-loop-only): the LLM authors the active task
+            # canvas's Mermaid. ``update_canvas`` validates + splices (replace)
+            # + stores via ``touch_canvas``; best-effort never raises -- the
+            # outer ``except`` is the final net. Gated by ``--task-canvas`` at
+            # the loop_tools append (the schema is never handed to the model
+            # when the flag is off, so this branch is unreachable then).
+            file_action = args.get("file_action") or "write"
+            if file_action not in ("write", "replace"):
+                return _err("update_canvas file_action must be 'write' or 'replace'")
+            mmd = args.get("mmd_content")
+            if file_action == "write" and (not isinstance(mmd, str) or not mmd.strip()):
+                return _err("update_canvas 'write' requires a non-empty mmd_content")
+            rblocks = args.get("replace_blocks") if isinstance(
+                args.get("replace_blocks"), list) else None
+            nmapping = args.get("node_mapping") if isinstance(
+                args.get("node_mapping"), dict) else None
+            result = orchestrator.update_canvas(
+                mmd_content=mmd if isinstance(mmd, str) else "",
+                file_action=file_action,
+                replace_blocks=rblocks,
+                node_mapping=nmapping,
+            )
+            return result if isinstance(result, str) and result else _err("update_canvas returned nothing")
 
         return _err(f"unknown tool: {name}")
     except Exception as e:  # noqa: BLE001 - never break the consumer's loop

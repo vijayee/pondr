@@ -44,6 +44,7 @@ from ..training.prompts import (
     bonsai_dedup_prompt,
     bonsai_doc_kind_prompt,
     bonsai_gist_prompt,
+    bonsai_judge_task_lifecycle_prompt,
     bonsai_typing_prompt,
     bonsai_verify_fidelity_prompt,
 )
@@ -256,6 +257,60 @@ class BonsaiDecider:
             "body": body if isinstance(body, str) else "",
             "merge_with": merge_with if isinstance(merge_with, str) else "",
             "reason": data.get("reason") or "",
+        }
+
+    @record_llm_call("judge_task_lifecycle")
+    def judge_task_lifecycle(
+        self,
+        user_id: str,
+        recent_messages: list[dict],
+        active_canvas: Optional[dict],
+        historical_canvases: list[dict],
+    ) -> Optional[dict]:
+        """L1.5 task-canvas lifecycle gate (B4): decide create/switch/clear/keep
+        for THIS turn, synchronously, before synthesis so the canvas is settled
+        before the LLM sees it.
+
+        Called ONCE per turn by the orchestrator (NOT the scene worker's async-
+        daemon shape -- this is a synchronous inline gate). The 8B emits a FLAT
+        JSON object ``{taskCompleted, isLongTask, isContinuation,
+        continuationCanvasId, newTaskLabel}``; the orchestrator's deterministic
+        ``apply_lifecycle`` maps it to store transitions (create / switch-resume
+        / clear / keep). Returns ``None`` on HTTP/parse failure OR a malformed
+        envelope (the orchestrator treats ``None`` as "keep the store's current
+        active canvas" -- best-effort, never breaks the turn). Reuses
+        ``_post_json`` (already sets ``response_format: json_object``, never
+        raises) with ``pause_gate=None`` (the sync gate does not yield to a
+        foreground it IS -- setting a gate would deadlock). Modeled on
+        ``author_scene`` (``bonsai_decider.py:210``). The prompt lives in
+        ``prompts.bonsai_judge_task_lifecycle_prompt``.
+        """
+        # Cold-start guard: nothing to decide + nothing to resume -> None (the
+        # orchestrator falls back to the store's current active, or no canvas).
+        if not recent_messages and active_canvas is None and not historical_canvases:
+            return None
+        prompt = bonsai_judge_task_lifecycle_prompt(
+            user_id, recent_messages, active_canvas, historical_canvases)
+        data = self._post_json(prompt)
+        if not isinstance(data, dict):
+            return None
+        task_completed = bool(data.get("taskCompleted"))
+        is_long = bool(data.get("isLongTask"))
+        is_cont = bool(data.get("isContinuation"))
+        cont_id = data.get("continuationCanvasId")
+        if not isinstance(cont_id, str):
+            cont_id = ""
+        label = data.get("newTaskLabel")
+        if not isinstance(label, str):
+            label = ""
+        # Sanitize the kebab label: lowercase, strip to <=30 chars, drop spaces.
+        label = re.sub(r"\s+", "-", label.strip().lower())[:30]
+        return {
+            "taskCompleted": task_completed,
+            "isLongTask": is_long,
+            "isContinuation": is_cont,
+            "continuationCanvasId": cont_id,
+            "newTaskLabel": label,
         }
 
     @record_llm_call("verify_fidelity")

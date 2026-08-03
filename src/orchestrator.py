@@ -36,6 +36,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -62,8 +63,12 @@ from .subconscious.relevance_score import (
     score_ring_slots, score_ring_slots_with_doc_embs,
 )
 from .subconscious.working_memory import WorkingMemory, WorkingMemoryState
+from .subconscious.canvas_format import (
+    apply_replace_blocks, parse_canvas_meta, validate_canvas,
+)
 from .tools import (
     LOOP_TOOLS, REMEMBER_SCHEMA, SEARCH_MEMORY_DRILLDOWN_SCHEMA,
+    UPDATE_CANVAS_SCHEMA,
     SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
     feedback_instruction, run_tool_loop,
 )
@@ -280,6 +285,8 @@ class PonderOrchestrator:
         tier2_recall_menu: bool = False,
         scene_blocks: bool = False,
         scene_worker: "Optional[SceneAuthoringWorker]" = None,
+        task_canvas: bool = False,
+        canvas_decider: "Optional[BonsaiDecider]" = None,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -491,6 +498,40 @@ class PonderOrchestrator:
         # flag is off / the LLM never called ``remember`` -> key ABSENT ->
         # byte-identical.
         self._last_remember_menu: Optional[list] = None
+
+        # B4: Mermaid task canvas (``--task-canvas``). A structural short-term
+        # task-state axis the fade cannot provide (fade is prose-only; R4 never
+        # fires on code). The L1.5 lifecycle gate (``canvas_decider``) runs
+        # SYNCHRONOUSLY at the top of ``query()`` (before ``_synthesize`` builds
+        # messages) to create/switch/clear/keep the ONE active per-user canvas
+        # in WaveDB; the active canvas's Mermaid is then injected into the USER
+        # message (per-turn dynamic -- like the fade block, NOT the cache-stable
+        # scene suffix) and the LLM revises it via the ``update_canvas`` tool in
+        # the loop. ``False`` (default, flag off) -> no gate call, no tool
+        # append, no injection, no reclaim, ``result["task_canvas"]`` absent ->
+        # byte-identical to pre-B4. ``canvas_decider`` is ``None`` when off (the
+        # gate + ``update_canvas`` short-circuit). Best-effort: any gate/store
+        # failure is swallowed (the turn proceeds unchanged); the active canvas
+        # is read fresh by id each turn (never enters ChunkedContext / episodes).
+        self._task_canvas = bool(task_canvas)
+        self._canvas_decider = canvas_decider
+        # The active canvas id for THIS turn (set by the gate, reset to ``None``
+        # at the top of each ``query()``). ``None`` when the flag is off, the
+        # gate produced no canvas, or the gate failed -> no injection -> byte-
+        # identical. ``_last_canvas`` mirrors ``_last_remember_menu``: stashed
+        # in ``_synthesize`` for surfacing, reset per query, key absent when
+        # ``None`` -> byte-identical.
+        self._active_canvas_id: Optional[str] = None
+        self._last_canvas: Optional[dict] = None
+        # Lazy import of the canvas-block formatter (mirrors the fade / scene
+        # lazy imports above). ``None`` (default, flag off) -> no user-message
+        # prepend -> byte-identical.
+        self._format_canvas_block = None
+        if self._task_canvas:
+            from src.subconscious.canvas_format import (  # local, light import
+                format_canvas_block,
+            )
+            self._format_canvas_block = format_canvas_block
 
         # The cross-query Working Memory (persistent state). embedder injected so
         # WM can embed episodes/queries on demand. ``ring_capacity`` overrides
@@ -753,6 +794,16 @@ class PonderOrchestrator:
         # early-return at the route gate below + the happy-path tail) so it never
         # leaks into the next query -- if a new return path is added, clear there.
         self._current_query = user_prompt
+        # B4: reset the per-turn canvas state so a skipped/failed turn never
+        # leaks the previous turn's active canvas / surfaced confirmation. The
+        # L1.5 gate below re-sets ``_active_canvas_id`` (or leaves it ``None``
+        # -> no injection -> byte-identical to flag-off). ``None`` here when the
+        # flag is off (the gate is skipped entirely).
+        self._active_canvas_id = None
+        self._last_canvas = None
+        if self._task_canvas and self._canvas_decider is not None \
+                and self.store is not None:
+            self._run_canvas_gate(user_prompt, conversation_history)
         # STRM Phase 4 Step 4/5: salience trigger. If armed, capture the pre-step
         # WM state (the 2c surprise term needs surprise(z_t, z_{t+1}) -> both
         # states) BEFORE the query step mutates it. Flag-off (the default) skips
@@ -1116,6 +1167,30 @@ class PonderOrchestrator:
                     block = ""
                 if block:
                     user_content = f"{block}\n\n{user_content}"
+            # B4: prepend the active task canvas's Mermaid block ahead of
+            # everything (per-turn dynamic, like the fade block, NOT the cache-
+            # stable scene suffix). Built from the canvas id the L1.5 gate set
+            # this turn (``self._active_canvas_id``); ``None`` / flag off / no
+            # active canvas -> ``format_canvas_block`` returns "" -> no prepend
+            # -> byte-identical to pre-B4. Prepended AFTER the fade block so the
+            # canvas stays outermost: ``[TASK CANVAS]`` -> ``[FADE MEMORY]`` ->
+            # ``Context from past conversations`` -> ``User``. Sits OUTSIDE
+            # ChunkedContext (prepended here, after the chunked context was
+            # assembled) so B3's PRIMARY-band reclaim cascade never touches it
+            # (mirrors the fade block siting). Best-effort swallow.
+            if self._format_canvas_block is not None \
+                    and self._active_canvas_id is not None \
+                    and self.store is not None:
+                try:
+                    _cv = self.store.get_canvas(self._active_canvas_id)
+                    if _cv is not None:
+                        _cv_block = self._format_canvas_block(
+                            [_cv],
+                            max_tokens=_runtime_config.canvas_block_max_tokens)
+                        if _cv_block:
+                            user_content = f"{_cv_block}\n\n{user_content}"
+                except Exception as e:  # noqa: BLE001 - never break the turn
+                    print(f"[canvas-inject-fail] {e}", file=sys.stderr)
             messages.append({"role": "user", "content": user_content})
 
             if loop_enabled:
@@ -1134,6 +1209,15 @@ class PonderOrchestrator:
                 # ``remember`` cannot be dispatched when the loop is off.
                 if self._tier2_recall_menu:
                     loop_tools = [*loop_tools, REMEMBER_SCHEMA]
+                # B4: append the ``update_canvas`` schema to a NEW list when
+                # ``--task-canvas`` is on (same new-list discipline as the
+                # ``remember`` append above -- never mutate the module-level
+                # lists, so the flag-off path hands the model the exact prior
+                # tool set -> byte-identical). Loop-path-only: the one-shot path
+                # below never sees it, so ``update_canvas`` cannot be dispatched
+                # when the loop is off (mirrors ``REMEMBER_SCHEMA``).
+                if _runtime_config.task_canvas_enabled:
+                    loop_tools = [*loop_tools, UPDATE_CANVAS_SCHEMA]
                 # B2: when ``--drill-down`` is on, swap the ``search_memory``
                 # entry for the variant WITH the ``verbatim`` param (the
                 # conversation-vs-memory split). Build a NEW list -- never
@@ -1282,6 +1366,14 @@ class PonderOrchestrator:
         if self._last_remember_menu is not None:
             result["remember_menu"] = self._last_remember_menu
             self._last_remember_menu = None
+        # B4: surface the active task canvas for observation (the gate's settled
+        # active canvas id+label+progress, or the last ``update_canvas``
+        # confirmation). Key ABSENT when the flag is off, the gate produced no
+        # canvas, or the LLM never called ``update_canvas`` this turn
+        # (``_last_canvas`` stays None) -> byte-identical to pre-B4.
+        if self._last_canvas is not None:
+            result["task_canvas"] = self._last_canvas
+            self._last_canvas = None
 
         # 2026-07-14: close the runtime gap -- persist the (prompt, response)
         # exchange as a new episode so the system learns from use. Always-encode
@@ -1289,6 +1381,20 @@ class PonderOrchestrator:
         # failure never loses the response the user already has.
         if auto_persist:
             self._persist_exchange(user_prompt, result, signal)
+        # B4: reclaim historical canvases in the same foreground-clear window
+        # as the scene decay (after persist, before the workers' foreground_busy
+        # clear -- the store mutation can't race the gate which already ran).
+        # Never deletes the active canvas; floor ``canvas_min_keep`` per user;
+        # oldest-by-``updated_ts`` beyond. Best-effort swallow. Flag-off -> no
+        # call -> byte-identical.
+        if _runtime_config.task_canvas_enabled and self.store is not None:
+            try:
+                self.store.reclaim_canvases(
+                    self.user_id,
+                    min_keep=_runtime_config.canvas_min_keep,
+                )
+            except Exception as ce:  # noqa: BLE001 - best-effort reclaim
+                print(f"[canvas-reclaim-fail] {ce}", file=sys.stderr)
         # The foreground response is fully built + persisted; release the
         # background distill worker so it can fill this turn's (and any queued
         # turn's) graph edges in the now-idle GPU gap. No-op without a worker.
@@ -1989,6 +2095,189 @@ class PonderOrchestrator:
         text = _format_remember_menu(items)
         self._last_remember_menu = items  # structured observability (surfaces on result)
         return text
+
+    # ── B4: Mermaid task canvas -- L1.5 lifecycle gate + authoring tool ──
+
+    def _run_canvas_gate(self, user_prompt: str,
+                         conversation_history: Optional[list[dict]]) -> None:
+        """L1.5 task-lifecycle gate -- SYNCHRONOUS, per-turn, best-effort.
+
+        Runs at the top of ``query()`` (before ``_synthesize`` builds messages)
+        so the active canvas is settled before injection. Asks
+        ``canvas_decider.judge_task_lifecycle`` for a 5-field judgment, then
+        ``apply_lifecycle`` maps it deterministically to one of four
+        transitions (create / switch-resume / clear / keep) on the store.
+        Sets ``self._active_canvas_id`` for the turn; ``None`` when the gate
+        produced no canvas or failed -> no injection -> byte-identical to flag-
+        off for that turn. Never raises: a gate failure logs + leaves the
+        active canvas as whatever the store's current active is (or ``None``).
+        """
+        try:
+            active = self.store.get_active_canvas(self.user_id)
+            # Historical catalog for the resume decision (most-recent 10 by
+            # ``updated_ts``); best-effort -- a hydrate failure skips an id.
+            hist: list[dict] = []
+            try:
+                cids = self.store.canvas_ids_for_user(self.user_id) or set()
+                for cid in cids:
+                    if active is not None and cid == active.get("canvas_id"):
+                        continue
+                    cv = self.store.get_canvas(cid)
+                    if cv is not None:
+                        hist.append(cv)
+                hist.sort(key=lambda c: c.get("updated_ts") or "",
+                          reverse=True)
+                hist = hist[:10]
+            except Exception as he:  # noqa: BLE001 - catalog is best-effort
+                print(f"[canvas-catalog-fail] {he}", file=sys.stderr)
+                hist = []
+            # Trim the recent messages to the last ~6 (text truncated) the
+            # prompt helper expects; ``conversation_history`` may be None.
+            recent = (conversation_history or [])[-6:]
+            judgment = self._canvas_decider.judge_task_lifecycle(
+                self.user_id, recent, active, hist)
+            self._apply_canvas_lifecycle(user_prompt, active, hist, judgment)
+        except Exception as e:  # noqa: BLE001 - gate is best-effort
+            print(f"[canvas-gate-fail] {e}", file=sys.stderr)
+            # Fall back to the store's current active (or None) so the turn
+            # proceeds; never break the turn.
+            try:
+                cur = self.store.get_active_canvas(self.user_id)
+                self._active_canvas_id = (
+                    cur["canvas_id"] if cur is not None else None)
+            except Exception:  # noqa: BLE001
+                self._active_canvas_id = None
+
+    def _apply_canvas_lifecycle(self, user_prompt: str,
+                                active: Optional[dict], hist: list[dict],
+                                judgment: Optional[dict]) -> None:
+        """Deterministic mapping of the gate's 5-field judgment to a store
+        transition. No LLM. Precedence matches the prompt's stated order: clear
+        (taskCompleted) > switch/resume (isContinuation +
+        continuationCanvasId) > create (isLongTask and no active) > keep.
+        Sets ``self._active_canvas_id``."""
+        uid = self.user_id
+        if judgment is None:
+            # Gate returned None (cold-start or failure): keep the store's
+            # current active; no transition.
+            self._active_canvas_id = (
+                active["canvas_id"] if active is not None else None)
+            return
+        completed = bool(judgment.get("taskCompleted"))
+        is_long = bool(judgment.get("isLongTask"))
+        is_cont = bool(judgment.get("isContinuation"))
+        cont_id = judgment.get("continuationCanvasId") or ""
+        label = judgment.get("newTaskLabel") or "task"
+        # Defensive kebab-case normalization (the decider SHOULD already do this,
+        # but the orchestrator never trusts the decider's formatting -- a raw
+        # label with spaces would create an inconsistent ``has_topic T:{label}``
+        # edge key). Mirrors the decider's own normalization.
+        label = re.sub(r"\s+", "-", label.strip().lower())[:30] or "task"
+        # 1. clear -- task completed: flip the active canvas to historical
+        # (active="0"); no new active this turn.
+        if completed and active is not None:
+            try:
+                self.store.set_active_canvas(uid, None)
+            except Exception as e:  # noqa: BLE001
+                print(f"[canvas-clear-fail] {e}", file=sys.stderr)
+            self._active_canvas_id = None
+            return
+        # 2. switch/resume -- continue a prior task: set the named canvas active
+        # (must exist + belong to the user; else fall through). Checked BEFORE
+        # create so a named resume wins over a coincident isLongTask -- the
+        # prompt documents ``isContinuation > isLongTask``.
+        if is_cont and cont_id:
+            try:
+                cids = self.store.canvas_ids_for_user(uid) or set()
+                if cont_id in cids:
+                    self.store.set_active_canvas(uid, cont_id)
+                    self._active_canvas_id = cont_id
+                    self._last_canvas = {"canvas_id": cont_id,
+                                         "action": "resume"}
+                    return
+            except Exception as e:  # noqa: BLE001
+                print(f"[canvas-resume-fail] {e}", file=sys.stderr)
+            # bad id / failure -> fall through to create / keep
+        # 3. create -- a new long task with no active canvas: open a fresh
+        # canvas with a minimal Mermaid skeleton + set it active.
+        if is_long and active is None:
+            try:
+                cid = self.store.next_canvas_id()
+                ts = datetime.now().isoformat()
+                skeleton = self._canvas_skeleton(label, ts)
+                self.store.encode_canvas(
+                    cid, mermaid=skeleton, task_label=label, progress=0,
+                    created_ts=ts, updated_ts=ts, user_id=uid, active="1",
+                    node_mapping={})
+                self._active_canvas_id = cid
+                self._last_canvas = {"canvas_id": cid, "task_label": label,
+                                     "progress": 0, "action": "create"}
+            except Exception as e:  # noqa: BLE001
+                print(f"[canvas-create-fail] {e}", file=sys.stderr)
+                self._active_canvas_id = None
+            return
+        # 4. keep -- active canvas unchanged; the LLM revises it via
+        # ``update_canvas`` during synthesis.
+        self._active_canvas_id = (
+            active["canvas_id"] if active is not None else None)
+
+    @staticmethod
+    def _canvas_skeleton(label: str, ts: str) -> str:
+        """Minimal first-turn Mermaid skeleton for a freshly-created canvas.
+        The LLM revises it via ``update_canvas`` on subsequent turns."""
+        goal = (label or "task")[:60]
+        return (
+            f"%%{{taskGoal: {goal}, progress: 0, "
+            f"createdTime: {ts}, updatedTime: {ts}}}%%\n"
+            "flowchart TD\n"
+            f"    N1[\"phase: plan<br/>status: doing<br/>summary: <br/>"
+            f"Timestamp: {ts}\"]\n"
+        )
+
+    def update_canvas(self, mmd_content: str = "",
+                      file_action: str = "write",
+                      replace_blocks: Optional[list] = None,
+                      node_mapping: Optional[dict] = None) -> str:
+        """Bonsai-loop ``update_canvas`` tool handler (write/replace dual-mode).
+
+        Operates on ``self._active_canvas_id`` (the canvas the L1.5 gate
+        settled this turn). Returns a short JSON confirmation string; never
+        raises (``dispatch_tool``'s outer ``except`` is the final net). When
+        no active canvas exists -> a short ``"no active task canvas"`` error
+        (the LLM sees it as the tool result). Best-effort at every stage:
+        a validate/store failure returns a short error string, not a crash.
+        Stashes the confirmation on ``self._last_canvas`` for surfacing on
+        the result dict by ``query``.
+        """
+        if self._active_canvas_id is None or self.store is None:
+            return json.dumps({"error": "no active task canvas"})
+        try:
+            cid = self._active_canvas_id
+            cur = self.store.get_canvas(cid)
+            if cur is None:
+                return json.dumps({"error": "active canvas not found"})
+            if file_action == "replace":
+                stored = cur.get("mermaid") or ""
+                mermaid = apply_replace_blocks(stored, replace_blocks or [])
+            else:
+                mermaid = mmd_content or ""
+            ok, err = validate_canvas(
+                mermaid, max_chars=_runtime_config.canvas_max_mermaid_chars)
+            if not ok:
+                return json.dumps({"error": f"invalid canvas: {err}"})
+            meta = parse_canvas_meta(mermaid)
+            progress = int(meta.get("progress", 0))
+            self.store.touch_canvas(
+                cid, mermaid=mermaid, progress=progress,
+                node_mapping=node_mapping)
+            label = cur.get("task_label", "")
+            self._last_canvas = {"canvas_id": cid, "task_label": label,
+                                 "progress": progress, "action": file_action}
+            return json.dumps({"ok": True, "canvas_id": cid,
+                                "progress": progress})
+        except Exception as e:  # noqa: BLE001 - never raise from a tool
+            print(f"[update-canvas-fail] {e}", file=sys.stderr)
+            return json.dumps({"error": f"update failed: {e}"})
 
     def end_conversation(self) -> None:
         """Close the live-encode conversation session.

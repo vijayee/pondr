@@ -1000,3 +1000,104 @@ SOURCE:
 
 Return ONLY valid JSON:
 {{"summary": "..."}}"""
+
+
+def bonsai_judge_task_lifecycle_prompt(
+    user_id: str,
+    recent_messages: list[dict],
+    active_canvas: Optional[dict],
+    historical_canvases: list[dict],
+) -> str:
+    """Prompt for the Bonsai L1.5 task-canvas LIFECYCLE gate (B4).
+
+    The orchestrator calls this ONCE per turn (synchronous, before synthesis)
+    to decide create/switch/clear/keep for the active task canvas. The 8B picks
+    one of five lifecycle judgments, emitted as a FLAT JSON object (single
+    object, like ``bonsai_author_scene_prompt`` -- NOT a list, so no
+    ``{{"tasks":[...]}}`` envelope trick is needed; ``_parse_json_object``'s
+    dict-only guard accepts it):
+
+    * ``taskCompleted`` -- the active task is done; clear it (flip to historical).
+    * ``isLongTask`` -- this turn starts/resumes a long-horizon task that
+      warrants a canvas (create one if none is active).
+    * ``isContinuation`` + ``continuationCanvasId`` -- this turn resumes a
+      PRIOR task; switch the active canvas to that historical id.
+    * ``newTaskLabel`` -- a kebab-case label <=30 chars for a newly created
+      canvas (empty when not creating).
+
+    Inputs: the last ~6 ``conversation_history`` messages, the active canvas
+    (id+label+progress or ``None``), the most recent ~10 historical canvases by
+    ``updated_ts`` (id+label+progress, for the resume decision). Wording is
+    OPTIONAL guidance ("you may"), never imperative (per
+    [[llm-tool-use-prompts-optional]]). The orchestrator's deterministic
+    ``apply_lifecycle`` maps the 5-field judgment to store transitions.
+    """
+    import json as _json
+    # Recent messages: last 6, rendered as "role: text" (text truncated).
+    msg_lines = []
+    for m in (recent_messages or [])[-6:]:
+        role = m.get("role", "?") if isinstance(m, dict) else "?"
+        text = (m.get("content", "") if isinstance(m, dict) else str(m)) or ""
+        msg_lines.append(f"- {role}: {text[:300]}")
+    msg_block = "\n".join(msg_lines) or "(no prior messages)"
+    if active_canvas is None:
+        active_block = "(no active canvas)"
+    else:
+        active_block = (
+            f"canvas_id={active_canvas.get('canvas_id', '')}  "
+            f"label={active_canvas.get('task_label', '')}  "
+            f"progress={active_canvas.get('progress', 0)}%")
+    if not historical_canvases:
+        hist_block = "(no historical canvases to resume)"
+    else:
+        hist_lines = [
+            f"- {c.get('canvas_id', '')} (label={c.get('task_label', '')}, "
+            f"progress={c.get('progress', 0)}%)"
+            for c in historical_canvases[:10]
+        ]
+        hist_block = "\n".join(hist_lines)
+    return f"""You are the task-lifecycle gate of a personal memory system. For one
+user ({user_id}) the system maintains an OPTIONAL "task canvas" -- a per-task
+Mermaid flowchart of the phases of a long-horizon task (done|doing|paused|
+blocked). At most ONE canvas is active at a time. Your job: decide THIS turn's
+lifecycle action from the recent conversation + the canvas state.
+
+You may decide the task is complete, that this turn is casual (no long task),
+that a long task is starting, or that the user is resuming a prior task. If you
+are unsure whether a long task is underway, prefer keeping the current state
+(no change) over creating or clearing.
+
+Decide:
+  taskCompleted (bool)    -- the active task is finished; the system will clear
+                             it (flip to historical). True only if an active
+                             canvas exists AND the user clearly wrapped it up.
+  isLongTask (bool)       -- this turn is part of a long-horizon task that
+                             warrants a canvas. False for casual chat / one-shot
+                             questions. If True and no canvas is active, the
+                             system creates one with newTaskLabel.
+  isContinuation (bool)   -- the user is resuming a PRIOR task listed in the
+                             historical canvases below. Set
+                             continuationCanvasId to that canvas's id.
+  continuationCanvasId    -- the historical canvas_id to resume (empty unless
+                             isContinuation is True).
+  newTaskLabel            -- a kebab-case label <=30 chars for a newly created
+                             canvas (lowercase, hyphens, no spaces). Empty when
+                             not creating.
+
+Precedence: taskCompleted > isContinuation > isLongTask(create) > keep.
+
+RECENT CONVERSATION:
+{msg_block}
+
+ACTIVE CANVAS:
+{active_block}
+
+HISTORICAL CANVASES (resumable):
+{hist_block}
+
+Return ONLY valid JSON:
+{{"taskCompleted": false,
+  "isLongTask": false,
+  "isContinuation": false,
+  "continuationCanvasId": "",
+  "newTaskLabel": ""}}"""

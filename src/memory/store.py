@@ -588,6 +588,266 @@ class HippocampalStore:
             ids.add(parts[2])
         return sorted(ids)
 
+    # ---- task canvas (B4: structural short-term task-state memory) ----
+    #
+    # A task canvas is a per-task Mermaid flowchart the LLM authors + reads each
+    # turn -- a STRUCTURAL task-state axis (phases: done|doing|paused|blocked)
+    # the fade cannot provide (fade is prose-only; R4 never fires on code). The
+    # offload-stack L2 analog of Tencent's Mermaid canvas. Stored IN WaveDB
+    # under ``content/canvas/{canvas_id}/...`` (mirrors B1 scenes; NOT a file on
+    # disk). The canvas is STRUCTURAL -> NO vector index (no ``_index_embedding``
+    # call); it is the ONE active canvas per user, read by id after the L1.5
+    # lifecycle gate sets it, NOT retrieved via the graph+vector pipeline (so it
+    # never enters ``episodes``/``ChunkedContext`` -- different from scenes, which
+    # ride the topics axis). One active canvas per user (``active`` = "1"/"0");
+    # a reclaim pass in the persist tail keeps a per-user historical floor.
+    # Flag-gated (``--task-canvas``) default OFF, byte-identical when off: no
+    # canvas is ever written with the flag off, so ``canvas_ids_for_user()`` is
+    # empty and no ``canvas_`` id ever enters the graph.
+
+    def _canvas_content_ops(self, canvas_id, mermaid, task_label, progress,
+                            created_ts, updated_ts, user_id, active,
+                            node_mapping=None) -> list[dict]:
+        """Content puts under ``content/canvas/{canvas_id}/...`` -- the stub half
+        of a canvas (no graph edges). Mirrors ``_scene_content_ops``: ``encode_canvas``
+        merges these with ``_canvas_edge_ops`` into ONE atomic ``batch_sync``.
+        ``mermaid`` is the Mermaid string (the VALUE, never a file on disk);
+        ``progress`` is a stringified int 0-100 (parsed from the ``%%{...}%%``
+        header on write); ``active`` is "1"/"0" (one active canvas per user);
+        ``node_mapping`` is a json dict of ``{node_id: source_id}`` provenance
+        (stored verbatim in v1 -- episode resolution is a v2 follow-on)."""
+        ops: list[dict] = [
+            {"type": "put", "key": f"content/canvas/{canvas_id}/mermaid",
+             "value": mermaid or ""},
+            {"type": "put", "key": f"content/canvas/{canvas_id}/task_label",
+             "value": task_label or ""},
+            {"type": "put", "key": f"content/canvas/{canvas_id}/progress",
+             "value": str(int(progress or 0))},
+            {"type": "put", "key": f"content/canvas/{canvas_id}/created_ts",
+             "value": created_ts or ""},
+            {"type": "put", "key": f"content/canvas/{canvas_id}/updated_ts",
+             "value": updated_ts or ""},
+            {"type": "put", "key": f"content/canvas/{canvas_id}/user_id",
+             "value": user_id or ""},
+            {"type": "put", "key": f"content/canvas/{canvas_id}/active",
+             "value": str(active or "0")},
+            {"type": "put", "key": f"content/canvas/{canvas_id}/node_mapping",
+             "value": json.dumps(node_mapping or {})},
+        ]
+        return ops
+
+    def _canvas_edge_ops(self, canvas_id, task_label, user_id,
+                         delete: bool = False) -> list[dict]:
+        """Graph index ops for a canvas (put or delete). Mirrors
+        ``_scene_edge_ops``'s ``emit`` closure + symmetric reversal. Three edge
+        types (NO ``cites`` -- v1 has no episode links):
+
+        * ``(canvas, instanceOf, CanvasBlock)`` -- typing.
+        * ``(canvas, has_topic, T:{task_label})`` -- optional topic axis
+          (grouping; the canvas is read by id, not retrieved, so this is a
+          future-facing index, not a retrieval path).
+        * ``(U:{user}, owns_canvas, canvas)`` forward + ``(canvas, owned_by,
+          U:{user})`` reverse -- the scope scan uses the forward SPO edge
+          ``memory/spo/{user}/owns_canvas/`` (see ``canvas_ids_for_user``).
+        """
+        ops: list[dict] = []
+
+        def emit(s: str, p: str, o: str) -> None:
+            ops.extend(self.graph.expand_triple(s, p, o, delete=delete))
+
+        emit(canvas_id, "instanceOf", "CanvasBlock")
+        if task_label:
+            emit(canvas_id, "has_topic", f"T:{task_label}")
+        if user_id:
+            user_node = f"U:{user_id}"
+            emit(user_node, "owns_canvas", canvas_id)
+            emit(canvas_id, "owned_by", user_node)
+        return ops
+
+    def encode_canvas(self, canvas_id, mermaid, task_label, progress,
+                      created_ts, updated_ts, user_id, active,
+                      node_mapping=None) -> None:
+        """Store a canvas's content + graph index in ONE atomic batch. Mirrors
+        ``encode_scene`` MINUS the vector index (the canvas is structural -> no
+        ``_index_embedding`` call). Idempotent: re-encoding the same
+        ``canvas_id`` overwrites in place (``batch_sync`` puts replace); with
+        ``task_label`` + ``user_id`` held stable the edges are unchanged."""
+        ops = (self._canvas_content_ops(canvas_id, mermaid, task_label, progress,
+                                        created_ts, updated_ts, user_id, active,
+                                        node_mapping)
+               + self._canvas_edge_ops(canvas_id, task_label, user_id, delete=False))
+        self.db.batch_sync(ops)
+
+    def get_canvas(self, canvas_id: str) -> "Optional[dict]":
+        """Load a canvas's content fields. Returns ``None`` for an absent
+        canvas (detected via the always-written ``active`` key -- ``get_sync``
+        returns ``None`` for a missing key, distinct from ``_b2s``'s ``""`` for
+        an empty one). Mirrors ``get_scene``."""
+        active_raw = self.db.get_sync(f"content/canvas/{canvas_id}/active")
+        if active_raw is None:
+            return None
+        mermaid = _b2s(self.db.get_sync(f"content/canvas/{canvas_id}/mermaid"))
+        task_label = _b2s(self.db.get_sync(f"content/canvas/{canvas_id}/task_label"))
+        progress_raw = _b2s(self.db.get_sync(f"content/canvas/{canvas_id}/progress"))
+        created_ts = _b2s(self.db.get_sync(f"content/canvas/{canvas_id}/created_ts"))
+        updated_ts = _b2s(self.db.get_sync(f"content/canvas/{canvas_id}/updated_ts"))
+        user_id = _b2s(self.db.get_sync(f"content/canvas/{canvas_id}/user_id"))
+        node_mapping_raw = _b2s(
+            self.db.get_sync(f"content/canvas/{canvas_id}/node_mapping"))
+        try:
+            progress = int(progress_raw) if progress_raw else 0
+        except ValueError:
+            progress = 0
+        try:
+            node_mapping = json.loads(node_mapping_raw) if node_mapping_raw else {}
+        except (ValueError, TypeError):
+            node_mapping = {}
+        return {
+            "canvas_id": canvas_id,
+            "mermaid": mermaid,
+            "task_label": task_label,
+            "progress": progress,
+            "created_ts": created_ts,
+            "updated_ts": updated_ts,
+            "user_id": user_id or None,
+            "active": _b2s(active_raw) == "1",
+            "node_mapping": node_mapping,
+        }
+
+    def touch_canvas(self, canvas_id: str, mermaid=None, progress=None,
+                     node_mapping=None) -> None:
+        """Re-write a canvas's mutable fields (``mermaid``/``progress``/
+        ``node_mapping``) + bump ``updated_ts`` (naive-local, no Z -- matches
+        episode timestamps so a mixed-result sort never TypeErrors). The cheap
+        path ``update_canvas`` calls -- no full re-encode (edges + ``user_id``/
+        ``task_label``/``active``/``created_ts`` unchanged). A missing canvas is
+        a no-op. Never raises (mirrors ``touch_scene``'s best-effort contract)."""
+        try:
+            if self.db.get_sync(f"content/canvas/{canvas_id}/active") is None:
+                return
+            ops: list[dict] = [{
+                "type": "put",
+                "key": f"content/canvas/{canvas_id}/updated_ts",
+                "value": datetime.now().isoformat(),
+            }]
+            if mermaid is not None:
+                ops.append({"type": "put",
+                            "key": f"content/canvas/{canvas_id}/mermaid",
+                            "value": mermaid})
+            if progress is not None:
+                ops.append({"type": "put",
+                            "key": f"content/canvas/{canvas_id}/progress",
+                            "value": str(int(progress))})
+            if node_mapping is not None:
+                ops.append({"type": "put",
+                            "key": f"content/canvas/{canvas_id}/node_mapping",
+                            "value": json.dumps(node_mapping)})
+            self.db.batch_sync(ops)
+        except Exception:  # noqa: BLE001 - touch is best-effort, never breaks a turn
+            pass
+
+    def delete_canvas(self, canvas_id: str) -> None:
+        """Evict a canvas: delete ALL its content keys + its graph edges
+        (symmetric reversal -- no orphan SPO/POS/OSP entries) in ONE atomic
+        ``batch_sync``. Mirrors ``delete_scene``. Content-op type is ``"del"``
+        (NOT ``"delete"`` -- the de-wonk fix; ``"delete"`` would be silently
+        wrong). NO ``_unindex_embedding`` -- the canvas is never vector-indexed.
+        The range scan enumerates every field key so a future-added field is
+        cleaned up too."""
+        cv = self.get_canvas(canvas_id)
+        ops: list[dict] = []
+        start = f"content/canvas/{canvas_id}/"
+        end = f"content/canvas/{canvas_id}/\x7f"
+        for k, _ in self.db.create_read_stream(start=start, end=end):
+            ops.append({"type": "del", "key": k})
+        if cv is not None:
+            ops += self._canvas_edge_ops(
+                canvas_id, cv.get("task_label") or "", cv.get("user_id"),
+                delete=True)
+        if ops:
+            self.db.batch_sync(ops)
+
+    def canvas_ids_for_user(self, user_id: str) -> set:
+        """All canvas ids owned by a user (scan the ``owns_canvas`` SPO index).
+        EXACT mirror of ``scene_ids_for_user`` with the canvas predicate. Empty
+        for an unknown user; canvases with ``user_id=None`` are NOT in any
+        user's set (excluded under strict scope)."""
+        user = f"U:{user_id}"
+        start = f"memory/spo/{user}/owns_canvas/"
+        end = f"memory/spo/{user}/owns_canvas/\x7f"
+        out: set = set()
+        for k, _ in self.db.create_read_stream(start=start, end=end):
+            canvas_id = k.rsplit("/", 1)[-1]
+            if canvas_id:
+                out.add(canvas_id)
+        return out
+
+    def set_active_canvas(self, user_id: str, canvas_id: str) -> None:
+        """Mark ``canvas_id`` as the ONE active canvas for ``user_id``: flip the
+        prior active canvas's ``active`` field to "0" (if any), set the new one's
+        to "1". Enforces one-active-per-user. A ``canvas_id`` of ``None``/empty
+        just clears the prior (the ``clear`` lifecycle case). Best-effort never
+        raises -- a corrupt prior-active is skipped, not fatal."""
+        try:
+            # Flip the prior active canvas (if any) to historical.
+            prior = self.get_active_canvas(user_id)
+            if prior is not None and prior["canvas_id"] != canvas_id:
+                self.db.batch_sync([{
+                    "type": "put",
+                    "key": f"content/canvas/{prior['canvas_id']}/active",
+                    "value": "0",
+                }])
+            if canvas_id:
+                self.db.batch_sync([{
+                    "type": "put",
+                    "key": f"content/canvas/{canvas_id}/active",
+                    "value": "1",
+                }])
+        except Exception:  # noqa: BLE001 - active flip is best-effort
+            pass
+
+    def get_active_canvas(self, user_id: str) -> "Optional[dict]":
+        """The ONE active canvas for ``user_id`` (``active == "1"``), or
+        ``None``. Scans ``canvas_ids_for_user`` + reads each ``active`` flag;
+        returns the first active. (At most one by the ``set_active_canvas``
+        invariant; a pre-existing double-active from a race resolves to the
+        lowest id deterministically.)"""
+        for cid in sorted(self.canvas_ids_for_user(user_id)):
+            if _b2s(self.db.get_sync(f"content/canvas/{cid}/active")) == "1":
+                return self.get_canvas(cid)
+        return None
+
+    def reclaim_canvases(self, user_id: str, *, min_keep: int = 15) -> int:
+        """Per-user historical-canvas reclaim: NEVER delete the active canvas;
+        keep at least ``min_keep`` historical canvases; beyond the floor, delete
+        oldest-by-``updated_ts``. Returns the number deleted. Mirrors the
+        scene heat-evict macro-forgetting but on the ``updated_ts`` axis (a
+        canvas has no heat signal -- recency is the forgetting signal). Called
+        by the orchestrator's persist-tail reclaim step (gated on
+        ``--task-canvas``). Best-effort never raises."""
+        try:
+            ids = self.canvas_ids_for_user(user_id)
+            if not ids:
+                return 0
+            canvases = [c for c in (self.get_canvas(cid) for cid in ids) if c]
+            active = [c for c in canvases if c["active"]]
+            historical = [c for c in canvases if not c["active"]]
+            if len(historical) <= min_keep:
+                return 0
+            # Oldest-by-updated_ts beyond the floor. Empty/missing ts sorts
+            # oldest (treated as "" -> sorts first) -- the conservative choice.
+            historical.sort(key=lambda c: c.get("updated_ts") or "")
+            to_drop = historical[:len(historical) - min_keep]
+            for c in to_drop:
+                # Defensive: never delete an active canvas even if the active
+                # flag flipped between the partition above and here.
+                if c["active"]:
+                    continue
+                self.delete_canvas(c["canvas_id"])
+            return len(to_drop)
+        except Exception:  # noqa: BLE001 - reclaim is best-effort
+            return 0
+
     # ---- retrieve ----
 
     def get_episode(self, episode_id: str) -> Optional[Episode]:
@@ -1761,6 +2021,15 @@ class HippocampalStore:
         ``next_episode_id``). Mirrors ``next_document_id`` (``store.py:1714``).
         """
         return f"scene_{self._counter_next('scene_counter'):06d}"
+
+    def next_canvas_id(self) -> str:
+        """Globally-unique, monotonically-increasing task-canvas id
+        (``canvas_NNNNNN``).
+
+        Counter lives under ``content/system/canvas_counter`` -- a NEW counter
+        key, no collision (same non-atomic-RMW caveat as ``next_scene_id``).
+        Mirrors ``next_scene_id`` (``store.py:1754``)."""
+        return f"canvas_{self._counter_next('canvas_counter'):06d}"
 
     def document_id_by_source(self, source_path: str) -> Optional[str]:
         """Resolve upsert identity: the doc id for ``source_path``, or ``None``.

@@ -94,6 +94,7 @@ def build_ponder(
     fade_drift_defer_threshold: Optional[float] = None,
     drill_down: bool = False,
     reclaim: bool = False,
+    task_canvas: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -277,6 +278,15 @@ def build_ponder(
     # overflow path -> byte-identical. No constructor threading: the formatter
     # reads ``config.reclaim_enabled`` + the three tunables directly.
     config.reclaim_enabled = reclaim
+    # B4: Mermaid task canvas master flag (read at call time by the orchestrator
+    # L1.5 gate + injection + loop_tools append + reclaim -- same master-config
+    # convention as ``reclaim`` / ``drill_down`` / ``dedup``). Set before the
+    # store ctor so call-time reads see a consistent value. ``serve_ponder`` sets
+    # the same global before build_ponder; setting it here too covers direct
+    # build_ponder callers. Default OFF -> no gate call / tool / injection /
+    # reclaim -> byte-identical. No constructor threading: the orchestrator reads
+    # ``config.task_canvas_enabled`` + the three tunables directly.
+    config.task_canvas_enabled = task_canvas
     if llm_telemetry:
         # Swap the module sink to a path-backed JSONL writer. The null sink
         # (default) records nothing, so flag-on-without-configure is a silent
@@ -515,6 +525,21 @@ def build_ponder(
         scene_worker = SceneAuthoringWorker(
             store, default_scene_author().decider, embedder)
 
+    # B4: the L1.5 task-canvas lifecycle gate's decider. Constructed ONLY when
+    # ``task_canvas`` is on (the byte-identical-OFF gate: flag off -> no decider
+    # -> ``self._canvas_decider is None`` -> the gate + ``update_canvas`` short-
+    # circuit -> no gate call / tool / injection -> byte-identical to pre-B4).
+    # A fresh ``BonsaiDecider()`` (reads endpoint/model from config; HTTP call
+    # lazy + one-per-turn). ``pause_gate`` stays ``None`` (the class default): the
+    # gate runs SYNCHRONOUSLY inline in ``query()`` -- installing a pause_gate
+    # there would deadlock (it would block while the foreground is busy). A
+    # second decider instance is cheap (no connection at construct time) and
+    # matches the dedup path's ``BonsaiDecider()`` pattern.
+    canvas_decider = None
+    if task_canvas:
+        from .gnn.bonsai_decider import BonsaiDecider
+        canvas_decider = BonsaiDecider()
+
     orch = PonderOrchestrator(
         store=store,
         retriever=retriever,
@@ -540,6 +565,8 @@ def build_ponder(
         tier2_recall_menu=tier2_recall_menu,
         scene_blocks=scene_blocks,
         scene_worker=scene_worker,
+        task_canvas=task_canvas,
+        canvas_decider=canvas_decider,
     )
     return orch
 
