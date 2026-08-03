@@ -893,6 +893,13 @@ class PonderOrchestrator:
                         "regime": r.regime,
                         "regime_name": names.get(r.regime, "?"),
                         "cos": r.cos,
+                        # A4: prompt relevance (cos(bge(prompt), bge(anchor))),
+                        # surfaced from BlurbStore.retrieve in FadeMemory.recall.
+                        # The within-regime drop key for the fade-block budget
+                        # cascade (the free router ``cos`` is recoverability).
+                        # Observability + the drop-key source -- NOT LLM-facing
+                        # (only the rendered block string reaches the LLM).
+                        "cos_q": r.cos_q,
                         "content": r.content,
                         "blurb": r.blurb,
                         # Phase C observability: how many times this anchor has
@@ -1083,7 +1090,14 @@ class PonderOrchestrator:
                 # a render failure leaves ``user_content`` unchanged (the turn
                 # proceeds), mirroring the recall seam's swallow.
                 try:
-                    block = self._format_fade_block(fade_recalls)
+                    # A4: pass the fade-block token budget so ``format_fade_block``
+                    # can drop recalls regime-cascade (R3 before R1; lowest cos_q
+                    # within a regime) when the block overflows. Default config
+                    # 1024 is inert at current top_k=5 x blurb_chars=600 (~750
+                    # tokens) -> no drop -> byte-identical to pre-A4.
+                    block = self._format_fade_block(
+                        fade_recalls,
+                        max_tokens=self._fade.cfg.fade_block_max_tokens)
                 except Exception as e:  # noqa: BLE001 - never break the turn
                     print(f"[fade-inject-fail] {e}", file=sys.stderr)
                     block = ""

@@ -84,11 +84,11 @@ REGIME_NAME: dict[int, str] = {
 }
 
 
-def format_fade_block(recalls: list[dict]) -> str:
+def format_fade_block(recalls: list[dict], max_tokens: int = 0) -> str:
     """Render fade recalls as a ``[FADE MEMORY]`` block for the LLM context.
 
     Takes the dict shape the orchestrator's RECALL seam builds
-    (``{anchor_id, regime, regime_name, cos, content, blurb}``). Lists only
+    (``{anchor_id, regime, regime_name, cos, cos_q, content, blurb}``). Lists only
     CONTENT-BEARING recalls:
 
     - R1 (verbatim): the recent exact text.
@@ -105,8 +105,33 @@ def format_fade_block(recalls: list[dict]) -> str:
     Returns ``""`` when no content-bearing recalls are present (so the block is
     omitted entirely -- no empty header). Bounded by the seam's ``top_k`` /
     ``blurb_chars`` caps (the recalls arrive already capped).
+
+    A4 budget cascade (``max_tokens > 0``): the block sits OUTSIDE the chunker's
+    context budget, so this is the only place it is bounded. When the rendered
+    block exceeds ``max_tokens`` (``len//4`` estimate, the codebase convention),
+    recalls are dropped until it fits: most-faded first -- R3 (gist) before R1
+    (verbatim), R4 already excluded -- and within a regime the lowest ``cos_q``
+    (prompt relevance) first. ``max_tokens=0`` (default) = no budget = the block
+    is byte-identical to pre-A4. When the block fits, no drop occurs -> also
+    byte-identical. Kept recalls preserve their input order (the retriever's
+    relevance order).
     """
-    lines: list[str] = []
+    header = ("[FADE MEMORY -- your fading working memory of this conversation]\n"
+              "(Recent exchanges are recalled exactly; older ones are given as a "
+              "fading gist. What has fully faded is not listed.)")
+
+    def _line(regime: int, content: str, r: dict) -> str:
+        if regime == REGIME_VERBATIM:
+            return f"[verbatim, recent] {content}"
+        if regime == REGIME_GIST:
+            return f"[gist, fading] {content}"
+        if regime == REGIME_FILL:
+            return f"[fill, reconstructed] {content}"
+        return f"[{r.get('regime_name') or regime}] {content}"
+
+    # Content-bearing items in INPUT order (preserves the retriever's relevance
+    # order for the kept recalls -> byte-identical when none are dropped).
+    items: list[tuple[int, str, dict]] = []
     for r in recalls:
         regime = r.get("regime")
         if regime == REGIME_FORGOTTEN:
@@ -114,20 +139,32 @@ def format_fade_block(recalls: list[dict]) -> str:
         content = (r.get("content") or "").strip()
         if not content:
             continue
-        if regime == REGIME_VERBATIM:
-            lines.append(f"[verbatim, recent] {content}")
-        elif regime == REGIME_GIST:
-            lines.append(f"[gist, fading] {content}")
-        elif regime == REGIME_FILL:
-            lines.append(f"[fill, reconstructed] {content}")
-        else:
-            lines.append(f"[{r.get('regime_name') or regime}] {content}")
-    if not lines:
+        items.append((regime, content, r))
+    if not items:
         return ""
-    header = ("[FADE MEMORY -- your fading working memory of this conversation]\n"
-              "(Recent exchanges are recalled exactly; older ones are given as a "
-              "fading gist. What has fully faded is not listed.)")
-    return header + "\n" + "\n".join(lines)
+
+    def _render(its: list[tuple[int, str, dict]]) -> str:
+        return header + "\n" + "\n".join(_line(reg, c, r) for reg, c, r in its)
+
+    block = _render(items)
+
+    # A4: regime-cascade drop when over budget. Highest regime first (R3=3 >
+    # R2=2 > R1=1; R4 already excluded); within a regime, lowest cos_q (max of
+    # ``-cos_q``) first. Re-render after each drop. Terminates: ``items``
+    # shrinks each iteration.
+    if max_tokens > 0:
+        while items and (len(block) // 4) > max_tokens:
+            victim = max(range(len(items)),
+                         key=lambda i: (items[i][0], -items[i][2].get("cos_q", 0.0)))
+            items.pop(victim)
+            block = _render(items)
+        # Budget too tight for any recall -> omit the block entirely (no empty
+        # header -- mirrors the no-items contract above). Unreachable at the
+        # inert default 1024 (~750-token block); only a very tight config drops
+        # every recall, and a header-only block would mislead the LLM.
+        if not items:
+            return ""
+    return block
 
 
 class Embedder(Protocol):
@@ -173,6 +210,15 @@ class FadeConfig:
     blurb_chars: int = 600      # max chars of chunk text stored as the blurb
     expand_tokens: int = 64     # SSM-B continuation length for a gist
     regime2_enabled: bool = False  # Transformer fill-holes (Stage 2, off)
+    # A4: token budget on the rendered ``[FADE MEMORY]`` block. The block sits
+    # OUTSIDE the chunker's context budget (it is prepended to ``user_content``
+    # after the chunked context is built), so without this it escapes every
+    # cap. Inert at current defaults (top_k=5 x blurb_chars=600 ~ 750 tokens <
+    # 1024). When the block overflows, ``format_fade_block`` drops recalls
+    # regime-cascade: R3 (gist) before R1 (verbatim) -- R4 is already skipped at
+    # render; within a regime, lowest ``cos_q`` (prompt relevance) first. 0 = no
+    # budget = byte-identical to pre-A4. ~25% of the 4000-token context budget.
+    fade_block_max_tokens: int = 1024
 
 
 # ----------------------------------------------------------------------- SSM-A
@@ -422,6 +468,12 @@ class Recall:
     cos: float                  # cos(state_t, bge(anchor_i)) -- the free router
     content: str                # verbatim text (R1) / expanded blurb (R3) / marker (R4)
     blurb: Optional[str] = None  # the retrieved blurb before expansion (R3 only)
+    cos_q: float = 0.0          # cos(bge(prompt), bge(anchor)) -- prompt relevance;
+                                # the within-regime drop key for the A4 budget cascade
+                                # (the free router ``cos`` is recoverability, ~constant
+                                # within a regime, so it is useless as a tiebreak).
+                                # Surfaced from ``BlurbStore.retrieve`` in ``recall``
+                                # (was discarded pre-A4); 0.0 when unset.
 
 
 # ----------------------------------------------------------------- FadeMemory
@@ -584,9 +636,13 @@ class FadeMemory:
         q = self._encode_one(query_text)
         candidates = self.blurbs.retrieve(q, k=top_k)  # (anchor_id, cos_q, text)
         out: list[Recall] = []
-        for anchor_id, _, _ in candidates:
+        for anchor_id, cos_q, _ in candidates:
             r = self.recall_anchor(anchor_id)
             if r is not None:
+                # A4: surface the prompt-relevance cosine (was discarded pre-A4)
+                # so ``format_fade_block``'s budget cascade can drop the
+                # least-prompt-relevant recall within a regime first.
+                r.cos_q = cos_q
                 out.append(r)
         return out
 
