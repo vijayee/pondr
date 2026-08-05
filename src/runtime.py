@@ -88,6 +88,7 @@ def build_ponder(
     tier2_recall_menu: bool = False,
     scene_blocks: bool = False,
     hybrid_retrieval: bool = False,
+    rerank: bool = False,
     dedup: bool = False,
     llm_telemetry: bool = False,
     llm_telemetry_path: Optional[str] = None,
@@ -244,6 +245,13 @@ def build_ponder(
     # entry points agree; setting it here too covers direct ``build_ponder``
     # callers (tests, scripts) that pass the param without going through serve.
     config.hybrid_retrieval = hybrid_retrieval
+    # Cross-encoder re-ranker (LongMemEval fix (2)): set the master-config flag
+    # before the retriever ctor so the call-time gate (``_rerank_cross_encoder``
+    # reads ``config.rerank_enabled``) sees a consistent value (same convention
+    # as ``hybrid_retrieval`` above). ``serve_ponder`` sets the same global
+    # before build_ponder; setting it here too covers direct ``build_ponder``
+    # callers (tests, scripts) that pass the param without going through serve.
+    config.rerank_enabled = rerank
     # A1: set the master-config flag before the store + encoder ctor so the
     # encoder's call-time gate (``_maybe_dedup`` reads ``config.dedup_enabled``)
     # sees a consistent value (same convention as ``hybrid_retrieval`` above).
@@ -341,6 +349,20 @@ def build_ponder(
         from .retrieval.bm25 import BM25Search
         retriever.bm25 = BM25Search(store.db)
         retriever.hybrid_retrieval = True
+
+    # Cross-encoder re-ranker (LongMemEval fix (2)): attach a
+    # ``CrossEncoderReranker`` so the retriever's call-time gate
+    # (``_rerank_cross_encoder``) re-scores the final results with a dedicated
+    # cross-encoder. ``rerank_enabled`` already set the master-config singleton
+    # above so the gate is on; this wires the reranker instance. Off -> the attr
+    # stays None -> the gate is a no-op -> byte-identical. The reranker lazy-
+    # loads the model on first ``rerank`` call (NOT at build), so attaching it
+    # here is cheap and defers the ~568MB download to first query.
+    if rerank:
+        from .retrieval.reranker import CrossEncoderReranker
+        retriever.reranker = CrossEncoderReranker(
+            model_name=config.rerank_model, device=config.rerank_device,
+        )
 
     gen = mode_a if mode_a is not None else ModeAGenerator(retriever, endpoint=endpoint)
 

@@ -380,6 +380,31 @@ def main() -> int:
                         "-> no content/idx/ keys written + retrieve takes the "
                         "existing graph+vector-fallback path -> byte-identical "
                         "to pre-A2. No new training/GPU/GNN/LLM-call.")
+    p.add_argument("--rerank", action="store_true", default=False,
+                   help="Cross-encoder re-ranker (LongMemEval fix (2)): after "
+                        "graph+vector(+BM25) retrieval, re-score the final "
+                        "top-K results with a dedicated cross-encoder "
+                        "(--rerank-model, default BAAI/bge-reranker-v2-m3) by "
+                        "query-doc interaction, then re-order by that score. A "
+                        "DIFFERENT signal than the DeepSeek same-model re-rank "
+                        "(fix (2), scored 38/50 -- added nothing) and than "
+                        "bi-embedding cosine: it can demote a lexically-similar-"
+                        "but-off-topic hit that graph+vector+BM25 all ranked "
+                        "high. Targets the multi-session failure mode (relevant "
+                        "cross-session episodes surfaced by recall but buried "
+                        "rank 4-20). The reranker lazy-loads the model on the "
+                        "first query (~568MB one-time download). DEFAULT OFF "
+                        "-> no reranker attached + the retriever call site is a "
+                        "guarded no-op -> byte-identical. No new "
+                        "training/GPU/GNN. --rerank-device 'auto' uses CUDA w/ "
+                        "CPU fallback (mirrors --gliner-device).")
+    p.add_argument("--rerank-model", default="BAAI/bge-reranker-v2-m3",
+                   help="The cross-encoder model name for --rerank (a "
+                        "sentence_transformers.CrossEncoder-compatible HF id). "
+                        "Default BAAI/bge-reranker-v2-m3 (multilingual, 568MB).")
+    p.add_argument("--rerank-device", default="auto",
+                   help="Device for the cross-encoder ('auto' -> CUDA if "
+                        "available else CPU; mirrors --gliner-device).")
     p.add_argument("--dedup", action="store_true", default=False,
                    help="A1 LLM-judged 4-action dedup: after each new episode is "
                         "fully encoded, vector-recall the user's active corpus "
@@ -466,6 +491,15 @@ def main() -> int:
     # build_ponder (build_ponder also sets it from its param, covering direct
     # callers). Default OFF -> no content/idx/ writes + retrieve off-path.
     _config.hybrid_retrieval = args.hybrid_retrieval
+    # Cross-encoder re-ranker: rerank_enabled is read at call time by the
+    # retriever's ``_rerank_cross_encoder`` gate (master-config convention), so
+    # set the global BEFORE build_ponder (build_ponder also sets it from its
+    # param, covering direct callers). Default OFF -> gate no-op -> byte-
+    # identical. ``rerank_model`` + ``rerank_device`` are read by build_ponder
+    # when attaching the reranker, so set them here too (cover the serve path).
+    _config.rerank_enabled = args.rerank
+    _config.rerank_model = args.rerank_model
+    _config.rerank_device = args.rerank_device
     # A1: dedup_enabled is read at call time by the encoder's ``_maybe_dedup``
     # (the master-config convention), so set the global BEFORE build_ponder
     # (build_ponder also sets it from its param, covering direct callers).
@@ -719,6 +753,8 @@ def main() -> int:
     print(f"[load] tier2_recall_menu={args.tier2_recall_menu}", file=sys.stderr)
     print(f"[load] scene_blocks={args.scene_blocks}", file=sys.stderr)
     print(f"[load] hybrid_retrieval={args.hybrid_retrieval}", file=sys.stderr)
+    print(f"[load] rerank={args.rerank} model={args.rerank_model} "
+          f"device={args.rerank_device}", file=sys.stderr)
     print(f"[load] dedup={args.dedup}", file=sys.stderr)
     print(f"[load] llm_telemetry={args.llm_telemetry}", file=sys.stderr)
     print(f"[load] drill_down={args.drill_down}", file=sys.stderr)
@@ -762,6 +798,7 @@ def main() -> int:
         tier2_recall_menu=args.tier2_recall_menu,
         scene_blocks=args.scene_blocks,
         hybrid_retrieval=args.hybrid_retrieval,
+        rerank=args.rerank,
         dedup=args.dedup,
         llm_telemetry=args.llm_telemetry,
         llm_telemetry_path=args.llm_telemetry_path,

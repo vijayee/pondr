@@ -39,6 +39,7 @@ if TYPE_CHECKING:  # torch/subconscious only needed for type hints, not at runti
     from ..subconscious.routing import RoutingDecision, RoutingOutcome
     from .bm25 import BM25Search
     from .document_retriever import DocumentRetriever
+    from .reranker import CrossEncoderReranker
 
 
 # User-scope vector over-fetch factor. When user-scope is ON, the semantic /
@@ -121,6 +122,16 @@ class HippocampalRetriever:
         # without attaching one (e.g. a test that toggles the global directly).
         self.hybrid_retrieval = False
         self.bm25: "Optional[BM25Search]" = None
+
+        # Cross-encoder re-ranker (LongMemEval fix (2)): when
+        # ``config.rerank_enabled`` is set AND a ``CrossEncoderReranker`` is
+        # attached (both by ``runtime.build_ponder`` under ``--rerank``),
+        # :meth:`retrieve` and :meth:`_retrieve_hybrid` re-score their final
+        # results with a dedicated cross-encoder before returning. The call site
+        # is a guarded no-op when the flag is off OR the reranker is None ->
+        # byte-identical to pre-rerank. ``reranker`` defaults None so a test that
+        # toggles the global without attaching one still takes the off path.
+        self.reranker: "Optional[CrossEncoderReranker]" = None
 
     def _try_load_vector_index(self) -> None:
         """Attach a vector backend for the semantic fallback.
@@ -301,6 +312,11 @@ class HippocampalRetriever:
         if self.document_retriever is not None:
             results = self.document_retriever.aggregate_results(results)
 
+        # Cross-encoder re-rank (LongMemEval fix (2)): a dedicated cross-encoder
+        # re-scores the final results by query-doc interaction, demoting
+        # off-topic hits that graph+vector+BM25 all ranked high. Guarded no-op
+        # when the flag is off OR no reranker attached -> byte-identical.
+        results = self._rerank_cross_encoder(prompt, results)
         return results
 
     def _retrieve_hybrid(
@@ -415,7 +431,37 @@ class HippocampalRetriever:
         results = self._kind_aware_rerank(results)
         if self.document_retriever is not None:
             results = self.document_retriever.aggregate_results(results)
+        # Cross-encoder re-rank (same guarded no-op as the off path; see
+        # ``retrieve``). The RRF order is the input to the cross-encoder, so a
+        # genuine cross-encoder signal re-orders it; OFF -> byte-identical.
+        results = self._rerank_cross_encoder(prompt, results)
         return results
+
+    def _rerank_cross_encoder(
+        self, prompt: str, results: list[dict],
+    ) -> list[dict]:
+        """Re-order ``results`` with the attached cross-encoder re-ranker.
+
+        Guarded no-op when ``config.rerank_enabled`` is off OR no reranker is
+        attached -> returns ``results`` unchanged (byte-identical to pre-rerank).
+        ``CrossEncoderReranker.rerank`` itself has a graceful failure-fallback
+        (any load/predict/OOM error -> input unchanged), so this seam is doubly
+        safe: the gate prevents the call off-path; the reranker prevents a crash
+        on-path. ``prompt`` (the raw query) is the cross-encoder's query input;
+        the reranker reads each result's ``text``/``summary`` for the doc side.
+
+        Ordering: this runs AFTER ``_kind_aware_rerank`` (the diversity cap) +
+        document aggregation, so the cross-encoder is the FINAL authority on
+        order. For a single-kind corpus (LongMemEval conversations -- all
+        ``episode``) the cap is a no-op, so this is unambiguous. For a mixed-
+        kind corpus with the cap active, the cross-encoder may bunch one kind at
+        the top -- that is the deliberate "relevance overrides diversity" trade
+        a dedicated re-ranker makes, and it is default-OFF so the baseline
+        diversity behavior is unchanged unless a caller opts in.
+        """
+        if not config.rerank_enabled or self.reranker is None:
+            return results
+        return self.reranker.rerank(prompt, results)
 
     def retrieve_with_plan(self, query_plan: dict, signal: str = "routine") -> list[dict]:
         """Traverse directly with a caller-supplied plan (skips the planner).

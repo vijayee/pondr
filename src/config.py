@@ -210,6 +210,24 @@ class Config:
     # ``assertion_extraction_enabled`` / ``forgetting_enabled``).
     hybrid_retrieval: bool = False
 
+    # ── Cross-encoder re-ranker (LongMemEval fix (2) -- dedicated signal) ──
+    # When True, the retriever re-scores its top-K results with a
+    # ``CrossEncoder`` (default ``BAAI/bge-reranker-v2-m3``) -- query-doc
+    # interaction scoring, a DIFFERENT signal than the graph/vector/BM25 ranks
+    # and the DeepSeek same-model re-rank. Targets the multi-session failure
+    # mode where relevant cross-session episodes are surfaced by RRF recall but
+    # buried at rank 4-20 under off-topic hits. The reranker is attached to the
+    # retriever by ``runtime.build_ponder`` under ``--rerank`` (mirrors
+    # ``hybrid_retrieval``'s BM25 wiring); the call site is a guarded no-op when
+    # the flag is off OR the reranker is None -> byte-identical to pre-rerank.
+    # Read at call time via ``from ..config import config`` (master-config style,
+    # mirrors ``hybrid_retrieval`` / ``dedup_enabled``). ``rerank_model`` +
+    # ``rerank_device`` (``"auto"`` -> CUDA w/ CPU fallback) are read at load
+    # time only when the flag is on.
+    rerank_enabled: bool = False
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    rerank_device: str = "auto"
+
     # ── A1: LLM-judged 4-action dedup (Tencent-survey Phase 1 item 4) ──
     # When True, the encoder runs a post-commit dedup reconcile after each new
     # episode is fully encoded: vector-recall the user's active corpus for near-
