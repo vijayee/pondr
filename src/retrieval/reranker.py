@@ -29,8 +29,9 @@ offline tools). No new dependency: ``transformers`` is already a Pondr dep
 
 Device handling mirrors ``build_embedder`` / GLiNER (``[[gliner-gpu-config-task]]``):
 ``device="auto"`` -> CUDA if available, else CPU. The CUDA move is OOM-safe
-(catches the runtime error and falls back to CPU). The model is loaded ONCE in
-the ctor and reused; ``rerank`` is stateless after that.
+(catches the runtime error and falls back to CPU). The model is loaded ONCE
+(lazily, on the first ``rerank`` call) and reused; ``rerank`` is stateless
+after that first load.
 """
 
 from __future__ import annotations
