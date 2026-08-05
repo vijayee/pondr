@@ -204,10 +204,17 @@ def test_rerank_empty_input_returns_empty():
 
 def test_result_text_prefers_text_over_summary():
     from src.retrieval.reranker import _result_text
+    # Internal retriever shape: text (full) > summary (gist).
     assert _result_text({"text": "full", "summary": "gist"}) == "full"
-    # Falls back to summary when text absent/empty.
+    # Harness-mapped shape: source_evidence (full) > memory (gist).
+    assert _result_text({"source_evidence": "full", "memory": "gist"}) == "full"
+    # text wins over source_evidence (internal shape takes precedence).
+    assert _result_text({"text": "t", "source_evidence": "se"}) == "t"
+    # Falls back across shapes: text absent -> source_evidence -> summary -> memory.
+    assert _result_text({"source_evidence": "se"}) == "se"
     assert _result_text({"summary": "gist"}) == "gist"
-    assert _result_text({"text": "", "summary": "gist"}) == "gist"
+    assert _result_text({"memory": "mem"}) == "mem"
+    assert _result_text({"text": "", "source_evidence": "se"}) == "se"
     # Empty dict -> "" (never raises; the scorer gets a low score for it).
     assert _result_text({}) == ""
     assert _result_text({"text": None, "summary": None}) == ""

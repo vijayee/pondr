@@ -50,13 +50,24 @@ def _result_text(r: dict) -> str:
     """The text we re-rank a result against the query by.
 
     Prefers ``text`` (the episode's full_text -- the most discriminative
-    surface; the same field BM25 indexes), falls back to ``summary`` (the gist)
-    for results that carry only a summary (e.g. a hydrated graph hit whose
-    full_text was truncated), then ``""`` so an empty result never breaks the
-    scorer (``CrossEncoder.predict`` on an empty string returns a low score,
-    which is the honest outcome for a contentless candidate).
+    surface; the same field BM25 indexes), then ``source_evidence`` (the harness
+    adapter's name for the same full_text -- the saved-search result shape),
+    then ``summary`` / ``memory`` (the gist -- for a hydrated graph hit whose
+    full_text was truncated, or the harness adapter's gist field), then ``""``
+    so an empty result never breaks the scorer (``CrossEncoder.predict`` on an
+    empty string returns a low score, which is the honest outcome for a
+    contentless candidate). Handling BOTH the retriever's internal dict shape
+    (``text``/``summary``) and the harness-mapped shape (``source_evidence``/
+    ``memory``) lets the same reranker re-rank live pipeline results AND saved
+    search-results files (the A/B experiment reuses saved searches).
     """
-    return (r.get("text") or r.get("summary") or "")
+    return (
+        r.get("text")
+        or r.get("source_evidence")
+        or r.get("summary")
+        or r.get("memory")
+        or ""
+    )
 
 
 class CrossEncoderReranker:
