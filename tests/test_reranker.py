@@ -1,23 +1,23 @@
 """Cross-encoder re-ranker (LongMemEval fix (2) -- dedicated signal).
 
-``src/retrieval/reranker.py`` wraps ``sentence_transformers.CrossEncoder``:
-load once (CUDA w/ CPU fallback), ``rerank(query, results)`` scores each
-result's ``text``/``summary`` vs the query and returns a NEW list in
-score-desc order. The retriever's ``_rerank_cross_encoder`` is a guarded no-op
-when ``config.rerank_enabled`` is off OR no reranker is attached (byte-
-identical). ``rerank`` itself has a graceful failure-fallback (any load /
-predict / OOM error -> input unchanged).
+``src/retrieval/reranker.py`` wraps ``transformers.AutoModelForSequence
+Classification`` (bge-reranker-v2-m3): load once (CUDA w/ CPU fallback),
+``rerank(query, results)`` scores each result's ``text``/``summary`` vs the
+query and returns a NEW list in score-desc order. The retriever's
+``_rerank_cross_encoder`` is a guarded no-op when ``config.rerank_enabled`` is
+off OR no reranker is attached (byte-identical). ``rerank`` itself has a
+graceful failure-fallback (any load / predict / OOM error -> input unchanged).
 
 These tests pin: byte-identical-OFF (gate + no reranker); ON re-orders by the
 attached reranker (stub, no network); the failure-fallback returns input
 unchanged; the input is not mutated; ``top_k`` truncates; empty input is
 byte-identical; ``_result_text`` prefers ``text`` over ``summary``.
 
-Offline: the real ``CrossEncoder`` is never loaded here -- a stub reranker
-stands in so the tests run without ``sentence_transformers`` / a 568MB
+Offline: the real ``transformers`` model is never loaded here -- a stub
+reranker stands in so the tests run without ``transformers`` / a 568MB
 download. ``CrossEncoderReranker``'s own lazy-load + fallback are exercised
 with a deliberately-broken model name (caught -> no-op), which does NOT touch
-the network when ``sentence_transformers`` is absent (the ImportError path).
+the network when ``transformers`` is absent (the ImportError path).
 """
 
 from __future__ import annotations
@@ -178,9 +178,9 @@ def test_rerank_on_does_not_mutate_input(tmp_path, rerank_on):
 # ── CrossEncoderReranker failure-fallback ─────────────────────────────────────
 
 def test_rerank_failure_fallback_returns_input_unchanged():
-    """A CrossEncoderReranker whose model fails to load (here: ``sentence_tran-
-    senters`` absent OR a bogus model name) returns the input list UNCHANGED --
-    the graceful no-op. No network when the package is absent (ImportError path)."""
+    """A CrossEncoderReranker whose model fails to load (here: ``transformers``
+    absent OR a bogus model name) returns the input list UNCHANGED -- the
+    graceful no-op. No network when the package is absent (ImportError path)."""
     from src.retrieval.reranker import CrossEncoderReranker
     ce = CrossEncoderReranker(model_name="bogus/nonexistent-model-xyz", device="cpu")
     results = [

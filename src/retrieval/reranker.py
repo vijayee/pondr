@@ -12,15 +12,25 @@ all ranked high.
 
 Flag-gated (``config.rerank_enabled``), default OFF, byte-identical when off
 (the call site is a guarded no-op: ``if config.rerank_enabled and self.reranker
-is not None``). No new dependency: ``sentence_transformers`` is already a Pondr
-dep (``build_embedder`` lazy-imports ``SentenceTransformer``; ``CrossEncoder``
-ships in the same package). Lazy-imported here too so this module imports
-without the package installed (tests + offline tools).
+is not None``).
+
+Implementation: uses ``transformers`` directly (``AutoModelForSequenceClassification``
++ ``AutoTokenizer``), NOT ``sentence_transformers.CrossEncoder``. The harness
+eval repo ships a ``datasets/`` benchmark package that shadows HuggingFace
+``datasets`` at import time, which ``sentence_transformers`` imports -- so
+``sentence_transformers`` is unimportable in the harness env (the A/B experiment
+runs there). ``transformers`` alone has no ``datasets`` import, so this module
+works in BOTH the Pondr env (live serve) and the harness env (the experiment).
+bge-reranker-v2-m3 is a standard 1-label sequence-classification transformer;
+the score is the raw logit (monotonic -> rank-equivalent to sigmoid). Lazy-
+imported so this module imports without ``transformers`` installed (tests +
+offline tools). No new dependency: ``transformers`` is already a Pondr dep
+(``build_embedder`` pulls it transitively, and the encoder uses it directly).
 
 Device handling mirrors ``build_embedder`` / GLiNER (``[[gliner-gpu-config-task]]``):
 ``device="auto"`` -> CUDA if available, else CPU. The CUDA move is OOM-safe
-(catches the runtime error and falls back to CPU). ``CrossEncoder`` is loaded
-ONCE in the ctor and reused; ``rerank`` is stateless after that.
+(catches the runtime error and falls back to CPU). The model is loaded ONCE in
+the ctor and reused; ``rerank`` is stateless after that.
 """
 
 from __future__ import annotations
@@ -71,14 +81,17 @@ def _result_text(r: dict) -> str:
 
 
 class CrossEncoderReranker:
-    """A cross-encoder re-ranker wrapping ``sentence_transformers.CrossEncoder``.
+    """A cross-encoder re-ranker over ``transformers`` sequence-classification.
 
-    Constructed ONCE (model loaded + moved to device) and reused across calls.
-    ``rerank`` scores each result's text vs the query and returns a NEW list in
-    score-desc order. The input list is never mutated. On ANY error (model load
-    failure, predict failure, OOM) ``rerank`` returns the input list UNCHANGED
-    -- the failure-fallback is "graceful no-op" (retrieval stays correct, just
-    un-re-ranked), matching the codebase convention that an optional stage never
+    bge-reranker-v2-m3 is a 1-label ``AutoModelForSequenceClassification``: the
+    relevance score for a (query, doc) pair is the model's single output logit
+    (raw, monotonic -> rank-equivalent to sigmoid). Constructed ONCE (model +
+    tokenizer loaded + moved to device) and reused across calls. ``rerank``
+    scores each result's text vs the query and returns a NEW list in score-desc
+    order. The input list is never mutated. On ANY error (model load failure,
+    predict failure, OOM) ``rerank`` returns the input list UNCHANGED -- the
+    failure-fallback is "graceful no-op" (retrieval stays correct, just un-re-
+    ranked), matching the codebase convention that an optional stage never
     degrades the baseline.
     """
 
@@ -87,30 +100,36 @@ class CrossEncoderReranker:
         model_name: str = "BAAI/bge-reranker-v2-m3",
         device: str = "auto",
         max_length: int = 512,
+        batch_size: int = 16,
     ) -> None:
         self.model_name = model_name
         self.device = device
         self.max_length = max_length
-        self._ce: Optional[Any] = None  # lazily loaded so import is side-effect-free
+        self.batch_size = batch_size
+        # Lazily loaded so the module import is side-effect-free; ``_model`` /
+        # ``_tokenizer`` are None until the first ``rerank``.
+        self._model: Optional[Any] = None
+        self._tokenizer: Optional[Any] = None
+        self._device: Optional[str] = None
 
     # ── lazy load ───────────────────────────────────────────────────────────
 
-    def _ensure_loaded(self) -> Any:
-        """Load the CrossEncoder on first use (CUDA w/ CPU fallback).
+    def _ensure_loaded(self) -> None:
+        """Load tokenizer + model on first use (CUDA w/ CPU fallback).
 
         Raises are caught at the ``rerank`` boundary so a load failure degrades
         to the no-op fallback rather than crashing retrieval. Loaded once and
-        cached on ``self._ce``.
+        cached on ``self._model`` / ``self._tokenizer``.
         """
-        if self._ce is not None:
-            return self._ce
-        from sentence_transformers import CrossEncoder  # type: ignore
+        if self._model is not None:
+            return
+        from transformers import (  # type: ignore
+            AutoModelForSequenceClassification, AutoTokenizer,
+        )
         resolved = _resolve_device(self.device)
         try:
-            self._ce = CrossEncoder(
-                self.model_name, max_length=self.max_length, device=resolved,
-            )
-        except (OSError, RuntimeError, ValueError):
+            self._load_on(resolved, AutoModelForSequenceClassification, AutoTokenizer)
+        except (OSError, RuntimeError, ValueError, EnvironmentError):
             # CUDA OOM / unavailable after the auto check, or a corrupt load ->
             # retry on CPU (the honest fallback; the model still works, just
             # slower). If THIS fails too, ``rerank`` catches it -> no-op. Skip
@@ -118,12 +137,46 @@ class CrossEncoderReranker:
             # would just re-fail the same way and delay the no-op fallback.
             if resolved == "cpu":
                 raise
-            self._ce = CrossEncoder(
-                self.model_name, max_length=self.max_length, device="cpu",
-            )
-        return self._ce
+            self._load_on("cpu", AutoModelForSequenceClassification, AutoTokenizer)
+
+    def _load_on(self, device: str, model_cls, tok_cls) -> None:
+        tok = tok_cls.from_pretrained(self.model_name)
+        model = model_cls.from_pretrained(self.model_name)
+        model.eval()
+        model.to(device)
+        self._tokenizer = tok
+        self._model = model
+        self._device = device
 
     # ── public ──────────────────────────────────────────────────────────────
+
+    def _score_pairs(self, query: str, texts: list[str]) -> list[float]:
+        """Score (query, text) pairs with the loaded model, batched.
+
+        Returns one float per pair (the raw logit). Pairs are tokenized as
+        paired sequence-classification input (query, text) with padding +
+        truncation to ``max_length``; the model's single output logit per pair
+        is the relevance score. Batched by ``batch_size`` to bound GPU memory.
+        """
+        import torch  # type: ignore
+        tok = self._tokenizer
+        model = self._model
+        device = self._device
+        scores: list[float] = []
+        for i in range(0, len(texts), self.batch_size):
+            batch_texts = texts[i:i + self.batch_size]
+            inputs = tok(
+                [query] * len(batch_texts), batch_texts,
+                padding=True, truncation=True, max_length=self.max_length,
+                return_tensors="pt",
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                logits = model(**inputs).logits.squeeze(-1)
+            # ``logits`` may be shape () (single pair), (n,) or (n, 1) ->
+            # ``tolist`` flattens all to plain floats.
+            scores.extend(float(s) for s in logits.tolist())
+        return scores
 
     def rerank(
         self,
@@ -148,20 +201,13 @@ class CrossEncoderReranker:
         if not results:
             return list(results)
         try:
-            ce = self._ensure_loaded()
-            pairs = [(query, _result_text(r)) for r in results]
-            scores = ce.predict(pairs)
-            # CrossEncoder.predict returns an ndarray; coerce to plain floats so
-            # the stamped ``rerank_score`` is JSON-serializable (the harness
-            # round-trips result dicts through json).
-            try:
-                import numpy as np  # type: ignore
-                scores = [float(s) for s in np.asarray(scores).reshape(-1)]
-            except ImportError:
-                scores = [float(s) for s in scores]
+            self._ensure_loaded()
+            texts = [_result_text(r) for r in results]
+            scores = self._score_pairs(query, texts)
         except Exception:  # noqa: BLE001 - any failure -> graceful no-op
-            # Load failure, predict failure, OOM, or numpy missing. Return the
-            # input unchanged; retrieval stays correct, just un-re-ranked.
+            # Load failure, predict failure, OOM, or transformers missing.
+            # Return the input unchanged; retrieval stays correct, just un-re-
+            # ranked.
             return list(results)
 
         # Sort by score desc. Python's sort is stable, so equal scores retain
