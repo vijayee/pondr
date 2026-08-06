@@ -10,10 +10,14 @@ dependencies = [
     # Storage: WaveDB (Graph layer = hippocampal index, HBTrie = neocortical store).
     # Windows installs use the prebuilt-DLL wheel; Linux builds libwavedb from C
     # source via CMake (needs a C compiler at install time).
-    "wavedb>=0.2.5",  # >=0.2.5: 0.2.2 sync_only scan fix (delete+re-put keys stay
-                      # visible to range scans) + vector_layer_migrate + persisted
-                      # __format type; 0.2.4 bounds subtree prefix scans to stop
-                      # over-deleting lex-greater siblings (HBTrie range-scan
+    "wavedb>=0.2.6",  # 0.2.6: atexit hook closes live dbs (subtrees-first) on
+                      # interpreter shutdown, fixing a SIGSEGV (exit 139 / Windows
+                      # 0xC0000005 in wal_manager_flush) caused by a db<->child
+                      # reference cycle stranding __del__ and leaving C worker
+                      # threads running. Prior: 0.2.2 sync_only scan fix (delete+
+                      # re-put keys stay visible to range scans) + vector_layer_migrate
+                      # + persisted __format type; 0.2.4 bounds subtree prefix scans
+                      # to stop over-deleting lex-greater siblings (HBTrie range-scan
                       # correctness -- BM25 A2 + graph traversals depend on this) +
                       # handles unpersisted root offset in superblock (persistence
                       # correctness); 0.2.5 preserves integer type through
