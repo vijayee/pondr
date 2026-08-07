@@ -48,7 +48,8 @@ Isolated module: no orchestrator/runtime/serve IMPORTS (the wiring flows one way
 imports the serve path). The voice (SSM-B) and the embedder (bge) are injected
 (``Voice`` / ``Embedder`` protocols) so the unit test runs CPU-only with synthetic
 vectors and a test-double voice; production wires the real token-LM
-(``load_token_lm_voice``) + the shared bge embedder (reused from ``build_ponder``).
+(``load_token_lm_voice``) or a pretrained Mamba3 LM (``load_mamba3_voice``) +
+the shared bge embedder (reused from ``build_ponder``).
 """
 
 from __future__ import annotations
@@ -449,6 +450,157 @@ def load_token_lm_voice(checkpoint_path: str, tokenizer_path: str,
     model.eval()
     tok = train_or_load_tokenizer(iter([]), tokenizer_path, vocab_size=cfg.vocab)
     return TokenLMVoice(model, tok, device, temperature, top_k)
+
+
+# ----------------------------------------------------------- Mamba3 voice leg
+def _bundled_tcc() -> Optional[str]:
+    """Path to the triton-windows bundled TinyCC compiler, if present.
+
+    ``triton-windows``'s ``get_cc()`` (``triton/runtime/build.py``) prefers an
+    env-MSVC ``cl`` that is too old for ``/std:c11`` over the bundled TinyCC
+    (``tcc.exe``, C11-capable), which breaks the Mamba3 Triton SISO JIT on this
+    Windows dev box. Setting ``CC=<tcc>`` forces TinyCC and unblocks the JIT.
+    See ``mamba3-siso-local-inference-works``. Returns ``None`` when triton is
+    not installed or the bundled compiler is absent (non-Windows / no
+    triton-windows) -- the caller must then export ``CC`` manually.
+
+    Locates tcc via the triton package itself first (reliable for ``--user``
+    installs, where ``sysconfig.get_paths()['platlib']`` is the SYSTEM
+    site-packages and misses the ``--user`` triton), then falls back to the
+    standard site-packages dirs.
+    """
+    import os
+    import site
+    import sysconfig
+
+    candidates: list[str] = []
+    try:
+        import triton  # noqa: F401 -- located, not used
+        candidates.append(os.path.join(os.path.dirname(triton.__file__),
+                                       "runtime", "tcc", "tcc.exe"))
+    except ImportError:
+        pass
+    for base in [sysconfig.get_paths()["platlib"], site.getusersitepackages(),
+                 *site.getsitepackages()]:
+        candidates.append(os.path.join(base, "triton", "runtime", "tcc",
+                                       "tcc.exe"))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+class Mamba3Voice:
+    """SSM-B: a real Mamba3 LM expands a retrieved blurb via continuation.
+
+    Wraps the official ``mamba_ssm`` Mamba3-SISO checkpoint
+    (``state-spaces/mamba3-siso-443m``) + the Llama-3.1 tokenizer. Unlike
+    ``TokenLMVoice`` (the owned 7.9M SelectiveSSM, val ppl 177 -- see
+    ``pondr-token-lm-ssm-result``), this is a real 443M LM -- the comparison that
+    shows what a production-scale Mamba3 brings to the voice leg. Same
+    ``Voice`` contract as ``TokenLMVoice``; selectable from ``runtime.py`` via
+    ``fade_memory_voice_backend="mamba3"``.
+
+    The official per-token ``step()`` decode kernel (CuTe DSL) is unavailable on
+    this Windows dev box (``mamba3_step_fn`` imports to ``None``), so ``expand``
+    generates via forward-per-token -- re-running the Triton SISO kernel over
+    the growing prefix each step (quadratic, but a blurb is short and 64-128
+    expand tokens is cheap on a 443M model). Research substrate; production
+    swaps in the serving LLM as the voice.
+    """
+
+    def __init__(self, model, tokenizer, device: str = "cuda",
+                 temperature: float = 0.7, top_p: float = 0.9,
+                 seed: int = 0) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.seed = int(seed)
+
+    def expand(self, blurb: str, max_new_tokens: int) -> str:
+        import torch  # lazy: keeps the module importable without torch
+
+        if not blurb.strip():
+            return blurb
+        # Llama-3.1 tokenizer: encode adds BOS (model trained with it); decode
+        # skips special tokens so the continuation is plain text.
+        ids = self.tokenizer.encode(blurb)
+        if not ids:
+            return blurb
+        cur = torch.tensor([ids], dtype=torch.long, device=self.device)
+        gen = (torch.Generator(device=self.device).manual_seed(self.seed)
+               if self.temperature > 0 else None)
+        start = cur.shape[1]
+        eos = self.tokenizer.eos_token_id
+        with torch.inference_mode():
+            for _ in range(max_new_tokens):
+                out = self.model(cur)
+                logits = out.logits if hasattr(out, "logits") else out
+                nxt = logits[0, -1].float()
+                if self.temperature <= 0:
+                    choice = torch.tensor([int(nxt.argmax().item())],
+                                          device=self.device)
+                else:
+                    probs = torch.softmax(nxt / self.temperature, dim=-1)
+                    if self.top_p < 1.0:
+                        srt, idx = torch.sort(probs, descending=True)
+                        cum = torch.cumsum(srt, dim=-1)
+                        keep = (cum - srt) < self.top_p
+                        keep[0] = True
+                        mask = torch.zeros_like(probs)
+                        mask.scatter_(0, idx[keep], srt[keep])
+                        probs = mask / mask.sum()
+                    choice = torch.multinomial(probs, 1, generator=gen)
+                cur = torch.cat([cur, choice.view(1, 1)], dim=1)
+                if int(choice.item()) == eos:
+                    break
+        new_ids = cur[0].tolist()[start:]
+        return self.tokenizer.decode(new_ids, skip_special_tokens=True)
+
+
+def load_mamba3_voice(model_id: str, tokenizer_id: str, device: str = "auto",
+                      temperature: float = 0.7, top_p: float = 0.9,
+                      seed: int = 0) -> Mamba3Voice:
+    """Load a pretrained Mamba3-SISO LM as the SSM-B voice. Lazy imports.
+
+    ``model_id``: a ``state-spaces/mamba3-siso-*`` checkpoint (443m / 893m /
+    1.5b). ``tokenizer_id``: a Llama-3.1 tokenizer repo -- the official
+    ``meta-llama/Llama-3.1-8B`` is gated; ``NousResearch/Meta-Llama-3.1-8B`` is
+    the ungated mirror. The model is frozen (``eval()``); the voice expands, it
+    does not train.
+
+    ``device`` accepts ``"auto"`` (resolve to cuda if available, else cpu), like
+    ``load_token_lm_voice``. The Mamba3 Triton SISO kernel is CUDA-only, so
+    ``"cpu"`` will fail at the first ``forward()`` -- ``"auto"`` is right.
+
+    Self-contained: if ``CC`` is unset and the triton-windows bundled TinyCC is
+    present, sets ``CC`` to it so the Triton JIT uses TinyCC instead of the
+    env-MSVC ``cl`` that breaks on ``/std:c11``. Without this the caller must
+    export ``CC=<.../tcc.exe>`` before invoking the serve path. The official
+    MIMO (``mamba3-mimo-*``) checkpoints need the tilelang kernel, which is
+    unavailable here -- use the SISO checkpoints.
+    """
+    import os
+
+    if os.environ.get("CC") is None:
+        tcc = _bundled_tcc()
+        if tcc is not None:
+            os.environ.setdefault("CC", tcc)
+
+    import torch
+    from transformers import AutoTokenizer
+
+    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = MambaLMHeadModel.from_pretrained(
+        model_id, device=device, dtype=torch.bfloat16)
+    model.eval()
+    tok = AutoTokenizer.from_pretrained(tokenizer_id)
+    return Mamba3Voice(model, tok, device, temperature, top_p, seed)
 
 
 def bge_embedder() -> Embedder:

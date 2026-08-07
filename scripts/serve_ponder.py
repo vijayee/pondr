@@ -250,7 +250,23 @@ def main() -> int:
                         "--fade-memory-tokenizer-path when set.")
     p.add_argument("--fade-memory-tokenizer-path", default=None,
                    help="the token-LM tokenizer path (required when "
-                        "--fade-memory-voice-path is set).")
+                        "--fade-memory-voice-path is set and "
+                        "--fade-memory-voice-backend=token-lm).")
+    p.add_argument("--fade-memory-voice-backend", default="token-lm",
+                   help="which SSM-B voice to wire: 'token-lm' (default, the owned "
+                        "7.9M SSMLanguageModel via --fade-memory-voice-path) or "
+                        "'mamba3' (a pretrained state-spaces/mamba3-siso-* LM via "
+                        "--fade-memory-mamba3-model). 'mamba3' runs the real LM at "
+                        "the SSM-B slot; needs CUDA + triton-windows (the loader "
+                        "sets CC to the bundled TinyCC when present). Default "
+                        "'token-lm' -> byte-identical to pre-Mamba3.")
+    p.add_argument("--fade-memory-mamba3-model", default="state-spaces/mamba3-siso-443m",
+                   help="HF model id for the 'mamba3' voice (default the SISO 443M).")
+    p.add_argument("--fade-memory-mamba3-tokenizer",
+                   default="NousResearch/Meta-Llama-3.1-8B",
+                   help="HF Llama-3.1 tokenizer id for the 'mamba3' voice (default "
+                        "the ungated NousResearch mirror; meta-llama/Llama-3.1-8B "
+                        "is gated).")
     p.add_argument("--fade-memory-top-k", type=int, default=5,
                    help="how many past anchors to route per query (default 5).")
     p.add_argument("--fade-memory-decay", type=float, default=0.99,
@@ -645,18 +661,22 @@ def main() -> int:
                   "--fade-consolidation-validate; drift is computed inside the "
                   "validate gate). Drift stays observe-only.", file=sys.stderr)
             args.fade_drift_defer_threshold = None
-        if args.fade_memory_voice_path and not args.fade_memory_tokenizer_path:
+        if (args.fade_memory_voice_backend == "token-lm"
+                and args.fade_memory_voice_path
+                and not args.fade_memory_tokenizer_path):
             print("ERROR: --fade-memory-voice-path requires "
                   "--fade-memory-tokenizer-path (the token-LM voice leg needs "
                   "its tokenizer).", file=sys.stderr)
             return 1
-        if args.fade_memory_voice_path:
+        if (args.fade_memory_voice_backend == "token-lm"
+                and args.fade_memory_voice_path):
             vp = Path(args.fade_memory_voice_path)
             if not vp.exists():
                 print(f"ERROR: --fade-memory-voice-path not found at {vp}. "
-                      f"Either point it at a real token-LM ckpt or drop the flag "
-                      f"(Regime 3 then returns the blurb verbatim, no token-LM "
-                      f"loaded).", file=sys.stderr)
+                      f"Either point it at a real token-LM ckpt, switch to "
+                      f"--fade-memory-voice-backend=mamba3, or drop the flag "
+                      f"(Regime 3 then returns the blurb verbatim).",
+                      file=sys.stderr)
                 return 1
 
     backbone_path = Path(args.backbone)
@@ -736,6 +756,7 @@ def main() -> int:
           f"strm_salience_thresholds={salience_thresholds_path or '(off)'}",
           file=sys.stderr)
     print(f"[load] fade_memory={args.fade_memory} "
+          f"fade_memory_voice_backend={args.fade_memory_voice_backend} "
           f"fade_memory_voice_path={args.fade_memory_voice_path or '(off)'} "
           f"fade_memory_cos_gist={args.fade_memory_cos_gist} "
           f"fade_memory_decay={args.fade_memory_decay} "
@@ -784,6 +805,9 @@ def main() -> int:
         fade_memory=args.fade_memory,
         fade_memory_voice_path=args.fade_memory_voice_path,
         fade_memory_tokenizer_path=args.fade_memory_tokenizer_path,
+        fade_memory_voice_backend=args.fade_memory_voice_backend,
+        fade_memory_mamba3_model=args.fade_memory_mamba3_model,
+        fade_memory_mamba3_tokenizer=args.fade_memory_mamba3_tokenizer,
         fade_memory_top_k=args.fade_memory_top_k,
         fade_memory_decay=args.fade_memory_decay,
         fade_memory_cos_gist=args.fade_memory_cos_gist,

@@ -609,3 +609,94 @@ def test_consolidate_skip_when_narrative_none() -> None:
     assert mem.recall_anchor(aid).regime == REGIME_FORGOTTEN
     assert mem.blurbs.text(aid) == before_text
     assert mem.consolidation_count(aid) == before_count == 0
+
+# --------------------------------------------------------------- Mamba3 voice
+class _StubMamba3Out:
+    """Mimics the HF-style ``model(input_ids)`` return: an object with ``.logits``."""
+
+    def __init__(self, logits):
+        self.logits = logits
+
+
+class _StubMamba3Model:
+    """Stand-in for ``MambaLMHeadModel``: argmax of the last position rotates each
+    call so the greedy continuation is a deterministic token sequence. Records
+    the prefix length it saw each call (forward-per-token -> it must grow)."""
+
+    def __init__(self, vocab: int = 20):
+        self.vocab = vocab
+        self.calls = 0
+        self.seen_seq: list[int] = []
+
+    def __call__(self, cur):
+        import torch
+
+        self.calls += 1
+        seq = cur.shape[1]
+        self.seen_seq.append(seq)
+        nxt = 10 + (self.calls % 5)      # deterministic rotating argmax
+        logits = torch.full((1, seq, self.vocab), -1e4)
+        logits[0, -1, nxt] = 0.0
+        return _StubMamba3Out(logits)
+
+
+class _StubHFTokenizer:
+    """Stand-in for the Llama-3.1 ``AutoTokenizer``: encode -> fixed ids,
+    eos -> 0 (never hit), decode -> a readable token-per-id string."""
+
+    def __init__(self):
+        self.eos_token_id = 0
+
+    def encode(self, text, add_special_tokens=True):
+        return [1, 2, 3]                 # ignores text; non-empty -> proceeds
+
+    def decode(self, ids, skip_special_tokens=True):
+        return " ".join(f"t{i}" for i in ids)
+
+
+def test_mamba3_voice_expand_greedy_continuation():
+    """Mamba3Voice.expand primes on the blurb, then forward-per-tokens: each
+    call sees the growing prefix (the quadratic re-forward, since the CuTe
+    step() kernel is unavailable). Greedy argmax -> deterministic continuation."""
+    from src.subconscious.fade import Mamba3Voice
+
+    model = _StubMamba3Model()
+    voice = Mamba3Voice(model, _StubHFTokenizer(), device="cpu", temperature=0.0)
+    out = voice.expand("the blurb", 4)
+    assert out == "t11 t12 t13 t14"          # calls 1..4 -> argmax 11..14
+    assert model.calls == 4
+    # forward-per-token: the prefix the model sees grows by one each step.
+    assert model.seen_seq == [3, 4, 5, 6]
+
+
+def test_mamba3_voice_empty_blurb_passthrough():
+    """An empty/whitespace blurb returns unchanged and never calls the model
+    (the guard before encode -> forward)."""
+    from src.subconscious.fade import Mamba3Voice
+
+    model = _StubMamba3Model()
+    voice = Mamba3Voice(model, _StubHFTokenizer(), device="cpu", temperature=0.0)
+    assert voice.expand("   ", 4) == "   "
+    assert model.calls == 0
+
+
+def test_mamba3_voice_satisfies_voice_protocol():
+    """Mamba3Voice has the ``expand(blurb, max_new_tokens) -> str`` contract the
+    ``FadeMemory`` Regime-3 path calls (duck-typed, like ``_StubVoice``)."""
+    from src.subconscious.fade import Mamba3Voice, Voice
+
+    voice = Mamba3Voice(_StubMamba3Model(), _StubHFTokenizer(), device="cpu")
+    assert callable(getattr(voice, "expand", None))
+    # Voice is a Protocol (structural); the call site does not isinstance-check,
+    # but the signature must match.
+    assert voice.expand("x", 1) != "x"
+
+
+def test_bundled_tcc_helper_is_safe():
+    """``_bundled_tcc`` returns a path when triton-windows is installed and
+    ``None`` otherwise -- never raises. Used by ``load_mamba3_voice`` to
+    self-set ``CC`` for the TinyCC Triton JIT path."""
+    from src.subconscious.fade import _bundled_tcc
+
+    tcc = _bundled_tcc()
+    assert tcc is None or isinstance(tcc, str)

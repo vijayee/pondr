@@ -74,6 +74,9 @@ def build_ponder(
     fade_memory: bool = False,
     fade_memory_voice_path: Optional[str] = None,
     fade_memory_tokenizer_path: Optional[str] = None,
+    fade_memory_voice_backend: str = "token-lm",
+    fade_memory_mamba3_model: str = "state-spaces/mamba3-siso-443m",
+    fade_memory_mamba3_tokenizer: str = "NousResearch/Meta-Llama-3.1-8B",
     fade_memory_top_k: int = 5,
     fade_memory_decay: float = 0.99,
     fade_memory_cos_gist: float = 0.40,
@@ -194,6 +197,20 @@ def build_ponder(
             is on HF, not local). Requires ``fade_memory_tokenizer_path`` when set.
         fade_memory_tokenizer_path: the token-LM tokenizer path (required when
             ``fade_memory_voice_path`` is set).
+        fade_memory_voice_backend: which SSM-B voice to wire -- ``"token-lm"``
+            (default, the owned 7.9M ``SSMLanguageModel`` via
+            ``fade_memory_voice_path``/``fade_memory_tokenizer_path``) or
+            ``"mamba3"`` (a pretrained ``state-spaces/mamba3-siso-*`` LM via
+            ``fade_memory_mamba3_model``/``fade_memory_mamba3_tokenizer``). The
+            Mamba3 voice runs the real LM at the SSM-B slot (the comparison vs
+            the 7.9M toy); it needs CUDA + triton-windows (the loader sets
+            ``CC`` to the bundled TinyCC when present). Default ``"token-lm"``
+            -> byte-identical to pre-Mamba3.
+        fade_memory_mamba3_model: the Mamba3-SISO HF model id for the
+            ``"mamba3"`` voice (default ``state-spaces/mamba3-siso-443m``).
+        fade_memory_mamba3_tokenizer: the Llama-3.1 tokenizer HF id for the
+            ``"mamba3"`` voice (default the ungated
+            ``NousResearch/Meta-Llama-3.1-8B`` mirror).
         fade_memory_top_k: how many past anchors to route per query (default 5).
         fade_memory_decay: SSM-A EWMA decay -- the fade timescale (default 0.99
             -> ~8-16-turn gist window at one chunk per exchange).
@@ -479,18 +496,27 @@ def build_ponder(
 
     # Fade memory (optional, Phase A). When ``fade_memory`` is set, construct a
     # ``FadeMemory`` that reuses THIS ``embedder`` (the one bge instance -- no
-    # second load) and an optional token-LM voice. The voice leg loads only when
-    # ``fade_memory_voice_path`` is given; otherwise Regime 3 returns the blurb
-    # verbatim (built-in passthrough), so Phase A runs without the token-LM ckpt
-    # (it is on HF, not local). ``None`` (default) -> no fade memory at serve
+    # second load) and an optional SSM-B voice. The voice leg loads when
+    # ``fade_memory_voice_backend`` is ``"mamba3"`` (a pretrained state-spaces
+    # checkpoint) or ``"token-lm"`` (the owned 7.9M SelectiveSSM, via
+    # ``fade_memory_voice_path``/``fade_memory_tokenizer_path``); otherwise
+    # (default ``"token-lm"`` with no voice path) Regime 3 returns the blurb
+    # verbatim (built-in passthrough), so Phase A runs without any voice ckpt
+    # (the token-LM ckpt is on HF, not local). ``None`` (default) -> no fade memory at serve
     # (byte-identical to pre-fade). The orchestrator gates every read on
     # ``self._fade is not None``; recalls are surfaced as ``result["fade_recalls"]``
     # for observation only -- NOT fed into the LLM context (Phase A scope).
     fade_mem = None
     if fade_memory:
-        from .subconscious.fade import FadeConfig, FadeMemory, load_token_lm_voice
+        from .subconscious.fade import (
+            FadeConfig, FadeMemory, load_mamba3_voice, load_token_lm_voice,
+        )
         voice = None
-        if fade_memory_voice_path:
+        if fade_memory_voice_backend == "mamba3":
+            voice = load_mamba3_voice(
+                fade_memory_mamba3_model, fade_memory_mamba3_tokenizer,
+                device=device)
+        elif fade_memory_voice_path:
             if not fade_memory_tokenizer_path:
                 raise ValueError(
                     "fade_memory_voice_path requires fade_memory_tokenizer_path "
