@@ -490,6 +490,100 @@ def _bundled_tcc() -> Optional[str]:
     return None
 
 
+def _mamba3_siso_carry_forward(self, u, seq_idx=None, cu_seqlens=None,
+                               inference_params=None):
+    """Carry-correct ``Mamba3.forward`` for the SISO checkpoints on this box.
+
+    Stock ``Mamba3.forward`` never threads the cached recurrent state back into
+    the Triton SISO kernel: ``Input_States`` is hardcoded ``None`` and the resume
+    path (``seqlen_offset > 0``) routes to ``self.step()``, which asserts the CuTe
+    ``mamba3_step_fn`` -- ``None`` on this pure-python install (no
+    nvidia-cutlass-dsl / quack-kernels; see ``mamba3-cuda-build-fails``). So the
+    state is written to the ``InferenceParams`` cache and never read back: naive
+    cross-call usage is silently stateless, correct usage crashes.
+
+    This forward is byte-identical to stock EXCEPT it drops the
+    ``seqlen_offset > 0 -> self.step()`` early return and threads the cached
+    state into ``mamba3_siso_combined``'s ``Input_States`` when resuming (the K
+    cache holds ``(B,1,H,d_state)``; the kernel wants ``(B,H,d_state)`` so it is
+    squeezed). ``return_final_states=True`` whenever a cache is present so the
+    next resume can seed from this call's final state. The combined kernel uses
+    EXACT math (no ``cos_approx`` / ``sin_approx`` / ``sigmoid_approx`` /
+    ``tanh_approx``), so a length-1 decode via this path is exact and O(n) -- the
+    correct local decode (the Triton ``mamba3_siso_step`` kernel accumulates
+    approximation error and collapses to a repetition attractor within a few
+    tokens; the CuTe ``mamba3_step_fn`` would be faster but needs a Linux GPU
+    pod). See ``mamba3-inference-params-carry-verdict``.
+
+    SISO-only (``is_mimo=False``); MIMO needs the tilelang kernel, unavailable
+    here -- ``load_mamba3_voice`` guards this and leaves stock forward alone for
+    MIMO checkpoints.
+    """
+    import torch
+    import torch.nn.functional as F
+    from einops import rearrange
+
+    from mamba_ssm.modules.mamba3 import heavy_tail_activation, mamba3_siso_combined
+
+    assert not self.is_mimo, "_mamba3_siso_carry_forward is SISO-only"
+    batch, seqlen, dim = u.shape
+
+    angle_dt_state = ssm_state = k_state = v_state = None
+    if inference_params is not None:
+        inference_batch = (cu_seqlens.shape[0] - 1
+                           if cu_seqlens is not None else batch)
+        angle_dt_state, ssm_state, k_state, v_state = self._get_states_from_cache(
+            inference_params, inference_batch)
+    resume = inference_params is not None and inference_params.seqlen_offset > 0
+
+    zxBCdtAtrap = self.in_proj(u)
+    z, x, B, C, dd_dt, dd_A, trap, angles = torch.split(
+        zxBCdtAtrap,
+        [self.d_inner, self.d_inner,
+         self.d_state * self.num_bc_heads * self.mimo_rank,
+         self.d_state * self.num_bc_heads * self.mimo_rank,
+         self.nheads, self.nheads, self.nheads, self.num_rope_angles],
+        dim=-1)
+    z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim)
+    x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
+    B = rearrange(B, "b l (r g n) -> b l r g n", r=self.mimo_rank, g=self.num_bc_heads)
+    C = rearrange(C, "b l (r g n) -> b l r g n", r=self.mimo_rank, g=self.num_bc_heads)
+    trap = rearrange(trap, "b l h -> b h l")
+
+    _A = torch.clamp(-heavy_tail_activation(dd_A.to(torch.float32)),
+                     max=-self.A_floor)
+    DT = F.softplus(dd_dt + self.dt_bias)
+    ADT = _A * DT
+    DT = rearrange(DT, "b l n -> b n l")
+    ADT = rearrange(ADT, "b l n -> b n l")
+    angles = angles.unsqueeze(-2).expand(-1, -1, self.nheads, -1).to(torch.float32)
+
+    B = self.B_norm(B)
+    C = self.C_norm(C)
+
+    input_states = ((angle_dt_state, ssm_state, k_state.squeeze(1), v_state)
+                    if resume else None)
+    y = mamba3_siso_combined(
+        Q=C.squeeze(2), K=B.squeeze(2), V=x, ADT=ADT, DT=DT, Trap=trap,
+        Q_bias=self.C_bias.squeeze(1), K_bias=self.B_bias.squeeze(1),
+        Angles=angles, D=self.D, Z=z if not self.is_outproj_norm else None,
+        chunk_size=self.chunk_size, Input_States=input_states,
+        return_final_states=ssm_state is not None, cu_seqlens=cu_seqlens,
+    )
+    if ssm_state is not None:
+        y, last_angle, last_state, last_k, last_v, *rest = y
+        angle_dt_state.copy_(last_angle)
+        ssm_state.copy_(last_state)
+        k_state.copy_(last_k.unsqueeze(1))
+        v_state.copy_(last_v)
+    y = rearrange(y, "b l h p -> b l (h p)")
+    if self.is_outproj_norm:
+        z = rearrange(z, "b l h p -> b l (h p)")
+        y = self.norm(y, z)
+    out = self.out_proj(y.to(x.dtype))
+    return out
+
+
 class Mamba3Voice:
     """SSM-B: a real Mamba3 LM expands a retrieved blurb via continuation.
 
@@ -501,12 +595,16 @@ class Mamba3Voice:
     ``Voice`` contract as ``TokenLMVoice``; selectable from ``runtime.py`` via
     ``fade_memory_voice_backend="mamba3"``.
 
-    The official per-token ``step()`` decode kernel (CuTe DSL) is unavailable on
-    this Windows dev box (``mamba3_step_fn`` imports to ``None``), so ``expand``
-    generates via forward-per-token -- re-running the Triton SISO kernel over
-    the growing prefix each step (quadratic, but a blurb is short and 64-128
-    expand tokens is cheap on a 443M model). Research substrate; production
-    swaps in the serving LLM as the voice.
+    ``expand`` runs a correct O(n) decode: one prefill forward over the blurb
+    seeds the recurrent state into an ``InferenceParams`` cache, then each new
+    token is a single length-1 forward that resumes from the carried state.
+    ``load_mamba3_voice`` patches ``Mamba3.forward`` with
+    ``_mamba3_siso_carry_forward`` so the resume threads the cache into the
+    EXACT Triton SISO combined kernel (``Input_States``) instead of the CuTe
+    ``step()`` kernel (``None`` on this box). The Triton ``mamba3_siso_step``
+    kernel is NOT used -- its approximations accumulate and collapse to a
+    repetition attractor within a few tokens (see ``mamba3-inference-params-carry-verdict``).
+    Research substrate; production swaps in the serving LLM as the voice.
     """
 
     def __init__(self, model, tokenizer, device: str = "cuda",
@@ -521,6 +619,7 @@ class Mamba3Voice:
 
     def expand(self, blurb: str, max_new_tokens: int) -> str:
         import torch  # lazy: keeps the module importable without torch
+        from mamba_ssm.utils.generation import InferenceParams
 
         if not blurb.strip():
             return blurb
@@ -529,19 +628,27 @@ class Mamba3Voice:
         ids = self.tokenizer.encode(blurb)
         if not ids:
             return blurb
-        cur = torch.tensor([ids], dtype=torch.long, device=self.device)
+        prompt = torch.tensor([ids], dtype=torch.long, device=self.device)
         gen = (torch.Generator(device=self.device).manual_seed(self.seed)
                if self.temperature > 0 else None)
-        start = cur.shape[1]
         eos = self.tokenizer.eos_token_id
+        # O(n) decode: prefill seeds the recurrent state into the InferenceParams
+        # cache; each new token is a length-1 forward that resumes from the
+        # carried state (via the patched _mamba3_siso_carry_forward). One forward
+        # per token, no growing-prefix re-forward.
+        max_seqlen = len(ids) + max_new_tokens + 1
+        inf = InferenceParams(max_seqlen=max_seqlen, max_batch_size=1)
+        inf.key_value_memory_dict = self.model.allocate_inference_cache(
+            1, max_seqlen)
+        new_ids: list[int] = []
         with torch.inference_mode():
+            out = self.model(prompt, inference_params=inf)
+            logits = out.logits if hasattr(out, "logits") else out
+            nxt = logits[0, -1].float()
+            inf.seqlen_offset = len(ids)
             for _ in range(max_new_tokens):
-                out = self.model(cur)
-                logits = out.logits if hasattr(out, "logits") else out
-                nxt = logits[0, -1].float()
                 if self.temperature <= 0:
-                    choice = torch.tensor([int(nxt.argmax().item())],
-                                          device=self.device)
+                    choice = int(nxt.argmax().item())
                 else:
                     probs = torch.softmax(nxt / self.temperature, dim=-1)
                     if self.top_p < 1.0:
@@ -552,11 +659,16 @@ class Mamba3Voice:
                         mask = torch.zeros_like(probs)
                         mask.scatter_(0, idx[keep], srt[keep])
                         probs = mask / mask.sum()
-                    choice = torch.multinomial(probs, 1, generator=gen)
-                cur = torch.cat([cur, choice.view(1, 1)], dim=1)
-                if int(choice.item()) == eos:
+                    choice = int(torch.multinomial(probs, 1, generator=gen).item())
+                if choice == eos:
                     break
-        new_ids = cur[0].tolist()[start:]
+                new_ids.append(choice)
+                tok = torch.tensor([[choice]], dtype=torch.long,
+                                   device=self.device)
+                out = self.model(tok, inference_params=inf)
+                logits = out.logits if hasattr(out, "logits") else out
+                nxt = logits[0, -1].float()
+                inf.seqlen_offset += 1
         return self.tokenizer.decode(new_ids, skip_special_tokens=True)
 
 
@@ -600,6 +712,14 @@ def load_mamba3_voice(model_id: str, tokenizer_id: str, device: str = "auto",
         model_id, device=device, dtype=torch.bfloat16)
     model.eval()
     tok = AutoTokenizer.from_pretrained(tokenizer_id)
+    # Patch the per-layer Mamba3 forward with the carry-correct SISO variant so
+    # the InferenceParams cache is threaded into the EXACT Triton combined kernel
+    # on resume (stock routes resume to the CuTe step() kernel, None on this box,
+    # and hardcodes Input_States=None so the cache is written but never read).
+    # SISO checkpoints only; MIMO would need the tilelang kernel (unavailable here).
+    from mamba_ssm.modules.mamba3 import Mamba3
+    if not getattr(model.backbone.layers[0].mixer, "is_mimo", False):
+        Mamba3.forward = _mamba3_siso_carry_forward
     return Mamba3Voice(model, tok, device, temperature, top_p, seed)
 
 

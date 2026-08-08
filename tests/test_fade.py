@@ -621,14 +621,20 @@ class _StubMamba3Out:
 class _StubMamba3Model:
     """Stand-in for ``MambaLMHeadModel``: argmax of the last position rotates each
     call so the greedy continuation is a deterministic token sequence. Records
-    the prefix length it saw each call (forward-per-token -> it must grow)."""
+    the sequence length it saw each call. ``expand``'s O(n) decode makes ONE
+    prefill call over the blurb (sees ``len(ids)``) then one length-1 call per
+    generated token (sees 1) -- so ``seen_seq`` is ``[blurb_len, 1, 1, ...]``,
+    NOT the growing-prefix ``[blurb, blurb+1, ...]`` of the old forward-per-token
+    path. ``inference_params`` is accepted and ignored (the stub has no real
+    recurrent state); ``allocate_inference_cache`` returns an empty dict the
+    caller stores and never inspects."""
 
     def __init__(self, vocab: int = 20):
         self.vocab = vocab
         self.calls = 0
         self.seen_seq: list[int] = []
 
-    def __call__(self, cur):
+    def __call__(self, cur, inference_params=None):
         import torch
 
         self.calls += 1
@@ -638,6 +644,10 @@ class _StubMamba3Model:
         logits = torch.full((1, seq, self.vocab), -1e4)
         logits[0, -1, nxt] = 0.0
         return _StubMamba3Out(logits)
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None,
+                                 **kwargs):
+        return {}                       # stub: no real recurrent state
 
 
 class _StubHFTokenizer:
@@ -655,18 +665,21 @@ class _StubHFTokenizer:
 
 
 def test_mamba3_voice_expand_greedy_continuation():
-    """Mamba3Voice.expand primes on the blurb, then forward-per-tokens: each
-    call sees the growing prefix (the quadratic re-forward, since the CuTe
-    step() kernel is unavailable). Greedy argmax -> deterministic continuation."""
+    """Mamba3Voice.expand prefills the blurb (one call over the full blurb) then
+    decodes one token per call via the carried state -- O(n), no growing-prefix
+    re-forward. Greedy argmax -> deterministic continuation. The prefill is call
+    1 (argmax 11); the 4 decode calls rotate to 12, 13, 14, 15 -- but only the
+    first 4 are sampled (call 5's logits are never argmaxed), so the output is
+    t11..t14, same as before, but the call pattern is [3, 1, 1, 1, 1]."""
     from src.subconscious.fade import Mamba3Voice
 
     model = _StubMamba3Model()
     voice = Mamba3Voice(model, _StubHFTokenizer(), device="cpu", temperature=0.0)
     out = voice.expand("the blurb", 4)
-    assert out == "t11 t12 t13 t14"          # calls 1..4 -> argmax 11..14
-    assert model.calls == 4
-    # forward-per-token: the prefix the model sees grows by one each step.
-    assert model.seen_seq == [3, 4, 5, 6]
+    assert out == "t11 t12 t13 t14"          # prefill argmax 11, then 12,13,14
+    # prefill (sees the 3-token blurb) + 4 length-1 decodes (call 5's logits unused)
+    assert model.calls == 5
+    assert model.seen_seq == [3, 1, 1, 1, 1]
 
 
 def test_mamba3_voice_empty_blurb_passthrough():
