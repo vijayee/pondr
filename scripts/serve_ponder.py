@@ -142,6 +142,15 @@ def main() -> int:
                         "use --no-gliner-timing to disable)")
     p.add_argument("--no-live-encode", action="store_true",
                    help="do not persist exchanges (skip the encoder + GLiNER)")
+    p.add_argument("--no-gate", action="store_true", default=False,
+                   help="Bypass the trained RetrievalGate (default OFF). The gate is a "
+                        "STATEFUL SSM: on a fresh recurrent state it routes ~every "
+                        "query to ssm_direct (unsupported -> no response), which "
+                        "blocks fresh-conversation serve evals. --no-gate sets "
+                        "gate=None so the orchestrator's no-gate branch runs (plain "
+                        "retrieve + synthesize every turn). The backbone still loads "
+                        "(used by WorkingMemory + the SSMChunker). Byte-identical to "
+                        "flag-off when off.")
     p.add_argument("--user-id", default="ponder", help="user the encoder attributes episodes to")
     p.add_argument("--query", default=None, help="one-shot query; omit for the interactive REPL")
     p.add_argument("--bonsai-endpoint", default=None, help="override the Bonsai LLM endpoint")
@@ -743,7 +752,13 @@ def main() -> int:
         print(f"ERROR: backbone checkpoint not found at {backbone_path}", file=sys.stderr)
         return 1
     gate_path = Path(args.gate)
-    if not gate_path.exists():
+    if args.no_gate:
+        print("NOTE: --no-gate bypasses the trained RetrievalGate (gate=None -> "
+              "the orchestrator's no-gate branch: plain retrieve + synthesize "
+              "every turn). The backbone still loads. The gate checkpoint is NOT "
+              "loaded, so its path is not checked.",
+              file=sys.stderr)
+    elif not gate_path.exists():
         print(f"ERROR: gate checkpoint not found at {gate_path}", file=sys.stderr)
         return 1
     relevance_head_path = None
@@ -812,7 +827,8 @@ def main() -> int:
           f"strm_latent_dynamics_head={latent_dynamics_head_path or '(off)'} "
           f"strm_graduation_head={graduation_head_path or '(off)'} "
           f"strm_salience={args.strm_salience} "
-          f"strm_salience_thresholds={salience_thresholds_path or '(off)'}",
+          f"strm_salience_thresholds={salience_thresholds_path or '(off)'} "
+          f"no_gate={args.no_gate}",
           file=sys.stderr)
     print(f"[load] fade_memory={args.fade_memory} "
           f"fade_memory_voice_backend={args.fade_memory_voice_backend} "
@@ -854,6 +870,7 @@ def main() -> int:
         gliner_timing=args.gliner_timing,
         live_encode=not args.no_live_encode,
         user_id=args.user_id,
+        no_gate=args.no_gate,
         relevance_head_path=relevance_head_path,
         graduation_proxy=args.strm_graduation_proxy,
         graduation_head_path=graduation_head_path,

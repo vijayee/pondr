@@ -53,6 +53,7 @@ def build_ponder(
     *,
     backbone_path: str = DEFAULT_BACKBONE_PATH,
     gate_path: str = DEFAULT_GATE_PATH,
+    no_gate: bool = False,
     embedder_source: str = "on-demand",
     bonsai_endpoint: Optional[str] = None,
     device: str = "auto",
@@ -109,6 +110,13 @@ def build_ponder(
             ``config.db_path`` (``$HIPPOCAMPAL_DB_PATH`` / ``./data/memory_db``).
         backbone_path: Phase 2a backbone checkpoint (``backbone_final.pt``).
         gate_path: Phase 2b RetrievalGate checkpoint (``best.pt`` / ``final.pt``).
+        no_gate: when True, skip the gate load (``gate = None``) so the
+            orchestrator's no-gate branch runs (plain ``retrieve`` +
+            ``synthesize`` every turn). The trained gate is a STATEFUL SSM that
+            routes fresh-conversation queries to ``ssm_direct`` (unsupported ->
+            no response), blocking fresh serve evals; this bypasses it. The
+            backbone still loads (used by WorkingMemory + SSMChunker). Default
+            OFF -> byte-identical (gate loads as today).
         embedder_source: ``"on-demand"`` (real bge-small-en-v1.5, 384-dim -- the
             embeddings the gate was trained on, so routing is meaningful) or
             ``"stub"`` (deterministic hash; shape-only, for offline wiring tests).
@@ -334,7 +342,18 @@ def build_ponder(
     # gate's state_dict excludes the backbone (object.__setattr__), so
     # load_retrieval_gate reuses this frozen backbone rather than reloading.
     backbone = load_backbone(backbone_path, BackboneConfig(), device=device)
-    gate = load_retrieval_gate(gate_path, backbone, device=device)
+    # ``--no-gate`` (default OFF): skip the trained RetrievalGate so
+    # ``HippocampalRetriever.gate is None`` -> the orchestrator's no-gate branch
+    # (plain ``retrieve`` + ``synthesize`` every turn). The gate is a STATEFUL
+    # SSM: on a fresh recurrent state it routes ~every query to ``ssm_direct``
+    # (unsupported -> no response -> fade never ingests), which blocks all
+    # fresh-conversation serve evals ([[pondr-gate-stateful-ssm-direct-fresh]]).
+    # The backbone STILL loads (``load_backbone`` above) -- it is used by
+    # WorkingMemory and the SSMChunker, not just the gate. Only the gate
+    # checkpoint load is skipped. Byte-identical to today when ``no_gate`` is
+    # False (the gate loads as today).
+    gate = None if no_gate else load_retrieval_gate(gate_path, backbone,
+                                                   device=device)
 
     # Real bge-small embedder: 384-dim, matching the gate's training embeddings
     # AND the backbone's d_model. Injected into the retriever (for routing) and
