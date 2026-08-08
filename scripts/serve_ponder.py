@@ -323,6 +323,16 @@ def main() -> int:
                         "response. Without it --fade-memory stays observability-only "
                         "(Phase A, byte-identical to flag-off). Requires --fade-memory. "
                         "DEFAULT OFF.")
+    p.add_argument("--force-synthesize", action="store_true", default=False,
+                   help="Force the synthesize end-state on every query (default "
+                        "OFF). The presentation gate routes factual lookups to "
+                        "'direct' (no LLM call), so --fade-inject never fires on "
+                        "those turns and the [FADE MEMORY] block (incl. the carry "
+                        "line) is not injected. --force-synthesize passes "
+                        "end_state='synthesize' to every query() so the 27B "
+                        "synthesizes and consumes the fade/carry block. Byte-"
+                        "identical to flag-off (end_state=None -> the heuristic "
+                        "picks the end-state as today).")
     p.add_argument("--fade-debug", action="store_true", default=False,
                    help="print result[\"fade_recalls\"] to stderr after each "
                         "query (the Phase A observability mechanism -- the way to "
@@ -840,6 +850,7 @@ def main() -> int:
           f"fade_memory_collapse={args.fade_memory_collapse} "
           f"fade_inject={args.fade_inject} "
           f"fade_debug={args.fade_debug} "
+          f"force_synthesize={args.force_synthesize} "
           f"fade_consolidation={args.fade_consolidation} "
           f"fade_consolidation_epsilon={args.fade_consolidation_epsilon} "
           f"fade_consolidation_max_depth={args.fade_consolidation_max_depth} "
@@ -921,9 +932,21 @@ def main() -> int:
         print(f"[claim-docs] stamped {claimed} unscoped document(s) to user "
               f"'{args.user_id}' (idempotent; rerun anytime).", file=sys.stderr)
 
+    # --force-synthesize (default OFF): pass end_state="synthesize" to every
+    # query() so the presentation gate does not route to 'direct' (no LLM call)
+    # and --fade-inject fires -> the 27B consumes the [FADE MEMORY]/carry block.
+    # None (flag off) -> the heuristic picks the end-state as today (byte-
+    # identical).
+    force_es = "synthesize" if args.force_synthesize else None
+    if args.force_synthesize:
+        print("NOTE: --force-synthesize forces end_state='synthesize' on every "
+              "query (the presentation gate's 'direct' routing is bypassed, so "
+              "--fade-inject always fires and the 27B consumes the fade/carry "
+              "block).", file=sys.stderr)
+
     try:
         if args.query is not None:
-            res = orch.query(args.query)
+            res = orch.query(args.query, end_state=force_es)
             _print_result(res)
             if args.fade_debug:
                 print(f"[fade] {res.get('fade_recalls', [])}", file=sys.stderr)
@@ -941,7 +964,8 @@ def main() -> int:
                 break
             if not line.strip():
                 break
-            res = orch.query(line, conversation_history=list(history))
+            res = orch.query(line, conversation_history=list(history),
+                             end_state=force_es)
             _print_result(res)
             if args.fade_debug:
                 print(f"[fade] {res.get('fade_recalls', [])}", file=sys.stderr)
