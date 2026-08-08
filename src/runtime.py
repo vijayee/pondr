@@ -83,6 +83,7 @@ def build_ponder(
     fade_memory_ring_capacity: int = 32,
     fade_memory_expand_tokens: int = 64,
     fade_memory_voice_carry: bool = False,
+    fade_memory_collapse: bool = False,
     fade_inject: bool = False,
     fade_consolidation: bool = False,
     fade_consolidation_epsilon: float = 0.03,
@@ -533,6 +534,20 @@ def build_ponder(
             voice = load_token_lm_voice(
                 fade_memory_voice_path, fade_memory_tokenizer_path,
                 device=device)
+        # The collapse (exp #4 follow-on, default OFF): suppresses SSM-A so the
+        # carried Mamba3 is the SOLE within-window memory. Collapse IMPLIES carry
+        # (the carried state IS the within-window state), so auto-enable
+        # ``voice_carry`` here too (belt-and-suspenders with the serve guard) and
+        # require the mamba3 backend -- only ``Mamba3Voice`` is a ``CarryVoice``;
+        # the token-LM / passthrough voices have no carried state, so a collapsed
+        # fade without a CarryVoice would recall nothing every turn.
+        if fade_memory_collapse:
+            if fade_memory_voice_backend != "mamba3":
+                raise ValueError(
+                    "fade_memory_collapse requires fade_memory_voice_backend="
+                    "'mamba3' (the carried Mamba3 is the sole within-window "
+                    "memory; only Mamba3Voice keeps a carried state).")
+            fade_memory_voice_carry = True
         fade_cfg = FadeConfig(
             decay=fade_memory_decay,
             cos_gist=fade_memory_cos_gist,
@@ -540,6 +555,7 @@ def build_ponder(
             expand_tokens=fade_memory_expand_tokens,
             regime2_enabled=False,  # Stage 2 readout is deprioritized (probe #31)
             voice_carry=fade_memory_voice_carry,  # exp #4, additive, default OFF
+            collapse=fade_memory_collapse,  # exp #4 follow-on, default OFF
         )
         fade_mem = FadeMemory(fade_cfg, embedder, voice, dim=384)
 

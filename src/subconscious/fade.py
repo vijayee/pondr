@@ -271,6 +271,28 @@ class FadeConfig:
     voice_carry: bool = False
     voice_carry_max_tokens: int = 2048  # Mamba3-SISO training-ctx ceiling
     voice_carry_recall_tokens: int = 64  # decode length for a carried recall
+    # The collapse (exp #4 follow-on, additive, default OFF). When True, the SSM-A
+    # ingest/recall path is SUPPRESSED and the carried Mamba3 state is the SOLE
+    # within-window cross-turn memory; beyond the ~2048-token training-ctx ceiling
+    # is WaveDB's job (the orchestrator's retriever -- a separate path this memory
+    # never owned). The keystone premise ([[pondr-fade-architecture-router]]: "Mamba3
+    # has zero cross-context memory") is FALSIFIED by exp #4: carry IS in-context
+    # recall, lossless to the ceiling, so SSM-A (bge EWMA + BlurbStore + the cosine
+    # router + R1/R3/R4 cascade) is REDUNDANT within the window. The cosine router
+    # is DROPPED, not redesigned: it exists only because SSM-A's state is a bge
+    # vector you can ``cos(state, bge(anchor))``; with SSM-A gone there is nothing to
+    # route -- the within-window recall is UNCONDITIONAL carry (cue + decode one
+    # continuation), and beyond-window is the orchestrator's retriever. Requires
+    # ``voice_carry`` + a ``CarryVoice`` (``Mamba3Voice``); ``build_ponder`` /
+    # ``serve_ponder`` auto-enable carry under collapse and require the mamba3
+    # backend. Tradeoff: recall BREADTH narrows from top-k routed anchors to ONE
+    # ~64-token carry continuation -- the thing to evaluate (cue engineering
+    # addresses recall QUALITY; a future multi-cue extension could address breadth).
+    # The SSM-A machinery (``VectorCarrySSM`` / ``BlurbStore`` / the ring / the
+    # regime cascade / consolidation) stays INTACT for the OFF baseline -- collapse
+    # disables it, does not delete it -- so the dual-SSM vs collapse is A/B-able.
+    # Byte-identical to today when False (the project default-OFF pattern).
+    collapse: bool = False
 
 
 # ----------------------------------------------------------------------- SSM-A
@@ -989,20 +1011,34 @@ class FadeMemory:
         the user actually wants back). The two must be allowed to differ so a
         "gist" of code can be a raw excerpt, not a purpose-summary."""
         anchor_id = self._next_id
-        self._next_id += 1
-        vec = self._encode_one(chunk_text)         # [dim] bge (unnormalized ok)
-        self.ssm_a.step(vec)                        # the fade leg advances
-        blurb_src = blurb_text if blurb_text is not None else chunk_text
-        blurb = blurb_src[: self.cfg.blurb_chars]
-        self.blurbs.add(anchor_id, vec, blurb)      # keyed by bge (the handle)
-        self.ring.append(anchor_id)                 # recency verbatim window
+        # The collapse (exp #4 follow-on, default OFF): when on, the SSM-A path is
+        # SUPPRESSED -- no anchor is created (no bge vector, no blurb, no ring
+        # slot), so the carried Mamba3 state is the SOLE within-window memory. The
+        # carry ingest below runs either way (it is the within-window leg; collapse
+        # makes it the ONLY leg). Returns -1 (the carry sentinel, matching
+        # ``Recall(anchor_id=-1)``) -- under collapse there is no SSM-A anchor_id
+        # to return; the value is unused by the orchestrator (it keys ``ingest`` on
+        # the return only to advance its own counters, which the collapse path does
+        # not touch). When off, byte-identical to today: encode, step SSM-A, store
+        # the blurb, push to the ring.
+        if self.cfg.collapse:
+            anchor_id = -1
+        else:
+            self._next_id += 1
+            vec = self._encode_one(chunk_text)     # [dim] bge (unnormalized ok)
+            self.ssm_a.step(vec)                    # the fade leg advances
+            blurb_src = blurb_text if blurb_text is not None else chunk_text
+            blurb = blurb_src[: self.cfg.blurb_chars]
+            self.blurbs.add(anchor_id, vec, blurb)  # keyed by bge (the handle)
+            self.ring.append(anchor_id)             # recency verbatim window
         # Cross-turn carry (exp #4, additive, default OFF): forward the turn
         # through the carried Mamba3 state too, so its recurrent state accumulates
         # the conversation. ``ingest_turn`` is the sole writer; ``chunk_text`` is
         # the full turn (the orchestrator passes the joined "User: ... \nAssistant:
         # ..." text). Best-effort: a carry failure is swallowed so the SSM-A ingest
         # that just succeeded is not masked. No-op when ``voice_carry`` is off or
-        # the voice is not a ``CarryVoice`` (``hasattr`` guard).
+        # the voice is not a ``CarryVoice`` (``hasattr`` guard). Under collapse this
+        # is the ONLY ingest path (the SSM-A branch above is skipped).
         if self.cfg.voice_carry and hasattr(self.voice, "ingest_turn"):
             try:
                 self.voice.ingest_turn(
@@ -1108,16 +1144,23 @@ class FadeMemory:
         the free cosine router (recency -> verbatim / gist / forgotten). Returns
         the routed recalls, best-relevance first."""
         q = self._encode_one(query_text)
-        candidates = self.blurbs.retrieve(q, k=top_k)  # (anchor_id, cos_q, text)
         out: list[Recall] = []
-        for anchor_id, cos_q, _ in candidates:
-            r = self.recall_anchor(anchor_id)
-            if r is not None:
-                # A4: surface the prompt-relevance cosine (was discarded pre-A4)
-                # so ``format_fade_block``'s budget cascade can drop the
-                # least-prompt-relevant recall within a regime first.
-                r.cos_q = cos_q
-                out.append(r)
+        # The collapse (exp #4 follow-on, default OFF): when on, SKIP the SSM-A
+        # regime path entirely -- no BlurbStore retrieve, no per-anchor routing.
+        # The within-window recall is UNCONDITIONAL carry (the block below); there
+        # is nothing to route (no SSM-A state -> no cosine-vs-anchor signal). When
+        # off, byte-identical to today: retrieve candidates, route each by the
+        # free cosine router.
+        if not self.cfg.collapse:
+            candidates = self.blurbs.retrieve(q, k=top_k)  # (anchor_id, cos_q, text)
+            for anchor_id, cos_q, _ in candidates:
+                r = self.recall_anchor(anchor_id)
+                if r is not None:
+                    # A4: surface the prompt-relevance cosine (was discarded pre-A4)
+                    # so ``format_fade_block``'s budget cascade can drop the
+                    # least-prompt-relevant recall within a regime first.
+                    r.cos_q = cos_q
+                    out.append(r)
         # Cross-turn carry (exp #4, additive, default OFF): cue the carried
         # conversation state and PREPEND a within-window recall. Skipped when
         # ``voice_carry`` is off, the voice is not a ``CarryVoice``, or no turn has
@@ -1125,8 +1168,11 @@ class FadeMemory:
         # is 0). The carried recall is a synthetic anchor (id = -1) routed to
         # ``REGIME_CARRY``; ``cos=1.0`` ranks it first and ``cos_q=0.0`` is inert
         # (it has no bge-vs-anchor signal -- Mamba3's state is not a bge vector).
-        # Best-effort: a decode failure yields no carried recall (the SSM-A
-        # regime recalls above are unaffected).
+        # Best-effort: a decode failure yields no carried recall. Under collapse
+        # this is the ONLY recall path -- ``out`` is just ``[carry]`` (or ``[]`` on
+        # turn 1 / an empty decode). ``q`` is computed above even under collapse
+        # (cheap, one encode) and is simply unused -- kept for a single-branch read
+        # and to avoid a divergence that a ``if not collapse: q = ...`` would invite.
         if self.cfg.voice_carry and hasattr(self.voice, "recall_from_carry") \
                 and getattr(self.voice, "_carry_seqlen", 0) > 0:
             try:

@@ -293,6 +293,19 @@ def main() -> int:
                         "the SSM-A regime path. Requires --fade-memory "
                         "--fade-memory-voice-backend=mamba3. No-op (byte-identical) "
                         "when off or with a non-mamba3 voice.")
+    p.add_argument("--fade-memory-collapse", action="store_true", default=False,
+                   help="The collapse (exp #4 follow-on, default OFF): suppress "
+                        "SSM-A so the carried Mamba3 is the SOLE within-window "
+                        "memory (beyond the ~2048-token ceiling is WaveDB's job). "
+                        "The keystone premise (Mamba3 has zero cross-context "
+                        "memory) is FALSIFIED -- carry IS in-context recall, so "
+                        "SSM-A is redundant within the window; the cosine router is "
+                        "dropped (nothing to route). Requires --fade-memory "
+                        "--fade-memory-voice-backend=mamba3; auto-enables "
+                        "--fade-memory-voice-carry. Consolidation is inert under "
+                        "collapse (no SSM-A anchors to gist). A/B-able against the "
+                        "dual-SSM baseline (which stays the off-default). "
+                        "EXPERIMENTAL.")
     p.add_argument("--fade-inject", action="store_true", default=False,
                    help="Phase B: feed the fade recalls into the LLM context. A "
                         "[FADE MEMORY] block (R1 verbatim + R3 gist; R4 forgotten is "
@@ -687,6 +700,26 @@ def main() -> int:
                       "(with --fade-inject) gains a [carry, in-context] line. "
                       "Byte-identical to flag-off when off.",
                       file=sys.stderr)
+        if args.fade_memory_collapse:
+            if args.fade_memory_voice_backend != "mamba3":
+                print("NOTE: --fade-memory-collapse ignored (requires "
+                      "--fade-memory-voice-backend=mamba3; the carried Mamba3 is "
+                      "the sole within-window memory). Collapse stays off.",
+                      file=sys.stderr)
+                args.fade_memory_collapse = False
+            else:
+                # Collapse IMPLIES carry (the carried state IS the within-window
+                # state): auto-enable it so the user does not have to pass both
+                # flags. build_ponder enforces this too (belt-and-suspenders).
+                args.fade_memory_voice_carry = True
+                print("NOTE: --fade-memory-collapse is EXPERIMENTAL (exp #4 "
+                      "follow-on). SSM-A is SUPPRESSED -- the carried Mamba3 is "
+                      "the SOLE within-window memory (beyond the ~2048-token "
+                      "ceiling is WaveDB's job); the cosine router is dropped "
+                      "(nothing to route). --fade-memory-voice-carry auto-enabled. "
+                      "Consolidation is inert under collapse (no SSM-A anchors to "
+                      "gist). A/B-able against the dual-SSM off-baseline.",
+                      file=sys.stderr)
         if (args.fade_memory_voice_backend == "token-lm"
                 and args.fade_memory_voice_path
                 and not args.fade_memory_tokenizer_path):
@@ -788,6 +821,7 @@ def main() -> int:
           f"fade_memory_decay={args.fade_memory_decay} "
           f"fade_memory_top_k={args.fade_memory_top_k} "
           f"fade_memory_voice_carry={args.fade_memory_voice_carry} "
+          f"fade_memory_collapse={args.fade_memory_collapse} "
           f"fade_inject={args.fade_inject} "
           f"fade_debug={args.fade_debug} "
           f"fade_consolidation={args.fade_consolidation} "
@@ -841,6 +875,7 @@ def main() -> int:
         fade_memory_ring_capacity=args.fade_memory_ring_capacity,
         fade_memory_expand_tokens=args.fade_memory_expand_tokens,
         fade_memory_voice_carry=args.fade_memory_voice_carry,
+        fade_memory_collapse=args.fade_memory_collapse,
         fade_inject=args.fade_inject,
         fade_consolidation=args.fade_consolidation,
         fade_consolidation_epsilon=args.fade_consolidation_epsilon,
