@@ -302,6 +302,16 @@ def main() -> int:
                         "the SSM-A regime path. Requires --fade-memory "
                         "--fade-memory-voice-backend=mamba3. No-op (byte-identical) "
                         "when off or with a non-mamba3 voice.")
+    p.add_argument("--fade-memory-voice-carry-cue-template", default="{cue}",
+                   help="Cue engineering (exp #4 follow-on, default IDENTITY "
+                        "'{cue}'): a str.format template applied to the cue before "
+                        "recall_from_carry. The 443M is a base (non-instruct) LM; "
+                        "a completion-style cue (e.g. ' {cue}\\nA:') can elicit the "
+                        "carried content better than the raw user_prompt. The "
+                        "template receives {cue}=the user prompt. Default '{cue}' "
+                        "is identity -> byte-identical (the format call is "
+                        "skipped). Requires --fade-memory --fade-memory-voice-"
+                        "carry --fade-memory-voice-backend=mamba3.")
     p.add_argument("--fade-memory-collapse", action="store_true", default=False,
                    help="The collapse (exp #4 follow-on, default OFF): suppress "
                         "SSM-A so the carried Mamba3 is the SOLE within-window "
@@ -854,7 +864,9 @@ def main() -> int:
           f"fade_consolidation={args.fade_consolidation} "
           f"fade_consolidation_epsilon={args.fade_consolidation_epsilon} "
           f"fade_consolidation_max_depth={args.fade_consolidation_max_depth} "
-          f"fade_consolidation_validate={args.fade_consolidation_validate}",
+          f"fade_consolidation_validate={args.fade_consolidation_validate} "
+          f"fade_memory_voice_carry_cue_template="
+          f"{args.fade_memory_voice_carry_cue_template!r}",
           file=sys.stderr)
     print(f"[load] retrieval_user_scope={args.retrieval_user_scope} "
           f"claim_docs={args.claim_docs} user_id={args.user_id}",
@@ -904,6 +916,7 @@ def main() -> int:
         fade_memory_expand_tokens=args.fade_memory_expand_tokens,
         fade_memory_voice_carry=args.fade_memory_voice_carry,
         fade_memory_collapse=args.fade_memory_collapse,
+        fade_memory_voice_carry_cue_template=args.fade_memory_voice_carry_cue_template,
         fade_inject=args.fade_inject,
         fade_consolidation=args.fade_consolidation,
         fade_consolidation_epsilon=args.fade_consolidation_epsilon,

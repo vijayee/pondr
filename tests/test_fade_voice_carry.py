@@ -442,6 +442,84 @@ def test_carry_recall_flows_into_fade_block():
 
 
 # ---------------------------------------------------------------------------
+# cue engineering: voice_carry_cue_template
+# ---------------------------------------------------------------------------
+# The 443M is a base (non-instruct) LM; the live A/B showed variable completion
+# when cued with the raw user_prompt. ``FadeConfig.voice_carry_cue_template``
+# (default "{cue}" = identity) reshapes the cue before ``recall_from_carry``.
+
+def test_cue_template_default_is_identity_byte_identical():
+    """The default ``"{cue}"`` template is IDENTITY: ``recall_from_carry`` receives
+    the raw user_prompt (the format call is skipped). Byte-identical to a
+    ``FadeConfig`` with the template unset."""
+    voice = _StubCarryVoice()
+    mem = FadeMemory(_cfg(voice_carry=True), _StubEmbedder(), voice)   # default
+    assert mem.cfg.voice_carry_cue_template == "{cue}"
+    mem.ingest("User: the passphrase is SQUEAKY-RAVEN-42\nAssistant: noted")
+    mem.recall("what was the passphrase", top_k=3)
+    # the stub received the RAW prompt (no format applied).
+    assert voice.recall_calls[-1][0] == "what was the passphrase"
+
+
+def test_cue_template_non_default_reaches_recall_reshaped():
+    """A non-default template reaches ``recall_from_carry`` RESHAPED: the stub
+    records the cue it received, which equals ``template.format(cue=prompt)``."""
+    voice = _StubCarryVoice()
+    mem = FadeMemory(_cfg(voice_carry=True,
+                          voice_carry_cue_template="Q: {cue}\nA:"),
+                     _StubEmbedder(), voice)
+    mem.ingest("User: the plate is ABC-9921\nAssistant: noted")
+    mem.recall("what was the plate", top_k=3)
+    assert voice.recall_calls[-1][0] == "Q: what was the plate\nA:"
+
+
+def test_cue_template_preserves_carry_content():
+    """A reshaped cue still surfaces the carried content (the template reshapes
+    the cue, not the decoded continuation -- the stub returns the carried text
+    regardless of the cue shape)."""
+    voice = _StubCarryVoice()
+    mem = FadeMemory(_cfg(voice_carry=True,
+                          voice_carry_cue_template=" {cue}\nA:"),
+                     _StubEmbedder(), voice)
+    mem.ingest("User: the passphrase is SQUEAKY-RAVEN-42\nAssistant: noted")
+    results = mem.recall("what was the passphrase", top_k=3)
+    assert results[0].regime == REGIME_CARRY
+    assert "SQUEAKY-RAVEN-42" in results[0].content
+
+
+def test_cue_template_misconfigured_is_swallowed():
+    """A template with a placeholder other than ``{cue}`` (e.g. ``{foo}``)
+    ``KeyError``s at format time; that is INSIDE the try/except -> swallowed -> no
+    carry recall, but the SSM-A regime recalls SURVIVE (the carry failure does not
+    break the regime path). The safest failure mode for a misconfigured template."""
+    voice = _StubCarryVoice()
+    mem = FadeMemory(_cfg(voice_carry=True,
+                          voice_carry_cue_template="{foo}"),
+                     _StubEmbedder(), voice)
+    mem.ingest("User: hi\nAssistant: hello")
+    results = mem.recall("hi", top_k=3)
+    # the KeyError was swallowed: no carry recall.
+    assert not any(r.regime == REGIME_CARRY for r in results)
+    # the SSM-A regime recalls survived (the carry failure is isolated).
+    assert len(results) > 0
+
+
+def test_cue_template_literal_without_placeholder():
+    """A template with NO placeholder (a literal string) does NOT KeyError
+    (``str.format`` ignores unused kwargs) -- it cues ``recall_from_carry`` with
+    the literal. The recall fires (the stub returns the carried text); only the
+    cue shape differs."""
+    voice = _StubCarryVoice()
+    mem = FadeMemory(_cfg(voice_carry=True,
+                          voice_carry_cue_template="please continue"),
+                     _StubEmbedder(), voice)
+    mem.ingest("User: the passphrase is SQUEAKY-RAVEN-42\nAssistant: noted")
+    mem.recall("what was the passphrase", top_k=3)
+    # the stub received the literal (no KeyError; unused {cue} kwarg ignored).
+    assert voice.recall_calls[-1][0] == "please continue"
+
+
+# ---------------------------------------------------------------------------
 # the REAL Mamba3Voice carry methods (stub model, no torch/HF/CUDA)
 # ---------------------------------------------------------------------------
 # The stub-``_StubCarryVoice`` tests above pin the FadeMemory WIRING (hooks fire,

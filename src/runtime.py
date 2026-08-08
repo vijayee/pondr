@@ -85,6 +85,7 @@ def build_ponder(
     fade_memory_expand_tokens: int = 64,
     fade_memory_voice_carry: bool = False,
     fade_memory_collapse: bool = False,
+    fade_memory_voice_carry_cue_template: str = "{cue}",
     fade_inject: bool = False,
     fade_consolidation: bool = False,
     fade_consolidation_epsilon: float = 0.03,
@@ -575,6 +576,7 @@ def build_ponder(
             regime2_enabled=False,  # Stage 2 readout is deprioritized (probe #31)
             voice_carry=fade_memory_voice_carry,  # exp #4, additive, default OFF
             collapse=fade_memory_collapse,  # exp #4 follow-on, default OFF
+            voice_carry_cue_template=fade_memory_voice_carry_cue_template,  # cue eng
         )
         fade_mem = FadeMemory(fade_cfg, embedder, voice, dim=384)
 
