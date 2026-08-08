@@ -82,6 +82,7 @@ def build_ponder(
     fade_memory_cos_gist: float = 0.40,
     fade_memory_ring_capacity: int = 32,
     fade_memory_expand_tokens: int = 64,
+    fade_memory_voice_carry: bool = False,
     fade_inject: bool = False,
     fade_consolidation: bool = False,
     fade_consolidation_epsilon: float = 0.03,
@@ -220,6 +221,14 @@ def build_ponder(
         fade_memory_ring_capacity: the recency verbatim window (default 32).
         fade_memory_expand_tokens: SSM-B continuation length for a gist (default
             64; unused when ``fade_memory_voice_path`` is None).
+        fade_memory_voice_carry: cross-turn Mamba3 carry (exp #4, additive,
+            default OFF). When True AND the voice is a ``Mamba3Voice``
+            (``fade_memory_voice_backend="mamba3"``), each ingest also forwards
+            the turn through a per-conversation carried InferenceParams and recall
+            prepends a ``REGIME_CARRY`` within-window recall from it. Makes the
+            cross-turn carry finding real in serve; A/B-able against the SSM-A
+            regime path. No-op (byte-identical) when off or with a non-carry
+            voice. Requires ``fade_memory`` + the mamba3 backend.
         fade_inject: Phase B -- when True, format the fade recalls into a
             ``[FADE MEMORY]`` block prepended to the LLM user message on synthesize
             turns (R1 verbatim + R3 gist; R4 forgotten is a signal, not content).
@@ -530,6 +539,7 @@ def build_ponder(
             ring_capacity=fade_memory_ring_capacity,
             expand_tokens=fade_memory_expand_tokens,
             regime2_enabled=False,  # Stage 2 readout is deprioritized (probe #31)
+            voice_carry=fade_memory_voice_carry,  # exp #4, additive, default OFF
         )
         fade_mem = FadeMemory(fade_cfg, embedder, voice, dim=384)
 

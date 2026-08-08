@@ -284,6 +284,15 @@ def main() -> int:
     p.add_argument("--fade-memory-expand-tokens", type=int, default=64,
                    help="SSM-B continuation length for a gist (default 64; unused "
                         "when --fade-memory-voice-path is unset).")
+    p.add_argument("--fade-memory-voice-carry", action="store_true", default=False,
+                   help="Cross-turn Mamba3 carry (exp #4, ADDITIVE, default OFF). "
+                        "Each ingest also forwards the turn through a per-"
+                        "conversation carried InferenceParams and recall prepends "
+                        "a REGIME_CARRY within-window recall from it -- makes the "
+                        "cross-turn carry finding real in serve. A/B-able against "
+                        "the SSM-A regime path. Requires --fade-memory "
+                        "--fade-memory-voice-backend=mamba3. No-op (byte-identical) "
+                        "when off or with a non-mamba3 voice.")
     p.add_argument("--fade-inject", action="store_true", default=False,
                    help="Phase B: feed the fade recalls into the LLM context. A "
                         "[FADE MEMORY] block (R1 verbatim + R3 gist; R4 forgotten is "
@@ -661,6 +670,23 @@ def main() -> int:
                   "--fade-consolidation-validate; drift is computed inside the "
                   "validate gate). Drift stays observe-only.", file=sys.stderr)
             args.fade_drift_defer_threshold = None
+        if args.fade_memory_voice_carry:
+            if args.fade_memory_voice_backend != "mamba3":
+                print("NOTE: --fade-memory-voice-carry ignored (requires "
+                      "--fade-memory-voice-backend=mamba3; only Mamba3Voice "
+                      "keeps a carried state). Carry stays off.",
+                      file=sys.stderr)
+                args.fade_memory_voice_carry = False
+            else:
+                print("NOTE: --fade-memory-voice-carry is EXPERIMENTAL (exp #4). "
+                      "Each ingest forwards the turn through a per-conversation "
+                      "carried Mamba3 InferenceParams and recall prepends a "
+                      "REGIME_CARRY within-window recall from it (cross-turn "
+                      "carry = in-context recall, to the ~2048-token ceiling). "
+                      "Additive to the SSM-A regime path; the [FADE MEMORY] block "
+                      "(with --fade-inject) gains a [carry, in-context] line. "
+                      "Byte-identical to flag-off when off.",
+                      file=sys.stderr)
         if (args.fade_memory_voice_backend == "token-lm"
                 and args.fade_memory_voice_path
                 and not args.fade_memory_tokenizer_path):
@@ -761,6 +787,7 @@ def main() -> int:
           f"fade_memory_cos_gist={args.fade_memory_cos_gist} "
           f"fade_memory_decay={args.fade_memory_decay} "
           f"fade_memory_top_k={args.fade_memory_top_k} "
+          f"fade_memory_voice_carry={args.fade_memory_voice_carry} "
           f"fade_inject={args.fade_inject} "
           f"fade_debug={args.fade_debug} "
           f"fade_consolidation={args.fade_consolidation} "
@@ -813,6 +840,7 @@ def main() -> int:
         fade_memory_cos_gist=args.fade_memory_cos_gist,
         fade_memory_ring_capacity=args.fade_memory_ring_capacity,
         fade_memory_expand_tokens=args.fade_memory_expand_tokens,
+        fade_memory_voice_carry=args.fade_memory_voice_carry,
         fade_inject=args.fade_inject,
         fade_consolidation=args.fade_consolidation,
         fade_consolidation_epsilon=args.fade_consolidation_epsilon,
