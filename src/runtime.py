@@ -105,6 +105,7 @@ def build_ponder(
     task_canvas: bool = False,
     ssm_chunker_gist_backend: str = "topics",
     ssm_chunker_gist_cue: str = "Summary:",
+    ssm_chunker_gist_query_conditioned: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -593,6 +594,10 @@ def build_ponder(
     # sharing the model is safe (the chunker runs sequentially in the same
     # query(), never reentrant with fade). Else load a fresh instance. ``None``
     # (the default ``"topics"`` backend) -> no voice -> byte-identical to today.
+    # ``ssm_chunker_gist_query_conditioned`` (default OFF, mamba3 backend only):
+    # thread the user's prompt into the gist decode so the cue becomes
+    # ``Q: {prompt}\nA:`` (recall what was asked) instead of the fixed
+    # ``gist_cue`` (summarize everything) -- see SSMChunker.compress_gist_mamba3.
     chunker_voice = None
     if ssm_chunker_gist_backend == "mamba3":
         from .subconscious.fade import Mamba3Voice, load_mamba3_voice
@@ -688,6 +693,7 @@ def build_ponder(
         canvas_decider=canvas_decider,
         ssm_chunker_gist_backend=ssm_chunker_gist_backend,
         ssm_chunker_gist_cue=ssm_chunker_gist_cue,
+        ssm_chunker_gist_query_conditioned=ssm_chunker_gist_query_conditioned,
         chunker_voice=chunker_voice,
     )
     return orch

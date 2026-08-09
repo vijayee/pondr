@@ -144,6 +144,8 @@ class SSMChunker:
         self,
         episodes: list[dict],
         presentation_plan,
+        *,
+        query: Optional[str] = None,
     ) -> ChunkedContext:
         """Split ``episodes`` (ranked, highest score first) into primary + compressed.
 
@@ -152,6 +154,18 @@ class SSMChunker:
         we keep (further bounded by ``max_primary_chunks`` and the token budget).
         Episodes that do not fit the primary budget are compressed into the SSM
         state. ``expandable_ids`` is exactly the compressed set.
+
+        ``query`` (optional, keyword-only): when the gist backend is ``mamba3`` and
+        a ``query`` is supplied, the gist is decoded QUERY-CONDITIONED -- the cue
+        becomes ``Q: {query}\\nA:`` (the carry path's proven completion shape,
+        [[pondr-mamba3-carry-wired]]) instead of the fixed ``gist_cue``. The base
+        443M is a recall machine, not a summarizer ([[pondr-mamba3-gist-eval-result]]):
+        a global ``Summary:`` cue degenerates (0/8 needles), while a targeted Q-A
+        cue that names the asked-for facts recalls them (3/8). Threading the user's
+        question into the decode moves the secondary-episodes gist from the
+        degenerate "summarize everything" path to the honest "recall what was
+        asked" path. ``None`` (default) -> the fixed ``gist_cue`` (byte-identical to
+        the pre-query-conditioned mamba3 path); the ``topics`` backend ignores it.
         """
         primary_cap = min(
             getattr(presentation_plan, "primary_chunk_count", self.max_primary_chunks),
@@ -194,7 +208,7 @@ class SSMChunker:
         if secondary:
             if self.gist_backend == "mamba3" and self.voice is not None:
                 compressed_state = None
-                compressed_gist = self.compress_gist_mamba3(secondary)
+                compressed_gist = self.compress_gist_mamba3(secondary, query=query)
             elif self.gist_backend == "mamba3":
                 # mamba3 requested but no voice loaded -> skip the backbone
                 # compressor (the user opted out of the topics path); the
@@ -242,7 +256,7 @@ class SSMChunker:
             metadata={"compressed_episode_ids": [ep.get("episode_id") for ep in episodes]}
         )
 
-    def compress_gist_mamba3(self, episodes: list[dict]) -> str:
+    def compress_gist_mamba3(self, episodes: list[dict], *, query: Optional[str] = None) -> str:
         """Decode a textual gist of ``episodes`` via the Mamba3 voice (ephemeral).
 
         The deferred Phase 2c path (docs/Phase 2c.md lines 552-559): the original
@@ -252,14 +266,24 @@ class SSMChunker:
         with no text-decoder head); a Mamba3 LM IS the decoder. Here the
         secondary episode FULL TEXTS (text, falling back to summary) are
         concatenated and prefilled into a FRESH Mamba3 recurrent state, then a
-        completion cue (``_gist_cue``) elicits a greedy-decoded summary
-        continuation -- the gist Bonsai consumes (text, not a state vector).
+        completion cue elicits a greedy-decoded summary continuation -- the gist
+        Bonsai consumes (text, not a state vector).
 
         The full text (not the summary) is ingested because the whole point of
         the decode path is to surface DETAILS the topic-union labels cannot --
         the summary is already a gist, and summarizing a summary loses the
         facts the decoder is meant to retain. (The bge-into-backbone path uses
         summaries; the decode path needs the content.)
+
+        ``query`` (optional): when supplied, the cue is QUERY-CONDITIONED --
+        ``Q: {query}\\nA:`` (the carry path's proven completion shape,
+        [[pondr-mamba3-carry-wired]]) -- instead of the fixed ``_gist_cue``. The
+        base 443M is a recall machine, not a summarizer ([[pondr-mamba3-gist-eval-
+        result]]): a global ``Summary:`` cue degenerates (0/8 needles), while a
+        targeted Q-A cue that names the asked-for facts recalls them (3/8). So a
+        query-conditioned decode is the honest "recall what was asked" path vs the
+        degenerate "summarize everything" path. ``None`` -> ``_gist_cue``
+        (byte-identical to the pre-query-conditioned mamba3 path).
 
         ``voice.ephemeral_gist`` allocates its own ``InferenceParams`` and
         discards it -- the voice's carried state (if any) is never touched, so
@@ -269,8 +293,9 @@ class SSMChunker:
         if self.voice is None:
             return ""
         texts = [ep.get("text", "") or ep.get("summary", "") for ep in episodes]
+        cue = f"Q: {query}\nA:" if query is not None else self._gist_cue
         try:
-            return self.voice.ephemeral_gist(texts, self._gist_cue)
+            return self.voice.ephemeral_gist(texts, cue)
         except Exception:
             # Best-effort: a decode failure must not break the query. The
             # formatter falls back to the topic union from secondary_episodes.

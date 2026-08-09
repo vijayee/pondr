@@ -289,6 +289,7 @@ class PonderOrchestrator:
         canvas_decider: "Optional[BonsaiDecider]" = None,
         ssm_chunker_gist_backend: str = "topics",
         ssm_chunker_gist_cue: str = "Summary:",
+        ssm_chunker_gist_query_conditioned: bool = False,
         chunker_voice=None,
     ) -> None:
         self.store = store
@@ -554,6 +555,11 @@ class PonderOrchestrator:
             gist_backend=ssm_chunker_gist_backend,
             gist_cue=ssm_chunker_gist_cue,
         )
+        # Whether the mamba3 gist decode is QUERY-CONDITIONED (the cue becomes
+        # ``Q: {user_prompt}\nA:`` instead of the fixed gist_cue). Default OFF ->
+        # the chunk() call below passes ``query=None`` -> byte-identical to the
+        # pre-query-conditioned path. See SSMChunker.compress_gist_mamba3.
+        self.ssm_chunker_gist_query_conditioned = ssm_chunker_gist_query_conditioned
         self.presentation_gate = PresentationGate(config, embedder)
         # Wire the chunker's primary-chunk cap into the gate so the gate's
         # primary_chunk_count never exceeds what the chunker will keep.
@@ -1078,7 +1084,14 @@ class PonderOrchestrator:
         )
 
         # 7. chunk → ChunkedContext.
-        chunked = self.ssm_chunker.chunk(ordered_episodes, presentation_plan)
+        # When query-conditioning is ON, thread the user's prompt into the mamba3
+        # gist decode so the cue becomes ``Q: {user_prompt}\nA:`` (recall what was
+        # asked) instead of the fixed ``Summary:`` (summarize everything). OFF ->
+        # ``query=None`` -> byte-identical.
+        chunked = self.ssm_chunker.chunk(
+            ordered_episodes, presentation_plan,
+            query=user_prompt if self.ssm_chunker_gist_query_conditioned else None,
+        )
 
         # 8/9. format + dispatch on end state.
         # Reset the expand handler's per-query counter for the outcome signal.

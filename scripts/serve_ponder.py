@@ -565,7 +565,20 @@ def main() -> int:
                         "(default 'Summary:'). The 443M is a base (non-instruct) "
                         "LM, so a completion-style cue elicits the summary "
                         "continuation; tunable for sweeps. Ignored for the "
-                        "'topics' backend.")
+                        "'topics' backend and when --ssm-chunker-gist-query-"
+                        "conditioned is on (that overrides the cue with "
+                        "'Q: {user_prompt}\\nA:').")
+    p.add_argument("--ssm-chunker-gist-query-conditioned",
+                   action="store_true", default=False,
+                   help="(mamba3 backend only, default OFF) Thread the user's "
+                        "prompt into the gist decode so the cue becomes "
+                        "'Q: {user_prompt}\\nA:' (recall what was asked) instead "
+                        "of the fixed --ssm-chunker-gist-cue (summarize "
+                        "everything). The 443M is a recall machine, not a "
+                        "summarizer: a global 'Summary:' cue degenerates while a "
+                        "targeted Q-A cue recalls the asked-for facts. OFF -> "
+                        "byte-identical (the fixed gist_cue is used). Ignored for "
+                        "the 'topics' backend.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -906,17 +919,31 @@ def main() -> int:
     print(f"[load] task_canvas={args.task_canvas}", file=sys.stderr)
     if args.ssm_chunker_gist_backend == "mamba3":
         shared = (args.fade_memory and args.fade_memory_voice_backend == "mamba3")
+        cue_label = ("Q: {user_prompt}\\nA:" if args.ssm_chunker_gist_query_conditioned
+                     else args.ssm_chunker_gist_cue)
         print(f"[load] ssm_chunker_gist_backend=mamba3 "
-              f"cue={args.ssm_chunker_gist_cue!r} "
+              f"cue={cue_label!r} "
+              f"query_conditioned={args.ssm_chunker_gist_query_conditioned} "
               f"voice={'shared-fade' if shared else 'fresh'}", file=sys.stderr)
         print("NOTE: --ssm-chunker-gist-backend=mamba3 is EXPERIMENTAL (the "
               "deferred Phase 2c 'decode a summary from the SSM state' path). "
               "The secondary retrieved episodes are decoded into a textual "
               "gist via a Mamba3 LM and the formatter emits THAT instead of "
               "the topic union; the dead-weight backbone compressor is "
-              "skipped. The 443M is a base LM -- gist quality is cue-shaped "
-              "(--ssm-chunker-gist-cue). A/B-able against the 'topics' "
-              "off-baseline.",
+              "skipped. The 443M is a base LM -- gist quality is cue-shaped. "
+              "With --ssm-chunker-gist-query-conditioned the cue is "
+              "'Q: {user_prompt}\\nA:' (recall what was asked; the 443M is a "
+              "recall machine, not a summarizer), else the fixed "
+              "--ssm-chunker-gist-cue (summarize everything). A/B-able against "
+              "the 'topics' off-baseline.",
+              file=sys.stderr)
+    elif args.ssm_chunker_gist_query_conditioned:
+        # The flag is documented as "mamba3 backend only"; the topics backend
+        # emits labels (no decode), so a query has nothing to condition. NOTE
+        # the no-op so the silent footgun is visible at load time.
+        print("NOTE: --ssm-chunker-gist-query-conditioned is ignored without "
+              "--ssm-chunker-gist-backend=mamba3 (the 'topics' backend decodes "
+              "no gist, so there is nothing to query-condition).",
               file=sys.stderr)
 
     orch = build_ponder(
@@ -973,6 +1000,7 @@ def main() -> int:
         task_canvas=args.task_canvas,
         ssm_chunker_gist_backend=args.ssm_chunker_gist_backend,
         ssm_chunker_gist_cue=args.ssm_chunker_gist_cue,
+        ssm_chunker_gist_query_conditioned=args.ssm_chunker_gist_query_conditioned,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

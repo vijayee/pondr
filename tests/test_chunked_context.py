@@ -268,6 +268,45 @@ def test_mamba3_backend_no_secondary_episodes():
     assert "[COMPRESSED CONTEXT — SUMMARY]" not in out
 
 
+def test_mamba3_backend_query_conditioned_cue_is_q_a():
+    """``chunk(..., query=q)`` threads the user's question into the gist decode:
+    the cue becomes ``Q: {q}\\nA:`` (the carry path's proven completion shape),
+    NOT the fixed ``gist_cue``. The 443M is a recall machine, not a summarizer --
+    a targeted Q-A cue recalls the asked-for facts where a global ``Summary:``
+    cue degenerates (see ``pondr-mamba3-gist-eval-result``)."""
+    voice = _StubGistVoice(gist="The license plate is XYZ-4471.")
+    bb = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    chunker = SSMChunker(bb, _StubEmbedder(), cfg, voice=voice,
+                         gist_backend="mamba3", gist_cue="Summary:")
+    eps = [_ep(f"e{i}", text=f"episode {i} body " * 30,
+               topics=[f"topic_{i}"], summary=f"summary {i}")
+           for i in range(4)]
+    ctx = chunker.chunk(eps, _plan(strategy=CHUNKED, primary_chunk_count=2),
+                       query="What is the license plate of my rental car?")
+    assert len(voice.calls) == 1
+    _texts, cue = voice.calls[0]
+    assert cue == "Q: What is the license plate of my rental car?\nA:"
+    assert ctx.compressed_gist == "The license plate is XYZ-4471."
+
+
+def test_mamba3_backend_no_query_is_byte_identical_fixed_cue():
+    """``chunk(...)`` with NO ``query`` (the default at every call site until a
+    flag opts in) uses the fixed ``gist_cue`` -- byte-identical to the pre-query-
+    conditioned mamba3 path. The query-conditioning branch only fires when a
+    query is explicitly passed."""
+    voice = _StubGistVoice(gist="gist")
+    bb = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    chunker = SSMChunker(bb, _StubEmbedder(), cfg, voice=voice,
+                         gist_backend="mamba3", gist_cue="Summary:")
+    eps = [_ep(f"e{i}", text=f"episode {i} body " * 30,
+               topics=[f"topic_{i}"], summary=f"summary {i}")
+           for i in range(4)]
+    chunker.chunk(eps, _plan(strategy=CHUNKED, primary_chunk_count=2))  # no query
+    assert voice.calls[0][1] == "Summary:"     # the fixed cue, byte-identical
+
+
 def test_format_includes_working_memory_preamble():
     chunker = _chunker()
     eps = [_ep("e0", text="word " * 200) for _ in range(8)]
