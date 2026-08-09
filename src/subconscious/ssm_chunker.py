@@ -250,10 +250,16 @@ class SSMChunker:
         through the SSM, and decoding a summary from the SSM state." That decode
         step was not implementable on the Phase 2a backbone (a JEPA predictor
         with no text-decoder head); a Mamba3 LM IS the decoder. Here the
-        secondary episode texts (summary, falling back to full text) are
+        secondary episode FULL TEXTS (text, falling back to summary) are
         concatenated and prefilled into a FRESH Mamba3 recurrent state, then a
         completion cue (``_gist_cue``) elicits a greedy-decoded summary
         continuation -- the gist Bonsai consumes (text, not a state vector).
+
+        The full text (not the summary) is ingested because the whole point of
+        the decode path is to surface DETAILS the topic-union labels cannot --
+        the summary is already a gist, and summarizing a summary loses the
+        facts the decoder is meant to retain. (The bge-into-backbone path uses
+        summaries; the decode path needs the content.)
 
         ``voice.ephemeral_gist`` allocates its own ``InferenceParams`` and
         discards it -- the voice's carried state (if any) is never touched, so
@@ -262,7 +268,7 @@ class SSMChunker:
         """
         if self.voice is None:
             return ""
-        texts = [ep.get("summary", "") or ep.get("text", "") for ep in episodes]
+        texts = [ep.get("text", "") or ep.get("summary", "") for ep in episodes]
         try:
             return self.voice.ephemeral_gist(texts, self._gist_cue)
         except Exception:

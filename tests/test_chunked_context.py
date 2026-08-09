@@ -180,7 +180,9 @@ def test_mamba3_backend_decodes_gist_and_skips_backbone_compressor():
     texts, cue = voice.calls[0]
     assert cue == "Summary:"
     assert len(texts) == 4
-    assert texts[0] == "summary 2"  # summary preferred over full text
+    # The decode path ingests the FULL TEXT (not the summary) -- the decoder
+    # needs the content to summarize; summarizing a summary loses the facts.
+    assert texts[0].startswith("episode 2 body")  # text preferred over summary
     # The backbone compressor was skipped (no dead-weight SSM step).
     assert ctx.compressed_state is None
     # The decoded gist was captured on the ChunkedContext.
