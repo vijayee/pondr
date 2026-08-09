@@ -544,6 +544,28 @@ def main() -> int:
                         "Historical canvases are reclaimed (never delete active, "
                         "floor 15, oldest-by-mtime). DEFAULT OFF -> no gate call / "
                         "tool / injection / reclaim -> byte-identical.")
+    p.add_argument("--ssm-chunker-gist-backend", default="topics",
+                   choices=["topics", "mamba3"],
+                   help="SSMChunker gist backend (the deferred Phase 2c path, "
+                        "default 'topics'): 'topics' emits the union of the "
+                        "secondary episodes' topic strings (byte-identical to "
+                        "today; the bge-into-backbone SSM compressor still runs "
+                        "but its state is never read). 'mamba3' DECODES a "
+                        "textual gist from the secondary episodes via a Mamba3 "
+                        "LM (the 'decode a summary from the SSM state' path "
+                        "realized -- the JEPA backbone had no decoder head) and "
+                        "the formatter emits THAT instead of the topic union; "
+                        "the dead-weight backbone compressor is skipped. Loads "
+                        "a Mamba3Voice (reuses the fade mamba3 voice if one is "
+                        "already loaded, else a fresh ~1.5GB model). "
+                        "Silently inert when no retrieved episodes are "
+                        "compressed.")
+    p.add_argument("--ssm-chunker-gist-cue", default="Summary:",
+                   help="The completion cue for --ssm-chunker-gist-backend=mamba3 "
+                        "(default 'Summary:'). The 443M is a base (non-instruct) "
+                        "LM, so a completion-style cue elicits the summary "
+                        "continuation; tunable for sweeps. Ignored for the "
+                        "'topics' backend.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -882,6 +904,20 @@ def main() -> int:
     print(f"[load] drill_down={args.drill_down}", file=sys.stderr)
     print(f"[load] reclaim={args.reclaim}", file=sys.stderr)
     print(f"[load] task_canvas={args.task_canvas}", file=sys.stderr)
+    if args.ssm_chunker_gist_backend == "mamba3":
+        shared = (args.fade_memory and args.fade_memory_voice_backend == "mamba3")
+        print(f"[load] ssm_chunker_gist_backend=mamba3 "
+              f"cue={args.ssm_chunker_gist_cue!r} "
+              f"voice={'shared-fade' if shared else 'fresh'}", file=sys.stderr)
+        print("NOTE: --ssm-chunker-gist-backend=mamba3 is EXPERIMENTAL (the "
+              "deferred Phase 2c 'decode a summary from the SSM state' path). "
+              "The secondary retrieved episodes are decoded into a textual "
+              "gist via a Mamba3 LM and the formatter emits THAT instead of "
+              "the topic union; the dead-weight backbone compressor is "
+              "skipped. The 443M is a base LM -- gist quality is cue-shaped "
+              "(--ssm-chunker-gist-cue). A/B-able against the 'topics' "
+              "off-baseline.",
+              file=sys.stderr)
 
     orch = build_ponder(
         args.db,
@@ -935,6 +971,8 @@ def main() -> int:
         drill_down=args.drill_down,
         reclaim=args.reclaim,
         task_canvas=args.task_canvas,
+        ssm_chunker_gist_backend=args.ssm_chunker_gist_backend,
+        ssm_chunker_gist_cue=args.ssm_chunker_gist_cue,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

@@ -287,6 +287,9 @@ class PonderOrchestrator:
         scene_worker: "Optional[SceneAuthoringWorker]" = None,
         task_canvas: bool = False,
         canvas_decider: "Optional[BonsaiDecider]" = None,
+        ssm_chunker_gist_backend: str = "topics",
+        ssm_chunker_gist_cue: str = "Summary:",
+        chunker_voice=None,
     ) -> None:
         self.store = store
         self.retriever = retriever
@@ -545,7 +548,12 @@ class PonderOrchestrator:
             ring_capacity=ring_capacity, identity_instance=identity_instance,
             capture_pre_state=capture_pre_state,
         )
-        self.ssm_chunker = SSMChunker(backbone, embedder, config)
+        self.ssm_chunker = SSMChunker(
+            backbone, embedder, config,
+            voice=chunker_voice,
+            gist_backend=ssm_chunker_gist_backend,
+            gist_cue=ssm_chunker_gist_cue,
+        )
         self.presentation_gate = PresentationGate(config, embedder)
         # Wire the chunker's primary-chunk cap into the gate so the gate's
         # primary_chunk_count never exceeds what the chunker will keep.

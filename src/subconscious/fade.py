@@ -897,6 +897,66 @@ class Mamba3Voice:
         self._carry_seqlen = 0
         self._carry_max = 0
 
+    # -- ephemeral gist (SSMChunker compressor seam) ------------------
+    def ephemeral_gist(self, texts: list[str], cue: str,
+                       max_new_tokens: int = 128) -> str:
+        """Ephemeral prefill+decode that does NOT touch the carried state.
+
+        Allocates a FRESH ``InferenceParams`` (independent of ``_carry_inf``),
+        concatenates ``texts`` into one prefill (the secondary episode bodies),
+        then forwards ``cue`` and greedy-decodes ``max_new_tokens`` -- a
+        completion-style summary of the prefilled content. The fresh cache is
+        discarded on return; ``_carry_inf`` is never read or written, so this is
+        safe to call on a voice that is ALSO carrying cross-turn state (e.g. a
+        shared fade voice) -- the SSMChunker's per-query gist does not bleed
+        into or from the fade carry.
+
+        This is the deferred Phase 2c "decode a summary from the SSM state"
+        path (docs/Phase 2c.md lines 552-559) realized: the Mamba3 LM IS the
+        decoder the JEPA backbone lacked. Returns "" on empty input / a cold
+        decode. Greedy (temp 0) -- a gist, not a sample.
+        """
+        import torch
+        from mamba_ssm.utils.generation import InferenceParams
+
+        body = "\n".join(t for t in texts if t and t.strip())
+        if not body.strip():
+            return ""
+        body_ids = self.tokenizer.encode(body, add_special_tokens=False)
+        cue_ids = self.tokenizer.encode(cue, add_special_tokens=False)
+        if not body_ids:
+            return ""
+        all_ids = body_ids + cue_ids
+        # Size the cache to the prefill + decode (cannot grow after allocate).
+        max_seqlen = len(all_ids) + int(max_new_tokens) + 1
+        inf = InferenceParams(max_seqlen=max_seqlen, max_batch_size=1)
+        inf.key_value_memory_dict = self.model.allocate_inference_cache(
+            1, max_seqlen)
+        eos = self.tokenizer.eos_token_id
+        gen = min(int(max_new_tokens),
+                  max_seqlen - len(all_ids))
+        if gen <= 0:
+            return ""
+        out_ids: list[int] = []
+        with torch.inference_mode():
+            prompt = torch.tensor([all_ids], dtype=torch.long, device=self.device)
+            out = self.model(prompt, inference_params=inf)
+            logits = out.logits if hasattr(out, "logits") else out
+            nxt = logits[0, -1].float()
+            inf.seqlen_offset = len(all_ids)
+            for _ in range(gen):
+                choice = int(nxt.argmax().item())  # greedy
+                if choice == eos:
+                    break
+                out_ids.append(choice)
+                tok = torch.tensor([[choice]], dtype=torch.long,
+                                   device=self.device)
+                out = self.model(tok, inference_params=inf)
+                logits = out.logits if hasattr(out, "logits") else out
+                nxt = logits[0, -1].float()
+                inf.seqlen_offset += 1
+        return self.tokenizer.decode(out_ids, skip_special_tokens=True)
+
 
 def load_mamba3_voice(model_id: str, tokenizer_id: str, device: str = "auto",
                       temperature: float = 0.7, top_p: float = 0.9,

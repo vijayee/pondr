@@ -103,6 +103,8 @@ def build_ponder(
     drill_down: bool = False,
     reclaim: bool = False,
     task_canvas: bool = False,
+    ssm_chunker_gist_backend: str = "topics",
+    ssm_chunker_gist_cue: str = "Summary:",
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -580,6 +582,28 @@ def build_ponder(
         )
         fade_mem = FadeMemory(fade_cfg, embedder, voice, dim=384)
 
+    # SSMChunker Mamba3 gist backend (the deferred Phase 2c path, default OFF).
+    # When ``ssm_chunker_gist_backend == "mamba3"`` the chunker decodes a textual
+    # gist from the secondary episodes via a Mamba3 LM (``ephemeral_gist``) and
+    # the formatter emits THAT instead of the topic union; the dead-weight
+    # backbone compressor is skipped. ``chunker_voice`` is a Mamba3Voice. To
+    # avoid a second ~1.5GB model load when the fade voice is ALREADY a
+    # Mamba3Voice (same model+tokenizer), REUSE it -- ``ephemeral_gist``
+    # allocates its own InferenceParams and never touches the carried state, so
+    # sharing the model is safe (the chunker runs sequentially in the same
+    # query(), never reentrant with fade). Else load a fresh instance. ``None``
+    # (the default ``"topics"`` backend) -> no voice -> byte-identical to today.
+    chunker_voice = None
+    if ssm_chunker_gist_backend == "mamba3":
+        from .subconscious.fade import Mamba3Voice, load_mamba3_voice
+        if (fade_memory and fade_memory_voice_backend == "mamba3"
+                and isinstance(voice, Mamba3Voice)):
+            chunker_voice = voice  # reuse the fade model (no second load)
+        else:
+            chunker_voice = load_mamba3_voice(
+                fade_memory_mamba3_model, fade_memory_mamba3_tokenizer,
+                device=device)
+
     # Gist-on-forgetting consolidation (Phase C, optional). When
     # ``fade_consolidation`` is set (AND a fade memory is wired), construct a
     # ``BonsaiGister`` (composing the two existing Bonsai clients -- narrative
@@ -662,6 +686,9 @@ def build_ponder(
         scene_worker=scene_worker,
         task_canvas=task_canvas,
         canvas_decider=canvas_decider,
+        ssm_chunker_gist_backend=ssm_chunker_gist_backend,
+        ssm_chunker_gist_cue=ssm_chunker_gist_cue,
+        chunker_voice=chunker_voice,
     )
     return orch
 

@@ -116,19 +116,38 @@ class ChunkedContextFormatter:
                 token_count += chunk_tokens
         parts.append("\n".join(primary_lines))
 
-        # ── COMPRESSED (topic union from secondary episodes — NOT the state vector) ──
+        # ── COMPRESSED (gist of the secondary episodes) ──
+        # Two shapes, selected by the chunker's gist backend:
+        #   mamba3 (``compressed_gist`` is not None): a Mamba3-decoded TEXTUAL
+        #     summary -- the "decode a summary from the SSM state" path realized
+        #     (Phase 2c deferred). The decoded gist replaces the topic union.
+        #   topics (``compressed_gist`` is None, the default): the union of the
+        #     secondary episodes' topic strings (NOT the raw SSM state vector --
+        #     Bonsai consumes text, not state). Byte-identical to pre-mamba3.
+        # The EXPAND ids line is emitted either way (both backends keep the
+        # secondary episodes retrievable on demand).
         if chunked.has_compressed:
-            topics = sorted({
-                t for ep in chunked.secondary_episodes
-                for t in ep.get("topics", []) if t
-            })
-            comp_lines = [
-                "[COMPRESSED CONTEXT — SUMMARY]",
-                "The following topics are available in compressed form. If you need",
-                "specific details, use EXPAND(episode_id) to retrieve full text.",
-                f"Compressed topics: {', '.join(topics) if topics else '(none extracted)'}",
-                f"Expandable episode ids: {', '.join(sorted(chunked.expandable_ids))}",
-            ]
+            expand_ids = ', '.join(sorted(chunked.expandable_ids))
+            if chunked.compressed_gist:  # truthy: a non-empty decoded gist
+                comp_lines = [
+                    "[COMPRESSED CONTEXT — SUMMARY]",
+                    "The following is a summary of less-relevant past episodes. If you",
+                    "need specific details, use EXPAND(episode_id) to retrieve full text.",
+                    f"Summary: {chunked.compressed_gist}",
+                    f"Expandable episode ids: {expand_ids}",
+                ]
+            else:
+                topics = sorted({
+                    t for ep in chunked.secondary_episodes
+                    for t in ep.get("topics", []) if t
+                })
+                comp_lines = [
+                    "[COMPRESSED CONTEXT — SUMMARY]",
+                    "The following topics are available in compressed form. If you need",
+                    "specific details, use EXPAND(episode_id) to retrieve full text.",
+                    f"Compressed topics: {', '.join(topics) if topics else '(none extracted)'}",
+                    f"Expandable episode ids: {expand_ids}",
+                ]
             parts.append("\n".join(comp_lines))
 
         # ── WORKING MEMORY STATE (text preamble from WM metadata) ──

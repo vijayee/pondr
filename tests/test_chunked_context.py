@@ -80,6 +80,23 @@ def _chunker(max_primary_tokens=4096, max_primary_chunks=5):
     return SSMChunker(bb, _StubEmbedder(), cfg)
 
 
+class _StubGistVoice:
+    """A stub Mamba3Voice for the gist-backend tests (no torch, no HF).
+
+    Records the episode texts + cue it received and returns a canned gist, so
+    the tests can assert the chunker threaded the secondary episodes through
+    ``ephemeral_gist`` and the formatter emitted the decoded text.
+    """
+
+    def __init__(self, gist: str = "DECODED GIST") -> None:
+        self.gist = gist
+        self.calls: list[tuple[list[str], str]] = []
+
+    def ephemeral_gist(self, texts, cue, max_new_tokens=128):
+        self.calls.append((list(texts), cue))
+        return self.gist
+
+
 def _plan(strategy=CHUNKED, primary_chunk_count=5):
     return PresentationPlan(
         strategy=strategy, primary_chunk_count=primary_chunk_count,
@@ -118,6 +135,133 @@ def test_format_omits_compressed_section_when_none():
     chunker = _chunker()
     eps = [_ep("e0"), _ep("e1")]
     ctx = chunker.chunk(eps, _plan(strategy=DIRECT, primary_chunk_count=2))
+    out = ChunkedContextFormatter().format_for_llm(ctx)
+    assert "[COMPRESSED CONTEXT — SUMMARY]" not in out
+
+
+# ── Mamba3 gist backend (the deferred Phase 2c "decode a summary" path) ──
+
+
+def test_topics_backend_default_is_byte_identical_compressed_gist_none():
+    """The default 'topics' backend produces NO decoded gist (compressed_gist is
+    None) and the formatter emits the topic union -- byte-identical to the
+    pre-mamba3 path (the bge-into-backbone SSM compressor still runs but its
+    state is never read)."""
+    eps = [_ep(f"e{i}", text="word " * 200, topics=[f"topic_{i}", "shared"],
+               summary=f"sum {i}") for i in range(6)]
+    bb = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    chunker = SSMChunker(bb, _StubEmbedder(), cfg)  # default gist_backend="topics"
+    ctx = chunker.chunk(eps, _plan(strategy=CHUNKED, primary_chunk_count=2))
+    assert ctx.compressed_gist is None              # no decoded gist
+    assert ctx.compressed_state is not None         # the bge-into-backbone path ran
+    out = ChunkedContextFormatter().format_for_llm(ctx)
+    assert "[COMPRESSED CONTEXT — SUMMARY]" in out
+    assert "Compressed topics:" in out              # topic union, not a decoded gist
+    assert "Summary: " not in out.split("[COMPRESSED")[1]  # no decoded gist line
+
+
+def test_mamba3_backend_decodes_gist_and_skips_backbone_compressor():
+    """The 'mamba3' backend threads the secondary episodes through the voice's
+    ephemeral_gist (which returns a canned gist), skips the dead-weight backbone
+    compressor (compressed_state is None), and the formatter emits the decoded
+    gist text instead of the topic union."""
+    voice = _StubGistVoice(gist="The user discussed a rental car and a vet visit.")
+    bb = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    chunker = SSMChunker(bb, _StubEmbedder(), cfg, voice=voice,
+                         gist_backend="mamba3", gist_cue="Summary:")
+    eps = [_ep(f"e{i}", text=f"episode {i} body " * 30,
+               topics=[f"topic_{i}", "shared"], summary=f"summary {i}")
+           for i in range(6)]
+    ctx = chunker.chunk(eps, _plan(strategy=CHUNKED, primary_chunk_count=2))
+    # The voice received the SECONDARY episodes' texts (e2..e5, 4 of them).
+    assert len(voice.calls) == 1
+    texts, cue = voice.calls[0]
+    assert cue == "Summary:"
+    assert len(texts) == 4
+    assert texts[0] == "summary 2"  # summary preferred over full text
+    # The backbone compressor was skipped (no dead-weight SSM step).
+    assert ctx.compressed_state is None
+    # The decoded gist was captured on the ChunkedContext.
+    assert ctx.compressed_gist == "The user discussed a rental car and a vet visit."
+
+
+def test_mamba3_backend_formatter_emits_gist_not_topics():
+    """The formatter emits the decoded gist text (a 'Summary:' line) and keeps
+    the EXPAND ids line; the topic-union line is NOT emitted under mamba3."""
+    voice = _StubGistVoice(gist="Rental car plate ABC-9921; vet Dr. Voss at 3pm.")
+    bb = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    chunker = SSMChunker(bb, _StubEmbedder(), cfg, voice=voice,
+                         gist_backend="mamba3")
+    eps = [_ep(f"e{i}", text=f"body {i} " * 30, topics=[f"t{i}"],
+               summary=f"sum {i}") for i in range(5)]
+    ctx = chunker.chunk(eps, _plan(strategy=CHUNKED, primary_chunk_count=2))
+    out = ChunkedContextFormatter().format_for_llm(ctx)
+    assert "[COMPRESSED CONTEXT — SUMMARY]" in out
+    assert "Summary: Rental car plate ABC-9921; vet Dr. Voss at 3pm." in out
+    assert "EXPAND(episode_id)" in out        # EXPAND ids line kept
+    for i in range(2, 5):
+        assert f"e{i}" in out                 # expandable ids still listed
+    # The topic-union line is NOT emitted under mamba3.
+    assert "Compressed topics:" not in out
+
+
+def test_mamba3_backend_without_voice_falls_back_to_topics_formatter():
+    """mamba3 requested but no voice loaded -> no compression (no SSM state, no
+    gist); the formatter falls back to the topic union from secondary_episodes.
+    The backbone compressor is NOT run (the user opted out of the topics path)."""
+    bb = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    chunker = SSMChunker(bb, _StubEmbedder(), cfg, voice=None,
+                         gist_backend="mamba3")
+    eps = [_ep(f"e{i}", text=f"body {i} " * 30, topics=[f"t{i}", "shared"],
+               summary=f"sum {i}") for i in range(4)]
+    ctx = chunker.chunk(eps, _plan(strategy=CHUNKED, primary_chunk_count=2))
+    assert ctx.compressed_state is None       # backbone compressor skipped
+    assert ctx.compressed_gist is None        # no voice -> no decoded gist
+    out = ChunkedContextFormatter().format_for_llm(ctx)
+    # Formatter falls back to the topic union from the secondary episodes.
+    assert "Compressed topics:" in out
+    assert "shared" in out
+
+
+def test_mamba3_backend_empty_decode_falls_back_to_topics_formatter():
+    """A cold/empty decode (voice returns '') -> the formatter treats a falsy
+    gist as 'no gist' and falls back to the topic union from secondary_episodes
+    (topics > an empty 'Summary:' line for the LLM). compressed_gist is still
+    recorded as '' on the ChunkedContext (the decode happened; it was empty)."""
+    voice = _StubGistVoice(gist="")
+    bb = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    chunker = SSMChunker(bb, _StubEmbedder(), cfg, voice=voice,
+                         gist_backend="mamba3")
+    eps = [_ep(f"e{i}", text=f"body {i} " * 30, topics=[f"t{i}", "shared"],
+               summary=f"sum {i}") for i in range(4)]
+    ctx = chunker.chunk(eps, _plan(strategy=CHUNKED, primary_chunk_count=2))
+    assert ctx.compressed_gist == ""          # empty decode, recorded
+    out = ChunkedContextFormatter().format_for_llm(ctx)
+    # Formatter falls back to the topic union (truthy check on the gist).
+    assert "Compressed topics:" in out
+    assert "shared" in out
+    assert "Summary: " not in out.split("[COMPRESSED")[1]
+
+
+def test_mamba3_backend_no_secondary_episodes():
+    """No secondary episodes -> no gist decode, no SSM state; the formatter
+    omits the compressed section entirely (byte-identical to topics backend
+    with no secondary)."""
+    voice = _StubGistVoice()
+    bb = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    chunker = SSMChunker(bb, _StubEmbedder(), cfg, voice=voice,
+                         gist_backend="mamba3")
+    eps = [_ep("e0"), _ep("e1")]
+    ctx = chunker.chunk(eps, _plan(strategy=DIRECT, primary_chunk_count=2))
+    assert ctx.compressed_gist is None
+    assert ctx.compressed_state is None
+    assert voice.calls == []                   # no decode attempted
     out = ChunkedContextFormatter().format_for_llm(ctx)
     assert "[COMPRESSED CONTEXT — SUMMARY]" not in out
 

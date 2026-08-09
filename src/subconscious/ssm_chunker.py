@@ -56,10 +56,22 @@ class ChunkedContext:
     """The result of chunking a ranked episode list for presentation.
 
     ``primary_chunks`` carry full text; ``compressed_state`` carries the gist of
-    the rest as an SSM recurrent state; ``secondary_episodes`` retains the
-    compressed episode dicts (their topics feed the formatter's compressed
+    the rest as an SSM recurrent state (the bge-into-backbone path); ``secondary_episodes``
+    retains the compressed episode dicts (their topics feed the formatter's compressed
     summary, and EXPAND can resolve them in-memory before hitting the store).
     ``chunk_map`` and ``expandable_ids`` support EXPAND.
+
+    ``compressed_gist`` (the Mamba3 path, default None): when the gist backend is
+    ``"mamba3"`` a textual summary is DECODED from the secondary episodes (the
+    deferred Phase 2c "decode a summary from the SSM state" path -- realized via
+    a Mamba3 LM prefill+decode), and the formatter emits THIS text instead of the
+    topic union. ``None`` (the default ``"topics"`` backend) -> the formatter
+    emits the topic union from ``secondary_episodes`` (byte-identical to pre-
+    mamba3). An EMPTY string decode (``""``) also falls back to the topic union
+    (the formatter treats a falsy gist as "no gist" -- topics > an empty
+    ``Summary:`` line). Only one of ``compressed_state`` / a non-empty
+    ``compressed_gist`` is produced per chunk() (the backend selects the path);
+    the other is None / empty.
     """
     primary_chunks: list[dict]
     compressed_state: Optional[WorkingMemoryState]
@@ -69,6 +81,7 @@ class ChunkedContext:
     primary_token_count: int             # len(text)//4 estimate, summed over primary
     compressed_episode_count: int
     secondary_episodes: list[dict] = field(default_factory=list)  # the compressed dicts
+    compressed_gist: Optional[str] = None  # mamba3-decoded textual gist (None = topic union)
 
     @property
     def has_compressed(self) -> bool:
@@ -94,6 +107,10 @@ class SSMChunker:
         embedder,
         config,
         instance_config: Optional[InstanceConfig] = None,
+        *,
+        voice=None,
+        gist_backend: str = "topics",
+        gist_cue: str = "Summary:",
     ) -> None:
         self.backbone = backbone
         self.embedder = embedder
@@ -103,9 +120,25 @@ class SSMChunker:
         self.max_primary_chunks = chunk_cfg.max_primary_chunks
         cfg = instance_config or INSTANCE_CONFIGS["working_memory"]
         # Ephemeral compressor: fresh state per chunk() call (see compress_episodes).
+        # This is the bge-into-backbone path (the "topics" backend, default).
         self._compressor = WorkingMemory(
             backbone, config=cfg, embedder=embedder, decay_alpha=1.0
         )
+        # Mamba3 gist backend (the deferred Phase 2c path, default OFF). When
+        # ``gist_backend == "mamba3"`` and ``voice`` is a Mamba3 LM, the
+        # secondary episodes are decoded into a TEXTUAL gist (see
+        # ``compress_gist_mamba3``) instead of being stepped into the (falsified)
+        # backbone SSM whose state was computed-then-discarded (the ablation
+        # [[pondr-backbone-ablation-result]] falsified the backbone's identity
+        # objective; the formatter never read ``compressed_state`` anyway).
+        # ``voice`` is a ``Mamba3Voice`` (or any object exposing
+        # ``ephemeral_gist(texts, cue, max_new_tokens)``); ``None`` (default) ->
+        # the topics backend runs (byte-identical). ``gist_cue`` is the
+        # completion cue handed to the decoder (a base LM, not instruction-tuned
+        # -- a completion-style cue elicits the summary; tunable for sweeps).
+        self.voice = voice
+        self.gist_backend = gist_backend
+        self._gist_cue = gist_cue
 
     def chunk(
         self,
@@ -146,7 +179,34 @@ class SSMChunker:
                 secondary.append(ep)
                 chunk_map[eid] = -1
 
-        compressed_state = self.compress_episodes(secondary) if secondary else None
+        # Compress the secondary set. Two backends, selected by ``gist_backend``:
+        #   "topics" (default): step bge summary embeddings into the ephemeral
+        #     backbone SSM -> ``compressed_state`` (the gist as a recurrent state
+        #     vector). The formatter never reads this state (it emits the topic
+        #     union from ``secondary_episodes``), but computing it keeps the
+        #     ChunkedContext byte-identical to the pre-mamba3 path.
+        #   "mamba3": DECODE a textual gist from the secondary episodes via the
+        #     Mamba3 voice -> ``compressed_gist``. The formatter emits THIS text
+        #     instead of the topic union, and the backbone compressor is SKIPPED
+        #     (no dead-weight SSM step on the falsified backbone). Falls back to
+        #     no compression (no state, no gist) when the voice is absent -- the
+        #     formatter then emits the topic union from ``secondary_episodes``.
+        if secondary:
+            if self.gist_backend == "mamba3" and self.voice is not None:
+                compressed_state = None
+                compressed_gist = self.compress_gist_mamba3(secondary)
+            elif self.gist_backend == "mamba3":
+                # mamba3 requested but no voice loaded -> skip the backbone
+                # compressor (the user opted out of the topics path); the
+                # formatter falls back to the topic union from secondary_episodes.
+                compressed_state = None
+                compressed_gist = None
+            else:
+                compressed_state = self.compress_episodes(secondary)
+                compressed_gist = None
+        else:
+            compressed_state = None
+            compressed_gist = None
         return ChunkedContext(
             primary_chunks=primary_chunks,
             compressed_state=compressed_state,
@@ -156,6 +216,7 @@ class SSMChunker:
             primary_token_count=token_count,
             compressed_episode_count=len(secondary),
             secondary_episodes=list(secondary),
+            compressed_gist=compressed_gist,
         )
 
     def compress_episodes(self, episodes: list[dict]) -> WorkingMemoryState:
@@ -164,6 +225,11 @@ class SSMChunker:
         Returns the final recurrent state (gist of all the episodes). The
         compressor is reset before each call so the gist is scoped to this
         chunk() — never aliased to a previous query's compression.
+
+        (The "topics" backend. Note: the formatter never reads this state -- it
+        emits the topic union from ``secondary_episodes``; the state is
+        computed for the byte-identical pre-mamba3 path. The mamba3 backend
+        skips this entirely.)
         """
         if not episodes:
             raise ValueError("compress_episodes called with no episodes")
@@ -175,6 +241,34 @@ class SSMChunker:
         return self._compressor.snapshot(
             metadata={"compressed_episode_ids": [ep.get("episode_id") for ep in episodes]}
         )
+
+    def compress_gist_mamba3(self, episodes: list[dict]) -> str:
+        """Decode a textual gist of ``episodes`` via the Mamba3 voice (ephemeral).
+
+        The deferred Phase 2c path (docs/Phase 2c.md lines 552-559): the original
+        chat sketch "compresses the prompt by chunking it, stepping each chunk
+        through the SSM, and decoding a summary from the SSM state." That decode
+        step was not implementable on the Phase 2a backbone (a JEPA predictor
+        with no text-decoder head); a Mamba3 LM IS the decoder. Here the
+        secondary episode texts (summary, falling back to full text) are
+        concatenated and prefilled into a FRESH Mamba3 recurrent state, then a
+        completion cue (``_gist_cue``) elicits a greedy-decoded summary
+        continuation -- the gist Bonsai consumes (text, not a state vector).
+
+        ``voice.ephemeral_gist`` allocates its own ``InferenceParams`` and
+        discards it -- the voice's carried state (if any) is never touched, so
+        this is safe against a shared fade voice. Returns "" on a cold/empty
+        decode (the formatter then emits the topic union as a fallback).
+        """
+        if self.voice is None:
+            return ""
+        texts = [ep.get("summary", "") or ep.get("text", "") for ep in episodes]
+        try:
+            return self.voice.ephemeral_gist(texts, self._gist_cue)
+        except Exception:
+            # Best-effort: a decode failure must not break the query. The
+            # formatter falls back to the topic union from secondary_episodes.
+            return ""
 
     def expand(
         self,
