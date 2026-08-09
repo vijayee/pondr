@@ -201,8 +201,9 @@ def test_recall_prepends_carry_recall_after_ingest():
     assert results[0].anchor_id == -1
     assert results[0].cos == pytest.approx(1.0)
     assert "SQUEAKY-RAVEN-42" in results[0].content
-    # recall_from_carry was cued with the query text and the recall-token budget.
-    assert voice.recall_calls == [("what was the passphrase",
+    # recall_from_carry was cued with the DEFAULT completion cue
+    # ("Q: {cue}\nA:" -> the query reshaped) and the recall-token budget.
+    assert voice.recall_calls == [("Q: what was the passphrase\nA:",
                                    mem.cfg.voice_carry_recall_tokens)]
     # the rest are the SSM-A regime recalls (unchanged, still present).
     assert any(r.regime in (REGIME_VERBATIM, REGIME_GIST, REGIME_FORGOTTEN)
@@ -446,31 +447,47 @@ def test_carry_recall_flows_into_fade_block():
 # ---------------------------------------------------------------------------
 # The 443M is a base (non-instruct) LM; the live A/B showed variable completion
 # when cued with the raw user_prompt. ``FadeConfig.voice_carry_cue_template``
-# (default "{cue}" = identity) reshapes the cue before ``recall_from_carry``.
+# reshapes the cue before ``recall_from_carry``. The DEFAULT is the completion
+# cue ``"Q: {cue}\nA:"`` (a 12-conv eval: 12/12 needles vs raw ``"{cue}"`` 3/12);
+# ``"{cue}"`` is the raw identity (an explicit opt-back-in -> format skipped).
 
-def test_cue_template_default_is_identity_byte_identical():
-    """The default ``"{cue}"`` template is IDENTITY: ``recall_from_carry`` receives
-    the raw user_prompt (the format call is skipped). Byte-identical to a
-    ``FadeConfig`` with the template unset."""
+def test_cue_template_default_is_completion_cue():
+    """The DEFAULT template is ``"Q: {cue}\nA:"``: ``recall_from_carry`` receives
+    the user_prompt reshaped into a completion cue (the format call runs on the
+    default). This is the evidence-backed default; ``"{cue}"`` is the opt-out."""
     voice = _StubCarryVoice()
     mem = FadeMemory(_cfg(voice_carry=True), _StubEmbedder(), voice)   # default
-    assert mem.cfg.voice_carry_cue_template == "{cue}"
+    assert mem.cfg.voice_carry_cue_template == "Q: {cue}\nA:"
     mem.ingest("User: the passphrase is SQUEAKY-RAVEN-42\nAssistant: noted")
     mem.recall("what was the passphrase", top_k=3)
-    # the stub received the RAW prompt (no format applied).
+    # the stub received the completion cue (format applied on the default).
+    assert voice.recall_calls[-1][0] == "Q: what was the passphrase\nA:"
+
+
+def test_cue_template_identity_opt_out_is_byte_identical_to_raw():
+    """Setting the template back to ``"{cue}"`` is IDENTITY: the format call is
+    skipped (the hot-path guard) and ``recall_from_carry`` receives the raw
+    user_prompt -- byte-identical to passing the raw prompt directly."""
+    voice = _StubCarryVoice()
+    mem = FadeMemory(_cfg(voice_carry=True, voice_carry_cue_template="{cue}"),
+                     _StubEmbedder(), voice)
+    mem.ingest("User: the passphrase is SQUEAKY-RAVEN-42\nAssistant: noted")
+    mem.recall("what was the passphrase", top_k=3)
+    # the stub received the RAW prompt (no format applied -> byte-identical).
     assert voice.recall_calls[-1][0] == "what was the passphrase"
 
 
-def test_cue_template_non_default_reaches_recall_reshaped():
-    """A non-default template reaches ``recall_from_carry`` RESHAPED: the stub
-    records the cue it received, which equals ``template.format(cue=prompt)``."""
+def test_cue_template_explicit_passes_format_result_to_recall():
+    """An explicitly-passed template reaches ``recall_from_carry`` RESHAPED: the
+    stub records the cue it received, which equals ``template.format(cue=prompt)``
+    (the str.format result, not the raw prompt)."""
     voice = _StubCarryVoice()
-    mem = FadeMemory(_cfg(voice_carry=True,
-                          voice_carry_cue_template="Q: {cue}\nA:"),
+    tmpl = "Q: {cue}\nA:"
+    mem = FadeMemory(_cfg(voice_carry=True, voice_carry_cue_template=tmpl),
                      _StubEmbedder(), voice)
     mem.ingest("User: the plate is ABC-9921\nAssistant: noted")
     mem.recall("what was the plate", top_k=3)
-    assert voice.recall_calls[-1][0] == "Q: what was the plate\nA:"
+    assert voice.recall_calls[-1][0] == tmpl.format(cue="what was the plate")
 
 
 def test_cue_template_preserves_carry_content():

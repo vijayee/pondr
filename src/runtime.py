@@ -85,7 +85,7 @@ def build_ponder(
     fade_memory_expand_tokens: int = 64,
     fade_memory_voice_carry: bool = False,
     fade_memory_collapse: bool = False,
-    fade_memory_voice_carry_cue_template: str = "{cue}",
+    fade_memory_voice_carry_cue_template: str = "Q: {cue}\nA:",
     fade_inject: bool = False,
     fade_consolidation: bool = False,
     fade_consolidation_epsilon: float = 0.03,

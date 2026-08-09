@@ -271,16 +271,21 @@ class FadeConfig:
     voice_carry: bool = False
     voice_carry_max_tokens: int = 2048  # Mamba3-SISO training-ctx ceiling
     voice_carry_recall_tokens: int = 64  # decode length for a carried recall
-    # Cue engineering (exp #4 follow-on, default IDENTITY). A ``str.format``
-    # template applied to the cue before ``recall_from_carry``: the 443M is a
-    # BASE (non-instruct) LM ([[mamba3-recall-probe-result]]), and the live A/B
-    # showed variable completion (a needle on one turn, a degenerate loop on the
-    # next) when cued with the raw ``user_prompt``. A completion-style cue (e.g.
-    # ``" {cue}\nA:"``) can elicit the carried content better than a raw
-    # question. The template receives ``{cue}`` = the user_prompt. Default
-    # ``"{cue}"`` is IDENTITY -> byte-identical (the recall path skips the
-    # ``format`` call on the default so the hot path is untouched).
-    voice_carry_cue_template: str = "{cue}"
+    # Cue engineering (exp #4 follow-on). A ``str.format`` template applied to
+    # the cue before ``recall_from_carry``: the 443M is a BASE (non-instruct) LM
+    # ([[mamba3-recall-probe-result]]), and the live A/B showed variable
+    # completion (a needle on one turn, a degenerate loop on the next) when cued
+    # with the raw ``user_prompt``. A completion-style cue elicits the carried
+    # content far better than a raw question: a 12-conversation eval
+    # (scripts/_scratch/eval_carry_cue.py) found ``"Q: {cue}\nA:"`` hits 12/12
+    # needles vs raw ``"{cue}"`` 3/12 (and raw's 3 are degenerate verbatim loops,
+    # not answers). So the DEFAULT is ``"Q: {cue}\nA:"``. The template receives
+    # ``{cue}`` = the user_prompt. Setting it to ``"{cue}"`` is IDENTITY -> the
+    # recall path skips the ``format`` call (the hot-path guard) so raw-cue carry
+    # is byte-identical to a hand-passed ``"{cue}"``. The cue template only
+    # applies when ``voice_carry`` is ON (itself default-OFF) -> carry-OFF is
+    # byte-identical to flag-off regardless of this default.
+    voice_carry_cue_template: str = "Q: {cue}\nA:"
     # The collapse (exp #4 follow-on, additive, default OFF). When True, the SSM-A
     # ingest/recall path is SUPPRESSED and the carried Mamba3 state is the SOLE
     # within-window cross-turn memory; beyond the ~2048-token training-ctx ceiling
@@ -1185,14 +1190,16 @@ class FadeMemory:
         # and to avoid a divergence that a ``if not collapse: q = ...`` would invite.
         if self.cfg.voice_carry and hasattr(self.voice, "recall_from_carry") \
                 and getattr(self.voice, "_carry_seqlen", 0) > 0:
-            # Cue engineering: apply the cue template (default "{cue}" is
-            # IDENTITY -- skip the format call entirely so the hot path is
-            # byte-identical to flag-off; only a non-default template reaches
-            # ``recall_from_carry`` reshaped). The template receives ``{cue}`` =
-            # the user prompt. A misconfigured template (a placeholder other
-            # than ``{cue}``, e.g. ``{foo}``) ``KeyError``s at format time; that
-            # is INSIDE the try/except below -> swallowed -> no carry recall
-            # (the safest failure mode; the regime recalls survive).
+            # Cue engineering: apply the cue template. The DEFAULT is
+            # ``"Q: {cue}\nA:"`` (a completion cue -- the 443M is a base LM and a
+            # raw question degenerates; see FadeConfig.voice_carry_cue_template).
+            # The guard skips the ``format`` call only when the template is the
+            # raw ``"{cue}"`` identity (an explicit opt-back-in) so raw-cue carry
+            # stays byte-identical to a hand-passed ``"{cue}"``. The template
+            # receives ``{cue}`` = the user prompt. A misconfigured template (a
+            # placeholder other than ``{cue}``, e.g. ``{foo}``) ``KeyError``s at
+            # format time; that is INSIDE the try/except below -> swallowed -> no
+            # carry recall (the safest failure mode; the regime recalls survive).
             try:
                 cue = query_text
                 if self.cfg.voice_carry_cue_template != "{cue}":

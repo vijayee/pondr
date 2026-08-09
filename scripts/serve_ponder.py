@@ -302,16 +302,17 @@ def main() -> int:
                         "the SSM-A regime path. Requires --fade-memory "
                         "--fade-memory-voice-backend=mamba3. No-op (byte-identical) "
                         "when off or with a non-mamba3 voice.")
-    p.add_argument("--fade-memory-voice-carry-cue-template", default="{cue}",
-                   help="Cue engineering (exp #4 follow-on, default IDENTITY "
-                        "'{cue}'): a str.format template applied to the cue before "
+    p.add_argument("--fade-memory-voice-carry-cue-template", default="Q: {cue}\nA:",
+                   help="Cue engineering (exp #4 follow-on, default 'Q: {cue}\\nA:'): "
+                        "a str.format template applied to the cue before "
                         "recall_from_carry. The 443M is a base (non-instruct) LM; "
-                        "a completion-style cue (e.g. ' {cue}\\nA:') can elicit the "
-                        "carried content better than the raw user_prompt. The "
-                        "template receives {cue}=the user prompt. Default '{cue}' "
-                        "is identity -> byte-identical (the format call is "
-                        "skipped). Requires --fade-memory --fade-memory-voice-"
-                        "carry --fade-memory-voice-backend=mamba3.")
+                        "a completion-style cue elicits the carried content far "
+                        "better than the raw user_prompt (12-conv eval: 'Q: {cue}\\n"
+                        "A:' hits 12/12 needles vs raw '{cue}' 3/12). The template "
+                        "receives {cue}=the user prompt. Set to '{cue}' for raw "
+                        "identity (byte-identical; the format call is skipped). "
+                        "Requires --fade-memory --fade-memory-voice-carry --fade-"
+                        "memory-voice-backend=mamba3.")
     p.add_argument("--fade-memory-collapse", action="store_true", default=False,
                    help="The collapse (exp #4 follow-on, default OFF): suppress "
                         "SSM-A so the carried Mamba3 is the SOLE within-window "
