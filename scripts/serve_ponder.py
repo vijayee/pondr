@@ -565,9 +565,27 @@ def main() -> int:
                         "(default 'Summary:'). The 443M is a base (non-instruct) "
                         "LM, so a completion-style cue elicits the summary "
                         "continuation; tunable for sweeps. Ignored for the "
-                        "'topics' backend and when --ssm-chunker-gist-query-"
+                        "'topics' backend, when --ssm-chunker-gist-query-"
                         "conditioned is on (that overrides the cue with "
-                        "'Q: {user_prompt}\\nA:').")
+                        "'Q: {user_prompt}\\nA:'), and when a named "
+                        "--ssm-chunker-gist-cue-preset is set (the preset "
+                        "overrides this raw cue).")
+    p.add_argument("--ssm-chunker-gist-cue-preset", default=None,
+                   choices=["summary", "instruct-labeled", "instruct-additive"],
+                   help="(mamba3 backend only, default None = byte-identical) A "
+                        "named gist-decode cue preset that overrides "
+                        "--ssm-chunker-gist-cue: 'summary' (the bare 'Summary:' "
+                        "cue), 'instruct-labeled' (extract every concrete fact as "
+                        "'subject: value' lines -- toy 4/4, 58%% at scale on the "
+                        "LongMemEval forced-secondary stress), or "
+                        "'instruct-additive' (labeled PLUS explicit capture of "
+                        "counts, time/date/sequence markers, and user "
+                        "preferences -- 67%% at scale, fixes the preference + "
+                        "temporal failures; ADDITIVE not suppressive). Inert for "
+                        "the 'topics' backend and when --ssm-chunker-gist-query-"
+                        "conditioned is on. NOTE: results are 12-item stress-"
+                        "test scale (full 50/500 pending); the two fixes are "
+                        "structural, count-aggregation cases stay open.")
     p.add_argument("--ssm-chunker-gist-query-conditioned",
                    action="store_true", default=False,
                    help="(mamba3 backend only, default OFF) Thread the user's "
@@ -1000,6 +1018,7 @@ def main() -> int:
         task_canvas=args.task_canvas,
         ssm_chunker_gist_backend=args.ssm_chunker_gist_backend,
         ssm_chunker_gist_cue=args.ssm_chunker_gist_cue,
+        ssm_chunker_gist_cue_preset=args.ssm_chunker_gist_cue_preset,
         ssm_chunker_gist_query_conditioned=args.ssm_chunker_gist_query_conditioned,
     )
 

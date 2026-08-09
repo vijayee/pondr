@@ -289,6 +289,7 @@ class PonderOrchestrator:
         canvas_decider: "Optional[BonsaiDecider]" = None,
         ssm_chunker_gist_backend: str = "topics",
         ssm_chunker_gist_cue: str = "Summary:",
+        ssm_chunker_gist_cue_preset: Optional[str] = None,
         ssm_chunker_gist_query_conditioned: bool = False,
         chunker_voice=None,
     ) -> None:
@@ -554,6 +555,7 @@ class PonderOrchestrator:
             voice=chunker_voice,
             gist_backend=ssm_chunker_gist_backend,
             gist_cue=ssm_chunker_gist_cue,
+            gist_cue_preset=ssm_chunker_gist_cue_preset,
         )
         # Whether the mamba3 gist decode is QUERY-CONDITIONED (the cue becomes
         # ``Q: {user_prompt}\nA:`` instead of the fixed gist_cue). Default OFF ->

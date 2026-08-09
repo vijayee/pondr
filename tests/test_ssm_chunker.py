@@ -20,6 +20,7 @@ from src.subconscious.ssm_chunker import (
     ChunkedContext,
     EpisodeNotExpandable,
     EpisodeNotFound,
+    GIST_CUE_PRESETS,
     SSMChunker,
 )
 from src.subconscious.working_memory import WorkingMemoryState
@@ -249,3 +250,77 @@ def test_chunk_50_episodes_under_300ms():
     # corrected realistic bound is <300ms for 50 episodes (docs/Phase 2c.md §9.2).
     # ~45 compress steps + 5 primary overhead.
     assert elapsed_ms < 300.0, f"chunk 50 eps took {elapsed_ms:.1f}ms"
+
+
+# ── gist-cue presets (mamba3 decode backend) ──────────────────────────────────
+
+class _StubVoice:
+    """Records the cue ``ephemeral_gist`` was called with; returns a marker."""
+    def __init__(self) -> None:
+        self.last_cue = None
+
+    def ephemeral_gist(self, texts, cue, max_new_tokens=1024):
+        self.last_cue = cue
+        return "<gist>"
+
+
+def _voice_chunker(gist_cue="Summary:", gist_cue_preset=None) -> SSMChunker:
+    """SSMChunker wired with a stub voice (the mamba3-decode surface)."""
+    bb = JGSBackbone(BackboneConfig())
+    cfg = Phase2cConfig()
+    return SSMChunker(
+        bb, _StubEmbedder(), cfg,
+        voice=_StubVoice(),
+        gist_backend="mamba3",
+        gist_cue=gist_cue,
+        gist_cue_preset=gist_cue_preset,
+    )
+
+
+def test_gist_cue_preset_none_uses_gist_cue_byte_identical():
+    """No preset -> the raw gist_cue reaches the decoder (byte-identical default)."""
+    chunker = _voice_chunker(gist_cue="Summary:", gist_cue_preset=None)
+    chunker.compress_gist_mamba3([_ep("e1")], query=None)
+    assert chunker.voice.last_cue == "Summary:"
+
+
+def test_gist_cue_preset_overrides_gist_cue():
+    """A named preset wins over gist_cue; the preset's exact cue reaches the decoder."""
+    chunker = _voice_chunker(
+        gist_cue="ignored-raw-cue", gist_cue_preset="instruct-additive")
+    assert chunker._gist_cue == GIST_CUE_PRESETS["instruct-additive"]
+    chunker.compress_gist_mamba3([_ep("e1")], query=None)
+    assert chunker.voice.last_cue == GIST_CUE_PRESETS["instruct-additive"]
+
+
+def test_gist_cue_preset_each_named_key_resolves():
+    """Every shipped preset key resolves to its constant and reaches the decoder."""
+    for key in ("summary", "instruct-labeled", "instruct-additive"):
+        chunker = _voice_chunker(gist_cue="raw", gist_cue_preset=key)
+        assert chunker._gist_cue == GIST_CUE_PRESETS[key]
+        chunker.compress_gist_mamba3([_ep("e1")], query=None)
+        assert chunker.voice.last_cue == GIST_CUE_PRESETS[key]
+
+
+def test_gist_cue_preset_unknown_raises():
+    """An unknown preset name raises ValueError at construction (not silently)."""
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        _voice_chunker(gist_cue_preset="bogus")
+
+
+def test_gist_cue_preset_loses_to_query_conditioning():
+    """Query-conditioning builds 'Q: {query}\\nA:' and ignores the preset cue."""
+    chunker = _voice_chunker(gist_cue_preset="instruct-additive")
+    chunker.compress_gist_mamba3([_ep("e1")], query="what is the wifi password?")
+    assert chunker.voice.last_cue == "Q: what is the wifi password?\nA:"
+
+
+def test_gist_cue_presets_table_is_consistent():
+    """The preset table is non-empty and 'summary' is the byte-identical default cue."""
+    assert set(GIST_CUE_PRESETS) == {"summary", "instruct-labeled", "instruct-additive"}
+    assert GIST_CUE_PRESETS["summary"] == "Summary:"
+    # Generic examples must not leak the toy needles (clean-cue lesson).
+    add = GIST_CUE_PRESETS["instruct-additive"].lower()
+    for needle in ("xyz-4471", "helena voss", "pinecone-river"):
+        assert needle not in add

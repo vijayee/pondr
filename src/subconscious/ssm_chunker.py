@@ -38,6 +38,53 @@ from .configs import INSTANCE_CONFIGS, InstanceConfig
 from .working_memory import WorkingMemory, WorkingMemoryState
 
 
+# Named gist-cue presets for the ``mamba3`` decode backend. Each is a completion
+# cue handed to ``voice.ephemeral_gist``; selected via the ``gist_cue_preset``
+# ctor arg. A non-None preset OVERRIDES ``gist_cue``; ``None`` (the default) ->
+# ``gist_cue`` is used as-is (byte-identical to the pre-preset path). Inert for
+# the ``topics`` backend and when query-conditioning is on (those paths do not
+# read ``_gist_cue`` -- query-conditioning builds ``Q: {query}\nA:`` directly).
+#
+# - ``summary``: the original bare completion cue (the byte-identical default).
+# - ``instruct-labeled``: extract every concrete fact as ``subject: value``
+#   lines. The toy 4-needle eval scored 4/4 (vs 0/4 for ``Summary:``); at scale
+#   (12-item LongMemEval forced-secondary stress) 58% (7/12) -- 5/5 single-
+#   discrete-fact hits, multi-item/reasoning still hard
+#   ([[pondr-mamba3-gist-eval-result]]). Generic examples (no needle values) so
+#   the gist is real extraction, not cue-echo.
+# - ``instruct-additive``: ``instruct-labeled`` PLUS explicit instructions to
+#   capture counts/quantities, time/date/sequence markers, and user preferences
+#   -- the three things the failure diagnosis showed the labeled cue dropped.
+#   ADDITIVE, not suppressive: a suppressive "do not list the assistant's
+#   advice" cue dropped load-bearing assistant-sourced facts (item 3's needle
+#   lived in the assistant's shift sheet) -> strictly worse. At scale 67%
+#   (8/12): fixes the preference (item 4) and temporal (item 12) failures
+#   without breaking the single-fact hits. Thin (12 items; full set 50/500
+#   pending); two structural fixes + one sampling loss vs the labeled cue.
+GIST_CUE_PRESETS: dict[str, str] = {
+    "summary": "Summary:",
+    "instruct-labeled": (
+        "List every concrete fact from the context WITH its subject, as "
+        "'subject: value' on its own line (e.g. 'colleague name: John Smith', "
+        "'meeting date: March 15', 'locker code: AB-123'). Cover names, numbers, "
+        "dates, codes, IDs. Be exhaustive and literal. Use ONLY the provided context."
+    ),
+    "instruct-additive": (
+        "List every concrete fact from the context WITH its subject, as "
+        "'subject: value' on its own line. Cover names, numbers, dates, codes, IDs, "
+        "preferences, activities, and roles. Be exhaustive and literal. Make sure to "
+        "ALSO capture, when present: (1) any counts or quantities the user states "
+        "(e.g. 'restaurants tried: five', 'projects led: two'); (2) any time, date, "
+        "or sequence markers (e.g. 'webinar attended: two months ago', 'workshop "
+        "attended: last Saturday', 'first event: the workshop'); and (3) the user's "
+        "preferences and self-described activities (e.g. 'preferred software: Vim', "
+        "'current role: team lead'). Examples: 'colleague name: John Smith', 'meeting "
+        "date: March 15', 'locker code: AB-123', 'preferred editor: Vim', 'meetings "
+        "attended: three', 'course started: last June'. Use ONLY the provided context."
+    ),
+}
+
+
 class EpisodeNotExpandable(Exception):
     """Raised when EXPAND is asked for an episode that is already primary.
 
@@ -111,6 +158,7 @@ class SSMChunker:
         voice=None,
         gist_backend: str = "topics",
         gist_cue: str = "Summary:",
+        gist_cue_preset: Optional[str] = None,
     ) -> None:
         self.backbone = backbone
         self.embedder = embedder
@@ -136,9 +184,21 @@ class SSMChunker:
         # the topics backend runs (byte-identical). ``gist_cue`` is the
         # completion cue handed to the decoder (a base LM, not instruction-tuned
         # -- a completion-style cue elicits the summary; tunable for sweeps).
+        # ``gist_cue_preset`` (optional): a named key into ``GIST_CUE_PRESETS``
+        # (``"summary"`` / ``"instruct-labeled"`` / ``"instruct-additive"``).
+        # When set it OVERRIDES ``gist_cue`` (an explicit preset wins); ``None``
+        # (default) -> ``gist_cue`` is used as-is (byte-identical to pre-preset).
         self.voice = voice
         self.gist_backend = gist_backend
-        self._gist_cue = gist_cue
+        if gist_cue_preset is not None:
+            if gist_cue_preset not in GIST_CUE_PRESETS:
+                raise ValueError(
+                    f"unknown gist_cue_preset {gist_cue_preset!r}; "
+                    f"choose from {sorted(GIST_CUE_PRESETS)}"
+                )
+            self._gist_cue = GIST_CUE_PRESETS[gist_cue_preset]
+        else:
+            self._gist_cue = gist_cue
 
     def chunk(
         self,
