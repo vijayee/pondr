@@ -264,16 +264,39 @@ class _StubVoice:
         return "<gist>"
 
 
-def _voice_chunker(gist_cue="Summary:", gist_cue_preset=None) -> SSMChunker:
+class _RecordingVoice:
+    """Records every ``ephemeral_gist`` call (texts, cue, max_new_tokens).
+
+    Returns a marker embedding the call index so concatenated per-episode gists
+    are distinguishable. Optionally raises on a call whose joined body contains
+    ``fail_on`` (to test the per-episode skip-on-failure path).
+    """
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.calls: list[dict] = []
+        self.fail_on = fail_on
+
+    def ephemeral_gist(self, texts, cue, max_new_tokens=1024):
+        body = "\n".join(texts)
+        if self.fail_on is not None and self.fail_on in body:
+            raise RuntimeError(f"boom on {self.fail_on!r}")
+        self.calls.append({
+            "texts": list(texts), "cue": cue, "max_new_tokens": max_new_tokens,
+        })
+        return f"<gist{len(self.calls)}>"
+
+
+def _voice_chunker(gist_cue="Summary:", gist_cue_preset=None,
+                   gist_per_episode=False, voice=None) -> SSMChunker:
     """SSMChunker wired with a stub voice (the mamba3-decode surface)."""
     bb = JGSBackbone(BackboneConfig())
     cfg = Phase2cConfig()
     return SSMChunker(
         bb, _StubEmbedder(), cfg,
-        voice=_StubVoice(),
+        voice=voice if voice is not None else _StubVoice(),
         gist_backend="mamba3",
         gist_cue=gist_cue,
         gist_cue_preset=gist_cue_preset,
+        gist_per_episode=gist_per_episode,
     )
 
 
@@ -324,3 +347,132 @@ def test_gist_cue_presets_table_is_consistent():
     add = GIST_CUE_PRESETS["instruct-additive"].lower()
     for needle in ("xyz-4471", "helena voss", "pinecone-river"):
         assert needle not in add
+
+
+# ── per-episode gisting (mamba3 decode backend) ───────────────────────────────
+
+def test_gist_per_episode_off_is_one_joined_call_byte_identical():
+    """OFF -> one ephemeral_gist call with ALL texts (byte-identical to pre-flag)."""
+    voice = _RecordingVoice()
+    chunker = _voice_chunker(gist_per_episode=False, voice=voice)
+    eps = [_ep("e1", text="alpha details"), _ep("e2", text="beta details"),
+           _ep("e3", text="gamma details")]
+    out = chunker.compress_gist_mamba3(eps, query=None)
+    assert len(voice.calls) == 1
+    assert [t for t in voice.calls[0]["texts"]] == [
+        "alpha details", "beta details", "gamma details"]
+    # No max_new_tokens override on the joined path (the voice default is used).
+    assert voice.calls[0]["max_new_tokens"] == 1024
+    assert out == "<gist1>"
+
+
+def test_gist_per_episode_on_calls_once_per_nonempty_episode():
+    """ON -> one bounded call per non-empty episode, concatenated."""
+    voice = _RecordingVoice()
+    chunker = _voice_chunker(gist_per_episode=True, voice=voice)
+    eps = [_ep("e1", text="alpha details"), _ep("e2", text="beta details"),
+           _ep("e3", text="gamma details")]
+    out = chunker.compress_gist_mamba3(eps, query=None)
+    assert len(voice.calls) == 3
+    for call in voice.calls:
+        # Each call gets a SINGLE-element texts list (one episode, decoded alone).
+        assert len(call["texts"]) == 1
+        # The per-episode cap (256 new tokens) bounds each decode.
+        assert call["max_new_tokens"] == 256
+        assert call["cue"] == "Summary:"
+    # The per-episode gists are concatenated with newlines, in episode order.
+    assert out == "<gist1>\n<gist2>\n<gist3>"
+
+
+def test_gist_per_episode_skips_empty_text_episodes():
+    """ON -> empty/whitespace-only episodes get NO call (skipped, not gist'd).
+
+    Note ``compress_gist_mamba3`` uses ``text or summary`` -- an empty ``text``
+    falls back to ``summary`` (the production behavior). So to actually skip an
+    episode, BOTH ``text`` and ``summary`` must be empty/whitespace.
+    """
+    voice = _RecordingVoice()
+    chunker = _voice_chunker(gist_per_episode=True, voice=voice)
+    eps = [_ep("e1", text="alpha details"),
+           _ep("e2", text="   ", summary="   "),
+           _ep("e3", text="", summary=""),
+           _ep("e4", text="delta details")]
+    out = chunker.compress_gist_mamba3(eps, query=None)
+    # Only the two non-empty episodes were decoded.
+    assert len(voice.calls) == 2
+    assert voice.calls[0]["texts"] == ["alpha details"]
+    assert voice.calls[1]["texts"] == ["delta details"]
+    assert out == "<gist1>\n<gist2>"
+
+
+def test_gist_per_episode_all_empty_returns_empty():
+    """ON -> every episode empty -> no calls, "" returned (formatter falls back).
+
+    Both ``text`` and ``summary`` empty (see the note on the skip test above)."""
+    voice = _RecordingVoice()
+    chunker = _voice_chunker(gist_per_episode=True, voice=voice)
+    eps = [_ep("e1", text="", summary=""), _ep("e2", text="   ", summary="   ")]
+    out = chunker.compress_gist_mamba3(eps, query=None)
+    assert voice.calls == []
+    assert out == ""
+
+
+def test_gist_per_episode_with_query_conditioning_uses_qa_cue_per_call():
+    """ON + query -> each per-episode call gets the Q-A cue (not the gist_cue)."""
+    voice = _RecordingVoice()
+    chunker = _voice_chunker(
+        gist_cue="Summary:", gist_per_episode=True, voice=voice)
+    eps = [_ep("e1", text="alpha details"), _ep("e2", text="beta details")]
+    chunker.compress_gist_mamba3(eps, query="what is the wifi password?")
+    assert len(voice.calls) == 2
+    for call in voice.calls:
+        assert call["cue"] == "Q: what is the wifi password?\nA:"
+
+
+def test_gist_per_episode_skips_failed_episode_keeps_others():
+    """ON -> an episode whose decode raises is skipped; the rest are kept.
+
+    One episode's decode failure must not zero the whole gist (graceful skip).
+    """
+    voice = _RecordingVoice(fail_on="beta")  # the e2 body contains 'beta'
+    chunker = _voice_chunker(gist_per_episode=True, voice=voice)
+    eps = [_ep("e1", text="alpha details"), _ep("e2", text="beta details"),
+           _ep("e3", text="gamma details")]
+    out = chunker.compress_gist_mamba3(eps, query=None)
+    # e2 raised -> skipped; e1 and e3 still produced gists.
+    assert len(voice.calls) == 2
+    bodies = [c["texts"][0] for c in voice.calls]
+    assert "alpha details" in bodies
+    assert "gamma details" in bodies
+    assert "beta details" not in bodies
+    # e1's marker is <gist1>; e2 raised (no marker); e3's is <gist2>.
+    assert out == "<gist1>\n<gist2>"
+
+
+def test_gist_per_episode_off_is_default_in_chunk():
+    """The chunk() path with the flag OFF produces a joined gist (one voice call)."""
+    voice = _RecordingVoice()
+    chunker = _voice_chunker(gist_per_episode=False, voice=voice)
+    eps = [_ep("e1", text="word " * 200), _ep("e2", text="word " * 200),
+           _ep("e3", text="word " * 200), _ep("e4", text="word " * 200)]
+    ctx = chunker.chunk(eps, _plan(primary_chunk_count=1))
+    # 1 primary, 3 secondary -> ONE joined decode over the 3 secondary texts.
+    assert ctx.compressed_episode_count == 3
+    assert ctx.compressed_gist == "<gist1>"
+    assert len(voice.calls) == 1
+    assert len(voice.calls[0]["texts"]) == 3
+
+
+def test_gist_per_episode_on_in_chunk_splits_secondary():
+    """The chunk() path with the flag ON decodes each secondary episode alone."""
+    voice = _RecordingVoice()
+    chunker = _voice_chunker(gist_per_episode=True, voice=voice)
+    eps = [_ep("e1", text="word " * 200), _ep("e2", text="word " * 200),
+           _ep("e3", text="word " * 200), _ep("e4", text="word " * 200)]
+    ctx = chunker.chunk(eps, _plan(primary_chunk_count=1))
+    # 1 primary, 3 secondary -> THREE per-episode decodes, concatenated.
+    assert ctx.compressed_episode_count == 3
+    assert ctx.compressed_gist == "<gist1>\n<gist2>\n<gist3>"
+    assert len(voice.calls) == 3
+    for call in voice.calls:
+        assert len(call["texts"]) == 1

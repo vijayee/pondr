@@ -107,6 +107,7 @@ def build_ponder(
     ssm_chunker_gist_cue: str = "Summary:",
     ssm_chunker_gist_cue_preset: Optional[str] = None,
     ssm_chunker_gist_query_conditioned: bool = False,
+    ssm_chunker_gist_per_episode: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -606,6 +607,12 @@ def build_ponder(
     # The proven decode cues: ``instruct-labeled`` (toy 4/4, 58% at scale) and
     # ``instruct-additive`` (67% at scale, fixes the preference + temporal
     # failures). Inert for the topics backend and when query-conditioning is on.
+    # ``ssm_chunker_gist_per_episode`` (default OFF, mamba3 backend only): decode
+    # each secondary episode in its own bounded call and concatenate, instead of
+    # one joined decode -- the structural fix for dominant-session drowning (a
+    # joined decode exhausts its budget on the largest session before reaching
+    # non-dominant needles). OFF -> one joined call (byte-identical). Inert for
+    # the topics backend.
     chunker_voice = None
     if ssm_chunker_gist_backend == "mamba3":
         from .subconscious.fade import Mamba3Voice, load_mamba3_voice
@@ -703,6 +710,7 @@ def build_ponder(
         ssm_chunker_gist_cue=ssm_chunker_gist_cue,
         ssm_chunker_gist_cue_preset=ssm_chunker_gist_cue_preset,
         ssm_chunker_gist_query_conditioned=ssm_chunker_gist_query_conditioned,
+        ssm_chunker_gist_per_episode=ssm_chunker_gist_per_episode,
         chunker_voice=chunker_voice,
     )
     return orch

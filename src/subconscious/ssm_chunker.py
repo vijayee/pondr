@@ -159,6 +159,7 @@ class SSMChunker:
         gist_backend: str = "topics",
         gist_cue: str = "Summary:",
         gist_cue_preset: Optional[str] = None,
+        gist_per_episode: bool = False,
     ) -> None:
         self.backbone = backbone
         self.embedder = embedder
@@ -188,8 +189,13 @@ class SSMChunker:
         # (``"summary"`` / ``"instruct-labeled"`` / ``"instruct-additive"``).
         # When set it OVERRIDES ``gist_cue`` (an explicit preset wins); ``None``
         # (default) -> ``gist_cue`` is used as-is (byte-identical to pre-preset).
+        # ``gist_per_episode`` (optional, default OFF): when True the mamba3 gist
+        # is decoded ONE EPISODE AT A TIME (each in its own bounded decode) and
+        # the per-episode gists are concatenated, instead of one joined decode
+        # over the whole secondary corpus. See ``compress_gist_mamba3`` for why.
         self.voice = voice
         self.gist_backend = gist_backend
+        self.gist_per_episode = gist_per_episode
         if gist_cue_preset is not None:
             if gist_cue_preset not in GIST_CUE_PRESETS:
                 raise ValueError(
@@ -349,13 +355,48 @@ class SSMChunker:
         discards it -- the voice's carried state (if any) is never touched, so
         this is safe against a shared fade voice. Returns "" on a cold/empty
         decode (the formatter then emits the topic union as a fallback).
+
+        ``gist_per_episode`` (ctor flag, default OFF): when True, decode each
+        episode in its OWN bounded ``ephemeral_gist`` call (a single-element
+        ``texts`` list) and concatenate the per-episode gists, instead of one
+        joined decode over the whole secondary corpus. The joined decode lets a
+        single dominant session monopolize the prefill+decode budget -- the model
+        exhausts its tokens on the largest session before reaching non-dominant
+        needles (the LongMemEval drowning failure: 4/5 count/summation misses had
+        the counts MISSING from the gist, not misaggregated; a "cover ALL
+        sessions" cue could NOT overcome it -- the failure is structural, not
+        cue-shaped). Decoding each episode alone means the needle episode,
+        whatever session it belongs to, gets a decode with nothing else to drown
+        it out -- the structural fix the cue could not supply. Each per-episode
+        decode is capped at 256 new tokens (one turn needs far fewer than the
+        joined 1024, and the cap bounds both latency and repetition loops). A
+        failed/empty episode is skipped; if ALL skip, "" is returned (the
+        formatter falls back to the topic union, as on a cold joined decode).
+        OFF (the default) -> one joined ``ephemeral_gist`` call (byte-identical
+        to the pre-flag path).
         """
         if self.voice is None:
             return ""
         texts = [ep.get("text", "") or ep.get("summary", "") for ep in episodes]
         cue = f"Q: {query}\nA:" if query is not None else self._gist_cue
         try:
-            return self.voice.ephemeral_gist(texts, cue)
+            if not self.gist_per_episode:
+                return self.voice.ephemeral_gist(texts, cue)
+            # PER-EPISODE: one bounded decode per non-empty episode, concatenated.
+            parts: list[str] = []
+            for t in texts:
+                if not t or not t.strip():
+                    continue
+                try:
+                    g = self.voice.ephemeral_gist([t], cue, max_new_tokens=256)
+                except Exception:
+                    # One episode's decode failure must not zero the whole gist;
+                    # skip it and keep what the other episodes produced. The
+                    # formatter falls back to the topic union only if ALL skip.
+                    continue
+                if g:
+                    parts.append(g)
+            return "\n".join(parts)
         except Exception:
             # Best-effort: a decode failure must not break the query. The
             # formatter falls back to the topic union from secondary_episodes.

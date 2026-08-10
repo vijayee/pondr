@@ -597,6 +597,22 @@ def main() -> int:
                         "targeted Q-A cue recalls the asked-for facts. OFF -> "
                         "byte-identical (the fixed gist_cue is used). Ignored for "
                         "the 'topics' backend.")
+    p.add_argument("--ssm-chunker-gist-per-episode",
+                   action="store_true", default=False,
+                   help="(mamba3 backend only, default OFF) Decode each secondary "
+                        "episode in its OWN bounded gist call and concatenate the "
+                        "per-episode gists, instead of one joined decode over the "
+                        "whole secondary corpus. The joined decode lets a single "
+                        "dominant session monopolize the prefill+decode budget -- "
+                        "the model exhausts its tokens on the largest session "
+                        "before reaching non-dominant needles (the LongMemEval "
+                        "drowning failure: counts MISSING from the gist, not "
+                        "misaggregated; a 'cover ALL sessions' cue could NOT "
+                        "overcome it). Decoding each episode alone means the "
+                        "needle episode gets a decode with nothing to drown it. "
+                        "OFF -> one joined call (byte-identical). Ignored for the "
+                        "'topics' backend. Costs N decodes vs 1 (N = secondary "
+                        "episode count); each is capped at 256 new tokens.")
     args = p.parse_args()
 
     # The orchestrator reads these two flags off the global config singleton at
@@ -942,6 +958,7 @@ def main() -> int:
         print(f"[load] ssm_chunker_gist_backend=mamba3 "
               f"cue={cue_label!r} "
               f"query_conditioned={args.ssm_chunker_gist_query_conditioned} "
+              f"per_episode={args.ssm_chunker_gist_per_episode} "
               f"voice={'shared-fade' if shared else 'fresh'}", file=sys.stderr)
         print("NOTE: --ssm-chunker-gist-backend=mamba3 is EXPERIMENTAL (the "
               "deferred Phase 2c 'decode a summary from the SSM state' path). "
@@ -955,6 +972,14 @@ def main() -> int:
               "--ssm-chunker-gist-cue (summarize everything). A/B-able against "
               "the 'topics' off-baseline.",
               file=sys.stderr)
+        if args.ssm_chunker_gist_per_episode:
+            print("NOTE: --ssm-chunker-gist-per-episode is ON -- each secondary "
+                  "episode gets its own bounded gist decode (256 new tokens), "
+                  "concatenated. This is the structural fix for dominant-session "
+                  "drowning (a joined decode exhausts its budget on the largest "
+                  "session before reaching non-dominant needles). Costs N decodes "
+                  "vs 1 (N = secondary episode count).",
+                  file=sys.stderr)
     elif args.ssm_chunker_gist_query_conditioned:
         # The flag is documented as "mamba3 backend only"; the topics backend
         # emits labels (no decode), so a query has nothing to condition. NOTE
@@ -962,6 +987,14 @@ def main() -> int:
         print("NOTE: --ssm-chunker-gist-query-conditioned is ignored without "
               "--ssm-chunker-gist-backend=mamba3 (the 'topics' backend decodes "
               "no gist, so there is nothing to query-condition).",
+              file=sys.stderr)
+    if (args.ssm_chunker_gist_per_episode
+            and args.ssm_chunker_gist_backend != "mamba3"):
+        # Same silent-footgun guard as query-conditioning: the topics backend
+        # decodes no gist, so there is nothing to split per-episode.
+        print("NOTE: --ssm-chunker-gist-per-episode is ignored without "
+              "--ssm-chunker-gist-backend=mamba3 (the 'topics' backend decodes "
+              "no gist, so there is nothing to split per-episode).",
               file=sys.stderr)
 
     orch = build_ponder(
@@ -1020,6 +1053,7 @@ def main() -> int:
         ssm_chunker_gist_cue=args.ssm_chunker_gist_cue,
         ssm_chunker_gist_cue_preset=args.ssm_chunker_gist_cue_preset,
         ssm_chunker_gist_query_conditioned=args.ssm_chunker_gist_query_conditioned,
+        ssm_chunker_gist_per_episode=args.ssm_chunker_gist_per_episode,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc
