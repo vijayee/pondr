@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../views/auth/login_view.dart' show LoginView;
 import '../views/auth/register_view.dart' show RegisterView;
 import '../views/chat/chat_page.dart' show ChatHeader, ChatPage;
+import '../views/settings/settings_view.dart' show SettingsView;
 import 'shell.dart' show AdaptiveShell;
 
 /// The branch-swapping page — a ZERO-duration transition. The export's view
@@ -175,11 +176,12 @@ final routerProvider = Provider<GoRouter>((ref) {
           ),
         ],
       ),
-      // Task 6 swaps in settings_view.dart.
+      // Task 6's settings page (lib/views/settings/settings_view.dart): the
+      // standalone layout with its own nav aside (app.tsx:1248-1869).
       GoRoute(
         path: '/settings',
         pageBuilder: (BuildContext context, GoRouterState state) =>
-            _instantPage(state, const SettingsBodyPlaceholder()),
+            _instantPage(state, const SettingsView()),
       ),
     ],
   );
@@ -197,32 +199,6 @@ class SubconsciousBodyPlaceholder extends StatelessWidget {
     return const ColoredBox(
       color: Color(0xFF07061A),
       child: Center(child: Text('subconscious — Task 7')),
-    );
-  }
-}
-
-/// Task 6 swaps this for the real settings page.
-class SettingsBodyPlaceholder extends StatelessWidget {
-  const SettingsBodyPlaceholder({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            const Text('settings — Task 6'),
-            const SizedBox(height: 8),
-            IconButton(
-              key: const Key('settings.back'),
-              // The mock's back-to-chat arrow (app.tsx:1254-1259).
-              onPressed: () => context.go('/chat'),
-              icon: const Icon(Icons.arrow_back),
-            ),
-          ],
-        ),
-      ),
     );
   }
 }

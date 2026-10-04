@@ -216,7 +216,8 @@ void main() {
       context.go('/settings');
       await tester.pumpAndSettle();
 
-      expect(find.text('settings — Task 6'), findsOneWidget);
+      // Task 6's real view landed: the standalone settings page.
+      expect(find.byKey(const Key('settings.content-pane')), findsOneWidget);
       expect(find.byKey(shellStaticPaneKey), findsNothing);
 
       // The mock's back-to-chat arrow (app.tsx:1254-1259).
@@ -239,7 +240,8 @@ void main() {
 
       await tester.tap(find.byKey(const Key('sidebar.footer-settings')));
       await tester.pumpAndSettle();
-      expect(find.text('settings — Task 6'), findsOneWidget);
+      // Task 6's real view landed: the standalone settings page.
+      expect(find.byKey(const Key('settings.content-pane')), findsOneWidget);
 
       // Back home, then sign out through the pane's footer (app.tsx:2089).
       await tester.tap(find.byKey(const Key('settings.back')));
