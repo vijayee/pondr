@@ -180,26 +180,26 @@ void main() {
       context.go('/subconscious');
       await tester.pumpAndSettle();
 
-      expect(find.text('subconscious — Task 7'), findsOneWidget);
+      expect(find.text('The Subconscious'), findsOneWidget);
       // The mock renders SubconsciousView inside the chat layout (app.tsx:
       // 2112-2114): the sessions pane stays beside it.
       expect(find.byKey(shellStaticPaneKey), findsOneWidget);
       // The plan's entrance: a custom transitioning page — the 220 ms pin
       // (the default pages transition at 300 ms), fade + scale present.
       final TransitionRoute<Object?> route =
-          ModalRoute.of(tester.element(find.text('subconscious — Task 7')))!
+          ModalRoute.of(tester.element(find.text('The Subconscious')))!
               as TransitionRoute<Object?>;
       expect(route.transitionDuration, const Duration(milliseconds: 220));
       expect(
         find.ancestor(
-          of: find.text('subconscious — Task 7'),
+          of: find.text('The Subconscious'),
           matching: find.byType(FadeTransition),
         ),
         findsWidgets,
       );
       expect(
         find.ancestor(
-          of: find.text('subconscious — Task 7'),
+          of: find.text('The Subconscious'),
           matching: find.byType(ScaleTransition),
         ),
         findsWidgets,

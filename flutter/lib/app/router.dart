@@ -6,6 +6,7 @@ import '../views/auth/login_view.dart' show LoginView;
 import '../views/auth/register_view.dart' show RegisterView;
 import '../views/chat/chat_page.dart' show ChatHeader, ChatPage;
 import '../views/settings/settings_view.dart' show SettingsView;
+import '../views/subconscious/subconscious_view.dart' show SubconsciousView;
 import 'shell.dart' show AdaptiveShell;
 
 /// The branch-swapping page — a ZERO-duration transition. The export's view
@@ -132,7 +133,19 @@ final routerProvider = Provider<GoRouter>((ref) {
               ),
             );
           }
-          return _instantPage(state, AdaptiveShell(child: child));
+          // The subconscious branch REPLACES the whole main area on narrow —
+          // its own header with only the close X, no menu affordance (the
+          // export's menu button lives solely in the chat header,
+          // app.tsx:2112-2144) — so the stand-in top bar shrinks away.
+          return _instantPage(
+            state,
+            AdaptiveShell(
+              topBarBuilder:
+                  (BuildContext context, Widget menuButton) =>
+                      const SizedBox.shrink(),
+              child: child,
+            ),
+          );
         },
         routes: <RouteBase>[
           // The chat canvas (lib/views/chat/chat_page.dart): the header
@@ -142,13 +155,13 @@ final routerProvider = Provider<GoRouter>((ref) {
             builder: (BuildContext context, GoRouterState state) =>
                 const ChatPage(),
           ),
-          // Task 7 swaps the body slot for subconscious_view.dart + the sim.
+          // Task 7: the subconscious sim (lib/views/subconscious/).
           GoRoute(
             path: '/subconscious',
             pageBuilder: (BuildContext context, GoRouterState state) =>
                 CustomTransitionPage<Object?>(
                   key: state.pageKey,
-                  child: const SubconsciousBodyPlaceholder(),
+                  child: const SubconsciousView(),
                   opaque: true,
                   transitionDuration: const Duration(milliseconds: 220),
                   transitionsBuilder: (
@@ -186,19 +199,3 @@ final routerProvider = Provider<GoRouter>((ref) {
     ],
   );
 });
-
-// ─── Branch placeholders (each swapped by its Task listed above) ──────────
-
-/// Task 7 swaps this for the real subconscious sim. Its own opaque bg, per
-/// the export's container (app.tsx:504).
-class SubconsciousBodyPlaceholder extends StatelessWidget {
-  const SubconsciousBodyPlaceholder({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return const ColoredBox(
-      color: Color(0xFF07061A),
-      child: Center(child: Text('subconscious — Task 7')),
-    );
-  }
-}
