@@ -713,12 +713,17 @@ class GraphPainter extends CustomPainter {
       );
 
       // The gradient fill (app.tsx:563-568): the radial `sc-g-<id>` —
-      // 40%/35% centre, r 65%, the colour fading to 35% at the rim.
+      // 40%/35% centre, r 65%, the colour fading to 35% at the rim. The
+      // svg's dim is the whole circle's opacity (app.tsx:600) — fill,
+      // stroke and glow dim as one 0.15 whole, so the stops carry it too.
       final Paint fill = Paint()
         ..shader = RadialGradient(
           center: const Alignment(-0.2, -0.3), // cx 40% cy 35%
           radius: 0.65,
-          colors: <Color>[color, color.withValues(alpha: 0.35)],
+          colors: <Color>[
+            color.withValues(alpha: opacity),
+            color.withValues(alpha: 0.35 * opacity),
+          ],
           stops: const <double>[0, 1],
         ).createShader(
           Rect.fromCircle(

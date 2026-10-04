@@ -16,7 +16,7 @@ import 'package:pondr/views/subconscious/force_sim.dart';
 import 'package:pondr/views/subconscious/subconscious_view.dart';
 
 /// The subconscious surface's tests: the sim's verbatim-port contract
-/// (the placement, one tick's numbers, the determinism, the settle), the
+/// (the placement, two ticks' numbers, the determinism, the settle), the
 /// disc hit-test, and the view's chrome (header, legend, detail card, the
 /// routes' close paths).
 void main() {
@@ -53,8 +53,9 @@ void main() {
       expect(sim.edgeIndices.length, baseEdges.length); // none dangling
     });
 
-    test('one tick on a 2-node/1-edge graph — the mock\'s numbers, '
-        'recomputed from app.tsx:418-446', () {
+    test('two ticks on a 2-node/1-edge graph — the mock\'s numbers, '
+        'recomputed from app.tsx:418-446 (the FIRST tick integrates at '
+        'alpha 1.0; the second at 0.988)', () {
       final ForceSim sim = ForceSim(
         nodes: <SimNode>[node('a', 10), node('b', 12)],
         edges: const <SimEdge>[SimEdge(source: 'a', target: 'b')],
@@ -76,9 +77,6 @@ void main() {
       expect(sim.live[1].x, bx0);
       expect(sim.live[1].y, by0);
 
-      expect(sim.tick(), isFalse);
-      expect(sim.alpha, 0.988); // decayed before the forces use it
-
       final double dxA = ax0 - bx0;
       final double dyA = ay0 - by0;
       final double d2A = dxA * dxA + dyA * dyA;
@@ -98,15 +96,57 @@ void main() {
       final double bVx = -repFx + -springFx - 0.025 * bx0;
       final double bVy = -repFy + -springFy - 0.025 * by0;
 
-      expect(sim.live[0].x, closeTo(ax0 + aVx * 0.988, 1e-9));
-      expect(sim.live[0].y, closeTo(ay0 + aVy * 0.988, 1e-9));
-      expect(sim.live[1].x, closeTo(bx0 + bVx * 0.988, 1e-9));
-      expect(sim.live[1].y, closeTo(by0 + bVy * 0.988, 1e-9));
+      // Tick 1 — the SNAPSHOT precedes the decay (app.tsx:413-415): the
+      // forces integrate at 1.0 and `alphaRef *= 0.988` only arms the next
+      // tick, so sim.alpha reads 0.988 AFTER this tick's integration.
+      expect(sim.tick(), isFalse);
+      expect(sim.alpha, 0.988);
+      expect(sim.live[0].x, closeTo(ax0 + aVx, 1e-9));
+      expect(sim.live[0].y, closeTo(ay0 + aVy, 1e-9));
+      expect(sim.live[1].x, closeTo(bx0 + bVx, 1e-9));
+      expect(sim.live[1].y, closeTo(by0 + bVy, 1e-9));
       // The velocities damp AFTER integrating (app.tsx:445-446).
       expect(sim.live[0].vx, closeTo(aVx * 0.82, 1e-12));
       expect(sim.live[0].vy, closeTo(aVy * 0.82, 1e-12));
       expect(sim.live[1].vx, closeTo(bVx * 0.82, 1e-12));
       expect(sim.live[1].vy, closeTo(bVy * 0.82, 1e-12));
+
+      // Tick 2 — the snapshot now reads 0.988: the forces re-run on the
+      // tick-1 positions and the damped tick-1 velocities, then integrate
+      // at 0.988.
+      final double aX1 = ax0 + aVx;
+      final double aY1 = ay0 + aVy;
+      final double bX1 = bx0 + bVx;
+      final double bY1 = by0 + bVy;
+      final double dxA2 = aX1 - bX1;
+      final double dyA2 = aY1 - bY1;
+      final double d2A2 = dxA2 * dxA2 + dyA2 * dyA2;
+      final double dA2 = sqrt(d2A2);
+      final double rep2 = 2400 / d2A2;
+      final double repFx2 = rep2 * dxA2 / dA2;
+      final double repFy2 = rep2 * dyA2 / dA2;
+      final double dxB2 = bX1 - aX1;
+      final double dyB2 = bY1 - aY1;
+      final double dB2 = sqrt(dxB2 * dxB2 + dyB2 * dyB2);
+      final double spring2 = 0.07 * (dB2 - 160);
+      final double springFx2 = spring2 * dxB2 / dB2;
+      final double springFy2 = spring2 * dyB2 / dB2;
+
+      final double aVx2 = aVx * 0.82 + repFx2 + springFx2 - 0.025 * aX1;
+      final double aVy2 = aVy * 0.82 + repFy2 + springFy2 - 0.025 * aY1;
+      final double bVx2 = bVx * 0.82 + -repFx2 + -springFx2 - 0.025 * bX1;
+      final double bVy2 = bVy * 0.82 + -repFy2 + -springFy2 - 0.025 * bY1;
+
+      expect(sim.tick(), isFalse);
+      expect(sim.alpha, closeTo(0.988 * 0.988, 1e-12));
+      expect(sim.live[0].x, closeTo(aX1 + aVx2 * 0.988, 1e-9));
+      expect(sim.live[0].y, closeTo(aY1 + aVy2 * 0.988, 1e-9));
+      expect(sim.live[1].x, closeTo(bX1 + bVx2 * 0.988, 1e-9));
+      expect(sim.live[1].y, closeTo(bY1 + bVy2 * 0.988, 1e-9));
+      expect(sim.live[0].vx, closeTo(aVx2 * 0.82, 1e-12));
+      expect(sim.live[0].vy, closeTo(aVy2 * 0.82, 1e-12));
+      expect(sim.live[1].vx, closeTo(bVx2 * 0.82, 1e-12));
+      expect(sim.live[1].vy, closeTo(bVy2 * 0.82, 1e-12));
     });
 
     test('a seeded sim is deterministic — two runs, identical positions '

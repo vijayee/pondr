@@ -129,7 +129,10 @@ class ForceSim extends ChangeNotifier {
   /// 1. The settle check — alpha below 0.002: NOTHING moves this call; the
   ///    caller stops the frame loop. (The export's `alphaRef` only ever
   ///    decays here, so the check reads one frame behind integration.)
-  /// 2. `alpha *= 0.988` — THEN the forces use the new alpha.
+  /// 2. The SNAPSHOT (`const alpha = alphaRef.current`, app.tsx:413) is
+  ///    taken BEFORE `alphaRef.current *= 0.988` (app.tsx:415) — the decay
+  ///    only arms the NEXT tick, so every tick's forces and integration
+  ///    run on the PRE-decay alpha (the first tick integrates at 1.0).
   /// 3. The repulsion: pairwise CHARGE/d² (both terms on the guarded d²),
   ///    mirrored onto both velocities; the `|| 1` guard substitutes 1 for
   ///    d² = 0 only (JS truthiness — a NaN d² passes through, as here).
@@ -141,6 +144,10 @@ class ForceSim extends ChangeNotifier {
     if (_alpha < kAlphaSettle) {
       return true;
     }
+    // The snapshot (app.tsx:413) — the forces and integration below run on
+    // the PRE-decay alpha (the first tick integrates at 1.0);
+    // `alphaRef.current *= 0.988` (app.tsx:415) only arms the NEXT tick.
+    final double a = _alpha;
     _alpha *= kAlphaDecay;
 
     for (int i = 0; i < _count; i++) {
@@ -183,8 +190,8 @@ class ForceSim extends ChangeNotifier {
     for (final LiveNode node in live) {
       node.vx -= kGravity * node.x;
       node.vy -= kGravity * node.y;
-      node.x += node.vx * _alpha;
-      node.y += node.vy * _alpha;
+      node.x += node.vx * a;
+      node.y += node.vy * a;
       node.vx *= kDamping;
       node.vy *= kDamping;
     }
