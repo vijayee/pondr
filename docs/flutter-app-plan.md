@@ -216,3 +216,4 @@ The view: a `Ticker`-driven `CustomPainter` (nodes = circles with the cluster co
 - [x] Wire check: the binding file remains the ONLY place naming Mock* (grep: views import bindings.dart, never mock/*).
 - [x] Commit `flutter: the app complete — 1:1 with the mockup, the de-wonk pass`
 - [x] The final report: the run evidence + the mockup-parity notes (any intentional divergence listed for the owner's call) + the NEXT seams (the runtime FFI binding per the spec; the engine's subconscious data — the sim reads real episodes when the engine grows its serving surface).
+- Run evidence: `docs/flutter-app-run-evidence.md` (in-repo).
