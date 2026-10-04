@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../app/router.dart' show authStateProvider;
+import '../../app/sign_out.dart';
 import '../../app/shell.dart'
     show sidebarCollapsedProvider, sidebarOpenProvider;
 import '../../data/bindings.dart';
@@ -855,10 +855,7 @@ class _SessionsFooterState extends ConsumerState<_SessionsFooter> {
                             size: 13,
                             color: Color(0x80FFFFFF),
                           ),
-                          onPressed: () {
-                            ref.read(authStateProvider).signOut();
-                            context.go('/login');
-                          },
+                          onPressed: () => signOutWithConfirm(context, ref),
                         ),
                       ],
                     ),

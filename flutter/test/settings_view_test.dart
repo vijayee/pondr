@@ -154,15 +154,26 @@ void main() {
       expect(slide.duration, const Duration(milliseconds: 300));
     });
 
-    testWidgets('the sign-out returns to /login (the export\'s '
-        'setView("login") through the guard)', (WidgetTester tester) async {
+    testWidgets('the sign-out asks first, then returns to /login (the '
+        'owner directive: no automatic logout; the confirm dialog)', (
+        WidgetTester tester) async {
       await pumpSettings(tester, const Size(1100, 800));
       await tester.tap(find.byKey(const Key('settings.sign-out')));
+      await tester.pumpAndSettle();
+      // The first tap only opens the dialog — no route change happened.
+      expect(find.text('Sign out?'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('sign-out.stay')));
+      await tester.pumpAndSettle();
+      expect(find.text('Welcome back'), findsNothing); // still in settings
+
+      await tester.tap(find.byKey(const Key('settings.sign-out')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('sign-out.confirm')));
       await tester.pumpAndSettle();
       expect(
         find.text('Welcome back'),
         findsOneWidget,
-      ); // the router's guard snapped back to /login
+      ); // the confirm fired the real sign-out; the guard snapped back
     });
   });
 

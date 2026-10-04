@@ -246,7 +246,18 @@ void main() {
       // Back home, then sign out through the pane's footer (app.tsx:2089).
       await tester.tap(find.byKey(const Key('settings.back')));
       await tester.pumpAndSettle();
+      // The owner directive: sign-out asks first (the confirm dialog).
       await tester.tap(find.byKey(const Key('sidebar.sign-out')));
+      await tester.pumpAndSettle();
+      expect(find.text('Sign out?'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('sign-out.stay')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(authLoginCardKey), findsNothing); // still in chat
+      expect(container.read(authStateProvider).loggedIn, isTrue);
+
+      await tester.tap(find.byKey(const Key('sidebar.sign-out')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('sign-out.confirm')));
       await tester.pumpAndSettle();
 
       expect(find.byKey(authLoginCardKey), findsOneWidget); // /login

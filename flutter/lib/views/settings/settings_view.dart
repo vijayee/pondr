@@ -3,7 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../app/shell.dart' show ShellMode, kPaneBreakpoint;
-import '../../app/router.dart' show authStateProvider;
+import '../../app/sign_out.dart';
 import '../../data/bindings.dart' show settingsProvider;
 import '../../data/services.dart' show SettingsService;
 import '../../theme/tokens.dart';
@@ -498,7 +498,7 @@ class _SignOutButton extends ConsumerWidget {
         splashColor: Colors.transparent,
         highlightColor: Colors.transparent,
         hoverColor: Colors.transparent,
-        onTap: () => ref.read(authStateProvider).signOut(), // setView("login")
+        onTap: () => signOutWithConfirm(context, ref),
         child: const Padding(
           padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
           child: Row(
