@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:google_fonts/google_fonts.dart';
 
@@ -12,7 +13,7 @@ void main() {
   testWidgets('PondrApp boots on /login with the token theme', (
     WidgetTester tester,
   ) async {
-    await tester.pumpWidget(const PondrApp());
+    await tester.pumpWidget(const ProviderScope(child: PondrApp()));
     await tester.pumpAndSettle();
 
     expect(find.byType(Scaffold), findsOneWidget);
