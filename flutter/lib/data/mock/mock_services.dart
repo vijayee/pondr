@@ -71,6 +71,15 @@ class MockSessionsService implements SessionsService {
     _fire();
   }
 
+  /// The store's id lookup (the read side of the export's
+  /// `prev.map(s => s.id === activeId)` matchers).
+  ChatSession? byId(String id) {
+    for (final s in _sessions) {
+      if (s.id == id) return s;
+    }
+    return null;
+  }
+
   @override
   Stream<ChatsChanged> changes() => _controller.stream;
 
@@ -111,9 +120,16 @@ class MockChatService implements ChatService {
     final trimmed = text.trim();
     if (trimmed.isEmpty && files.isEmpty) return;
 
-    final active = _sessions.active();
+    // The send CAPTURES its session at entry (the export's `activeId` read
+    // inside `handleSend`) — the reply targets THAT session, even if the
+    // user switches away during the typing delay.
+    // The send CAPTURES its session at entry (the export's `activeId` read
+    // inside `handleSend`) — the reply later targets THAT id, not whatever
+    // is active when the typing delay elapses.
+    final captured = _sessions.active();
+    final capturedId = captured?.id;
     final now = DateTime.now();
-    if (active != null) {
+    if (captured != null) {
       final userMessage = Message(
         // The export's `m${Date.now()}`.
         id: 'm${now.millisecondsSinceEpoch}',
@@ -126,15 +142,15 @@ class MockChatService implements ChatService {
       // named "New conversation" takes its name from the first send —
       // the trimmed text's first 45 characters, plus '…' when the UNTRIMMED
       // input was longer (the export's length check is on `inputText`).
-      var name = active.name;
+      var name = captured.name;
       if (name == 'New conversation' && trimmed.isNotEmpty) {
         final cut = trimmed.substring(0, trimmed.length.clamp(0, 45));
         name = text.length > 45 ? '$cut…' : cut;
       }
       _sessions.replaceSession(
-        active.copyWith(
+        captured.copyWith(
           name: name,
-          messages: [...active.messages, userMessage],
+          messages: [...captured.messages, userMessage],
           updatedAt: now,
         ),
       );
@@ -152,13 +168,18 @@ class MockChatService implements ChatService {
     // independent (`AI_POOL[Math.floor(Math.random() * AI_POOL.length)]`).
     final reply = aiPool[_random.nextInt(aiPool.length)];
 
-    final activeNow = _sessions.active();
+    // The reply rides the CAPTURED id (the export's `setTimeout` closure
+    // matches `s.id === activeId` from the send render): the stored session
+    // with that id takes the reply; the view decides whether it is still the
+    // active one. Absent (deleted mid-typing) → no write, like the export's
+    // `map` missing.
     final repliedAt = DateTime.now();
-    if (activeNow != null) {
+    final target = capturedId == null ? null : _sessions.byId(capturedId);
+    if (target != null) {
       _sessions.replaceSession(
-        activeNow.copyWith(
+        target.copyWith(
           messages: [
-            ...activeNow.messages,
+            ...target.messages,
             Message(
               id: 'm${repliedAt.millisecondsSinceEpoch}',
               role: MessageRole.assistant,

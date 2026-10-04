@@ -195,6 +195,34 @@ void main() {
       expect(sessions.active(), before);
     });
 
+    test('the reply lands on the session captured at send time (the export\'s '
+        'setTimeout closure), not the active one mid-typing', () async {
+      final sessions = MockSessionsService(); // s1 active
+      final chat = MockChatService(sessions);
+      final beforeS1 =
+          sessions.list().firstWhere((s) => s.id == 's1').messages.length;
+      final beforeS2 =
+          sessions.list().firstWhere((s) => s.id == 's2').messages.length;
+      // The switch happens AFTER the send's user append (its capture) — the
+      // typing event proves the send is mid-delay.
+      final typingSeen = Completer<ChatEvent>();
+      final finished = Completer<void>();
+      chat.send('hello', const <AttachedFile>[]).listen((event) {
+        if (!typingSeen.isCompleted) typingSeen.complete(event);
+      }, onDone: finished.complete);
+      final typing = await typingSeen.future as ChatTyping;
+      expect(typing.duration.inMilliseconds, inInclusiveRange(1100, 1799));
+      sessions.select('s2'); // the switch lands mid-typing
+      await finished.future; // the reply already landed wherever it belongs
+      final original = sessions.list().firstWhere((s) => s.id == 's1');
+      final now = sessions.active()!;
+      expect(now.id, 's2');
+      // The original session took BOTH writes, like the export's closure.
+      expect(now.messages, hasLength(beforeS2));
+      expect(original.messages, hasLength(beforeS1 + 2));
+      expect(original.messages.last.role, MessageRole.assistant);
+    });
+
     test('the send writes fire the session change stream twice', () async {
       final sessions = MockSessionsService();
       final fired = <ChatsChanged>[];

@@ -46,7 +46,7 @@ button/tap responsivity (the mock's hover/press shapes → Material states, feel
 abstract class ChatService { send(text) -> Stream<ChatEvent>; /* typing, delta, done */ }
 abstract class SessionsService { list() -> List<ChatSession>; create(); ... }
 abstract class SettingsService { providers/models get-set, appearance ... }
-abstract class SubconsciousService { graph() -> (nodes, edges); nodeDetail(id); }
+abstract class SubconsciousService { graph() -> (nodes, edges); }  // (the description rides SimNode — no separate call)
 ```
 MOCK implementations seed from the export's data (SEED_SESSIONS / BASE_NODES+BASE_EDGES /
 AI_POOL / SUGGESTIONS / CLUSTER_COLORS). ONE central binding file swaps an implementation per
