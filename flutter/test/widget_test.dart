@@ -1,14 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import 'package:pondr/main.dart';
 import 'package:pondr/theme/tokens.dart';
 
 void main() {
   // No font fetching at test time — the fallback face is fine here.
-  GoogleFonts.config.allowRuntimeFetching = false;
 
   testWidgets('PondrApp boots on /login with the token theme', (
     WidgetTester tester,

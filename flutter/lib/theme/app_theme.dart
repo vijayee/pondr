@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import 'tokens.dart';
 
@@ -7,6 +6,9 @@ import 'tokens.dart';
 ///
 /// Inter is the body font and Nunito the display font (h1-h4), following the
 /// export's `@layer base` rules in `mockup_reference/styles/globals.css`.
+/// FONTS: the two faces are BUNDLED assets (the plan's Task 1 open decision
+/// landed on offline determinism — the runtime fetch flaked in a real run);
+/// `pubspec.yaml` carries the weights.
 ThemeData buildPondrTheme() {
   final ColorScheme scheme = ColorScheme.dark(
     primary: PondrTokens.primary,
@@ -30,42 +32,61 @@ ThemeData buildPondrTheme() {
     brightness: Brightness.dark,
   );
 
-  final TextTheme base = GoogleFonts.interTextTheme(
-    ThemeData.dark().textTheme.apply(
-          bodyColor: PondrTokens.foreground,
-          displayColor: PondrTokens.foreground,
-        ),
-  );
-  // The export's h1-h4 use Nunito at medium (500) weight.
-  final TextTheme textTheme = base.copyWith(
-    headlineLarge: GoogleFonts.nunito(
-      textStyle: base.headlineLarge,
-      fontWeight: FontWeight.w500,
+  const TextTheme base = TextTheme(
+    displayLarge: TextStyle(
+      fontFamily: 'Inter',
+      color: PondrTokens.foreground,
     ),
-    headlineMedium: GoogleFonts.nunito(
-      textStyle: base.headlineMedium,
-      fontWeight: FontWeight.w500,
+    displayMedium: TextStyle(
+      fontFamily: 'Inter',
+      color: PondrTokens.foreground,
     ),
-    headlineSmall: GoogleFonts.nunito(
-      textStyle: base.headlineSmall,
-      fontWeight: FontWeight.w500,
+    displaySmall: TextStyle(
+      fontFamily: 'Inter',
+      color: PondrTokens.foreground,
     ),
-    titleLarge: GoogleFonts.nunito(
-      textStyle: base.titleLarge,
-      fontWeight: FontWeight.w500,
+    headlineLarge: TextStyle(
+      fontFamily: 'Nunito',
+      fontWeight: FontWeight.w500, // the export's h1-h4: Nunito 500
+      color: PondrTokens.foreground,
     ),
-    titleMedium: GoogleFonts.nunito(
-      textStyle: base.titleMedium,
+    headlineMedium: TextStyle(
+      fontFamily: 'Nunito',
       fontWeight: FontWeight.w500,
+      color: PondrTokens.foreground,
     ),
-    titleSmall: GoogleFonts.nunito(
-      textStyle: base.titleSmall,
+    headlineSmall: TextStyle(
+      fontFamily: 'Nunito',
       fontWeight: FontWeight.w500,
+      color: PondrTokens.foreground,
     ),
+    titleLarge: TextStyle(
+      fontFamily: 'Nunito',
+      fontWeight: FontWeight.w500,
+      color: PondrTokens.foreground,
+    ),
+    titleMedium: TextStyle(
+      fontFamily: 'Nunito',
+      fontWeight: FontWeight.w500,
+      color: PondrTokens.foreground,
+    ),
+    titleSmall: TextStyle(
+      fontFamily: 'Nunito',
+      fontWeight: FontWeight.w500,
+      color: PondrTokens.foreground,
+    ),
+    bodyLarge: TextStyle(fontFamily: 'Inter', color: PondrTokens.foreground),
+    bodyMedium: TextStyle(fontFamily: 'Inter', color: PondrTokens.foreground),
+    bodySmall: TextStyle(fontFamily: 'Inter', color: PondrTokens.foreground),
+    labelLarge: TextStyle(fontFamily: 'Inter', color: PondrTokens.foreground),
+    labelMedium: TextStyle(fontFamily: 'Inter', color: PondrTokens.foreground),
+    labelSmall: TextStyle(fontFamily: 'Inter', color: PondrTokens.foreground),
   );
 
   return ThemeData.dark().copyWith(
     colorScheme: scheme,
+    textTheme: base,
+    primaryTextTheme: base,
     scaffoldBackgroundColor: PondrTokens.background,
     canvasColor: PondrTokens.background,
     cardColor: PondrTokens.card,
@@ -76,7 +97,6 @@ ThemeData buildPondrTheme() {
       ),
     ),
     dividerColor: PondrTokens.border,
-    textTheme: textTheme,
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       fillColor: PondrTokens.inputBackground,

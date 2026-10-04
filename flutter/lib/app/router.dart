@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../theme/tokens.dart';
+import '../views/chat/chat_page.dart' show ChatHeader, ChatPage;
 import 'shell.dart' show AdaptiveShell;
 
 /// The route map.
@@ -33,7 +33,9 @@ import 'shell.dart' show AdaptiveShell;
 /// rather than riverpod's Notifier because [GoRouter.refreshListenable]
 /// wants a [Listenable].)
 class AuthState extends ChangeNotifier {
-  bool _loggedIn = false;
+  AuthState({bool startLoggedIn = false}) : _loggedIn = startLoggedIn;
+
+  bool _loggedIn;
   bool get loggedIn => _loggedIn;
 
   void signIn() {
@@ -48,7 +50,12 @@ class AuthState extends ChangeNotifier {
 }
 
 final authStateProvider = Provider<AuthState>((ref) {
-  final AuthState notifier = AuthState();
+  // The dev boot seam: `flutter run --dart-define=pondr.bootChat=1` starts
+  // AUTHED so a smoke run lands on the chat surface directly (production
+  // leaves it unset — the guard routes /login first).
+  final AuthState notifier = AuthState(
+    startLoggedIn: const bool.fromEnvironment('pondr.bootChat'),
+  );
   ref.onDispose(notifier.dispose);
   return notifier;
 });
@@ -90,16 +97,26 @@ final routerProvider = Provider<GoRouter>((ref) {
       // body slot. /settings is deliberately OUTSIDE it — the mock's settings
       // page has no sessions sidebar.
       ShellRoute(
-        builder: (BuildContext context, GoRouterState state, Widget child) =>
-            AdaptiveShell(child: child),
+        builder: (BuildContext context, GoRouterState state, Widget child) {
+          if (state.matchedLocation == '/chat') {
+            // The chat header is per-view composition (app.tsx:2118-2144):
+            // narrow screens it lives in the shell's top-bar slot with the
+            // menu button leading.
+            return AdaptiveShell(
+              topBarBuilder: (BuildContext context, Widget menuButton) =>
+                  ChatHeader(menuButton: menuButton),
+              child: child,
+            );
+          }
+          return AdaptiveShell(child: child);
+        },
         routes: <RouteBase>[
-          // Task 4 swaps the body slot for chat_page.dart (the header, the
-          // message canvas, the composer). The mock's chat header is per-view
-          // composition, not shell scaffolding (app.tsx:2118-2144).
+          // The chat canvas (lib/views/chat/chat_page.dart): the header
+          // composition, the message canvas, the composer.
           GoRoute(
             path: '/chat',
             builder: (BuildContext context, GoRouterState state) =>
-                const ChatBodyPlaceholder(),
+                const ChatPage(),
           ),
           // Task 7 swaps the body slot for subconscious_view.dart + the sim.
           GoRoute(
@@ -147,19 +164,6 @@ final routerProvider = Provider<GoRouter>((ref) {
 
 // ─── Branch placeholders (each swapped by its Task listed above) ──────────
 
-/// Task 4 swaps this for the real chat canvas.
-class ChatBodyPlaceholder extends StatelessWidget {
-  const ChatBodyPlaceholder({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return const ColoredBox(
-      color: PondrTokens.background,
-      child: Center(child: Text('chat canvas — Task 4')),
-    );
-  }
-}
-
 /// Task 7 swaps this for the real subconscious sim. Its own opaque bg, per
 /// the export's container (app.tsx:504).
 class SubconsciousBodyPlaceholder extends StatelessWidget {
@@ -174,14 +178,34 @@ class SubconsciousBodyPlaceholder extends StatelessWidget {
   }
 }
 
-/// Task 5 swaps this for the real login form.
+/// Task 5 swaps this for the real login form; the stand-in's mock sign-in
+/// rides the same provider so the smoke run can reach the chat surface.
 class LoginPlaceholder extends StatelessWidget {
   const LoginPlaceholder({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
-      body: Center(child: Text('Pondr')),
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            const Text('Pondr', style: TextStyle(fontSize: 28)),
+            const SizedBox(height: 16),
+            Consumer(
+              builder: (BuildContext context, WidgetRef ref, _) {
+                return FilledButton(
+                  key: const Key('login.sign-in'),
+                  onPressed: () {
+                    ref.read(authStateProvider).signIn();
+                  },
+                  child: const Text('Sign in'),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

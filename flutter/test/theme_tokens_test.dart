@@ -4,14 +4,12 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import 'package:pondr/theme/app_theme.dart';
 import 'package:pondr/theme/tokens.dart';
 
 void main() {
   // No font fetching at test time — the fallback face is fine for pinning.
-  GoogleFonts.config.allowRuntimeFetching = false;
 
   group('PondrTokens — pinned against mockup_reference/styles/theme.css', () {
     test('the solid colours', () {

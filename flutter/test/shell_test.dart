@@ -2,16 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import 'package:pondr/app/router.dart';
 import 'package:pondr/app/shell.dart';
 import 'package:pondr/main.dart';
 
 void main() {
-  // No font fetching at test time — the fallback face is fine here.
-  GoogleFonts.config.allowRuntimeFetching = false;
-
   // Pumps the app at a given logical size with a test-owned AuthState;
   // returns the container so tests drive the auth provider directly.
   Future<ProviderContainer> pumpApp(
@@ -70,7 +66,7 @@ void main() {
       container.read(authStateProvider).signIn();
       await tester.pumpAndSettle();
 
-      expect(find.text('chat canvas — Task 4'), findsOneWidget);
+      expect(find.byKey(const Key('chat.header')), findsOneWidget);
       expect(find.text('Pondr'), findsNothing); // left the login page
     });
 
@@ -80,13 +76,13 @@ void main() {
       await pumpApp(tester, const Size(1100, 800), loggedIn: true);
 
       final BuildContext context = tester.element(
-        find.text('chat canvas — Task 4'),
+        find.byKey(const Key('chat.header')),
       );
       context.go('/register');
       await tester.pumpAndSettle();
 
       expect(find.text('register — Task 5'), findsNothing);
-      expect(find.text('chat canvas — Task 4'), findsOneWidget);
+      expect(find.byKey(const Key('chat.header')), findsOneWidget);
     });
   });
 
@@ -100,7 +96,7 @@ void main() {
       // app.tsx:806) — a 64-dp icon rail.
       expect(find.byKey(shellStaticPaneKey), findsOneWidget);
       expect(tester.getSize(find.byKey(shellStaticPaneKey)).width, kRailWidth);
-      expect(find.text('chat canvas — Task 4'), findsOneWidget);
+      expect(find.byKey(const Key('chat.header')), findsOneWidget);
       // The drawer affordance is narrow-screen only (the mock's `lg:hidden`).
       expect(find.byKey(shellMenuButtonKey), findsNothing);
       expect(find.byKey(shellScrimKey), findsNothing);
@@ -176,7 +172,7 @@ void main() {
       await pumpApp(tester, const Size(1100, 800), loggedIn: true);
 
       final BuildContext context = tester.element(
-        find.text('chat canvas — Task 4'),
+        find.byKey(const Key('chat.header')),
       );
       context.go('/subconscious');
       await tester.pumpAndSettle();
@@ -212,7 +208,7 @@ void main() {
       await pumpApp(tester, const Size(1100, 800), loggedIn: true);
 
       final BuildContext context = tester.element(
-        find.text('chat canvas — Task 4'),
+        find.byKey(const Key('chat.header')),
       );
       context.go('/settings');
       await tester.pumpAndSettle();
@@ -224,7 +220,7 @@ void main() {
       await tester.tap(find.byKey(const Key('settings.back')));
       await tester.pumpAndSettle();
 
-      expect(find.text('chat canvas — Task 4'), findsOneWidget);
+      expect(find.byKey(const Key('chat.header')), findsOneWidget);
     });
 
     testWidgets('the shell\'s footer navigations: the avatar row to /settings '
@@ -238,14 +234,14 @@ void main() {
       ).read(sidebarCollapsedProvider.notifier).toggle();
       await tester.pumpAndSettle();
 
-      await tester.tap(find.text('Settings'));
+      await tester.tap(find.byKey(const Key('sidebar.footer-settings')));
       await tester.pumpAndSettle();
       expect(find.text('settings — Task 6'), findsOneWidget);
 
       // Back home, then sign out through the pane's footer (app.tsx:2089).
       await tester.tap(find.byKey(const Key('settings.back')));
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Sign out'));
+      await tester.tap(find.byKey(const Key('sidebar.sign-out')));
       await tester.pumpAndSettle();
 
       expect(find.text('Pondr'), findsOneWidget); // /login

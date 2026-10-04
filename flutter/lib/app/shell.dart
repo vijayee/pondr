@@ -1,9 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:go_router/go_router.dart';
 
 import '../theme/tokens.dart';
-import 'router.dart' show authStateProvider;
+import '../views/chat/session_sidebar.dart' show SessionPaneContent;
 
 /// The adaptive app shell — the chat branch's scaffolding (`lib/app/router.dart`
 /// puts ONLY `/chat` + `/subconscious` under it; the mock's settings page is a
@@ -32,13 +31,34 @@ import 'router.dart' show authStateProvider;
 ///   menu button wired in).
 ///
 /// The pane CONTENT (the grouped sessions list, the search toggle, the hover
-/// expansion) is Task 4 composition; until then [_PaneContent] hosts the
-/// shell-scoped navigations the mock puts in the sidebar: View Subconscious
-/// (app.tsx:1986-2011), the footer avatar row -> /settings (app.tsx:2063-2097)
-/// and its sign out (app.tsx:2088-2093).
+/// expansion) landed with Task 4: `SessionPaneContent` from
+/// `lib/views/chat/session_sidebar.dart` hosts the shell-scoped navigations
+/// the mock puts in the sidebar — View Subconscious (app.tsx:1986-2011), the
+/// footer avatar row -> /settings (app.tsx:2063-2097) and its sign out
+/// (app.tsx:2088-2093).
 
 /// The mock's chat-layout breakpoint (the plan's 900 dp).
 const double kPaneBreakpoint = 900.0;
+
+/// The shell's wide/narrow decision, handed DOWN so a branch's page sees the
+/// SAME decision the shell's [LayoutBuilder] made — a page can't re-measure
+/// with its own MediaQuery (the test surface and the route constraints
+/// disagree; the pane's own width animating makes body-slot width useless
+/// too).
+class ShellMode extends InheritedWidget {
+  const ShellMode({required this.wide, required super.child, super.key});
+
+  /// TRUE at [kPaneBreakpoint] and up.
+  final bool wide;
+
+  /// Null when no shell is above (a page pumped standalone falls back to
+  /// MediaQuery).
+  static bool? wideOf(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<ShellMode>()?.wide;
+
+  @override
+  bool updateShouldNotify(ShellMode oldWidget) => oldWidget.wide != wide;
+}
 
 /// The mock's collapsed rail / expanded pane / drawer widths (app.tsx:1894).
 const double kRailWidth = 64.0;
@@ -63,8 +83,9 @@ final sidebarOpenProvider =
     NotifierProvider<SidebarOpen, bool>(SidebarOpen.new);
 
 /// The export's `sidebarCollapsed` state (app.tsx:806) — boots TRUE, the
-/// collapsed rail; hovering the rail expands it (that hover lives with the
-/// pane content in Task 4).
+/// collapsed rail; hovering the rail expands it (that hover lives in the
+/// pane content, lib/views/chat/session_sidebar.dart), leaving it collapses
+/// back.
 class SidebarCollapsed extends Notifier<bool> {
   @override
   bool build() => true;
@@ -74,6 +95,9 @@ class SidebarCollapsed extends Notifier<bool> {
   /// The mock's narrow affordance un-collapses the rail as it opens the
   /// drawer (app.tsx:2121).
   void expand() => state = false;
+
+  /// The mock's onMouseLeave returns the rail to collapsed (app.tsx:1893).
+  void collapse() => state = true;
 }
 
 final sidebarCollapsedProvider =
@@ -102,14 +126,23 @@ class AdaptiveShell extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    return LayoutBuilder(
+    // The chat branch's Scaffold role: without a Material the texts fall to
+    // the framework's "no-Material" fallback style (`family: monospace` +
+    // the double yellow underline — THE debug run's broken face).
+    return Material(
+      type: MaterialType.transparency,
+      child: LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
         final bool wide = constraints.maxWidth >= kPaneBreakpoint;
         if (wide) {
-          return _WideShell(child: child);
+          return ShellMode(wide: true, child: _WideShell(child: child));
         }
-        return _NarrowShell(topBarBuilder: topBarBuilder, child: child);
+        return ShellMode(
+          wide: false,
+          child: _NarrowShell(topBarBuilder: topBarBuilder, child: child),
+        );
       },
+    ),
     );
   }
 }
@@ -135,13 +168,23 @@ class _ShellPane extends ConsumerWidget {
       duration: const Duration(milliseconds: 250),
       curve: Curves.easeOut,
       width: width,
+      clipBehavior: Clip.hardEdge,
       decoration: BoxDecoration(
         color: PondrTokens.sidebar,
         border: Border(
           right: BorderSide(color: PondrTokens.sidebarBorder),
         ),
       ),
-      child: contentBuilder(expanded),
+      // The content's width NEVER tracks the animating width: it snaps to
+      // the destination (like the export's instant React re-render) and the
+      // pane CLIPS the interim stick-out — the browser's overflow painting
+      // does the same for the export.
+      child: OverflowBox(
+        alignment: Alignment.topLeft,
+        minWidth: width,
+        maxWidth: width,
+        child: contentBuilder(expanded),
+      ),
     );
   }
 }
@@ -158,7 +201,7 @@ class _WideShell extends ConsumerWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         _ShellPane(drawer: false, contentBuilder: (bool expanded) {
-          return _PaneContent(expanded: expanded);
+          return SessionPaneContent(expanded: expanded, isDrawer: false);
         }),
         Expanded(child: child),
       ],
@@ -229,7 +272,7 @@ class _NarrowShell extends ConsumerWidget {
             duration: const Duration(milliseconds: 300),
             curve: Curves.easeOutCubic,
             child: _ShellPane(drawer: true, contentBuilder: (bool _) {
-              return const _PaneContent(expanded: true);
+              return SessionPaneContent(expanded: true, isDrawer: true);
             }),
           ),
         ),
@@ -252,130 +295,4 @@ Widget shellMenuButton(WidgetRef ref) {
       ref.read(sidebarOpenProvider.notifier).open();
     },
   );
-}
-
-/// The pane content at BOTH shapes, mirroring the mock's expanded /
-/// icon-only branches (app.tsx:1985-2011, 2063-2106). Task 4 swaps this
-/// whole widget out for `session_sidebar.dart` — which must keep these
-/// shell-scoped navigations: /subconscious, /settings on the avatar row and
-/// the sign out.
-class _PaneContent extends ConsumerWidget {
-  const _PaneContent({required this.expanded});
-
-  /// FALSE = the collapsed rail's icon-only variant (the mock's
-  /// `sidebarCollapsed` branch); TRUE = the labeled pane / the drawer.
-  final bool expanded;
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    // View Subconscious (app.tsx:1985-2011).
-    final Widget subconsciousEntry = expanded
-        ? TextButton.icon(
-            onPressed: () => context.go('/subconscious'),
-            icon: const Icon(Icons.psychology),
-            label: const Text('View Subconscious'),
-          )
-        : IconButton(
-            tooltip: 'View Subconscious',
-            onPressed: () => context.go('/subconscious'),
-            icon: const Icon(Icons.psychology),
-          );
-
-    final Widget newChatEntry = expanded
-        ? TextButton.icon(
-            onPressed: () => context.go('/chat'),
-            icon: const Icon(Icons.add),
-            label: const Text('New Chat'),
-          )
-        : IconButton(
-            tooltip: 'New Chat',
-            onPressed: () => context.go('/chat'),
-            icon: const Icon(Icons.add),
-          );
-
-    return Material(
-      type: MaterialType.transparency,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          const SizedBox(height: 16),
-          subconsciousEntry,
-          newChatEntry,
-          const Expanded(
-            child: Center(child: Text('sessions — Task 4')),
-          ),
-          // The footer avatar row's navigations (app.tsx:2063-2097). The mock
-          // builds these as simple flex rows whose labels collapse away —
-          // mirrored here (a ListTile dies on the narrow animation widths).
-          _PaneFooterButton(
-            key: const Key('shell.footer-avatar'),
-            expanded: expanded,
-            icon: Icons.account_circle,
-            label: 'Settings',
-            onTap: () => context.go('/settings'),
-          ),
-          _PaneFooterButton(
-            key: const Key('shell.sign-out'),
-            expanded: expanded,
-            icon: Icons.logout,
-            label: 'Sign out',
-            onTap: () {
-              // The mock's footer sign-out goes back to the login view
-              // (app.tsx:2089) — here: clear auth, the guard snaps to /login.
-              ref.read(authStateProvider).signOut();
-              context.go('/login');
-            },
-          ),
-          const SizedBox(height: 8),
-        ],
-      ),
-    );
-  }
-}
-
-/// One footer row: the icon always, the label only when the pane is expanded
-/// (the mock's collapsed branch renders icon-only rows, app.tsx:2098-2106).
-class _PaneFooterButton extends StatelessWidget {
-  const _PaneFooterButton({
-    required this.expanded,
-    required this.icon,
-    required this.label,
-    required this.onTap,
-    super.key,
-  });
-
-  final bool expanded;
-  final IconData icon;
-  final String label;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final Color fg = PondrTokens.primary;
-    final Icon iconWidget = Icon(icon, color: fg);
-    return InkWell(
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        child: expanded
-            ? Row(
-                children: <Widget>[
-                  iconWidget,
-                  Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.only(left: 12),
-                      child: Text(
-                        label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(color: fg),
-                      ),
-                    ),
-                  ),
-                ],
-              )
-            : Center(child: iconWidget),
-      ),
-    );
-  }
 }
