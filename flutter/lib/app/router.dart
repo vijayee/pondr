@@ -2,8 +2,27 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../views/auth/login_view.dart' show LoginView;
+import '../views/auth/register_view.dart' show RegisterView;
 import '../views/chat/chat_page.dart' show ChatHeader, ChatPage;
 import 'shell.dart' show AdaptiveShell;
+
+/// The branch-swapping page — a ZERO-duration transition. The export's view
+/// switches (`setView`) are instant EXCEPT the auth card pair's own 0.3 s
+/// enter/exit, which lives in the views' [AuthCardShell] (mode="wait",
+/// app.tsx:969) — so every whole-page swap here (login, register, the chat
+/// SHELL, settings) must not paint its own transition over it.
+CustomTransitionPage<void> _instantPage(GoRouterState state, Widget child) {
+  return CustomTransitionPage<void>(
+    key: state.pageKey,
+    child: child,
+    transitionDuration: Duration.zero,
+    reverseTransitionDuration: Duration.zero,
+    transitionsBuilder:
+        (_, Animation<double> enter, Animation<double> exit, Widget child) =>
+            child,
+  );
+}
 
 /// The route map.
 ///
@@ -81,34 +100,38 @@ final routerProvider = Provider<GoRouter>((ref) {
       return null;
     },
     routes: <RouteBase>[
-      // Task 5 swaps in the real auth views (login/register_view.dart); they
-      // call authStateProvider's signIn().
+      // The real auth views (lib/views/auth/): the submit calls
+      // authStateProvider's signIn(); the cards' cross-auth switch rides
+      // AuthCardShell's mode="wait" exit → context.go.
       GoRoute(
         path: '/login',
-        builder: (BuildContext context, GoRouterState state) =>
-            const LoginPlaceholder(),
+        pageBuilder: (BuildContext context, GoRouterState state) =>
+            _instantPage(state, const LoginView()),
       ),
       GoRoute(
         path: '/register',
-        builder: (BuildContext context, GoRouterState state) =>
-            const RegisterPlaceholder(),
+        pageBuilder: (BuildContext context, GoRouterState state) =>
+            _instantPage(state, const RegisterView()),
       ),
       // The chat branch's SHELL (lib/app/shell.dart): the sessions pane + the
       // body slot. /settings is deliberately OUTSIDE it — the mock's settings
       // page has no sessions sidebar.
       ShellRoute(
-        builder: (BuildContext context, GoRouterState state, Widget child) {
+        pageBuilder: (BuildContext context, GoRouterState state, Widget child) {
           if (state.matchedLocation == '/chat') {
             // The chat header is per-view composition (app.tsx:2118-2144):
             // narrow screens it lives in the shell's top-bar slot with the
             // menu button leading.
-            return AdaptiveShell(
-              topBarBuilder: (BuildContext context, Widget menuButton) =>
-                  ChatHeader(menuButton: menuButton),
-              child: child,
+            return _instantPage(
+              state,
+              AdaptiveShell(
+                topBarBuilder: (BuildContext context, Widget menuButton) =>
+                    ChatHeader(menuButton: menuButton),
+                child: child,
+              ),
             );
           }
-          return AdaptiveShell(child: child);
+          return _instantPage(state, AdaptiveShell(child: child));
         },
         routes: <RouteBase>[
           // The chat canvas (lib/views/chat/chat_page.dart): the header
@@ -155,8 +178,8 @@ final routerProvider = Provider<GoRouter>((ref) {
       // Task 6 swaps in settings_view.dart.
       GoRoute(
         path: '/settings',
-        builder: (BuildContext context, GoRouterState state) =>
-            const SettingsBodyPlaceholder(),
+        pageBuilder: (BuildContext context, GoRouterState state) =>
+            _instantPage(state, const SettingsBodyPlaceholder()),
       ),
     ],
   );
@@ -175,48 +198,6 @@ class SubconsciousBodyPlaceholder extends StatelessWidget {
       color: Color(0xFF07061A),
       child: Center(child: Text('subconscious — Task 7')),
     );
-  }
-}
-
-/// Task 5 swaps this for the real login form; the stand-in's mock sign-in
-/// rides the same provider so the smoke run can reach the chat surface.
-class LoginPlaceholder extends StatelessWidget {
-  const LoginPlaceholder({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            const Text('Pondr', style: TextStyle(fontSize: 28)),
-            const SizedBox(height: 16),
-            Consumer(
-              builder: (BuildContext context, WidgetRef ref, _) {
-                return FilledButton(
-                  key: const Key('login.sign-in'),
-                  onPressed: () {
-                    ref.read(authStateProvider).signIn();
-                  },
-                  child: const Text('Sign in'),
-                );
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// Task 5 swaps this for the real register form.
-class RegisterPlaceholder extends StatelessWidget {
-  const RegisterPlaceholder({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return const Scaffold(body: Center(child: Text('register — Task 5')));
   }
 }
 
@@ -245,4 +226,3 @@ class SettingsBodyPlaceholder extends StatelessWidget {
     );
   }
 }
-

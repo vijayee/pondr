@@ -278,13 +278,11 @@ class EmptySessionState extends ConsumerWidget {
                 child: const SparkAvatar(size: 261, bgAlpha: 0, glow: true),
               ),
               const SizedBox(height: 24),
-              const Text(
-                'Pondr',
-                style: TextStyle(
-                  fontSize: 28,
-                  fontWeight: FontWeight.w700, // Task 5 swaps the SVG
-                  color: Colors.white,
-                ),
+              // The export's `PondrLogo h-9 w-44` wordmark (app.tsx:2157).
+              const PondrWordmark(
+                key: Key('chat.empty-logo'),
+                width: 176,
+                height: 36,
               ),
               const SizedBox(height: 12),
               const Text(

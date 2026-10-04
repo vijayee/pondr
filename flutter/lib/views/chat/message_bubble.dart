@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 
 import '../../data/models.dart';
 import '../../theme/tokens.dart';
+import 'common.dart' show kThoughtSparkAsset;
 
 /// The export's MessageBubble (`app.tsx:732-788`) + its entrance motion.
 ///
@@ -93,8 +95,9 @@ class _BubbleRow extends StatelessWidget {
 }
 
 /// The 28 dp avatar (the export's `w-7 h-7`): user on `bg-primary/20` with
-/// the user glyph; assistant on `rgba(195,172,218,0.18)` with the spark. The
-/// ThoughtSpark SVG swaps in at Task 5's asset work.
+/// the 13 px user glyph (app.tsx:717); assistant on `rgba(195,172,218,0.18)`
+/// with the 20 px (`w-5 h-5`) ThoughtSpark mark (app.tsx:713) — the
+/// iridescent asset itself.
 class _BubbleAvatar extends StatelessWidget {
   const _BubbleAvatar({required this.isUser});
 
@@ -110,11 +113,13 @@ class _BubbleAvatar extends StatelessWidget {
         color: isUser ? const Color(0x33888DDF) : const Color(0x2EC3ACDA),
         shape: BoxShape.circle,
       ),
-      child: Icon(
-        isUser ? Icons.person : Icons.auto_awesome,
-        size: 16,
-        color: isUser ? PondrTokens.primary : const Color(0xFFE2E6FF),
-      ),
+      child: isUser
+          ? const Icon(Icons.person, size: 16, color: PondrTokens.primary)
+          : SizedBox(
+              width: 20, // w-5 h-5
+              height: 20,
+              child: SvgPicture.asset(kThoughtSparkAsset, fit: BoxFit.contain),
+            ),
     );
   }
 }

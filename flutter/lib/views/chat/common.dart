@@ -1,12 +1,43 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 
 /// Shared atoms of the chat surface: the spark avatar slot, the press-scale
 /// affordance and the anchored-popover scaffold the attachment picker and
 /// the model dropdown build on.
 
-/// The ThoughtSpark avatar slot — the iridescent SVG's circle. The asset
-/// itself lands with the auth views' SVG work (Task 5); the material
-/// stand-in holds the circle + glow shape (`app.tsx:743` / `:1909-1911`).
+/// The iridescent brand SVGs — the mock's `pondr_irridescent-2.svg` and
+/// `thoughtspark_irridescent.svg` (verbatim from mockup_reference/imports;
+/// the export's `normalizeSvg` → `width/height: 100%` reads as `BoxFit.contain`
+/// through flutter_svg, `app.tsx:15-26`).
+const String kPondrLogoAsset = 'assets/brand/pondr_logo.svg';
+const String kThoughtSparkAsset = 'assets/brand/thoughtspark.svg';
+
+/// The export's wordmark ([PondrLogo]) in a fixed box, contain-fit — the
+/// mock's boxes: `h-[104px]` + `max-w-sm` (the auth cards, app.tsx:984),
+/// `w-44 h-9` (the chat empty state, app.tsx:2157), `w-[174px] h-[40px]`
+/// (the sidebar, app.tsx:1921).
+class PondrWordmark extends StatelessWidget {
+  const PondrWordmark({required this.width, required this.height, super.key});
+
+  final double width;
+  final double height;
+
+  @override
+  Widget build(BuildContext context) {
+    return SvgPicture.asset(
+      kPondrLogoAsset,
+      width: width,
+      height: height,
+      fit: BoxFit.contain,
+    );
+  }
+}
+
+/// The ThoughtSpark avatar slot: the circle + glow shape with the
+/// iridescent mark inside (`app.tsx:743` / `:1909-1911`). MARK mode
+/// (`bgAlpha == 0` — the export's bare halo + `w-full h-full` mark,
+/// app.tsx:1911,2153) fills the box with the SVG; DISC mode keeps the
+/// export's `w-5` spark in the `w-7` disc (20/28, app.tsx:713).
 class SparkAvatar extends StatelessWidget {
   const SparkAvatar({this.size = 28, this.bgAlpha = 0.18, this.glow = false, super.key});
 
@@ -40,11 +71,17 @@ class SparkAvatar extends StatelessWidget {
       alignment: Alignment.center,
       child: Opacity(
         opacity: 0.9,
-        child: Icon(
-          Icons.auto_awesome,
-          size: size * 0.6,
-          color: const Color(0xFFE2E6FF),
-        ),
+        child: bgAlpha <= 0
+            ? SvgPicture.asset(
+                kThoughtSparkAsset,
+                fit: BoxFit.contain, // the export's `w-full h-full`
+              )
+            : SvgPicture.asset(
+                kThoughtSparkAsset,
+                width: size * 20 / 28, // the export's `w-5 h-5` in `w-7`
+                height: size * 20 / 28,
+                fit: BoxFit.contain,
+              ),
       ),
     );
   }

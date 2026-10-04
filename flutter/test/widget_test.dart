@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:pondr/main.dart';
 import 'package:pondr/theme/tokens.dart';
+import 'package:pondr/views/auth/auth_background.dart';
 
 void main() {
   // No font fetching at test time — the fallback face is fine here.
@@ -15,9 +16,10 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.byType(Scaffold), findsOneWidget);
-    expect(find.text('Pondr'), findsOneWidget);
+    expect(find.byKey(authLoginCardKey), findsOneWidget);
+    expect(find.byKey(loginSubmitKey), findsOneWidget);
 
-    final BuildContext context = tester.element(find.byType(Scaffold));
+    final BuildContext context = tester.element(find.byType(Scaffold).first);
     expect(Theme.of(context).scaffoldBackgroundColor, PondrTokens.background);
     expect(Theme.of(context).colorScheme.primary, PondrTokens.primary);
   });

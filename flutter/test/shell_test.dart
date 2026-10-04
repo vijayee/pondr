@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 import 'package:pondr/app/router.dart';
 import 'package:pondr/app/shell.dart';
 import 'package:pondr/main.dart';
+import 'package:pondr/views/auth/auth_background.dart';
 
 void main() {
   // Pumps the app at a given logical size with a test-owned AuthState;
@@ -39,7 +40,7 @@ void main() {
     ) async {
       await pumpApp(tester, const Size(1100, 800));
 
-      expect(find.text('Pondr'), findsOneWidget); // the login placeholder
+      expect(find.byKey(authLoginCardKey), findsOneWidget); // the login card
       expect(find.byKey(shellStaticPaneKey), findsNothing);
     });
 
@@ -48,12 +49,14 @@ void main() {
     ) async {
       await pumpApp(tester, const Size(1100, 800));
 
-      final BuildContext context = tester.element(find.text('Pondr'));
+      final BuildContext context = tester.element(
+        find.byKey(authLoginCardKey),
+      );
       context.go('/settings');
       await tester.pumpAndSettle();
 
       expect(find.text('settings — Task 6'), findsNothing);
-      expect(find.text('Pondr'), findsOneWidget); // still /login
+      expect(find.byKey(authLoginCardKey), findsOneWidget); // still /login
     });
 
     testWidgets('signing in moves /login to /chat (the mock\'s '
@@ -67,7 +70,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byKey(const Key('chat.header')), findsOneWidget);
-      expect(find.text('Pondr'), findsNothing); // left the login page
+      expect(find.byKey(authLoginCardKey), findsNothing); // left the login page
     });
 
     testWidgets('an authed viewer on an auth page redirects to /chat', (
@@ -244,7 +247,7 @@ void main() {
       await tester.tap(find.byKey(const Key('sidebar.sign-out')));
       await tester.pumpAndSettle();
 
-      expect(find.text('Pondr'), findsOneWidget); // /login
+      expect(find.byKey(authLoginCardKey), findsOneWidget); // /login
       expect(container.read(authStateProvider).loggedIn, isFalse);
     });
   });

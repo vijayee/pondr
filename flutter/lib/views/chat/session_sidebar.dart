@@ -108,15 +108,14 @@ class _TopRow extends ConsumerWidget {
               curve: Curves.easeOut,
               alignment: Alignment.centerLeft,
               child: expanded
-                  ? const Padding(
-                      padding: EdgeInsets.only(left: 10),
-                      child: Text(
-                        'Pondr',
-                        key: Key('sidebar.logo'),
-                        style: TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.w700, // Task 5 swaps the SVG
-                        ),
+                  ? Padding(
+                      padding: const EdgeInsets.only(left: 10),
+                      // The export's wordmark `PondrLogo w-[174px] h-[40px]`
+                      // (app.tsx:1921).
+                      child: PondrWordmark(
+                        key: const Key('sidebar.logo'),
+                        width: 174,
+                        height: 40,
                       ),
                     )
                   : const SizedBox.shrink(),

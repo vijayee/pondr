@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+
+import 'common.dart' show kThoughtSparkAsset;
 
 /// The export's TypingIndicator (`app.tsx:703-728`).
 ///
@@ -152,8 +155,8 @@ class _PulseDot extends StatelessWidget {
 }
 
 /// The 28 dp spark avatar (the export's `w-7 h-7` circle on
-/// `rgba(195,172,218,0.2)`); the ThoughtSpark SVG lands in Task 5's asset
-/// work — the material stand-in holds the slot.
+/// `rgba(195,172,218,0.2)`, app.tsx:711-715) with the 20 px `w-5 h-5`
+/// ThoughtSpark mark inside — the iridescent asset itself.
 class _SparkAvatar extends StatelessWidget {
   const _SparkAvatar();
 
@@ -167,7 +170,11 @@ class _SparkAvatar extends StatelessWidget {
         shape: BoxShape.circle,
       ),
       alignment: Alignment.center,
-      child: const Icon(Icons.auto_awesome, size: 18, color: Color(0xFFE2E6FF)),
+      child: SizedBox(
+        width: 20, // w-5 h-5
+        height: 20,
+        child: SvgPicture.asset(kThoughtSparkAsset, fit: BoxFit.contain),
+      ),
     );
   }
 }

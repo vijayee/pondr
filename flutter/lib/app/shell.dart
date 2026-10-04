@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../theme/tokens.dart';
+import '../views/chat/common.dart' show SparkAvatar;
 import '../views/chat/session_sidebar.dart' show SessionPaneContent;
 
 /// The adaptive app shell — the chat branch's scaffolding (`lib/app/router.dart`
@@ -281,15 +282,14 @@ class _NarrowShell extends ConsumerWidget {
   }
 }
 
-/// The drawer's opening affordance. The mock's narrow-screen leading button
-/// is the ThoughtSpark logo (app.tsx:2120-2128) — the Menu icon stands in
-/// until the SVG work (Task 5). It opens the sidebar AND un-collapses the
-/// rail, and is handed to the branch's top bar so Task 4's chat header
-/// carries it too.
+/// The drawer's opening affordance: the mock's narrow-screen leading button —
+/// the 44 dp ThoughtSpark mark over its `blur-sm` halo (`app.tsx:2123-2130`,
+/// the `w-11 h-11` box). It opens the sidebar AND un-collapses the rail, and
+/// is handed to the branch's top bar so Task 4's chat header carries it too.
 Widget shellMenuButton(WidgetRef ref) {
   return IconButton(
     key: shellMenuButtonKey,
-    icon: const Icon(Icons.menu),
+    icon: const SparkAvatar(size: 44, bgAlpha: 0, glow: true),
     onPressed: () {
       ref.read(sidebarCollapsedProvider.notifier).expand();
       ref.read(sidebarOpenProvider.notifier).open();
