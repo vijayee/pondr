@@ -89,8 +89,13 @@ class AuthBackground extends StatelessWidget {
             ),
           ),
           // `min-h-screen flex items-center justify-center p-4` (app.tsx:951).
+          // `min-h-screen` is a MINIMUM: a browser scrolls its VIEWPORT when
+          // the card is taller than the window (the register card alone is
+          // ~760 dp, which overflowed 246 px at a 500×500 window before this
+          // scroll). The scroll view is that page scroll — the centered
+          // `p-4` shape is preserved whenever the card fits.
           Center(
-            child: Padding(
+            child: SingleChildScrollView(
               padding: const EdgeInsets.all(16),
               child: ConstrainedBox(
                 constraints: const BoxConstraints(

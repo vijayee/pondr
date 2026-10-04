@@ -8,8 +8,8 @@ void main() {
   runApp(const ProviderScope(child: PondrApp()));
 }
 
-/// The app widget: the theme + the router (the plan's Task 3 replaced the
-/// temporary Task 1 stub — the route map lives in lib/app/router.dart).
+/// The app widget: the theme + the router; the route map lives in
+/// `lib/app/router.dart`.
 class PondrApp extends ConsumerWidget {
   const PondrApp({super.key});
 

@@ -45,7 +45,6 @@ CustomTransitionPage<void> _instantPage(GoRouterState state, Widget child) {
 ///   it. So the see-through-overlay question dissolves: an opaque page route
 ///   inside a ShellRoute shared with /chat is the honest 1:1 shape, with a
 ///   fade + slight scale as the plan's requested entrance (the plan, Task 3).
-/// Placeholders carry the Task number that swaps them in.
 
 /// The export's auth "state": there is no account system in the mock —
 /// handleLogin/handleRegister just setView("chat") (app.tsx:855-863). This is
@@ -71,9 +70,13 @@ class AuthState extends ChangeNotifier {
 }
 
 final authStateProvider = Provider<AuthState>((ref) {
-  // The dev boot seam: `flutter run --dart-define=pondr.bootChat=1` starts
+  // The dev boot seam: `flutter run --dart-define=pondr.bootChat=true` starts
   // AUTHED so a smoke run lands on the chat surface directly (production
-  // leaves it unset — the guard routes /login first).
+  // leaves it unset — the guard routes /login first). The value MUST be the
+  // literal string "true": [bool.fromEnvironment] is true only for "true" —
+  // a `=1` define compiles FALSE (the flag "didn't fire" finding — the
+  // compile passes the define through whole; only the value spelling was
+  // wrong).
   final AuthState notifier = AuthState(
     startLoggedIn: const bool.fromEnvironment('pondr.bootChat'),
   );
@@ -136,7 +139,7 @@ final routerProvider = Provider<GoRouter>((ref) {
           // The subconscious branch REPLACES the whole main area on narrow —
           // its own header with only the close X, no menu affordance (the
           // export's menu button lives solely in the chat header,
-          // app.tsx:2112-2144) — so the stand-in top bar shrinks away.
+          // app.tsx:2112-2144) — so the shell's bare top bar shrinks away.
           return _instantPage(
             state,
             AdaptiveShell(
@@ -155,7 +158,7 @@ final routerProvider = Provider<GoRouter>((ref) {
             builder: (BuildContext context, GoRouterState state) =>
                 const ChatPage(),
           ),
-          // Task 7: the subconscious sim (lib/views/subconscious/).
+          // The subconscious sim (lib/views/subconscious/).
           GoRoute(
             path: '/subconscious',
             pageBuilder: (BuildContext context, GoRouterState state) =>
@@ -189,7 +192,7 @@ final routerProvider = Provider<GoRouter>((ref) {
           ),
         ],
       ),
-      // Task 6's settings page (lib/views/settings/settings_view.dart): the
+      // The settings page (lib/views/settings/settings_view.dart): the
       // standalone layout with its own nav aside (app.tsx:1248-1869).
       GoRoute(
         path: '/settings',

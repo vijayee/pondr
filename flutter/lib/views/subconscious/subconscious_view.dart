@@ -763,13 +763,20 @@ class GraphPainter extends CustomPainter {
         textAlign: TextAlign.center,
       )..layout();
       // The svg's y = r + 13 IS the alphabetic baseline (app.tsx:602) —
-      // subtract the ascent to land this painter's box on it.
+      // subtract the ascent to land this painter's box on it. The svg's
+      // text x is the node's x minus the anchor-middle width (app.tsx:603)
+      // — the painter's box origin is the TOP-LEFT, so shift by the ascent
+      // there; without the node's (x, y) every label would pile at the
+      // canvas centre (the running-app finding).
       final double ascent = label.computeDistanceToActualBaseline(
         TextBaseline.alphabetic,
       );
       label.paint(
         canvas,
-        Offset(-label.width / 2, node.node.r + 13 - ascent),
+        Offset(
+          node.x - label.width / 2,
+          node.y + node.node.r + 13 - ascent,
+        ),
       );
     }
     canvas.restore();

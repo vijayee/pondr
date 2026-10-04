@@ -105,8 +105,8 @@ final sidebarCollapsedProvider =
     NotifierProvider<SidebarCollapsed, bool>(SidebarCollapsed.new);
 
 /// The shell around the chat branch's body slot. [topBarBuilder] replaces the
-/// default narrow top bar; pass `null` (the default) and the stand-in bar —
-/// carrying the [shellMenuButtonKey]-keyed button — shows.
+/// default narrow top bar; pass `null` (the default) and the shell's bare top
+/// bar — carrying the [shellMenuButtonKey]-keyed button — shows.
 class AdaptiveShell extends ConsumerWidget {
   const AdaptiveShell({
     required this.child,
@@ -210,7 +210,7 @@ class _WideShell extends ConsumerWidget {
   }
 }
 
-/// The narrow shell: the stand-in top bar with the menu affordance + the body
+/// The narrow shell: the bare top bar with the menu affordance + the body
 /// slot, with the sessions pane as the off-canvas drawer + scrim layer.
 class _NarrowShell extends ConsumerWidget {
   const _NarrowShell({required this.child, required this.topBarBuilder});

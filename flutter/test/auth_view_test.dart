@@ -248,4 +248,87 @@ void main() {
       expect(find.byKey(authRegisterCardKey), findsNothing);
     });
   });
+
+  group('the auth cards at short windows — `min-h-screen` is a minimum: the '
+      'browser scrolls its viewport when the card is taller '
+      '(app.tsx:951, the 246 px overflow finding)', () {
+    testWidgets('the login card lays out overflow-free at 500×500 and '
+        '640×480, its submit reachable through the page scroll', (
+      WidgetTester tester,
+    ) async {
+      ProviderContainer? container;
+      for (final Size size in <Size>[
+        const Size(500, 500),
+        const Size(640, 480),
+      ]) {
+        container = await pumpApp(tester, size);
+        expect(tester.takeException(), isNull, reason: 'at $size');
+        // The submit sits below the fold at this height — the page scroll
+        // brings it up, exactly the browser's way into the form.
+        await tester.ensureVisible(find.byKey(loginSubmitKey));
+        await tester.pumpAndSettle();
+        final bool offstage = tester
+            .getRect(find.byKey(loginSubmitKey))
+            .isEmpty;
+        expect(offstage, isFalse, reason: 'at $size');
+        expect(find.byKey(authLoginCardKey), findsOneWidget);
+      }
+      expect(container, isNotNull);
+    });
+
+    testWidgets('the login submit STILL signs in at 500×500 — scroll to it, '
+        'tap, and the flow lands on /chat', (WidgetTester tester) async {
+      final ProviderContainer container = await pumpApp(
+        tester,
+        const Size(500, 500),
+      );
+      await tester.ensureVisible(find.byKey(loginSubmitKey));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(loginSubmitKey));
+      await tester.pumpAndSettle();
+      expect(container.read(authStateProvider).loggedIn, isTrue);
+      expect(find.byKey(const Key('chat.header')), findsOneWidget);
+    });
+
+    testWidgets('the register card (the taller one) lays out overflow-free '
+        'at 500×500 and 640×480, reached through the scrolled footer link', (
+      WidgetTester tester,
+    ) async {
+      for (final Size size in <Size>[
+        const Size(500, 500),
+        const Size(640, 480),
+      ]) {
+        await pumpApp(tester, size);
+        // The `Create one` link rides the card footer — below the fold at
+        // this height, so the same page scroll reaches it.
+        await tester.ensureVisible(find.byKey(loginSwitchKey));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(loginSwitchKey));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull, reason: 'at $size');
+        expect(find.byKey(authRegisterCardKey), findsOneWidget, reason: 'at $size');
+        expect(find.text('Create your account'), findsOneWidget, reason: 'at $size');
+      }
+    });
+
+    testWidgets('…and overflow-free under a 1.3 text scale — the fields grow '
+        'past 24 dp tall and the card still scrolls, not overflows', (
+      WidgetTester tester,
+    ) async {
+      tester.platformDispatcher.textScaleFactorTestValue = 1.3;
+      addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+      for (final Size size in <Size>[
+        const Size(500, 500),
+        const Size(640, 480),
+      ]) {
+        await pumpApp(tester, size);
+        expect(
+          tester.getRect(find.byKey(loginUsernameKey)).height,
+          greaterThan(24), // the fields' inflated heights, measured
+          reason: 'at $size',
+        );
+        expect(tester.takeException(), isNull, reason: 'at $size');
+      }
+    });
+  });
 }
