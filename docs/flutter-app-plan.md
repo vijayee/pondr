@@ -6,7 +6,7 @@
 
 **Architecture:** Riverpod + go_router; the data layer = four abstract services + mock implementations behind ONE binding file; the design as a token file (the export's CSS variables → Dart); the subconscious graph = a faithful force-sim port behind a `CustomPainter`. Every view converts from the REFERENCE (the export committed into `pondr/flutter/mockup_reference/`), never from memory.
 
-**Tech Stack:** Flutter (SDK at ~/flutter), Riverpod ^2, go_router ^12, flutter_markdown; `flutter analyze` + `flutter test` are each task's gate; a real run at the end.
+**Tech Stack:** Flutter 3.44.2 (SDK at ~/flutter), Riverpod ^3 (3.4.3 installed; the sketches use the riverpod-2 idiom shape — implementers write the riverpod-3 idiom: Notifier/AsyncNotifier over StateNotifier), go_router ^18 (18.0.2 installed), flutter_markdown; `flutter analyze` zero + `flutter test` green are each task's gate; a real run at the end. (Scaffold deviations recorded: `flutter create` needed `--project-name pondr` — the target dir stays `flutter/`; the reference copy's path is absolute. Scaffold-template TODO comments (flutter's generated CMake/Gradle) are neutralized at Task 8's de-wonk, not before — they are the toolchain's markers, not unfinished work.)
 
 **Spec:** `pondr/docs/flutter-app-spec.md` — READ FIRST. **Conversion rules:** (1) the reference file is truth — read the relevant App.tsx region BEFORE each view; (2) NO inline state in widgets (the skill's rule) — all state flows through Riverpod providers backed by the services; (3) `const` constructors wherever possible; (4) dispose every controller/ticker/focus; (5) no network/state in `build()`; (6) animations are part of each view's done bar.
 
