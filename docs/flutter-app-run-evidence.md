@@ -84,7 +84,7 @@ Not resolvable on-screen through the stalling presenter — the exact tweens/cad
 # The BINDING Slice's Run Evidence (the daemon supervised, the chat real)
 
 **Date:** 2026-10-05. **Commits:** SecretAgent `50e7894` (the create-prompt's user
-record); pondr: the FFI-binding commits `6e4227d`…<the binding live>. **Gates at the
+record); pondr: the FFI-binding commits `6e4227d`…`b6ab02a` (main). **Gates at the
 land:** SecretAgent `setarch -R ctest --test-dir cmake-build-debug` **318/318**, the
 full ASan suite **319/319**, the targeted shared-lib/CA_CONFIG ASan filter
 (`TestClientApi|TestSaClient`) **44/44**, valgrind clean on the touched create path
