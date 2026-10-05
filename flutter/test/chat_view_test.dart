@@ -12,6 +12,7 @@ import 'package:pondr/app/router.dart'
     show AuthState, authStateProvider;
 import 'package:pondr/data/models.dart' hide Provider;
 import 'package:pondr/data/models.dart' as mockup show Provider;
+import 'package:pondr/data/services.dart';
 import 'package:pondr/main.dart';
 import 'package:pondr/views/chat/chat_state.dart';
 import 'package:pondr/views/chat/message_bubble.dart';
@@ -97,19 +98,38 @@ _FixtureSettings _pickerFixture() => _FixtureSettings(<mockup.Provider>[
       ),
     ]);
 
+/// The failed-turn chat stub (the daemon's `turn.end {error}` shape): the
+/// mock never emits a failure (its replies always succeed), so the
+/// composer's ChatFailed handling rides this stub.
+class _FailedChatService implements ChatService {
+  const _FailedChatService();
+
+  @override
+  Stream<ChatEvent> send(String text, List<AttachedFile> files) async* {
+    yield const ChatTyping(duration: Duration(milliseconds: 50));
+    // The failure rides in LATER (the turn ran first) — the typing window
+    // is observable before the terminal lands.
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    yield const ChatFailed('the model refused');
+  }
+}
+
 void main() {
   /// Pumps the app logged in at [size]; each test gets its own container and
-  /// therefore its own Mock services.
+  /// therefore its own Mock services. [chat] swaps the chat binding (the
+  /// failed-turn shape's stub; the mock never fails).
   Future<ProviderContainer> pumpChat(
     WidgetTester tester,
     Size size, {
     MockSettingsService? settings,
+    ChatService? chat,
   }) async {
     final AuthState authenticator = AuthState();
     final ProviderContainer container = ProviderContainer(
       overrides: [
         authStateProvider.overrideWith((_) => authenticator),
         if (settings != null) settingsProvider.overrideWith((_) => settings),
+        if (chat != null) chatServiceProvider.overrideWith((_) => chat),
       ],
     );
     addTearDown(container.dispose);
@@ -429,6 +449,87 @@ void main() {
       expect(s1.messages[4].files![1].name, 'portrait.png');
       expect(s1.messages[5].role, MessageRole.assistant);
       expect(aiPool.contains(s1.messages[5].content), isTrue);
+    });
+
+    testWidgets('a FAILED turn closes the typing flag (the ChatFailed '
+        'terminal — the fold\'s turn.end {error} mapping reaches the view)',
+        (WidgetTester tester) async {
+      await pumpChat(
+        tester,
+        const Size(1100, 800),
+        chat: const _FailedChatService(),
+      );
+
+      await sendDraft(tester, 'doomed');
+      expect(find.byKey(const ValueKey('chat.typing')), findsOneWidget);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('chat.typing')), findsNothing,
+          reason: 'the failed terminal closes the indicator like a done');
+    });
+
+    testWidgets("the failed turn's line renders DIMMED (the error bubble's "
+        'quieter inks; a reply keeps the mock’s card)',
+        (WidgetTester tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            backgroundColor: const Color(0xFF141322),
+            body: Center(
+              child: Column(
+                children: <Widget>[
+                  MessageBubble(
+                    key: const Key('probe.reply'),
+                    message: Message(
+                      id: 'm1',
+                      role: MessageRole.assistant,
+                      content: 'the reply',
+                      timestamp: DateTime(2025),
+                    ),
+                  ),
+                  MessageBubble(
+                    key: const Key('probe.failed'),
+                    message: Message(
+                      id: 'm2',
+                      role: MessageRole.assistant,
+                      content: 'the turn failed',
+                      timestamp: DateTime(2025),
+                      error: true,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // The cards' inks: the failed line is the quieter one, the reply the
+      // mock's unchanged card.
+      List<BoxDecoration> cardsOf(Key key) => tester
+          .widgetList<Container>(find.descendant(
+            of: find.byKey(key),
+            matching: find.byType(Container),
+          ))
+          .map((Container c) => c.decoration)
+          .whereType<BoxDecoration>()
+          .where((BoxDecoration d) => d.color != null)
+          .toList();
+      expect(
+        cardsOf(const Key('probe.reply')).map((d) => d.color),
+        contains(const Color(0x1F888DDF)),
+      );
+      expect(
+        cardsOf(const Key('probe.failed')).map((d) => d.color),
+        contains(const Color(0x14FFFFFF)),
+        reason: 'the failed bubble\'s card is dimmed, not the reply\'s card',
+      );
+      // The dimmed markdown ink (white/55).
+      final MarkdownBody failedBody = tester.widgetList<MarkdownBody>(
+          find.byType(MarkdownBody)).firstWhere((MarkdownBody b) =>
+          b.data == 'the turn failed');
+      expect(failedBody.styleSheet?.p?.color, const Color(0x8CFFFFFF),
+          reason: 'the failure\'s words sit quieter than a reply\'s');
     });
   });
 

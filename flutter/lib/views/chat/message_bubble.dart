@@ -158,6 +158,9 @@ class _BubbleColumn extends StatelessWidget {
 }
 
 /// The bubble itself: file chips above the markdown body (`app.tsx:755-783`).
+/// The failed turn's line ([Message.error], the record fold's terminal): the
+/// same assistant card in its dimmed inks — a quieter bubble than the mock's
+/// reply (which never fails), readable but visibly not a reply.
 class _BubbleBody extends StatelessWidget {
   const _BubbleBody({required this.message, required this.isUser});
 
@@ -167,13 +170,21 @@ class _BubbleBody extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final List<AttachedFile>? files = message.files;
+    final bool dimmed = message.error;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: BoxDecoration(
-        color: isUser ? PondrTokens.primary : const Color(0x1F888DDF),
+        color: isUser
+            ? PondrTokens.primary
+            : dimmed
+                ? const Color(0x14FFFFFF)
+                : const Color(0x1F888DDF),
         border: isUser
             ? null
-            : Border.all(color: const Color(0x4D888DDF)),
+            : Border.all(
+                color: dimmed
+                    ? const Color(0x26FFFFFF)
+                    : const Color(0x4D888DDF)),
         boxShadow: isUser
             ? const <BoxShadow>[
                 BoxShadow(
@@ -214,7 +225,7 @@ class _BubbleBody extends StatelessWidget {
               // (`app.tsx:670-699`): single newlines are REAL line breaks,
               // full-line `**bold**` heads each render block.
               softLineBreak: false,
-              styleSheet: _markdownStyle,
+              styleSheet: dimmed ? _dimmedStyle : _markdownStyle,
             ),
         ],
       ),
@@ -229,6 +240,17 @@ class _BubbleBody extends StatelessWidget {
     strong: TextStyle(fontWeight: FontWeight.w600, color: Colors.white),
     em: TextStyle(fontStyle: FontStyle.italic, color: Colors.white),
     listBullet: TextStyle(fontSize: 14, height: 1.625, color: Colors.white),
+    a: TextStyle(color: PondrTokens.primary, decoration: TextDecoration.underline),
+  );
+
+  /// The dimmed ink (the failed turn's line): white/55 — the bubble itself
+  /// reads, its words sit quieter than a reply's.
+  static final MarkdownStyleSheet _dimmedStyle = MarkdownStyleSheet(
+    p: TextStyle(fontSize: 14, height: 1.625, color: const Color(0x8CFFFFFF)),
+    pPadding: EdgeInsets.zero,
+    strong: TextStyle(fontWeight: FontWeight.w600, color: const Color(0x8CFFFFFF)),
+    em: TextStyle(fontStyle: FontStyle.italic, color: const Color(0x8CFFFFFF)),
+    listBullet: TextStyle(fontSize: 14, height: 1.625, color: const Color(0x8CFFFFFF)),
     a: TextStyle(color: PondrTokens.primary, decoration: TextDecoration.underline),
   );
 }

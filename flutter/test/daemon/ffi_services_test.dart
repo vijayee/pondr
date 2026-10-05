@@ -48,6 +48,30 @@ String controlRecord() => jsonEncode(<String, dynamic>{
       'payload': <String, dynamic>{'reason': 'lifecycle'},
     });
 
+/// The turn-closer rider (`lifecycle.h`'s `turn.end`): the reason's kind is
+/// the daemon's union member; the text rides only when the closer carries
+/// the control kind's wording.
+String turnEndRecord(String kind, {String? text}) => jsonEncode(
+      <String, dynamic>{
+        'type': 'turn.end',
+        'payload': <String, dynamic>{
+          'turn': 1,
+          'reason': <String, dynamic>{
+            'kind': kind,
+            'text': ?text,
+          },
+        },
+      },
+    );
+
+/// The quiet-completion record (the frame's `frame.report`): {child_sid,
+/// text} — its text is the turn.closer's done content when no assistant
+/// bubble ever rode the turn.
+String reportRecord(String text) => jsonEncode(<String, dynamic>{
+      'type': 'frame.report',
+      'payload': <String, dynamic>{'child_sid': 'sessions/e', 'text': text},
+    });
+
 /// The messages of a session's row (the tests' read shape).
 List<Message> messagesOf(FfiSessionsService sessions, String sid) =>
     sessions.byId(sid)?.messages ?? const <Message>[];
@@ -655,6 +679,212 @@ void main() {
       expect(outcome, isA<StateError>(),
           reason: 'the pending send errored through the DISCONNECTED '
               'failure — nobody hangs');
+      harness.dispose();
+    });
+
+    test('THE REPORT-COMPLETED TURN: a turn that closed via frame.report '
+        '(no assistant msg.append exists) completes at its turn.end with '
+        'the report\'s text as the done', () async {
+      final harness = await chatHarness();
+      final chat = harness.chat;
+      final fake = harness.fake;
+      final sessions = harness.sessions;
+      final rawEvents = harness.events;
+
+      fake.listed = <FakeRow>[
+        (
+          sid: 'sessions/e',
+          status: 'running',
+          goal: '',
+          created: 10,
+          depth: 1,
+        ),
+      ];
+      await sessions.refresh();
+      sessions.select('sessions/e');
+      fake.promptSid = ''; // the steer's queued registration
+      final collected = <ChatEvent>[];
+      final done = Completer<void>();
+      late final StreamSubscription<ChatEvent> sub;
+      sub = chat.send('the quiet turn', const <AttachedFile>[]).listen(
+          collected.add,
+          onDone: () {
+            sub.cancel();
+            done.complete();
+          }, onError: done.completeError);
+      await drain();
+      // The record order (the daemon's batch): the user's append, the
+      // report, then the turn.end rider carrying {completed}.
+      var seq = 0;
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/e',
+        seq: ++seq,
+        op: 0,
+        recordJson: msgRecord('user', 'the quiet turn'),
+      ));
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/e',
+        seq: ++seq,
+        op: 0,
+        recordJson: reportRecord('the report text'),
+      ));
+      await drain();
+      expect(done.isCompleted, isFalse,
+          reason: 'the report folds alone — the WAITER completes at the '
+              'turn.end, the closers\' record');
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/e',
+        seq: ++seq,
+        op: 0,
+        recordJson: turnEndRecord('completed'),
+      ));
+      await done.future.timeout(const Duration(seconds: 2));
+      expect(collected, hasLength(2), reason: 'the typing, then ONE done');
+      expect((collected.last as ChatDone).content, 'the report text',
+          reason: 'the quiet-completed turn\'s done content is the '
+              'report\'s text');
+      expect(messagesOf(sessions, 'sessions/e').map((m) => m.content)
+          .toList(), <String>['the quiet turn'],
+          reason: 'the report is not a bubble — the msg.append records stay '
+              'the message source of truth');
+      harness.dispose();
+    });
+
+    test('THE FAILED TURN: a turn.end {error} completes the send with a '
+        'ChatFailed and writes the dimmed failure line', () async {
+      final harness = await chatHarness();
+      final chat = harness.chat;
+      final fake = harness.fake;
+      final sessions = harness.sessions;
+      final rawEvents = harness.events;
+
+      fake.listed = <FakeRow>[
+        (
+          sid: 'sessions/f',
+          status: 'running',
+          goal: '',
+          created: 10,
+          depth: 1,
+        ),
+      ];
+      await sessions.refresh();
+      sessions.select('sessions/f');
+      fake.promptSid = ''; // the steer's queued registration
+      final collected = <ChatEvent>[];
+      final done = Completer<void>();
+      late final StreamSubscription<ChatEvent> sub;
+      sub = chat.send('the doomed turn', const <AttachedFile>[]).listen(
+          collected.add,
+          onDone: () {
+            sub.cancel();
+            done.complete();
+          }, onError: done.completeError);
+      await drain();
+      var seq = 0;
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/f',
+        seq: ++seq,
+        op: 0,
+        recordJson: msgRecord('user', 'the doomed turn'),
+      ));
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/f',
+        seq: ++seq,
+        op: 0,
+        recordJson: turnEndRecord('error', text: 'the model connection died'),
+      ));
+      await done.future.timeout(const Duration(seconds: 2));
+      expect(collected, hasLength(2), reason: 'the typing, then the failed');
+      expect((collected.last as ChatFailed).text, 'the model connection died',
+          reason: 'the failed turn\'s terminal carries the closer\'s '
+              'failure wording — the stream never hangs');
+      // The fold wrote the failure line (the dimmed assistant bubble the
+      // view renders), with its own deterministic id.
+      final stored = messagesOf(sessions, 'sessions/f');
+      expect(stored.map((m) => m.content).toList(),
+          <String>['the doomed turn', 'the model connection died']);
+      expect(stored.last.error, isTrue, reason: 'the failed-turn line');
+      expect(stored.last.id, 'e:sessions/f:2',
+          reason: 'the deterministic (sid, seq) backstop');
+      harness.dispose();
+    });
+
+    test('THE FED TURN\'S CLOSER PASSES: a turn.end arriving after an '
+        'assistant msg.append already fed the waiter settles NOTHING — the '
+        'next send keeps its own pairing', () async {
+      final harness = await chatHarness();
+      final chat = harness.chat;
+      final fake = harness.fake;
+      final sessions = harness.sessions;
+      final rawEvents = harness.events;
+
+      fake.listed = <FakeRow>[
+        (
+          sid: 'sessions/g',
+          status: 'running',
+          goal: '',
+          created: 10,
+          depth: 1,
+        ),
+      ];
+      await sessions.refresh();
+      sessions.select('sessions/g');
+      fake.promptSid = '';
+      final first = <ChatEvent>[];
+      final firstDone = Completer<void>();
+      late final StreamSubscription<ChatEvent> firstSub;
+      firstSub = chat.send('the fed turn', const <AttachedFile>[]).listen(
+          first.add,
+          onDone: () {
+            firstSub.cancel();
+            firstDone.complete();
+          }, onError: firstDone.completeError);
+      await drain();
+      var seq = 0;
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/g',
+        seq: ++seq,
+        op: 0,
+        recordJson: msgRecord('user', 'the fed turn'),
+      ));
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/g',
+        seq: ++seq,
+        op: 0,
+        recordJson: msgRecord('assistant', 'the fed reply'),
+      ));
+      await firstDone.future.timeout(const Duration(seconds: 2));
+      expect((first.last as ChatDone).content, 'the fed reply');
+
+      // The NEXT send registers; the fed turn's turn.end rider arrives.
+      final second = <ChatEvent>[];
+      final secondDone = Completer<void>();
+      late final StreamSubscription<ChatEvent> secondSub;
+      secondSub = chat.send('the next turn', const <AttachedFile>[]).listen(
+          second.add,
+          onDone: () {
+            secondSub.cancel();
+            secondDone.complete();
+          }, onError: secondDone.completeError);
+      await drain();
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/g',
+        seq: ++seq,
+        op: 0,
+        recordJson: turnEndRecord('completed'),
+      ));
+      await drain();
+      expect(second, hasLength(1),
+          reason: 'the fed turn\'s own closer passed — the next send\'s '
+              'waiter is untouched');
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/g',
+        seq: ++seq,
+        op: 0,
+        recordJson: msgRecord('assistant', 'the next reply'),
+      ));
+      await secondDone.future.timeout(const Duration(seconds: 2));
+      expect((second.last as ChatDone).content, 'the next reply');
       harness.dispose();
     });
   });

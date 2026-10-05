@@ -15,10 +15,17 @@
 /// RE-SUBSCRIBED session's replay-then-live from seq 0 therefore re-delivers
 /// everything it already folded — the seen set + the id guard swallow the
 /// whole replay (ONE message per (sid, seq), pinned in the tests), and the
-/// gap a focus change missed replays in on the way back. Non-`msg.append`
-/// records (cell/lifecycle/control) fold nothing — the chat view never sees
-/// them (the audit's view = a recorded follow-on; the ChatEvent tree is the
-/// interface's sealed typing/delta/done trio).
+/// gap a focus change missed replays in on the way back. The TERMINAL
+/// riders fold the send's close: a `turn.end` (any reason kind — the
+/// daemon's turn closers, `lifecycle.h`'s reason union) is THE terminal for
+/// this turn's send — a completed turn whose reply was `frame.report`ed
+/// (the quiet-completion shape; no `msg.append` exists) completes its
+/// waiter with the report's text as the [ChatDone], and an errored turn
+/// completes it with a [ChatFailed] (the fold also writes the dimmed
+/// assistant line the view renders). A `turn.end` that arrives after its
+/// turn's assistant `msg.append` already fed the waiter settles nothing —
+/// the fed turn's own closer passes. The remaining cell/control records
+/// fold nothing — the chat view never sees them.
 ///
 /// THE SUBSCRIPTION POLICY: the C contract is ONE active subscription per
 /// client, so the service follows the ACTIVE session ([_focus]; the
@@ -93,18 +100,33 @@ final class FfiChatService implements ChatService {
   /// The fold's per-sid max seq.
   final Map<String, int> _maxSeq = <String, int>{};
 
-  /// The pending sends' completers, FIFO per sid — each assistant
-  /// `msg.append` fold completes the HEAD; the parallel-sends' pairing is
-  /// the record order's.
-  final Map<String, Queue<Completer<String>>> _waiters =
-      <String, Queue<Completer<String>>>{};
+  /// The pending sends' completers, FIFO per sid — each turn's terminal
+  /// (its assistant `msg.append`, or its `turn.end` rider when the turn
+  /// closed quietly) completes the HEAD; the parallel-sends' pairing is the
+  /// record order's.
+  final Map<String, Queue<Completer<ChatEvent>>> _waiters =
+      <String, Queue<Completer<ChatEvent>>>{};
 
-  /// The create-race's fast-reply cache: an assistant record that folded
-  /// while a pending create had no sid yet (the fold landed between the
-  /// prompt's response and the waiter's registration) waits here for its
-  /// send; entries die at 60 s (a reply nobody claimed was history's).
-  final Map<String, List<(String, DateTime)>> _unclaimed =
-      <String, List<(String, DateTime)>>{};
+  /// The create-race's fast-reply cache: a terminal (the assistant record,
+  /// or the turn's `turn.end`) that folded while a pending create had no
+  /// sid yet (the fold landed between the prompt's response and the
+  /// waiter's registration) waits here for its send; entries die at 60 s
+  /// (a fold nobody claimed was history's).
+  final Map<String, List<(ChatEvent, DateTime)>> _unclaimed =
+      <String, List<(ChatEvent, DateTime)>>{};
+
+  /// The turn closers already owed: every assistant `msg.append` fold that
+  /// fed a waiter leaves this turn's own `turn.end` unarrived — a terminal
+  /// consuming one settles that fed turn (no waiter touch), so a report
+  /// turn's closers never steal the next send.
+  final Map<String, int> _fedTurns = <String, int>{};
+
+  /// The quiet-completion texts per sid, FIFO: a `frame.report` (the
+  /// payload's text — the cell's outcome wording) that landed before its
+  /// `turn.end` rider; the terminal consumes one as its [ChatDone]'s
+  /// content (the newest report wins is the log's convention — a turn
+  /// closes with at most one).
+  final Map<String, Queue<String>> _reports = <String, Queue<String>>{};
 
   /// Sends in the prompt-awaiting-its-create-sid window.
   int _pendingCreates = 0;
@@ -163,7 +185,7 @@ final class FfiChatService implements ChatService {
     }
     yield ChatTyping(duration: typingPace);
 
-    final waiter = Completer<String>();
+    final waiter = Completer<ChatEvent>();
     var sid = capturedId;
     final creates = capturedId.isEmpty;
     if (creates) _pendingCreates++;
@@ -185,12 +207,13 @@ final class FfiChatService implements ChatService {
           _seen.putIfAbsent(prompt.sid, () => <int>{});
         }
         await _focus(sid);
-        final queue = _waiters.putIfAbsent(sid, () => Queue<Completer<String>>());
+        final queue =
+            _waiters.putIfAbsent(sid, () => Queue<Completer<ChatEvent>>());
         queue.add(waiter);
         _drainUnclaimed(sid, waiter);
       } else if (prompt.queued) {
-        final queue =
-            _waiters.putIfAbsent(capturedId, () => Queue<Completer<String>>());
+        final queue = _waiters.putIfAbsent(
+            capturedId, () => Queue<Completer<ChatEvent>>());
         queue.add(waiter);
       } else {
         // The prompt failed loud: the send's stream errors into the view's
@@ -199,7 +222,7 @@ final class FfiChatService implements ChatService {
             'the daemon refused the prompt '
             '(status ${prompt.status})');
       }
-      yield ChatDone(await waiter.future);
+      yield await waiter.future; // the turn's terminal: a done, or a failed
     } catch (e) {
       // The send's registration (if any) dies with it: the FIFO keeps
       // pairing later assistant folds with later sends.
@@ -212,7 +235,7 @@ final class FfiChatService implements ChatService {
 
   /// The dead send's queue entry leaves (the fold's pairing of a stale
   /// entry would mis-route a later send's reply).
-  void _removeWaiter(String sid, Completer<String> waiter) {
+  void _removeWaiter(String sid, Completer<ChatEvent> waiter) {
     final queue = _waiters[sid];
     if (queue == null) return;
     while (queue.remove(waiter)) {
@@ -303,13 +326,27 @@ final class FfiChatService implements ChatService {
     } on FormatException {
       return; // a record the fold cannot read is not a chat message
     }
-    if (decoded['type'] != 'msg.append') {
-      return; // the cell/lifecycle/control records: the chat ignores them
+    switch (decoded['type']) {
+      case 'msg.append':
+        _onMsgAppend(sid, record.seq, decoded['payload']);
+        return;
+      case 'frame.report':
+        _onReport(sid, decoded['payload']);
+        return;
+      case 'turn.end':
+        _onTurnEnd(sid, record.seq, decoded['payload']);
+        return;
+      default:
+        return; // the cell/control records: the chat ignores them
     }
-    final payload = decoded['payload'];
-    if (payload is! Map<String, dynamic>) return;
-    final role = payload['role'];
-    final content = payload['content'];
+  }
+
+  /// The `msg.append` fold: the bubble, then the waiter (an assistant's
+  /// content is this turn's reply — its `turn.end` closer is now owed).
+  void _onMsgAppend(String sid, int seq, dynamic payloadDyn) {
+    if (payloadDyn is! Map<String, dynamic>) return;
+    final role = payloadDyn['role'];
+    final content = payloadDyn['content'];
     if (role is! String || content is! String) return;
     if (role != 'user' && role != 'assistant') {
       return; // some other role rides the same record type — fold nothing
@@ -317,15 +354,125 @@ final class FfiChatService implements ChatService {
     final message = Message(
       // The deterministic (sid, seq) id — the fold's store-side dedupe
       // backstop (the same record's re-delivery never re-appends).
-      id: 'm:$sid:${record.seq}',
+      id: 'm:$sid:$seq',
       role: role == 'user' ? MessageRole.user : MessageRole.assistant,
       content: content,
       timestamp: DateTime.now(),
     );
     _sessions.storeMessage(sid, message);
     if (role == 'assistant') {
-      _completeWaiters(sid, content);
+      if (_feedHead(sid, ChatDone(content))) {
+        _fedTurns[sid] = (_fedTurns[sid] ?? 0) + 1;
+      }
     }
+  }
+
+  /// The `frame.report` fold: the quiet-completion text waits for its
+  /// `turn.end` rider (the record order: report first, then the closer).
+  /// The REPORT IS NOT A BUBBLE — the msg.append records stay the message
+  /// source of truth; the report only feeds the terminal's content.
+  void _onReport(String sid, dynamic payloadDyn) {
+    if (payloadDyn is! Map<String, dynamic>) return;
+    final text = payloadDyn['text'];
+    if (text is! String) return;
+    _reports.putIfAbsent(sid, () => Queue<String>()).add(text);
+  }
+
+  /// The `turn.end` fold — THE TERMINAL: the turn's send never hangs past
+  /// its closer (the finding: a report-completed or errored turn left the
+  /// typing flag up until dispose).
+  ///
+  /// The pairing: this turn's closer, or the NEXT unfed waiter's — an
+  /// assistant fold that already fed its send leaves an owed closer here
+  /// ([_fedTurns]); a terminal consuming one settles nothing. A waiter was
+  /// never fed = the turn closed quietly (the report shape) or failed, so
+  /// the terminal's text decides: an `error` kind fails the waiter with
+  /// [ChatFailed] (the fold writes the dimmed assistant line), any other
+  /// reason kind completes it with the report's text (or honestly empty).
+  void _onTurnEnd(String sid, int seq, dynamic payloadDyn) {
+    if (payloadDyn is! Map<String, dynamic>) return;
+    final reason = payloadDyn['reason'];
+    if (reason is! Map<String, dynamic>) return;
+    final kind = reason['kind'];
+    if (kind is! String) return;
+
+    // The unread report text (FIFO — the record order's pairing), consumed
+    // by THIS closer either way.
+    String? reportText;
+    final reports = _reports[sid];
+    if (reports != null && reports.isNotEmpty) {
+      reportText = reports.removeFirst();
+      if (reports.isEmpty) _reports.remove(sid);
+    }
+
+    final fed = _fedTurns[sid] ?? 0;
+    if (fed > 0) {
+      _fedTurns[sid] = fed - 1; // the fed turn's own closer passes
+      return;
+    }
+
+    final String controlText =
+        reason['text'] is String ? reason['text'] as String : '';
+    final bool failed = kind == 'error';
+    final String text;
+    if (failed) {
+      // The failure's wording: the reason's control text, then the turn's
+      // report; none readable = the honest fixed line (the bubble's text
+      // never renders empty).
+      final candidate = controlText.isNotEmpty
+          ? controlText
+          : (reportText ?? '');
+      text = candidate.isNotEmpty ? candidate : 'the turn failed';
+    } else {
+      text = reportText ?? controlText;
+    }
+    if (failed) {
+      _sessions.storeMessage(
+        sid,
+        Message(
+          // The deterministic (sid, seq) id, `e:`-prefixed — the same
+          // (sid, seq) dedupe backstop as the bubbles.
+          id: 'e:$sid:$seq',
+          role: MessageRole.assistant,
+          content: text,
+          timestamp: DateTime.now(),
+          error: true,
+        ),
+      );
+      _feedHead(sid, ChatFailed(text));
+      return;
+    }
+    _feedHead(sid, ChatDone(text));
+  }
+
+  /// The queue's live head takes the folded terminal; a dead entry (a send
+  /// whose stream already failed) is skipped over — the pairing rides. No
+  /// live waiter: a turn that ran outside any send — a pending create's
+  /// window caches the event for its send's registration (the create
+  /// race's fast fold), otherwise it is a history fold nobody is on (the
+  /// store already has what it shows).
+  bool _feedHead(String sid, ChatEvent event) {
+    final queue = _waiters[sid];
+    if (queue != null) {
+      while (queue.isNotEmpty) {
+        final waiter = queue.removeFirst();
+        if (!waiter.isCompleted) {
+          waiter.complete(event);
+          return true;
+        }
+      }
+    }
+    if (_pendingCreates == 0) return false;
+    _unclaimed
+        .putIfAbsent(sid, () => <(ChatEvent, DateTime)>[])
+        .add((event, DateTime.now()));
+    _unclaimed[sid] = _unclaimed[sid]!
+        .where(
+          (entry) => DateTime.now().difference(entry.$2) <
+              const Duration(seconds: 60),
+        )
+        .toList();
+    return true;
   }
 
   void _onFailure(SaFailure failure) {
@@ -345,37 +492,10 @@ final class FfiChatService implements ChatService {
     }
   }
 
-  void _completeWaiters(String sid, String content) {
-    final queue = _waiters[sid];
-    if (queue != null) {
-      // The FIFO head takes the reply; a dead entry (a send whose stream
-      // already failed) is skipped over — the pairing rides.
-      while (queue.isNotEmpty) {
-        final waiter = queue.removeFirst();
-        if (!waiter.isCompleted) {
-          waiter.complete(content);
-          return;
-        }
-      }
-    }
-    // The create race: a fold that landed while a pending create's sid was
-    // unknown waits here (its send claims it at registration). No pending
-    // create = a HISTORY fold — no stream, the message store already has it.
-    if (_pendingCreates == 0) return;
-    _unclaimed
-        .putIfAbsent(sid, () => <(String, DateTime)>[])
-        .add((content, DateTime.now()));
-    _unclaimed[sid] = _unclaimed[sid]!
-        .where(
-          (entry) => DateTime.now().difference(entry.$2) <
-              const Duration(seconds: 60),
-        )
-        .toList();
-  }
-
   /// The waiter's registration claims its create race's fast fold (the same
-  /// send's reply that landed between the prompt's response and here).
-  void _drainUnclaimed(String sid, Completer<String> waiter) {
+  /// send's reply that landed between the prompt's response and here —
+  /// including its turn's terminal).
+  void _drainUnclaimed(String sid, Completer<ChatEvent> waiter) {
     final unclaimed = _unclaimed.remove(sid);
     if (unclaimed == null || unclaimed.isEmpty) return;
     if (!waiter.isCompleted) waiter.complete(unclaimed.first.$1);

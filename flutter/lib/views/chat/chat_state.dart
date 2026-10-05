@@ -149,7 +149,10 @@ class ComposerStore extends Notifier<ComposerState> {
     StreamSubscription<ChatEvent>? sub;
     sub = ref.read(chatServiceProvider).send(text, files).listen(
       (ChatEvent event) {
-        if (event is ChatDone) {
+        // BOTH terminals close the typing flag: ChatDone completes the turn,
+        // ChatFailed is the failed turn's terminal (the fold wrote the
+        // dimmed assistant line; the canvas shows it on the change stream).
+        if (event is ChatDone || event is ChatFailed) {
           _closeTyping(sub!);
         }
       },

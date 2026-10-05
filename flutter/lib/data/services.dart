@@ -54,6 +54,11 @@ abstract class SessionsService {
 /// - `ChatDelta` — reserved for streaming implementations; the MOCKUP never
 ///   emits deltas (its reply arrives whole — `app.tsx:922-930`).
 /// - `ChatDone` — the full reply text; terminates the stream.
+/// - `ChatFailed` — the daemon's turn ended with an error (the `turn.end`
+///   error rider's control wording); the whole failed turn's text as an
+///   assistant line. The MOCK never emits it (its replies always succeed —
+///   the real daemon's failure shape), and the chat view renders it as the
+///   dimmed assistant bubble the fold writes for it.
 sealed class ChatEvent {
   const ChatEvent();
 }
@@ -74,6 +79,18 @@ class ChatDone extends ChatEvent {
   const ChatDone(this.content);
 
   final String content;
+}
+
+/// A failed turn's terminal (the daemon's `turn.end {error}` rider): the
+/// stream's closing event where [ChatDone] rides a successful one. [text]
+/// is the failure's wording verbatim (the reason's control text, or the
+/// turn's report when the model said nothing) — the view renders it dimmed;
+/// an empty [text] keeps the terminal (the typing flag still closes) with
+/// nothing to show.
+class ChatFailed extends ChatEvent {
+  const ChatFailed(this.text);
+
+  final String text;
 }
 
 abstract class ChatService {

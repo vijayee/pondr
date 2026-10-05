@@ -49,6 +49,7 @@ class Message {
     required this.content,
     required this.timestamp,
     this.files,
+    this.error = false,
   });
 
   final String id;
@@ -56,6 +57,11 @@ class Message {
   final String content;
   final DateTime timestamp;
   final List<AttachedFile>? files;
+
+  /// The failed-turn line (the record fold's `turn.end {error}` terminal):
+  /// rendered dimmed by the chat view. The export has no such state — the
+  /// mockup's replies always succeed; only the daemon shape produces it.
+  final bool error;
 
   /// Equality by id — views key messages for the list animations by id.
   @override
