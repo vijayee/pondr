@@ -375,8 +375,9 @@ def main() -> int:
     p.add_argument("--fade-consolidation-max-depth", type=int, default=3,
                    help="the gist-of-gist depth cap (default 3). At this depth the "
                         "anchor is no longer re-gist-ed -- it stays R4, the "
-                        "forgotten -> long-term-memory pull floor (the fact_sink "
-                        "hook for the graph write is a follow-on).")
+                        "forgotten -> long-term-memory pull floor (with "
+                        "--fade-consolidation-fact-sink, the extracted facts are "
+                        "pulled to the graph at every consolidation pass).")
     p.add_argument("--fade-consolidation-validate", action="store_true",
                    default=False,
                    help="Validated compaction: a Bonsai fidelity judge checks each "
@@ -391,6 +392,21 @@ def main() -> int:
                         "never silently applied. The user is the corruption "
                         "verifier (human-in-the-loop). Requires --fade-consolidation. "
                         "DEFAULT OFF.")
+    p.add_argument("--fade-consolidation-fact-sink", action="store_true",
+                   default=False,
+                   help="The R4 -> long-term-memory pull hook: after each "
+                        "successful consolidation, write the gister's extracted "
+                        "facts to the WaveDB graph so they survive the fade. "
+                        "Relation triples go through expand_triple (mirrors the "
+                        "encoder's _edge_ops; idempotent), state assertions "
+                        "through _assertion_edge_ops (Phase 3c provenance: "
+                        "asserted_by='fade-anchor:<anchor_id>' -- the anchor is "
+                        "an int-keyed fade chunk with no episode id, so the "
+                        "marker names the pass itself -- + asserted_at). One "
+                        "atomic batch per consolidation; the worker's call is "
+                        "best-effort (a failure is logged, never breaks the "
+                        "turn). Requires --fade-consolidation. DEFAULT OFF -> "
+                        "no sink -> no graph writes -> byte-identical.")
     p.add_argument("--retrieval-user-scope", action="store_true", default=False,
                    help="Scope retrieval to THIS --user-id: every retrieve path "
                         "(graph traversal, semantic fallback, embedding search) "
@@ -822,6 +838,12 @@ def main() -> int:
                   "--fade-consolidation; the judge only validates gists the "
                   "consolidation loop produces).", file=sys.stderr)
             args.fade_consolidation_validate = False
+        if args.fade_consolidation_fact_sink and not args.fade_consolidation:
+            print("NOTE: --fade-consolidation-fact-sink ignored (requires "
+                  "--fade-consolidation; the sink writes the gister's facts, "
+                  "and only the consolidation loop produces them).",
+                  file=sys.stderr)
+            args.fade_consolidation_fact_sink = False
         if (args.fade_drift_defer_threshold is not None
                 and not args.fade_consolidation_validate):
             print("NOTE: --fade-drift-defer-threshold ignored (requires "
@@ -1083,6 +1105,7 @@ def main() -> int:
         fade_consolidation_epsilon=args.fade_consolidation_epsilon,
         fade_consolidation_max_depth=args.fade_consolidation_max_depth,
         fade_consolidation_validate=args.fade_consolidation_validate,
+        fade_consolidation_fact_sink=args.fade_consolidation_fact_sink,
         retrieval_user_scope=args.retrieval_user_scope,
         tier2_recall_menu=args.tier2_recall_menu,
         scene_blocks=args.scene_blocks,

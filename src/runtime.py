@@ -93,6 +93,7 @@ def build_ponder(
     fade_consolidation_epsilon: float = 0.03,
     fade_consolidation_max_depth: int = 3,
     fade_consolidation_validate: bool = False,
+    fade_consolidation_fact_sink: bool = False,
     retrieval_user_scope: bool = False,
     tier2_recall_menu: bool = False,
     scene_blocks: bool = False,
@@ -676,8 +677,8 @@ def build_ponder(
     # via ``BonsaiDecider.consolidate_gist`` + facts via
     # ``BonsaiRelationExtractor`` / ``extract_state_assertions``) and a
     # ``ConsolidationWorker`` that gists fading anchors in the background between
-    # turns. ``fact_sink`` is None in v1 (the R4 -> long-term-memory graph write
-    # is a follow-on; the facts are staged as a sidecar on the anchor). No
+    # turns. ``fact_sink`` is None unless ``fade_consolidation_fact_sink`` is
+    # on (when off, the facts remain staged as a sidecar on the anchor). No
     # consolidation worker when the fade is off (``fade_mem is None``) even if
     # the flag is on -> byte-identical to Phase B. The Bonsai HTTP call is lazy
     # (one per gist), so this is constructible offline (cold-start: a down
@@ -686,8 +687,13 @@ def build_ponder(
     if fade_consolidation and fade_mem is not None:
         from .subconscious.consolidation_worker import ConsolidationWorker
         from .subconscious.gister import default_gister
+        fact_sink = None
+        if fade_consolidation_fact_sink:
+            from .subconscious.graph_fact_sink import GraphFactSink
+            fact_sink = GraphFactSink(store)
         consolidation_worker = ConsolidationWorker(
             fade_mem, default_gister(),
+            fact_sink=fact_sink,
             epsilon=fade_consolidation_epsilon,
             max_depth=fade_consolidation_max_depth,
             validate=fade_consolidation_validate,
