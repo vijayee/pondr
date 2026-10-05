@@ -243,6 +243,37 @@ class HippocampalRetriever:
                 out.append((eid, sim))
         return out
 
+    def _filter_vector_hits_stale(
+        self, hits: list[tuple[str, float]]
+    ) -> tuple[list[tuple[str, float]], dict[str, dict]]:
+        """R1: the stale-mark recheck on VECTOR-leg hits (``scene_*``/``M:*``).
+
+        The graph leg rechecks inside ``GraphTraversal.retrieve``; the three
+        vector sites (``_semantic_fallback``, ``_retrieve_hybrid``'s vector
+        list, ``search_by_embedding``) hydrate derived ids WITHOUT that pass --
+        a still-stale scene hit via cosine would be KEPT here while dropped on
+        the graph leg (inconsistent verdicts for the same node). Route the
+        hit-id set through the same ``_filter_stale_derived`` recheck (its
+        resolve-ops write rides along, idempotent when already resolved).
+        The returned annotations are for KEPT still-stale M-nodes, so the
+        caller stamps the hydrated dicts exactly as the graph leg does.
+
+        Flag OFF -> ``hits`` unchanged + empty annotations (byte-identical).
+        """
+        if not config.stale_propagation_enabled:
+            return hits, {}
+        keep, annotations = self.traversal._filter_stale_derived(
+            {eid for eid, _ in hits})
+        return [(eid, sim) for eid, sim in hits if eid in keep], annotations
+
+    @staticmethod
+    def _stamp_stale_annotation(d: dict, annotations: dict[str, dict]) -> None:
+        """Stamp a hydrated dict with its kept-stale M-node annotation (R1)."""
+        a = annotations.get(d.get("episode_id"))
+        if a is not None:
+            d["stale_since"] = a["stale_since"]
+            d["stale_of"] = a["stale_of"]
+
     def retrieve(
         self,
         prompt: str,
@@ -389,11 +420,17 @@ class HippocampalRetriever:
         # 2. Vector list (cosine over summary embeddings). Over-fetch + scope-
         # filter when scoped, take top-k. Empty when no vector index configured.
         vector_rank: list[str] = []
+        _vector_stale_annos: dict[str, dict] = {}  # R1 (set below, always bound)
         if self.vector_search is not None:
             hits = self.vector_search.search(prompt, k=fetch_k)
             if scoped:
                 hits = self._filter_vector_hits_by_scope(
                     hits, allowed_ep, allowed_doc, allowed_scene)
+            # R1: recheck stale marks BEFORE the top-k cut so a dropped stale
+            # scene frees its slot for a healthy one (mirrors the graph path's
+            # filter-before-limit semantics).
+            hits, _vector_stale_annos = self._filter_vector_hits_stale(hits)
+            if scoped:
                 hits = hits[:k]
             vector_rank = [eid for eid, _ in hits]
 
@@ -420,6 +457,10 @@ class HippocampalRetriever:
             d = graph_by_id.get(eid)
             if d is None:
                 d = self.traversal._hydrate(eid)
+                # R1: a fused eid hydrated fresh here came from the vector or
+                # BM25 leg -- stamp its kept-stale M-node annotation (graph
+                # hits carry theirs already).
+                self._stamp_stale_annotation(d, _vector_stale_annos)
             d["score"] = rrf_score
             d["strategy"] = "hybrid"
             results.append(d)
@@ -531,11 +572,14 @@ class HippocampalRetriever:
         if scoped:
             hits = self._filter_vector_hits_by_scope(
                 hits, allowed_ep, allowed_doc, allowed_scene)
+        hits, stale_annos = self._filter_vector_hits_stale(hits)  # R1 pre-cut
+        if scoped:
             hits = hits[:k]
         out: list[dict] = []
         for eid, sim in hits:
             ep = self.traversal._hydrate(eid)
             ep["score"] = sim * 0.5  # discount so graph matches rank higher
+            self._stamp_stale_annotation(ep, stale_annos)
             out.append(ep)
         # Same boost path as the semantic fallback so no scored result bypasses
         # the per-unit feedback boost.
@@ -672,11 +716,14 @@ class HippocampalRetriever:
             hits = self._filter_vector_hits_by_scope(
                 hits, allowed_episode_ids, allowed_document_ids,
                 allowed_scene_ids)
+        hits, stale_annos = self._filter_vector_hits_stale(hits)  # R1 pre-cut
+        if scoped:
             hits = hits[:k]
         out: list[dict] = []
         for eid, sim in hits:
             ep = self.traversal._hydrate(eid)
             ep["score"] = sim * 0.5  # discount so graph matches rank higher
+            self._stamp_stale_annotation(ep, stale_annos)
             # B2: stamp the retrieval-path provenance. ``strategy`` is
             # additive; surfaced in ``build_context_string`` ONLY when
             # ``--drill-down`` is on. OFF -> the key is still set here but the

@@ -32,6 +32,8 @@ import json
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
+from ..config import config as _config
+
 if TYPE_CHECKING:
     from ..memory.store import HippocampalStore
 
@@ -132,6 +134,17 @@ class SemanticMemoryWriter:
           ``content/ep/{old}/validity_end = <ts>`` (the old episode stops
           appearing in default queries; it is NOT deleted).
 
+        R1 (``config.stale_propagation_enabled``, default OFF): the blast
+        radius -- scenes citing ``old`` (``cites`` in-edges) and semantic
+        memories abstracting it (``abstracts`` in-edges) -- is marked stale
+        (``stale_since`` + ``stale_of``) so the query-time recheck in
+        ``GraphTraversal._filter_stale_derived`` can resolve or drop them; see
+        that method for the read-side split (drop still-stale scenes, keep +
+        annotate still-stale M-nodes). OFF -> no derived-node keys are written
+        (byte-identical to pre-R1). The derived-node marks ride their OWN
+        ``batch_sync`` after the MVCC chain lands, so the supersession is never
+        blocked by the traversal (and never partially applies a mark).
+
         The new episode's own state/validity is left untouched (it stays
         ``current``). This only records the relationship; it does not create
         the new episode (the caller encodes that separately).
@@ -152,6 +165,74 @@ class SemanticMemoryWriter:
         # anomaly-driven supersession (Consolidator._apply) would leave the old
         # episode searchable via the semantic fallback.
         self.store._unindex_embedding(old_episode_id)
+
+        # R1 blast-radius propagation: mark scenes citing / memories abstracting
+        # the superseded episode (flag-gated, own atomic batch; OFF -> none).
+        if _config.stale_propagation_enabled:
+            derived_ops = self._stale_propagation_ops(old_episode_id, new_episode_id, ts)
+            if derived_ops:
+                self.store.db.batch_sync(derived_ops)
+
+    def _graph_vertices(
+        self, node_id: str, predicate: str, direction: str = "out"
+    ) -> list[str]:
+        """One-shot ``GraphQuery`` from ``node_id`` along ``predicate``.
+
+        Mirrors ``GraphTraversal._exec_vertices``: ``execute_sync`` consumes the
+        query handle and the ``GraphResult`` wraps a heap-allocated C struct, so
+        close it explicitly in a ``finally``.
+        """
+        q = self.store.graph.query().vertex(node_id)
+        q = q.out(predicate) if direction == "out" else q.in_(predicate)
+        result = q.execute_sync()
+        try:
+            return list(result.vertices)
+        finally:
+            result.close()
+
+    def _stale_propagation_ops(
+        self, old_episode_id: str, new_episode_id: str, ts: str
+    ) -> list[dict]:
+        """Mark derived nodes referencing ``old_episode_id`` stale (R1).
+
+        The in-edge traversal (Graft's ``blast`` pattern) walks TWO in-edge
+        families off the superseded episode:
+
+        * ``cites`` -> scene blocks (stored under ``content/scene/{id}/``).
+        * ``abstracts`` -> semantic memories (``M:`` nodes, stored under
+          ``content/mem/{id}/``).
+
+        A derived node that ALREADY cites/abstracts the replacement
+        ``new_episode_id`` is fresh -- skipped (cheap out-edge union per node;
+        scenes cite via ``_scene_edge_ops``, memories via ``create_abstract``).
+        The rest get ``stale_since = <ts>`` (the LATEST mark wins) and
+        ``stale_of`` = the merged json list of superseded source ids -- a node
+        marked by a later supersession UNIONs into the same field, so one mark
+        per node holds all its pending triggers. The
+        ``_filter_stale_derived`` recheck consumes both keys.
+        """
+        ops: list[dict] = []
+        for predicate, key_dir in (("cites", "scene"), ("abstracts", "mem")):
+            key_prefix = f"content/{key_dir}/"
+            for node_id in self._graph_vertices(old_episode_id, predicate, "in"):
+                cited: set[str] = set()
+                for out_pred in ("cites", "abstracts"):
+                    cited |= set(self._graph_vertices(node_id, out_pred, "out"))
+                if new_episode_id in cited:
+                    continue  # already references the replacement -> fresh
+                existing = _b2s(self.store.db.get_sync(f"{key_prefix}{node_id}/stale_of"))
+                try:
+                    pending = set(json.loads(existing)) if existing else set()
+                except (ValueError, TypeError):
+                    pending = set()
+                pending.add(old_episode_id)
+                ops.append({"type": "put",
+                            "key": f"{key_prefix}{node_id}/stale_since",
+                            "value": ts})
+                ops.append({"type": "put",
+                            "key": f"{key_prefix}{node_id}/stale_of",
+                            "value": json.dumps(sorted(pending))})
+        return ops
 
     def get_abstract(self, memory_id: str) -> Optional[dict]:
         """Read a semantic memory back. ``None`` if it doesn't exist."""

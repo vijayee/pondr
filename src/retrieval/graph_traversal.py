@@ -272,6 +272,120 @@ class GraphTraversal:
         return {eid for eid in episode_ids
                 if eid.startswith("doc_") or self.store.is_episode_active(eid)}
 
+    # ── R1: supersede blast-radius recheck (read side) ──
+
+    def _supersession_tip(self, episode_id: str) -> str:
+        """Follow the ``superseded_by`` back-pointer chain to its tip.
+
+        ``supersede_episode`` writes ``(old, superseded_by, new)``; the tip of
+        the chain is the episode with NO ``superseded_by`` successor. Empty
+        successors (no chain) -> return ``episode_id`` itself; more than one
+        successor -> take the sorted-first (deterministic). Bounded at
+        ``_MAX_FOLLOWS_HOPS`` like the follows walk.
+        """
+        tip = episode_id
+        for _ in range(_MAX_FOLLOWS_HOPS):
+            succ = self._exec_vertices(
+                self.graph.query().vertex(tip).out("superseded_by"))
+            if not succ:
+                break
+            tip = sorted(succ)[0]
+        return tip
+
+    def _node_citations(self, node_id: str) -> set[str]:
+        """A derived node's out-edge union over ``cites`` + ``abstracts``.
+
+        Scenes cite via ``_scene_edge_ops``, memories via ``create_abstract``;
+        a node whose union contains a supersession tip has been re-derived
+        against the current content and is fresh.
+        """
+        cited: set[str] = set()
+        for pred in ("cites", "abstracts"):
+            cited |= set(self._exec_vertices(
+                self.graph.query().vertex(node_id).out(pred)))
+        return cited
+
+    def _filter_stale_derived(
+        self, candidates: set[str]
+    ) -> tuple[set[str], dict[str, dict]]:
+        """Query-time staleness recheck on derived nodes (R1 read side).
+
+        Consumes the ``stale_since``/``stale_of`` keys
+        ``SemanticMemoryWriter._stale_propagation_ops`` wrote on supersession.
+        Only scene/M candidates are examined (the prefix discriminator runs
+        FIRST -- plain episodes/docs pay zero reads here); a missing
+        ``stale_since`` point lookup falls out immediately -- the mark is
+        written only under the flag, so flag-OFF means the pass is a pure
+        no-op even when the caller runs it.
+
+        Resolution rule per ``stale_of`` entry: the entry resolves iff the
+        node's citation union now contains that source's supersession TIP
+        (``_supersession_tip``). Scene re-authoring grows the ``cites`` union
+        (``_scene_edge_ops``), so re-derived tips become findable WITHOUT any
+        separate clearing step -- the recheck itself shrinks ``stale_of`` /
+        deletes both keys (one batch at the end) as entries resolve. A node with
+        a ``stale_since`` but an EMPTY/missing ``stale_of`` is treated as still
+        stale (conservative).
+
+        Asymmetric verdict on still-stale nodes:
+        * SCENE -> DROPPED from candidates (collateral low: cited-episode
+          facts stay reachable through the episode axis; only the macro prose
+          is stale).
+        * MEMORY (``M:``) -> KEPT but annotated (collateral high: its source
+          episodes are excluded from default candidates via ``abstracted=1``,
+          so dropping it would blind retrieval to healthy facts). The
+          annotation (``stale_since``/``stale_of``) rides the hydrated dict.
+
+        Returns ``(candidates', annotations)`` -- the surviving candidate set
+        minus dropped scenes, and ``{memory_id: {"stale_since", "stale_of"}}``
+        for kept still-stale M-nodes.
+        """
+        keep = candidates.copy()
+        annotations: dict[str, dict] = {}
+        resolve_ops: list[dict] = []
+        for eid in candidates:
+            if eid.startswith("scene_"):
+                prefix = "scene"
+            elif eid.startswith("M:"):
+                prefix = "mem"
+            else:
+                continue
+            stale_key = f"content/{prefix}/{eid}/stale_since"
+            stale_since = _b2s(self.db.get_sync(stale_key))
+            if not stale_since:
+                continue  # never marked -> no further reads
+            raw = _b2s(self.db.get_sync(f"content/{prefix}/{eid}/stale_of"))
+            try:
+                pending = set(json.loads(raw)) if raw else set()
+            except (ValueError, TypeError):
+                pending = set()
+            if pending:
+                cited = self._node_citations(eid)
+                pending = {
+                    src for src in pending
+                    if self._supersession_tip(src) not in cited
+                }
+            if pending:
+                # Partially resolved: shrink stale_of to the unresolved set
+                # (stale_since already carries "latest mark wins" semantics).
+                resolve_ops.append({
+                    "type": "put", "key": f"content/{prefix}/{eid}/stale_of",
+                    "value": json.dumps(sorted(pending))})
+            if not pending:
+                # Fully resolved -> clear both keys (back to never-marked).
+                resolve_ops.append({"type": "del", "key": stale_key})
+                resolve_ops.append({
+                    "type": "del", "key": f"content/{prefix}/{eid}/stale_of"})
+                continue
+            if prefix == "scene":
+                keep.discard(eid)  # still-stale scene -> drop
+            else:
+                annotations[eid] = {"stale_since": stale_since,
+                                    "stale_of": sorted(pending)}
+        if resolve_ops:
+            self.db.batch_sync(resolve_ops)
+        return keep, annotations
+
     # ── User-scope filter (the retrieval user boundary) ──
 
     @staticmethod
@@ -1067,6 +1181,17 @@ class GraphTraversal:
         if not candidates:
             return []
 
+        # R1: supersede blast-radius recheck on the derived candidates (scenes,
+        # M-nodes). Gated on ``stale_propagation_enabled``; OFF -> no keys on
+        # any node -> the pass touches nothing and ``annotations`` is empty
+        # (byte-identical). Runs BEFORE temporal re-anchoring so a follows walk
+        # rooted at a stale scene can never re-import it.
+        annotations: dict[str, dict] = {}
+        if _config.stale_propagation_enabled:
+            candidates, annotations = self._filter_stale_derived(candidates)
+            if not candidates:
+                return []
+
         # Temporal chain mode: re-anchor the candidate set to a follows-chain
         # rooted at the keyword-matching episode. If no anchor matches, fall
         # through with the axis-derived candidates.
@@ -1096,6 +1221,16 @@ class GraphTraversal:
             self._hydrate(eid, query_entities=entities, query_topics=topics)
             for eid in candidates
         ]
+        # R1: stamp the still-stale M-node annotation onto its hydrated dict.
+        # ``annotations`` is empty when the flag is OFF -> no keys -> the memory
+        # dicts stay byte-identical. Applied BEFORE scoring/limit so the cut
+        # results carry the annotation consistently.
+        if annotations:
+            for r in hydrated:
+                a = annotations.get(r.get("episode_id"))
+                if a is not None:
+                    r["stale_since"] = a["stale_since"]
+                    r["stale_of"] = a["stale_of"]
         scored = self._score_candidates(hydrated, entities, topics, tones)
         scored.sort(key=lambda r: r["score"], reverse=True)
         results = scored[:limit]

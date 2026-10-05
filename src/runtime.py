@@ -108,6 +108,7 @@ def build_ponder(
     ssm_chunker_gist_cue_preset: Optional[str] = None,
     ssm_chunker_gist_query_conditioned: bool = False,
     ssm_chunker_gist_per_episode: bool = False,
+    stale_propagation: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -270,6 +271,13 @@ def build_ponder(
             requires the tool loop (``self_chat_tool_loop_enabled``, ON by
             default); the flag does NOT auto-enable the loop (that would be a
             behavior change). No new training / GPU / GNN.
+        stale_propagation: R1 (Graft steal) -- when True, ``supersede_episode``
+            propagates the blast radius: scenes citing the superseded episode
+            and semantic memories abstracting it get ``stale_since`` +
+            ``stale_of`` marks, and retrieval's ``_filter_stale_derived`` recheck
+            resolves-or-drops them at query time. ``False`` (default) -> no
+            derived-node keys are written and the read side is a no-op ->
+            byte-identical to pre-R1.
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -336,6 +344,17 @@ def build_ponder(
     # reclaim -> byte-identical. No constructor threading: the orchestrator reads
     # ``config.task_canvas_enabled`` + the three tunables directly.
     config.task_canvas_enabled = task_canvas
+    # R1: supersede blast-radius master flag. Read at CALL TIME by
+    # ``SemanticMemoryWriter.supersede_episode`` (write-side mark) AND by
+    # ``GraphTraversal.retrieve`` (read-side recheck) -- same master-config
+    # convention as ``drill_down`` / ``reclaim`` / ``task_canvas``. Set before
+    # the store/encoder ctor so call-time reads see a consistent value.
+    # ``serve_ponder`` sets the same global before build_ponder; setting it here
+    # too covers direct build_ponder callers, and makes ALL supersede_episode
+    # call sites (A1 dedup, Consolidator --apply, orchestrator contradiction
+    # resolve) inherit the flag with no constructor threading. Default OFF ->
+    # no derived-node keys written, no recheck -> byte-identical.
+    config.stale_propagation_enabled = stale_propagation
     if llm_telemetry:
         # Swap the module sink to a path-backed JSONL writer. The null sink
         # (default) records nothing, so flag-on-without-configure is a silent

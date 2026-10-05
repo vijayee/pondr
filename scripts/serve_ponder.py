@@ -544,6 +544,17 @@ def main() -> int:
                         "Historical canvases are reclaimed (never delete active, "
                         "floor 15, oldest-by-mtime). DEFAULT OFF -> no gate call / "
                         "tool / injection / reclaim -> byte-identical.")
+    p.add_argument("--stale-propagation", action="store_true", default=False,
+                   help="R1 (Graft steal): supersede blast-radius propagation. "
+                        "On supersession (dedup update/merge, reconcile, "
+                        "consolidation), the scenes citing the superseded "
+                        "episode and the semantic memories abstracting it are "
+                        "marked stale (stale_since + stale_of); retrieval "
+                        "rechecks at query time -- re-derived nodes resolve "
+                        "(keys cleared), still-stale SCENES are dropped, "
+                        "still-stale M-nodes are kept + annotated. "
+                        "DEFAULT OFF -> no derived-node keys, no recheck -> "
+                        "byte-identical.")
     p.add_argument("--ssm-chunker-gist-backend", default="topics",
                    choices=["topics", "mamba3"],
                    help="SSMChunker gist backend (the deferred Phase 2c path, "
@@ -669,6 +680,11 @@ def main() -> int:
     # so set the global BEFORE build_ponder (build_ponder also sets it from its
     # param, covering direct callers). Default OFF -> byte-identical.
     _config.task_canvas_enabled = args.task_canvas
+    # R1: stale_propagation_enabled is read at call time by supersede_episode
+    # (write side) AND GraphTraversal.retrieve (read side) -- so set the global
+    # BEFORE build_ponder (build_ponder also sets it from its param, covering
+    # direct callers). Default OFF -> byte-identical.
+    _config.stale_propagation_enabled = args.stale_propagation
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
@@ -1054,6 +1070,7 @@ def main() -> int:
         ssm_chunker_gist_cue_preset=args.ssm_chunker_gist_cue_preset,
         ssm_chunker_gist_query_conditioned=args.ssm_chunker_gist_query_conditioned,
         ssm_chunker_gist_per_episode=args.ssm_chunker_gist_per_episode,
+        stale_propagation=args.stale_propagation,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

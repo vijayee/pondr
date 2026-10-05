@@ -338,6 +338,32 @@ class Config:
     canvas_block_max_tokens: int = 1024 # injection-block budget (truncate the Mermaid)
     canvas_max_mermaid_chars: int = 4000 # stored-Mermaid size cap (write/replace guard)
 
+    # ── R1: supersede blast-radius propagation (Graft steal) ──
+    # ``SemanticMemoryWriter.supersede_episode`` writes the E->E MVCC chain and
+    # STOPS: scenes citing the superseded episode (``cites`` edges, rendered
+    # into tier-1.5 scene blocks) and semantic memories abstracting it
+    # (``abstracts`` edges) are left silently stale -- they keep paraphrasing
+    # the old value (the entity-attr-swap class the Phase C gate misses; see
+    # [[pondr-graft-survey]]). When True, the WRITE side of ``supersede_episode``
+    # also traverses the old episode's in-edges and marks every derived node
+    # that does NOT cite the replacement: ``stale_since`` (mark ts) +
+    # ``stale_of`` (json list of superseded source ids), under
+    # ``content/scene/{id}/`` and ``content/mem/{id}/``. The READ side
+    # (``GraphTraversal._filter_stale_derived``) runs the cheap recheck at query
+    # time: an ``stale_of`` entry resolves iff the node now cites that source's
+    # supersession TIP (scene re-authoring grows ``cites``, so the tip becomes
+    # findable); resolved marks are cleared. STILL-stale scenes are dropped from
+    # the candidate set (their cited-episode facts stay reachable through the
+    # episode axis, so a drop's collateral is only the stale prose itself);
+    # still-stale M-nodes are KEPT but annotated (their sources are excluded
+    # from the default candidate set via ``abstracted=1`` -- dropping the node
+    # would blind retrieval to the healthy ones). Both halves read this flag at
+    # CALL TIME (master-config style, mirrors ``dedup_enabled`` /
+    # ``drill_down_enabled``; set in ``build_ponder`` / ``serve_ponder`` -- NO
+    # constructor threading). Default False: no ``stale_since`` writes, no
+    # recheck, no drops, no new hydrate keys -> byte-identical.
+    stale_propagation_enabled: bool = False
+
     # ── Phase 2c+: self-chat full agent loop ──
     # When True, the Bonsai self-chat synthesize path runs a multi-turn tool
     # loop (``run_tool_loop``): the model may call ``expand`` / ``search_memory``
