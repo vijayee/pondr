@@ -240,6 +240,20 @@ def main() -> int:
                         help="Min ontology-proposal confidence gated through Bonsai (default 0.0 "
                              "= every proposal above accept-threshold goes to Bonsai; raise to "
                              "skip Bonsai on very-high-confidence auto-accepts)")
+    # ── Apply-time eval gate (the junk-footgun defense; default ON) ──
+    parser.add_argument("--no-apply-gate", dest="apply_gate_enabled",
+                        action="store_false",
+                        help="EVAL GATE Escape hatch (default ON): allow the apply to write "
+                             "placeholder abstracts (no decider) and exceed the blast-radius "
+                             "caps. Use only for controlled A/B -- on a real corpus the refused "
+                             "mutation is the CORRECT outcome (placeholder M-nodes + "
+                             "abstracted=1 sources shrink recall).")
+    parser.add_argument("--apply-gate-max-prunes", type=int, default=None,
+                        help="Blast-radius cap: refuse the apply when this pass pruned more "
+                             "edges than this (default 64; 0 refuses ALL prunes).")
+    parser.add_argument("--apply-gate-max-abstracts", type=int, default=None,
+                        help="Blast-radius cap: refuse the apply when this pass proposed more "
+                             "abstracts than this (default 16; 0 refuses ALL abstracts).")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -271,6 +285,19 @@ def main() -> int:
         "contradiction_resolve_threshold": args.contradiction_resolve_threshold,
     }
     cfg = replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+    # Eval-gate blast-radius caps handled separately: None = the default caps
+    # (64 prunes / 16 abstracts), but an explicit 0 is a LEGITIMATE override
+    # (refuse ALL prunes/abstracts), so only override when explicitly passed.
+    if args.apply_gate_max_prunes is not None:
+        cfg = replace(cfg, apply_max_prunes=args.apply_gate_max_prunes)
+    if args.apply_gate_max_abstracts is not None:
+        cfg = replace(cfg, apply_max_abstracts=args.apply_gate_max_abstracts)
+    # ``apply_gate_enabled`` is a bool with a real False meaning (the
+    # --no-apply-gate A/B escape hatch), so it must NOT pass through the "is
+    # not None" filter (which drops False). Default (None) keeps the config
+    # default (True).
+    if not args.apply_gate_enabled:
+        cfg = replace(cfg, apply_gate_enabled=False)
     # ``bonsai_decider_enabled`` is a bool with a real False meaning (the
     # --no-bonsai A/B escape hatch), so it must NOT pass through the "is not
     # None" filter (which drops False). Override explicitly when --no-bonsai

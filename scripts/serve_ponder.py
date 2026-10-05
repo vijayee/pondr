@@ -555,6 +555,36 @@ def main() -> int:
                         "still-stale M-nodes are kept + annotated. "
                         "DEFAULT OFF -> no derived-node keys, no recheck -> "
                         "byte-identical.")
+    p.add_argument("--dream-consolidation", action="store_true",
+                   default=False,
+                   help="Phase 3a: wire the GNN dream-state consolidator into "
+                        "serve. A self-scheduling daemon thread runs one "
+                        "Consolidator pass every --dream-interval seconds "
+                        "(default nightly), foreground-gated so the pass "
+                        "mutates the store only between turns. REQUIRES a "
+                        "trained combined GNN checkpoint (--dream-checkpoint; "
+                        "the default path data/pod_runs/phase3a/"
+                        "all_fixed_bounded.pt must exist or startup fails). "
+                        "DEFAULT OFF -> consolidate is never constructed -> "
+                        "byte-identical.")
+    p.add_argument("--dream-checkpoint", default=None,
+                   help="Trained combined GNN checkpoint for "
+                        "--dream-consolidation. None -> the default "
+                        "data/pod_runs/phase3a/all_fixed_bounded.pt (assemble "
+                        "with scripts/assemble_gnn_checkpoint.py; the all.pt "
+                        "base alone has a silently-untrained ontology head).")
+    p.add_argument("--dream-interval", type=float, default=86400.0,
+                   help="Seconds between dream passes (default 86400 = "
+                        "nightly; smaller for soak tests).")
+    p.add_argument("--dream-apply", action="store_true", default=False,
+                   help="Apply the dream pass's evaluated mutations "
+                        "(abstractions / accepted edges / prunes) between "
+                        "turns. WITHOUT this, every pass is a dry-run report "
+                        "(evidence first). The apply-time eval gate refuses "
+                        "placeholder-abstract applies (no decider) and "
+                        "over-cap passes; ALWAYS run "
+                        "scripts/eval_consolidation_recall.py on a DB copy "
+                        "before enabling on a real corpus. DEFAULT OFF.")
     p.add_argument("--ssm-chunker-gist-backend", default="topics",
                    choices=["topics", "mamba3"],
                    help="SSMChunker gist backend (the deferred Phase 2c path, "
@@ -1071,6 +1101,10 @@ def main() -> int:
         ssm_chunker_gist_query_conditioned=args.ssm_chunker_gist_query_conditioned,
         ssm_chunker_gist_per_episode=args.ssm_chunker_gist_per_episode,
         stale_propagation=args.stale_propagation,
+        dream_consolidation=args.dream_consolidation,
+        dream_checkpoint=args.dream_checkpoint,
+        dream_interval_s=args.dream_interval,
+        dream_apply=args.dream_apply,
     )
 
     # One-time unscoped-doc backfill: stamp --user-id onto every ownerless doc

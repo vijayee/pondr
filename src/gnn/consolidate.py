@@ -313,6 +313,17 @@ class Consolidator:
                                 "pass allow_untrained_apply=True to force")
                 else:
                     self._apply(report)
+            elif self.cfg.apply_gate_enabled:
+                # Eval gate (the junk-footgun defense): refuse the mutation when
+                # the pass would apply placeholder abstracts (no decider wired)
+                # or exceeds the blast-radius caps. The report still records the
+                # proposals; only the WRITE is refused.
+                gate_msg = self._eval_apply_gate(report)
+                if gate_msg is not None:
+                    report["apply_skipped"] = f"eval gate: {gate_msg}"
+                    log.warning("apply skipped by eval gate: %s", gate_msg)
+                else:
+                    self._apply(report)
             else:
                 self._apply(report)
 
@@ -719,6 +730,44 @@ class Consolidator:
 
     # ── apply (mutates; only when not dry-run) ──
 
+    def _eval_apply_gate(self, report: dict) -> Optional[str]:
+        """Eval gate evaluated AFTER scoring, BEFORE ``_apply`` mutates.
+
+        Returns the refusal reason (a message), or None when the apply is
+        allowed. Three rules:
+
+        1. ``abstracts`` proposed with NO active decider -> refuse: ``_apply``
+           would write "Abstract of [ep...]" placeholder M-nodes whose sources
+           get ``abstracted=1`` (excluded from default candidates), so the
+           store's recall SHRINKS to the placeholders. This is the only rule
+           that guards a data-quality REGRESSION; refusing it is honest.
+        2. ``len(report["pruned"]) > cfg.apply_max_prunes`` -> refuse (a
+           mis-tuned salience threshold must show up as a bounded refusal, not
+           a gutted store).
+        3. ``len(report["abstracts"]) > cfg.apply_max_abstracts`` -> refuse
+           (same reasoning; each abstract is one new M-node consumers see).
+
+        The escape hatch is ``cfg.apply_gate_enabled = False`` (CLI
+        ``--no-apply-gate``) -- the caller owns the consequences.
+        """
+        decider_active = (
+            self.decider is not None and self.cfg.bonsai_decider_enabled
+        )
+        if report["abstracts"] and not decider_active:
+            return (f"{len(report['abstracts'])} abstract(s) proposed but no "
+                    "decider is active -- apply would write placeholder "
+                    "M-nodes and abstract away the source episodes (wire a "
+                    "decider or pass --no-apply-gate)")
+        max_prunes = self.cfg.apply_max_prunes
+        if max_prunes is not None and len(report["pruned"]) > max_prunes:
+            return (f"blast radius: {len(report['pruned'])} pruned edges "
+                    f"> apply_max_prunes={max_prunes}")
+        max_abstracts = self.cfg.apply_max_abstracts
+        if max_abstracts is not None and len(report["abstracts"]) > max_abstracts:
+            return (f"blast radius: {len(report['abstracts'])} abstracts "
+                    f"> apply_max_abstracts={max_abstracts}")
+        return None
+
     def _apply(self, report: dict) -> None:
         from ..config import config as _master_config
         decider_active = (
@@ -743,6 +792,14 @@ class Consolidator:
                 # Honest cold-start fallback (a placeholder, NOT a stub to
                 # remove): the M-node is still written + abstracts edges still
                 # link it to its sources, just without a real gist/embedding.
+                # The eval gate normally refuses to REACH this branch on an
+                # apply (placeholder M-nodes + abstracted=1 sources shrink
+                # recall) -- warning here so a --no-apply-gate run is at least
+                # LOUD about the junk it is choosing to write.
+                log.warning("writing placeholder abstract for sources %s "
+                            "(no decider gist) -- sources are now "
+                            "abstracted=1 and this M-node is the retrieval "
+                            "surface for them", ab["episodes"])
                 self.writer.create_abstract(
                     ab["episodes"], summary=f"Abstract of {ab['episodes']}",
                 )

@@ -76,6 +76,7 @@ from .tools import (
 if TYPE_CHECKING:
     from .encoding.encoder import HippocampalEncoder
     from .subconscious.consolidation_worker import ConsolidationWorker
+    from .subconscious.dream_worker import DreamWorker
     from .subconscious.fade import FadeMemory
     from .subconscious.scene_worker import SceneAuthoringWorker
 
@@ -285,6 +286,7 @@ class PonderOrchestrator:
         tier2_recall_menu: bool = False,
         scene_blocks: bool = False,
         scene_worker: "Optional[SceneAuthoringWorker]" = None,
+        dream_worker: "Optional[DreamWorker]" = None,
         task_canvas: bool = False,
         canvas_decider: "Optional[BonsaiDecider]" = None,
         ssm_chunker_gist_backend: str = "topics",
@@ -469,6 +471,14 @@ class PonderOrchestrator:
         # layer untouched, retried next batch -- no fabricated scene).
         self._scene_blocks = bool(scene_blocks)
         self._scene_worker = scene_worker
+        # Dream-state consolidation (Phase 3a): the GNN Consolidator scheduled
+        # by a daemon thread (NOT tick-driven -- it self-fires on a wall-clock
+        # interval and then waits on the shared foreground gate). ``None``
+        # (default, flag off) -> the thread is never started and drain() skips
+        # it -> byte-identical.
+        self._dream_worker = dream_worker
+        if dream_worker is not None:
+            dream_worker.start()
         if fade_memory is not None:
             from src.subconscious.fade import (  # local, light import
                 REGIME_NAME, format_fade_block,
@@ -777,6 +787,11 @@ class PonderOrchestrator:
         # in the gaps between turns (D3 -- mirrors the consolidation worker).
         if self._scene_worker is not None:
             self._scene_worker.foreground_busy.set()
+        # The dream worker self-schedules on a wall-clock interval; the gate
+        # ensures its store-mutating GNN pass waits out every live query (same
+        # race fix as the tick-driven workers above).
+        if self._dream_worker is not None:
+            self._dream_worker.foreground_busy.set()
         # Validated compaction: a review-resolution command (keep/accept/edit
         # <i>) is consumed as a meta-command THIS turn -- it resolves a deferred
         # consolidation review instead of running a normal query (so the line
@@ -795,6 +810,8 @@ class PonderOrchestrator:
                     self._consolidation_worker.foreground_busy.clear()
                 if self._scene_worker is not None:
                     self._scene_worker.foreground_busy.clear()
+                if self._dream_worker is not None:
+                    self._dream_worker.foreground_busy.clear()
                 self._current_query = None
                 return {
                     "response": ack,
@@ -907,6 +924,8 @@ class PonderOrchestrator:
                     self._consolidation_worker.foreground_busy.clear()
                 if self._scene_worker is not None:
                     self._scene_worker.foreground_busy.clear()
+                if self._dream_worker is not None:
+                    self._dream_worker.foreground_busy.clear()
                 self._current_query = None
                 return {
                     "response": None, "route": route, "retrieved_episodes": [],
@@ -1440,6 +1459,8 @@ class PonderOrchestrator:
             except Exception as de:  # noqa: BLE001 - best-effort macro-forgetting
                 print(f"[scene-decay-fail] {de}", file=sys.stderr)
             self._scene_worker.foreground_busy.clear()
+        if self._dream_worker is not None:
+            self._dream_worker.foreground_busy.clear()
         self._current_query = None
         return result
 
@@ -2337,6 +2358,8 @@ class PonderOrchestrator:
             ok = self._consolidation_worker.drain(timeout=timeout) and ok
         if self._scene_worker is not None:
             ok = self._scene_worker.drain(timeout=timeout) and ok
+        if self._dream_worker is not None:
+            ok = self._dream_worker.drain(timeout=timeout) and ok
         return ok
 
     # ── session persistence (reuses the shipped state serializer) ──

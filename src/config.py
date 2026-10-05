@@ -629,6 +629,22 @@ class ConsolidationConfig:
     # proposal at 0.0 -- acceptable for a nightly dream pass; see
     # ``--ontology-bonsai-threshold`` for the escape hatch).
     ontology_bonsai_threshold: float = 0.0
+    # ── Apply-time eval gate (the junk-footgun defense) ──
+    # Evaluated in Consolidator.run() AFTER scoring, BEFORE _apply mutates the
+    # store. Without it, ``--apply`` (or a served dream pass with apply on)
+    # without a wired decider writes "Abstract of [ep...]" PLACEHOLDER M-nodes
+    # whose source episodes get ``abstracted=1`` -> excluded from default
+    # candidates -> retrieval coverage SHRINKS (the placeholder gist is what
+    # remains reachable). The gate refuses that mutation; --no-apply-gate is
+    # the explicit escape hatch (default OFF).
+    apply_gate_enabled: bool = True
+    # Blast-radius caps: an apply that prunes more edges / creates more
+    # abstracts than these in ONE pass is refused (the gate fails with the
+    # counts) -- a bad model or a mis-tuned threshold shows up as a bounded
+    # refusal, not a silently gutted store. None (not a CLI-passable 0 --
+    # use --apply-gate-max-prunes 0 to refuse ALL prunes) = unbounded.
+    apply_max_prunes: Optional[int] = 64
+    apply_max_abstracts: Optional[int] = 16
 
 
 @dataclass

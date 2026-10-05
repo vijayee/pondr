@@ -25,6 +25,8 @@ the wiring offline (no Bonsai). The caller owns the store's lifetime
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Optional
 
 from .config import Phase2cConfig, config
@@ -109,6 +111,10 @@ def build_ponder(
     ssm_chunker_gist_query_conditioned: bool = False,
     ssm_chunker_gist_per_episode: bool = False,
     stale_propagation: bool = False,
+    dream_consolidation: bool = False,
+    dream_checkpoint: Optional[str] = None,
+    dream_interval_s: float = 86400.0,
+    dream_apply: bool = False,
 ) -> PonderOrchestrator:
     """Build a live ``PonderOrchestrator`` on the TRAINED backbone + gate.
 
@@ -278,6 +284,27 @@ def build_ponder(
             resolves-or-drops them at query time. ``False`` (default) -> no
             derived-node keys are written and the read side is a no-op ->
             byte-identical to pre-R1.
+        dream_consolidation: Phase 3a -- wire the GNN dream-state consolidation
+            into serve. When True, a ``DreamWorker`` (daemon thread,
+            wall-clock interval, foreground-gated to run only between turns)
+            runs a ``Consolidator`` pass over the live store. Requires a
+            TRAINED combined checkpoint (``dream_checkpoint``; refuses to
+            build on a missing/untrained artifact). ``False`` (default) -> no
+            worker -> the serve path never constructs the Consolidator ->
+            byte-identical.
+        dream_checkpoint: the trained combined GNN checkpoint path. ``None``
+            (default) -> ``data/pod_runs/phase3a/all_fixed_bounded.pt`` (the
+            freshest assembled artifact); a raise at build time tells the
+            operator to point ``dream_checkpoint`` at their assembled ckpt
+            (see ``scripts/assemble_gnn_checkpoint.py``).
+        dream_interval_s: seconds between dream passes (default 86400 =
+            nightly). The evaluator gates every apply (blast-radius caps +
+            placeholder-abstract refusal) before writes land.
+        dream_apply: when False (default), every pass is a DRY-RUN report
+            (observation only -- evidence first, recall-before/after eval via
+            ``scripts/eval_consolidation_recall.py`` before ever enabling).
+            True writes the evaluated mutations (abstractions/edges/prunes)
+            between turns.
 
     Returns:
         A ready ``PonderOrchestrator`` whose retriever gate is the TRAINED
@@ -698,6 +725,47 @@ def build_ponder(
         from .gnn.bonsai_decider import BonsaiDecider
         canvas_decider = BonsaiDecider()
 
+    # Dream-state consolidation (Phase 3a, serve-wired): the previously
+    # unwired path -- the serve loop never constructed the Consolidator and
+    # the "nightly dream pass" had no clock. When ``dream_consolidation`` is
+    # on, build a ``DreamWorker`` (self-scheduling daemon thread with the
+    # foreground gate) over a REQUIRED trained combined checkpoint -- a
+    # missing artifact raises here, at serve startup, per the
+    # trained-checkpoint defense (random-salience salience would archive
+    # ~every edge of a live store). A ``BonsaiDecider`` is wired with it so
+    # the apply-time eval gate can require a real gist: WITHOUT a decider an
+    # apply writes "Abstract of [...]" placeholder M-nodes whose sources get
+    # ``abstracted=1`` -- recall would SHRINK. HTTP is lazy (one per gist /
+    # adjudication), so this is constructible offline. ``apply=False`` is the
+    # default (dry-run reports = evidence before mutation); when True, the
+    # ConsolidationConfig eval gate still refuses placeholder-abstract or
+    # over-cap applies.
+    dream_worker = None
+    if dream_consolidation:
+        from .subconscious.dream_worker import (DEFAULT_DREAM_CHECKPOINT,
+                                                DreamWorker)
+        if dream_checkpoint is None:
+            ckpt_path = DEFAULT_DREAM_CHECKPOINT
+            if not Path(ckpt_path).is_file():
+                raise ValueError(
+                    "--dream-consolidation needs a trained combined GNN "
+                    f"checkpoint; default {ckpt_path!r} not found on this "
+                    "machine -- pass --dream-checkpoint (assemble one with "
+                    "scripts/assemble_gnn_checkpoint.py if needed)")
+        else:
+            ckpt_path = dream_checkpoint
+        if dream_apply:
+            print("NOTE: --dream-apply lets the scheduled dream pass MUTATE "
+                  "the store (abstractions / accepted edges / prunes). Run "
+                  "scripts/eval_consolidation_recall.py on a DB copy first; "
+                  "the apply-time eval gate still bounds each pass.",
+                  file=sys.stderr)
+        from .gnn.bonsai_decider import BonsaiDecider
+        dream_worker = DreamWorker(
+            store, checkpoint=ckpt_path, interval_s=dream_interval_s,
+            apply=dream_apply, device=device, decider=BonsaiDecider(),
+        )
+
     orch = PonderOrchestrator(
         store=store,
         retriever=retriever,
@@ -725,6 +793,7 @@ def build_ponder(
         scene_worker=scene_worker,
         task_canvas=task_canvas,
         canvas_decider=canvas_decider,
+        dream_worker=dream_worker,
         ssm_chunker_gist_backend=ssm_chunker_gist_backend,
         ssm_chunker_gist_cue=ssm_chunker_gist_cue,
         ssm_chunker_gist_cue_preset=ssm_chunker_gist_cue_preset,
