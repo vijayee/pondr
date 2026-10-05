@@ -74,10 +74,11 @@ final class DaemonSupervisor {
   /// adds nothing.
   final List<String> argsTemplate;
 
-  /// The daemon's binary. A bare name walks the PATH's entries (the
-  /// `frame-demo` default's resolution); a name with a path separator runs
-  /// verbatim. FB6's runtime settings section will carry the real path —
-  /// until then this is the constructor's default, on PATH resolved.
+  /// The daemon's binary. A bare name walks the PATH's entries; a name with
+  /// a path separator runs verbatim. The app's wiring
+  /// (`lib/data/bindings.dart`'s `defaultDaemonBinary`) resolves the
+  /// `prepare.sh` copy (`daemon/frame-demo` at the run's working directory)
+  /// before this constructor's PATH default ever rides.
   final String daemonBinary;
 
   /// One connect probe's budget (the C client's connect timeout).

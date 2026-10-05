@@ -113,6 +113,21 @@ class MockChatService implements ChatService {
   final MockSessionsService _sessions;
   final Random _random;
 
+  /// The message-id monotonic guard. The export's `m${Date.now()}` collides
+  /// when two messages compose in the same millisecond: a test's fake-async
+  /// pump lands the whole 1100-1799 ms typing delay inside one real
+  /// millisecond (and a real user's instant double-send the same way), and
+  /// the canvas's bubble key then trips the duplicate-key debug check. Each
+  /// id keeps the export's `m<ms>` shape; a same-millisecond follower just
+  /// ticks the counter forward one.
+  int _lastMessageIdMs = 0;
+
+  String _nextMessageId() {
+    final int ms = DateTime.now().millisecondsSinceEpoch;
+    _lastMessageIdMs = ms > _lastMessageIdMs ? ms : _lastMessageIdMs + 1;
+    return 'm$_lastMessageIdMs';
+  }
+
   @override
   Stream<ChatEvent> send(String text, List<AttachedFile> files) async* {
     // The export's guard (`app.tsx:897`): a blank text with nothing
@@ -131,8 +146,9 @@ class MockChatService implements ChatService {
     final now = DateTime.now();
     if (captured != null) {
       final userMessage = Message(
-        // The export's `m${Date.now()}`.
-        id: 'm${now.millisecondsSinceEpoch}',
+        // The export's `m${Date.now()}` (see _nextMessageId's guard: the raw
+        // ms collided on a same-millisecond append).
+        id: _nextMessageId(),
         role: MessageRole.user,
         content: trimmed,
         timestamp: now,
@@ -181,7 +197,7 @@ class MockChatService implements ChatService {
           messages: [
             ...target.messages,
             Message(
-              id: 'm${repliedAt.millisecondsSinceEpoch}',
+              id: _nextMessageId(),
               role: MessageRole.assistant,
               content: reply,
               timestamp: repliedAt,

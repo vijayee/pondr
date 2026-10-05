@@ -91,3 +91,26 @@ ASan on the C-side's new shared-lib paths.
 - The audit view (cells/tree rendering as a chat-adjacent surface); session deletion over the
   wire; mobile targets' verification; the persona/escalation layers (the NEXT runtime slice —
   its ask surface now has a real client to ask THROUGH).
+## The binding's state (the Task 6 landing, 2026-10-05)
+
+The slice LANDED: the daemon's supervised boot + the record-folded chat + the
+CA_CONFIG adoption run live under `--dart-define=pondr.mode=daemon`
+(`docs/flutter-app-run-evidence.md`'s BINDING section carries the run's
+evidence). Landed beyond this spec's original surface, all gate-caught:
+
+- **The create-prompt's user record** (SecretAgent `50e7894`): a create-path
+  prompt commits its text as the frame's `msg.append` {role: user} BEFORE
+  `frame_start` — without it the events channel never carried the first
+  send's user bubble (the chat contract's §2 mapping broke for every
+  session's FIRST send). Pinned by
+  `TestPromptCreateCommitsTheUserMessageRecord`.
+- **The dev's one command** `flutter/daemon/prepare.sh`: the sa_client +
+  frame-demo build, the copies at the loader's candidates
+  (`flutter/libsa_client.so`, the bundles' `lib/`), `frame-demo` at
+  `flutter/daemon/frame-demo`.
+- **The recorded follow-ons** (out of scope, unchanged): the engine's
+  serving surface; the audit view — which also absorbs today's shape note:
+  a no-model frame's `control {kind: model-missing}` record rides the
+  events channel while the chat's send stays open (no error, no reply) —
+  the control record's UI mapping lands with the audit surface; the idle
+  daemon's ~2.2-core spin (recorded in the run evidence, unrepaired).

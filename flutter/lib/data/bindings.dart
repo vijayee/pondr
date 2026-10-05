@@ -86,6 +86,20 @@ String defaultDaemonSocketPath() {
   return '$base/pondr/pondr.sock';
 }
 
+/// The daemon binary's default (the supervisor's spawn target): the
+/// `prepare.sh` copy (`flutter/daemon/frame-demo`, resolved against the run's
+/// working directory — a `flutter run` from the project dir), else the
+/// `PONDR_DAEMON_BIN` env's explicit path, else the PATH's bare
+/// `frame-demo` (the supervisor walks the PATH itself).
+String defaultDaemonBinary() {
+  final envSet = Platform.environment['PONDR_DAEMON_BIN'];
+  if (envSet != null && envSet.isNotEmpty) return envSet;
+  final local = '${Directory.current.path}'
+      '${Platform.pathSeparator}daemon${Platform.pathSeparator}frame-demo';
+  if (File(local).existsSync()) return local;
+  return 'frame-demo';
+}
+
 /// One supervisor for the app run: the socket + the spawn's args composed
 /// HERE (the model tag from the selected provider's `modelId` — the store's
 /// truth read at construction; the picker's later SELECTION re-templates the
@@ -100,6 +114,7 @@ final daemonSupervisorProvider = Provider<DaemonSupervisor>((ref) {
   final selected = resolveSelectedModel(config.providers, config.selectedModelKey);
   final supervisor = DaemonSupervisor(
     socketPath: socketPath,
+    daemonBinary: defaultDaemonBinary(),
     argsTemplate: <String>[
       'serve',
       '--socket-path',

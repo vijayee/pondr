@@ -159,7 +159,12 @@ class _MessageCanvasState extends ConsumerState<MessageCanvas> {
     _scrollPending = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _scrollPending = false;
-      if (!mounted || !_scroll.hasClients) {
+      // hasContentDimensions too: a canvas whose layout was aborted in this
+      // same frame (a build exception mid-tree) answers hasClients while its
+      // position holds no dimensions — the extent read would throw.
+      if (!mounted ||
+          !_scroll.hasClients ||
+          !_scroll.position.hasContentDimensions) {
         return;
       }
       _scroll.animateTo(

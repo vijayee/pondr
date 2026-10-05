@@ -43,3 +43,8 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# The FFI binding-slice copies (daemon/prepare.sh products; the loader
+# resolves both at dev-run time — never committed binaries):
+/libsa_client.so
+/daemon/frame-demo
