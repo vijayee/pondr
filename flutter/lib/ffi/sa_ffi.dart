@@ -264,6 +264,18 @@ typedef SaErrorCbNative = ffi.Void Function(ffi.Pointer<ffi.Void> ctx,
 typedef SaErrorCbDart = void Function(ffi.Pointer<ffi.Void> ctx, int reqId,
     int status, ffi.Pointer<ffi.Uint8> text);
 
+/* The CA_CONFIG pair's response callback (sa_client_config_get/set): the
+   three strings are the frame-config template's truth or the failure
+   delivery's all-NULL shape. The PRESENT members are HELD payloads (one
+   release per non-NULL pointer; the absent member rides NULL per the
+   wire's "" sentinel decode). */
+typedef SaConfigCbNative = ffi.Void Function(ffi.Pointer<ffi.Void> ctx,
+    ffi.Uint8 status, ffi.Pointer<ffi.Uint8> baseUrl,
+    ffi.Pointer<ffi.Uint8> apiKey, ffi.Pointer<ffi.Uint8> model);
+typedef SaConfigCbDart = void Function(ffi.Pointer<ffi.Void> ctx, int status,
+    ffi.Pointer<ffi.Uint8> baseUrl, ffi.Pointer<ffi.Uint8> apiKey,
+    ffi.Pointer<ffi.Uint8> model);
+
 // ── the C surface's own signatures (sa_client.h:163-264) ────────────────────
 
 typedef SaConfigDefaultFnNative = SaClientConfigFfi Function();
@@ -329,6 +341,30 @@ typedef SaSubscribeEventsFnDart = int Function(
 typedef SaUnsubscribeEventsFnNative = ffi.Int32 Function(
     ffi.Pointer<ffi.Void> client);
 typedef SaUnsubscribeEventsFnDart = int Function(ffi.Pointer<ffi.Void> client);
+
+typedef _SaConfigGetFnNative = ffi.Int32 Function(
+    ffi.Pointer<ffi.Void> client,
+    ffi.Pointer<ffi.NativeFunction<SaConfigCbNative>> callback,
+    ffi.Pointer<ffi.Void> ctx);
+typedef _SaConfigGetFnDart = int Function(
+    ffi.Pointer<ffi.Void> client,
+    ffi.Pointer<ffi.NativeFunction<SaConfigCbNative>> callback,
+    ffi.Pointer<ffi.Void> ctx);
+
+typedef _SaConfigSetFnNative = ffi.Int32 Function(
+    ffi.Pointer<ffi.Void> client,
+    ffi.Pointer<ffi.Uint8> baseUrl,
+    ffi.Pointer<ffi.Uint8> apiKey,
+    ffi.Pointer<ffi.Uint8> model,
+    ffi.Pointer<ffi.NativeFunction<SaConfigCbNative>> callback,
+    ffi.Pointer<ffi.Void> ctx);
+typedef _SaConfigSetFnDart = int Function(
+    ffi.Pointer<ffi.Void> client,
+    ffi.Pointer<ffi.Uint8> baseUrl,
+    ffi.Pointer<ffi.Uint8> apiKey,
+    ffi.Pointer<ffi.Uint8> model,
+    ffi.Pointer<ffi.NativeFunction<SaConfigCbNative>> callback,
+    ffi.Pointer<ffi.Void> ctx);
 
 typedef SaProbeSizeofFnNative = ffi.Size Function();
 typedef SaProbeSizeofFnDart = int Function();
@@ -441,6 +477,17 @@ abstract interface class SaFfiApi {
   int listSessions(int client, int serial, int sessionsCb);
   int subscribeEvents(int client, int serial, String sid, int eventsCb);
   int unsubscribeEvents(int client);
+
+  /// The CA_CONFIG pair's ops (the daemon's frame-config template; see
+  /// sa_client.h). The GET is the all-absent request; the SET rides only
+  /// the non-NULL members (an empty string is the wire's absent sentinel —
+  /// a member is set to text, never to empty). The callback fires with
+  /// status 0 + the template's post-set truth (the present members HELD —
+  /// the absent ones NULL), or the all-NULL failure delivery.
+  int configGet(int client, int serial, int configCb);
+  int configSet(
+      int client, int serial, String? baseUrl, String? apiKey, String? model,
+      int configCb);
 }
 
 // ── the real implementation ─────────────────────────────────────────────────
@@ -500,6 +547,12 @@ final class SaFfi implements SaFfiApi {
   late final _unsubscribeFn = _theLib
       .lookupFunction<SaUnsubscribeEventsFnNative, SaUnsubscribeEventsFnDart>(
           'sa_client_unsubscribe_events');
+  late final _configGetFn = _theLib
+      .lookupFunction<_SaConfigGetFnNative, _SaConfigGetFnDart>(
+          'sa_client_config_get');
+  late final _configSetFn = _theLib
+      .lookupFunction<_SaConfigSetFnNative, _SaConfigSetFnDart>(
+          'sa_client_config_set');
   late final _probeSizeofFn = _theLib
       .lookupFunction<SaProbeSizeofFnNative, SaProbeSizeofFnDart>(
           'sa_client_config_ffi_sizeof');
@@ -629,6 +682,36 @@ final class SaFfi implements SaFfiApi {
   @override
   int unsubscribeEvents(int client) =>
       _unsubscribeFn(ffi.Pointer<ffi.Void>.fromAddress(client));
+
+  @override
+  int configGet(int client, int serial, int configCb) => _configGetFn(
+      ffi.Pointer<ffi.Void>.fromAddress(client),
+      SaFfi.nativeFn<SaConfigCbNative>(configCb),
+      ffi.Pointer<ffi.Void>.fromAddress(serial));
+
+  @override
+  int configSet(int client, int serial, String? baseUrl, String? apiKey,
+      String? model, int configCb) {
+    final baseP = _copyField(baseUrl);
+    final keyP = _copyField(apiKey);
+    final modelP = _copyField(model);
+    try {
+      return _configSetFn(
+        ffi.Pointer<ffi.Void>.fromAddress(client),
+        baseP,
+        keyP,
+        modelP,
+        SaFfi.nativeFn<SaConfigCbNative>(configCb),
+        ffi.Pointer<ffi.Void>.fromAddress(serial),
+      );
+    } finally {
+      // The C dups every string at entry (sa_client_config_set) — the
+      // caller's buffers are consumed by the time the call returns.
+      for (final p in <ffi.Pointer<ffi.Uint8>>[baseP, keyP, modelP]) {
+        if (p.address != 0) SaUtf8.free(p);
+      }
+    }
+  }
 
   @override
   int probeConfigSizeof() => _probeSizeofFn();

@@ -189,6 +189,27 @@ final class SaPromptResult {
   String toString() => 'SaPromptResult(status: $status, sid: $sid)';
 }
 
+/// The config pair's outcome (the C's `sa_client_config_get`/`_set`
+/// callback): status 0 = the three strings are the daemon's frame-config
+/// template's POST-SET truth. A NULL member is the template's ABSENT
+/// member (the wire's "" sentinel decoded) — a present-but-empty member
+/// never exists. A failure delivery carries all-NULL.
+final class SaConfigResult {
+  const SaConfigResult(this.status, this.baseUrl, this.apiKey, this.model);
+
+  final int status;
+  final String? baseUrl;
+  final String? apiKey;
+  final String? model;
+
+  bool get ok => status == saClientStatusOk;
+
+  @override
+  String toString() =>
+      'SaConfigResult(status: $status, baseUrl: $baseUrl, '
+      'model: $model)';
+}
+
 /// One sessions row (the wire's [sid, status, goal, created, depth] shape;
 /// a NULL status means unknown, a NULL goal means absent).
 final class SaSessionRecord {
@@ -287,6 +308,34 @@ final class SaUnsubscribeCmd extends SaOpCommand {
 
   @override
   final int serial;
+}
+
+final class SaConfigGetCmd extends SaOpCommand {
+  const SaConfigGetCmd(this.serial, this.cb);
+
+  @override
+  final int serial;
+
+  /// The config callback's native function pointer (an address).
+  final int cb;
+}
+
+final class SaConfigSetCmd extends SaOpCommand {
+  const SaConfigSetCmd(this.serial, this.baseUrl, this.apiKey, this.model,
+      this.cb);
+
+  @override
+  final int serial;
+
+  /// The set members: null rides ABSENT (the template's member is kept; an
+  /// empty string is ALSO the wire's absent sentinel — set to text, never
+  /// to empty).
+  final String? baseUrl;
+  final String? apiKey;
+  final String? model;
+
+  /// The config callback's native function pointer (an address).
+  final int cb;
 }
 
 final class SaReleaseCmd extends SaOpCommand {
@@ -406,6 +455,17 @@ final class SaClientOpRunner {
             serial, api.subscribeEvents(_clientOrBust, serial, sid, cb)));
       case SaUnsubscribeCmd(:final serial):
         emit(SaOpDone(serial, api.unsubscribeEvents(_clientOrBust)));
+      case SaConfigGetCmd(:final serial, :final cb):
+        emit(SaOpDone(serial, api.configGet(_clientOrBust, serial, cb)));
+      case SaConfigSetCmd(
+            :final serial,
+            :final baseUrl,
+            :final apiKey,
+            :final model,
+            :final cb,
+          ):
+        emit(SaOpDone(
+            serial, api.configSet(_clientOrBust, serial, baseUrl, apiKey, model, cb)));
       case SaReleaseCmd(:final payload):
         // After destroy this mirrors the C's release-after-destroy no-op.
         final client = _client;
@@ -660,10 +720,10 @@ enum _SaClientState { idle, connecting, ready, closing, closed }
 
 /// The op kinds the pending map distinguishes: a `doneDriven` one (subscribe
 /// / unsubscribe) resolves on its done message; the callback-driven ones
-/// (prompt / interrupt / listSessions) resolve on their callback's listener
-/// post — and each kind names its OWN refusal shape (the C's -1 return
-/// fires no callback and carries no status).
-enum _SaOpKind { prompt, interrupt, list, subscribe, unsubscribe }
+/// (prompt / interrupt / listSessions / the config pair) resolve on their
+/// callback's listener post — and each kind names its OWN refusal shape (the
+/// C's -1 return fires no callback and carries no status).
+enum _SaOpKind { prompt, interrupt, list, subscribe, unsubscribe, configGet, configSet }
 
 /// One op's pending completion: serial-keyed. The map's remove-on-complete
 /// IS the dedup (the callback's post may land before or after the done;
@@ -684,6 +744,8 @@ final class _PendingOp {
         _SaOpKind.interrupt => SaErr(status),
         _SaOpKind.list => SaSessionsResult(status, const <SaSessionRecord>[]),
         _SaOpKind.subscribe || _SaOpKind.unsubscribe => SaErr(status),
+        _SaOpKind.configGet || _SaOpKind.configSet =>
+          SaConfigResult(status, null, null, null),
       };
 
   Future<Object?> get future => completer.future;
@@ -720,7 +782,7 @@ final class SaClientNative {
 
   StreamSubscription<SaOpEvent>? _eventsSub;
 
-  /// The five listeners (created on connect; closed at the dispose flow's
+  /// The six listeners (created on connect; closed at the dispose flow's
   /// ack or a failed connect — a NativeCallable.listener keeps the main
   /// isolate alive until closed).
   late final ffi.NativeCallable<SaPromptCbNative> _promptCb;
@@ -728,6 +790,7 @@ final class SaClientNative {
   late final ffi.NativeCallable<SaSessionsCbNative> _sessionsCb;
   late final ffi.NativeCallable<SaEventsCbNative> _eventsCb;
   late final ffi.NativeCallable<SaErrorCbNative> _errorCb;
+  late final ffi.NativeCallable<SaConfigCbNative> _configCb;
   bool _listenersOpen = false;
 
   final Map<int, _PendingOp> _pending = <int, _PendingOp>{};
@@ -876,6 +939,40 @@ final class SaClientNative {
     return _unsubscribe();
   }
 
+  /// The daemon's frame-config template (the CA_CONFIG get; the all-absent
+  /// request shape). status 0 = the template's truth; the ABSENT members
+  /// ride null.
+  Future<SaConfigResult> configGet() {
+    _guardReady();
+    final pending = _beginOp(_SaOpKind.configGet);
+    host.send(SaConfigGetCmd(
+      pending.serial,
+      _configCb.nativeFunction.address,
+    ));
+    return pending.future.then((value) => value! as SaConfigResult);
+  }
+
+  /// Mutates the daemon's frame-config template (the CA_CONFIG set): each
+  /// NON-NULL member rides its set; null is absent (unchanged) — and an
+  /// empty string is ALSO the wire's absent sentinel. The answer carries
+  /// the template's post-set truth.
+  Future<SaConfigResult> configSet({
+    String? baseUrl,
+    String? apiKey,
+    String? model,
+  }) {
+    _guardReady();
+    final pending = _beginOp(_SaOpKind.configSet);
+    host.send(SaConfigSetCmd(
+      pending.serial,
+      baseUrl,
+      apiKey,
+      model,
+      _configCb.nativeFunction.address,
+    ));
+    return pending.future.then((value) => value! as SaConfigResult);
+  }
+
   /// The unsubscribe's body without the ready guard (the dispose flow's
   /// internal shape; the command carries the pending's serial).
   Future<SaResult> _unsubscribe() {
@@ -897,6 +994,7 @@ final class SaClientNative {
     _sessionsCb = ffi.NativeCallable<SaSessionsCbNative>.listener(_onSessions);
     _eventsCb = ffi.NativeCallable<SaEventsCbNative>.listener(_onEvent);
     _errorCb = ffi.NativeCallable<SaErrorCbNative>.listener(_onError);
+    _configCb = ffi.NativeCallable<SaConfigCbNative>.listener(_onConfig);
     _listenersOpen = true;
   }
 
@@ -907,6 +1005,7 @@ final class SaClientNative {
     _sessionsCb.close();
     _eventsCb.close();
     _errorCb.close();
+    _configCb.close();
     _listenersOpen = false;
   }
 
@@ -966,6 +1065,18 @@ final class SaClientNative {
       host.send(SaReleaseCmd(payload));
     }
     _resolveOp(ctx.address, SaSessionsResult(status, records));
+  }
+
+  void _onConfig(ffi.Pointer<ffi.Void> ctx, int status,
+      ffi.Pointer<ffi.Uint8> baseUrl, ffi.Pointer<ffi.Uint8> apiKey,
+      ffi.Pointer<ffi.Uint8> model) {
+    // The sessions callback's shape, three strings wide: the PRESENT
+    // members are held payloads (copy → release → resolve); the absent
+    // members ride NULL and need no release.
+    final base = baseUrl.address == 0 ? null : _readAndRelease(baseUrl);
+    final key = apiKey.address == 0 ? null : _readAndRelease(apiKey);
+    final tag = model.address == 0 ? null : _readAndRelease(model);
+    _resolveOp(ctx.address, SaConfigResult(status, base, key, tag));
   }
 
   void _onEvent(ffi.Pointer<ffi.Void> ctx, ffi.Pointer<ffi.Uint8> sid, int seq,

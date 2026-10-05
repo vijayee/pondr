@@ -78,6 +78,23 @@ final class FakeSaFfi implements SaFfiApi {
   int subRefusalReqId = 77;
   String subRefusalText = 'refused';
 
+  /// The CONFIG pair's script: the template's truth the callback answers
+  /// (the fixture daemon's default: base/key absent, the model the
+  /// template's own default tag).
+  int configStatus = 0;
+  String? configBase;
+  String? configKey;
+  String? configModel;
+
+  /// The CONFIG ops' outright refusal script (false = the -1 return, NO
+  /// callback per the C's contract).
+  bool configFires = true;
+
+  /// The recorded SET calls (the members as they rode — absent = null).
+  final List<(String?, String?, String?)> configSets = <(String?, String?, String?)>[];
+  int configGetCalls = 0;
+  int configSetCalls = 0;
+
   // ── the state the assertions read ──
 
   SaConfigFields? lastConfig;
@@ -307,6 +324,39 @@ final class FakeSaFfi implements SaFfiApi {
   int _subCtx = 0;
   int _subCb = 0;
   int _errorCb = 0;
+
+  @override
+  int configGet(int client, int serial, int configCb) {
+    order.add('configGet');
+    configGetCalls++;
+    if (!configFires) return -1; // the outright refusal: NO callback
+    _fireConfigCb(configCb, serial);
+    return 0;
+  }
+
+  @override
+  int configSet(int client, int serial, String? baseUrl, String? apiKey,
+      String? model, int configCb) {
+    order.add('configSet');
+    configSetCalls++;
+    configSets.add((baseUrl, apiKey, model));
+    if (!configFires) return -1; // the outright refusal: NO callback
+    _fireConfigCb(configCb, serial);
+    return 0;
+  }
+
+  void _fireConfigCb(int cbAddress, int serial) {
+    final base = configBase == null ? 0 : hold('config.base', configBase!);
+    final key = configKey == null ? 0 : hold('config.key', configKey!);
+    final model = configModel == null ? 0 : hold('config.model', configModel!);
+    (SaFfi.nativeFn<SaConfigCbNative>(cbAddress).asFunction<SaConfigCbDart>())(
+      ffi.Pointer<ffi.Void>.fromAddress(serial),
+      configStatus,
+      ffi.Pointer<ffi.Uint8>.fromAddress(base),
+      ffi.Pointer<ffi.Uint8>.fromAddress(key),
+      ffi.Pointer<ffi.Uint8>.fromAddress(model),
+    );
+  }
 
   /// Queues one event's delivery (the reader handing one over).
   void enqueue(String sid, int seq, int op, String? recordJson) =>
@@ -813,6 +863,76 @@ void main() {
       expect(fake.destroyCalls, 1, reason: 'the double dispose is a no-op');
       expect(fake.order.length, after);
       expect(wrapper.isDisposed, isTrue);
+    });
+
+    test("the config get: the template's truth; the present members are "
+        'held then released; the absent members ride null', () async {
+      final (wrapper, fake, _, _) = await connectHarness();
+      fake.configBase = 'http://127.0.0.1:11434';
+      fake.configKey = 'sk-the-key';
+      fake.configModel = 'deepseek-chat';
+      final result = await wrapper.configGet();
+      expect(result.ok, isTrue);
+      expect(result.baseUrl, 'http://127.0.0.1:11434');
+      expect(result.apiKey, 'sk-the-key');
+      expect(result.model, 'deepseek-chat');
+      expect(
+        fake.order.where((entry) => entry.startsWith('release(')),
+        unorderedMatches(<String>[
+          'release(config.base)',
+          'release(config.key)',
+          'release(config.model)',
+        ]),
+        reason: 'the three present members released (the held-payload rules)',
+      );
+      expect(fake.outstandingPayloads, 0);
+
+      // The absent members ride null (the "" sentinel decoded absent) and
+      // need no release.
+      fake.configBase = null;
+      fake.configKey = null;
+      final absent = await wrapper.configGet();
+      expect(absent.baseUrl, isNull);
+      expect(absent.apiKey, isNull);
+      expect(absent.model, 'deepseek-chat');
+      expect(fake.outstandingPayloads, 0);
+      await wrapper.dispose();
+    });
+
+    test('the config set rides its members; the answer is the template\'s '
+        'post-set truth', () async {
+      final (wrapper, fake, _, _) = await connectHarness();
+      final result = await wrapper.configSet(
+        baseUrl: 'http://127.0.0.1:11434',
+        apiKey: 'sk-the-key',
+        model: 'deepseek-chat',
+      );
+      expect(result.ok, isTrue);
+      expect(fake.configSets.single, (
+        'http://127.0.0.1:11434',
+        'sk-the-key',
+        'deepseek-chat',
+      ));
+      // A null member is the ABSENT member (never sent).
+      fake.configSets.clear();
+      await wrapper.configSet(model: 'gemma4:latest');
+      expect(fake.configSets.single, (null, null, 'gemma4:latest'));
+      expect(fake.outstandingPayloads, 0);
+      await wrapper.dispose();
+    });
+
+    test('the outright-refused config op (-1, no callback)', () async {
+      final (wrapper, fake, _, _) = await connectHarness();
+      fake.configFires = false;
+      final getResult = await wrapper.configGet();
+      expect(getResult.ok, isFalse);
+      expect(getResult.status, saClientStatusCallRefused);
+      expect(fake.order, isNot(contains('release(config.model)')));
+      final setResult = await wrapper.configSet(model: 'x');
+      expect(setResult.status, saClientStatusCallRefused);
+      // The rides never lost the SET's record (the runner ran; no callback).
+      expect(fake.configSetCalls, 1);
+      await wrapper.dispose();
     });
 
     test('the in-process op host: started → stopped; post-stop drops', () async {
