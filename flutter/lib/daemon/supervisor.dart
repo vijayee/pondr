@@ -207,6 +207,13 @@ final class DaemonSupervisor {
       // the same honesty as the first one).
       final probed = await _probe();
       if (probed != null) {
+        // stop() started while the probe was in flight: its dispose owns the
+        // client, never hand it out past the stop-promise (the review's gate).
+        if (_stopping) {
+          _log('the probe landed under stop — the client was probed into '
+              'the teardown; refusing');
+          throw StateError('daemon supervision: stopped mid-ensure');
+        }
         _client = probed;
         return probed;
       }

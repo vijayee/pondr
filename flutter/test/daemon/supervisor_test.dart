@@ -314,5 +314,23 @@ void main() {
           1);
       expect(watch.elapsed, lessThan(const Duration(seconds: 3)));
     });
+
+    test('ensure() after stop() refuses loud (the post-stop contract)',
+        () async {
+      final lines = <String>[];
+      final theHarness = harness!;
+      final home = theHarness.fresh();
+      final supervisor = theHarness.build(
+          home.socketPath, lines, theHarness.serveArgs(home.socketPath));
+      await supervisor.ensure();
+      await supervisor.stop();
+      expect(supervisor.isLive, isFalse);
+      await expectLater(
+          supervisor.ensure(), throwsA(isA<StateError>()));
+      // The refusal is logged loud (the state's story is on the record).
+      expect(
+          lines.any((line) => line.contains('stopped mid-ensure') ||
+              line.contains('stopping')), isTrue);
+    });
   });
 }
