@@ -54,9 +54,10 @@ the shared bge embedder (reused from ``build_ponder``).
 
 from __future__ import annotations
 
+import base64
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 import numpy as np
 
@@ -308,6 +309,20 @@ class FadeConfig:
     # disables it, does not delete it -- so the dual-SSM vs collapse is A/B-able.
     # Byte-identical to today when False (the project default-OFF pattern).
     collapse: bool = False
+    # Session-resume (R3, TMT steal, default OFF): persist the carried Mamba3
+    # state alongside the session (``orchestrator.save_session``) and restore it
+    # on ``load_session``, so a resumed conversation keeps its within-window
+    # memory instead of starting cold. This flag is the POLICY (the orchestrator
+    # reads it off ``cfg``); the mechanism (``snapshot_carry``/``restore_carry``)
+    # lives on ``Mamba3Voice``. Requires ``voice_carry`` (there is nothing to
+    # resume without the carried state) + the mamba3 backend --
+    # ``build_ponder``/``serve_ponder`` auto-enable carry under resume, mirroring
+    # collapse. When on, ``save_session`` ALWAYS writes the carry blob (a
+    # no-carry snapshot is the clear marker that drops a stale persisted carry);
+    # ``load_session`` restores best-effort (a bad blob resets, never fails the
+    # load). Persistence scope is ``"voice_carry"`` (WaveDB, keyed by user like
+    # working_memory) plus a ``<sid>_carry.json`` file sibling.
+    voice_carry_resume: bool = False
 
 
 # ----------------------------------------------------------------------- SSM-A
@@ -697,13 +712,18 @@ class Mamba3Voice:
 
     def __init__(self, model, tokenizer, device: str = "cuda",
                  temperature: float = 0.7, top_p: float = 0.9,
-                 seed: int = 0) -> None:
+                 seed: int = 0, model_id: str = "") -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.temperature = float(temperature)
         self.top_p = float(top_p)
         self.seed = int(seed)
+        # The HF model id this voice was loaded from (``load_mamba3_voice``).
+        # Session-resume records it in the carry blob and checks it on restore
+        # alongside the structural (shape/dtype) match -- a blob from a different
+        # checkpoint must not be restored into this model.
+        self.model_id = str(model_id)
         # Cross-turn carry state (exp #4): the per-conversation InferenceParams
         # kept alive across turns so Mamba3's recurrent state accumulates the
         # conversation. ``None`` until the first ``ingest_turn`` allocates it
@@ -897,6 +917,155 @@ class Mamba3Voice:
         self._carry_seqlen = 0
         self._carry_max = 0
 
+    # -- session-resume (R3, TMT steal: persist the recurrent state) ------
+    def snapshot_carry(self) -> dict[str, Any]:
+        """Serialize the carried state to a plain JSON-safe dict (the R3
+        session-resume save path).
+
+        Format (``v`` = 1; tensors as base64 of raw little-endian float32 bytes,
+        mirroring ``state_serializer``'s text-safe pattern for WaveDB values):
+
+            {"v": 1, "carry": None}                                  # clear marker
+            {"v": 1, "carry": {
+                 "<layer>": [{"dtype": "float32", "shape": [..],
+                              "data": "<base64>"}, ...x4],
+                 ...},                                               # per-layer cache
+             "model_id": str, "seqlen": int, "offset": int, "max": int}
+
+        Each per-layer entry is the 4-tuple of SISO state tensors (angle_dt,
+        ssm, k, v -- see ``Mamba3._get_states_from_cache``); tensors are stored
+        widened to float32 and converted back to the cache's own dtype on
+        restore (bf16 -> f32 -> bf16 is bit-exact: the f32 widening carries the
+        bf16 mantissa fully).
+
+        A voice with NO carried state returns the ``{"carry": None}`` clear
+        marker on purpose: the save path overwrites whatever was persisted
+        before, so resetting to a carry-less session DROPS the stale blob
+        instead of leaving it keyed by user for a later load to wrongly
+        restore. The caller decides when to persist (the orchestrator's
+        ``save_session``); this is the mechanism only.
+        """
+        import torch
+
+        if self._carry_inf is None or self._carry_seqlen == 0:
+            return {"v": 1, "carry": None}
+        layers: dict[str, list[dict[str, Any]]] = {}
+        # Sort the layer keys so save/restore position-matches layers even when
+        # the serialized keys are strings and the cache's are ints (JSON forces
+        # the former on restore; matching by sorted position keeps every layer
+        # against its own tensors).
+        for key, cache in sorted(
+                self._carry_inf.key_value_memory_dict.items(),
+                key=lambda kv: str(kv[0])):
+            entries = []
+            for t in cache:
+                if not (torch.is_tensor(t) and t.is_floating_point()):
+                    raise ValueError(
+                        "carry cache holds a non-floating-point tensor -- not "
+                        "serializable; refusing to store a lossy blob")
+                t32 = t.detach().to("cpu", torch.float32).contiguous()
+                entries.append({
+                    "dtype": str(t.dtype),
+                    "shape": list(t.shape),
+                    "data": base64.b64encode(
+                        t32.numpy().tobytes()).decode("ascii"),
+                })
+            layers[str(key)] = entries
+        return {
+            "v": 1,
+            "carry": layers,
+            "model_id": self.model_id,
+            "seqlen": self._carry_seqlen,
+            # ``offset`` and ``seqlen`` advance together in ``ingest_turn``;
+            # stored separately so a restore never has to guess the mapping.
+            "offset": int(self._carry_inf.seqlen_offset),
+            "max": self._carry_max,
+        }
+
+    def restore_carry(self, blob: dict[str, Any]) -> bool:
+        """Restore a carried state from :meth:`snapshot_carry`'s dict (the R3
+        session-resume load path).
+
+        Allocates a fresh ``InferenceParams`` cache at the blob's ``max``, then
+        copies each saved tensor back into the matching cache slot (real
+        ``torch.equal``-style values, not a re-ingest -- the losslessness proven
+        lossless <=2048 by the carry probe transfers to restoration because
+        restore replays NOTHING: the state tensors are the state). A ``{"carry":
+        None}`` clear marker drops the carried state (the save-over-stale case).
+
+        Returns True whether a carry was restored or the clear marker consumed;
+        False on ANY mismatch (version, ``model_id`` identity, layer structure,
+        shape/dtype, malformed entry) -- False also RESETS the carry, so a bad
+        blob never leaves a half-restored state. Never raises.
+        """
+        import torch
+        from mamba_ssm.utils.generation import InferenceParams
+
+        if not isinstance(blob, dict) or blob.get("v") != 1:
+            self.reset_carry()
+            return False
+        if blob.get("carry") is None:
+            self.reset_carry()
+            return True
+        saved_id = blob.get("model_id", "")
+        if saved_id and self.model_id and saved_id != self.model_id:
+            self.reset_carry()
+            return False
+        try:
+            seqlen = int(blob["seqlen"])
+            offset = int(blob.get("offset", seqlen))
+            carry_max = int(blob["max"])
+            saved_layers = blob["carry"]
+        except (KeyError, TypeError, ValueError):
+            self.reset_carry()
+            return False
+        if carry_max <= 0 or not (0 <= seqlen <= carry_max) \
+                or not (0 <= offset <= carry_max) \
+                or not isinstance(saved_layers, dict):
+            self.reset_carry()
+            return False
+        self._carry_max = carry_max
+        inf = InferenceParams(max_seqlen=carry_max, max_batch_size=1)
+        inf.key_value_memory_dict = self.model.allocate_inference_cache(
+            1, carry_max)
+        # Position-match sorted layer keys (snapshot sorted them) + per-layer
+        # tensor entries; any structure/shape/dtype mismatch aborts the restore
+        # and leaves the fresh (zeroed) state uncommitted-in-memory -- reset
+        # instead, so no half-restored state survives a failed load.
+        akeys = sorted(inf.key_value_memory_dict.keys(), key=str)
+        saved_keys = sorted(saved_layers.keys(), key=str)
+        good = len(akeys) == len(saved_keys)
+        if good:
+            for akey, skey in zip(akeys, saved_keys):
+                acache = inf.key_value_memory_dict[akey]
+                sentries = saved_layers[skey]
+                if not isinstance(sentries, list) or len(sentries) != len(acache):
+                    good = False
+                    break
+                for a_t, entry in zip(acache, sentries):
+                    try:
+                        shape = [int(d) for d in entry["shape"]]
+                        if (str(a_t.dtype) != entry["dtype"]
+                                or list(a_t.shape) != shape):
+                            raise ValueError("shape/dtype mismatch")
+                        raw = base64.b64decode(entry["data"])
+                        src = torch.frombuffer(
+                            bytearray(raw), dtype=torch.float32)
+                        with torch.no_grad():
+                            a_t.copy_(src.reshape(list(a_t.shape)).to(a_t.dtype))
+                    except Exception:  # noqa: BLE001 - a bad tensor aborts the restore
+                        good = False
+                        break
+                if not good:
+                    break
+        if not good:
+            self.reset_carry()
+            return False
+        inf.seqlen_offset = offset
+        self._carry_inf = inf
+        self._carry_seqlen = seqlen
+        return True
+
     # -- ephemeral gist (SSMChunker compressor seam) ------------------
     def ephemeral_gist(self, texts: list[str], cue: str,
                        max_new_tokens: int = 128) -> str:
@@ -1006,7 +1175,8 @@ def load_mamba3_voice(model_id: str, tokenizer_id: str, device: str = "auto",
     from mamba_ssm.modules.mamba3 import Mamba3
     if not getattr(model.backbone.layers[0].mixer, "is_mimo", False):
         Mamba3.forward = _mamba3_siso_carry_forward
-    return Mamba3Voice(model, tok, device, temperature, top_p, seed)
+    return Mamba3Voice(model, tok, device, temperature, top_p, seed,
+                       model_id=model_id)
 
 
 def bge_embedder() -> Embedder:

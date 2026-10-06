@@ -2364,6 +2364,20 @@ class PonderOrchestrator:
 
     # ── session persistence (reuses the shipped state serializer) ──
 
+    def _carry_resume_voice(self):
+        """The voice to persist session-resume carry for (R3), or ``None``.
+
+        Needs the fade wired, ``FadeConfig.voice_carry_resume`` on, and a voice
+        exposing the snapshot/restore contract (``Mamba3Voice``). Any missing
+        piece -> ``None`` (the persistence seam stays silent -- byte-identical
+        to flag-off)."""
+        if self._fade is None:
+            return None
+        if not getattr(self._fade.cfg, "voice_carry_resume", False):
+            return None
+        voice = self._fade.voice
+        return voice if hasattr(voice, "snapshot_carry") else None
+
     def save_session(self, session_id: Optional[str] = None) -> Path:
         """Persist the current WM state to disk (and optionally the store).
 
@@ -2371,7 +2385,13 @@ class PonderOrchestrator:
         WaveDB. This persists the WM SSM state (the caller decides when); it is
         distinct from the per-exchange episode persistence, which ``query``
         does automatically (``auto_persist``).
-        """
+
+        With ``FadeConfig.voice_carry_resume`` on (R3), also persists the
+        carried Mamba3 state under the SAME trigger (the carry is part of the
+        session's within-window memory): scope ``"voice_carry"`` in the store +
+        a ``<sid>_carry.json`` file sibling. Written on every save -- a
+        no-carry snapshot is the clear marker that DROPS a stale persisted
+        carry, so flag-off-with-stale-blob cannot leak into a later load."""
         sid = session_id or self.user_id
         if sid is None:
             raise ValueError("save_session requires a session_id or a user_id")
@@ -2387,6 +2407,20 @@ class PonderOrchestrator:
         # Optional WaveDB-backed persistence (per-user cross-session).
         if self.store is not None:
             self.store.save_jgs_state(sid, blob, scope="working_memory")
+        # R3: the carried Mamba3 state rides the same save trigger.
+        voice = self._carry_resume_voice()
+        if voice is not None:
+            try:
+                carry_blob = json.dumps(voice.snapshot_carry())
+            except Exception:  # noqa: BLE001 - never fail the session save
+                # A bad snapshot degrades to the clear marker, mirroring the
+                # load-side contract: the stale persisted carry is DROPPED
+                # (never wrongly restored later) instead of failing the save.
+                carry_blob = json.dumps({"v": 1, "carry": None})
+            (self.sessions_dir / f"{sid}_carry.json").write_text(
+                carry_blob, encoding="utf-8")
+            if self.store is not None:
+                self.store.save_jgs_state(sid, carry_blob, scope="voice_carry")
         return path
 
     def load_session(self, session_id: Optional[str] = None) -> bool:
@@ -2407,6 +2441,27 @@ class PonderOrchestrator:
         snap = deserialize(blob)
         self.working_memory.reset()  # ensure state is initialized, then overwrite
         self.working_memory.restore(snap)
+        # R3: restore the carried Mamba3 state best-effort -- a corrupt or
+        # mismatched blob RESETS the carry instead of failing the session load
+        # (the carry is an additive within-window leg; today's session proceeds
+        # cold rather than broken).
+        voice = self._carry_resume_voice()
+        if voice is not None:
+            carry_blob = None
+            if self.store is not None:
+                carry_blob = self.store.load_jgs_state(sid, scope="voice_carry")
+            if not carry_blob:
+                cpath = self.sessions_dir / f"{sid}_carry.json"
+                if cpath.exists():
+                    carry_blob = cpath.read_text(encoding="utf-8")
+            if carry_blob:
+                ok = False
+                try:
+                    ok = voice.restore_carry(json.loads(carry_blob))
+                except Exception:  # noqa: BLE001 - never fail the session load
+                    ok = False
+                if not ok and hasattr(voice, "reset_carry"):
+                    voice.reset_carry()
         return True
 
     # ── EXPAND (delegated to the handler) ──

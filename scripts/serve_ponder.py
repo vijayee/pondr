@@ -326,6 +326,23 @@ def main() -> int:
                         "collapse (no SSM-A anchors to gist). A/B-able against the "
                         "dual-SSM baseline (which stays the off-default). "
                         "EXPERIMENTAL.")
+    p.add_argument("--fade-memory-session-resume", action="store_true",
+                   default=False,
+                   help="Session-resume of the carried Mamba3 state (R3, TMT "
+                        "steal, default OFF): --fade-memory-voice-carry saves "
+                        "the carried InferenceParams alongside the WM snapshot "
+                        "at save_session (scope 'voice_carry' in the store + a "
+                        "<sid>_carry.json file) and a later load_session "
+                        "restores it, so a resumed conversation keeps its "
+                        "within-window memory instead of starting cold "
+                        "(lossless <=2048 per the carry probe; restore is a "
+                        "state-tensor copy, no re-ingest). serve saves the "
+                        "session (WM + carry) at process exit when this flag is "
+                        "on. Requires --fade-"
+                        "memory --fade-memory-voice-backend=mamba3; auto-enables "
+                        "--fade-memory-voice-carry. A bad/mismatched blob resets "
+                        "the carry, never fails the load. OFF = byte-identical "
+                        "session persistence.")
     p.add_argument("--fade-inject", action="store_true", default=False,
                    help="Phase B: feed the fade recalls into the LLM context. A "
                         "[FADE MEMORY] block (R1 verbatim + R3 gist; R4 forgotten is "
@@ -887,6 +904,25 @@ def main() -> int:
                       "Consolidation is inert under collapse (no SSM-A anchors to "
                       "gist). A/B-able against the dual-SSM off-baseline.",
                       file=sys.stderr)
+        if args.fade_memory_session_resume:
+            if args.fade_memory_voice_backend != "mamba3":
+                print("NOTE: --fade-memory-session-resume ignored (requires "
+                      "--fade-memory-voice-backend=mamba3; only Mamba3Voice "
+                      "exposes the carry snapshot/restore contract). Resume "
+                      "stays off.", file=sys.stderr)
+                args.fade_memory_session_resume = False
+            else:
+                # Resume IMPLIES carry (there is nothing to resume without the
+                # carried state): auto-enable it so the user does not have to
+                # pass both flags. build_ponder enforces this too.
+                args.fade_memory_voice_carry = True
+                print("NOTE: --fade-memory-session-resume is EXPERIMENTAL (R3, "
+                      "TMT steal). save_session persists the carried Mamba3 "
+                      "state (scope 'voice_carry' + <sid>_carry.json) at "
+                      "process exit and load_session restores it on the next "
+                      "start; --fade-memory-voice-carry "
+                      "auto-enabled. Byte-identical session persistence when "
+                      "off.", file=sys.stderr)
         if (args.fade_memory_voice_backend == "token-lm"
                 and args.fade_memory_voice_path
                 and not args.fade_memory_tokenizer_path):
@@ -996,6 +1032,7 @@ def main() -> int:
           f"fade_memory_top_k={args.fade_memory_top_k} "
           f"fade_memory_voice_carry={args.fade_memory_voice_carry} "
           f"fade_memory_collapse={args.fade_memory_collapse} "
+          f"fade_memory_session_resume={args.fade_memory_session_resume} "
           f"fade_inject={args.fade_inject} "
           f"fade_debug={args.fade_debug} "
           f"force_synthesize={args.force_synthesize} "
@@ -1099,6 +1136,7 @@ def main() -> int:
         fade_memory_expand_tokens=args.fade_memory_expand_tokens,
         fade_memory_voice_carry=args.fade_memory_voice_carry,
         fade_memory_collapse=args.fade_memory_collapse,
+        fade_memory_session_resume=args.fade_memory_session_resume,
         fade_memory_voice_carry_cue_template=args.fade_memory_voice_carry_cue_template,
         fade_inject=args.fade_inject,
         fade_consolidation=args.fade_consolidation,
@@ -1201,6 +1239,18 @@ def main() -> int:
             orch.drain(timeout=drain_timeout)
         except Exception as e:  # noqa: BLE001 - never crash on cleanup
             print(f"[drain-fail] {e}", file=sys.stderr)
+        # R3 save trigger: under --fade-memory-session-resume the process exit
+        # IS the session end -- persist the WM + carried Mamba3 state here so a
+        # restarted serve load_session()s it back (the Phase 2c seam is
+        # caller-decides and serve provides the caller). Best-effort: a save
+        # failure must not block store close.
+        if args.fade_memory_session_resume:
+            try:
+                orch.save_session()
+                print("[carry] session (incl. Mamba3 carry) saved for "
+                      f"{args.user_id}", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001 - never crash on cleanup
+                print(f"[save-fail] {e}", file=sys.stderr)
         try:
             orch.store.close()
         except Exception as e:  # noqa: BLE001 - never crash on cleanup

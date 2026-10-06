@@ -87,6 +87,7 @@ def build_ponder(
     fade_memory_expand_tokens: int = 64,
     fade_memory_voice_carry: bool = False,
     fade_memory_collapse: bool = False,
+    fade_memory_session_resume: bool = False,
     fade_memory_voice_carry_cue_template: str = "Q: {cue}\nA:",
     fade_inject: bool = False,
     fade_consolidation: bool = False,
@@ -252,6 +253,17 @@ def build_ponder(
             cross-turn carry finding real in serve; A/B-able against the SSM-A
             regime path. No-op (byte-identical) when off or with a non-carry
             voice. Requires ``fade_memory`` + the mamba3 backend.
+        fade_memory_session_resume: session-resume of the carried Mamba3 state
+            (R3, TMT steal, default OFF). When True, ``save_session`` persists
+            the carried ``InferenceParams`` alongside the WM snapshot (scope
+            ``"voice_carry"`` in the store + a ``<sid>_carry.json`` file) and
+            ``load_session`` restores it, so a resumed conversation keeps its
+            within-window memory instead of starting cold (lossless <=2048 per
+            the carry probe). Requires ``fade_memory`` + the mamba3 backend;
+            auto-enables ``fade_memory_voice_carry`` (there is nothing to
+            resume without the carried state -- same belt-and-suspenders as
+            collapse). Flag off -> ``save_session``/``load_session`` are
+            byte-identical to the WM-only path.
         fade_inject: Phase B -- when True, format the fade recalls into a
             ``[FADE MEMORY]`` block prepended to the LLM user message on synthesize
             turns (R1 verbatim + R3 gist; R4 forgotten is a signal, not content).
@@ -620,6 +632,17 @@ def build_ponder(
                     "'mamba3' (the carried Mamba3 is the sole within-window "
                     "memory; only Mamba3Voice keeps a carried state).")
             fade_memory_voice_carry = True
+        # Session-resume (R3, default OFF): IMPLIES carry (there is nothing to
+        # resume without the carried state), mirroring collapse, and requires
+        # the mamba3 backend (only ``Mamba3Voice`` has the snapshot/restore
+        # contract). Belt-and-suspenders with the serve guard.
+        if fade_memory_session_resume:
+            if fade_memory_voice_backend != "mamba3":
+                raise ValueError(
+                    "fade_memory_session_resume requires fade_memory_voice_"
+                    "backend='mamba3' (only Mamba3Voice exposes the carry "
+                    "snapshot/restore contract).")
+            fade_memory_voice_carry = True
         fade_cfg = FadeConfig(
             decay=fade_memory_decay,
             cos_gist=fade_memory_cos_gist,
@@ -629,6 +652,7 @@ def build_ponder(
             voice_carry=fade_memory_voice_carry,  # exp #4, additive, default OFF
             collapse=fade_memory_collapse,  # exp #4 follow-on, default OFF
             voice_carry_cue_template=fade_memory_voice_carry_cue_template,  # cue eng
+            voice_carry_resume=fade_memory_session_resume,  # R3, default OFF
         )
         fade_mem = FadeMemory(fade_cfg, embedder, voice, dim=384)
 
