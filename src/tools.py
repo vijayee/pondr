@@ -269,6 +269,44 @@ UPDATE_CANVAS_SCHEMA: dict = {
 }
 
 
+# ── R4: per-query freshness, the ``check_freshness`` agent tool. STANDALONE
+# schema (NOT appended to ``TOOL_SCHEMAS``/``LOOP_TOOLS``/``SELF_CHAT_TOOLS``)
+# so the flag-off path hands the consumer the exact prior tool lists
+# (byte-identical). The orchestrator's loop path appends it to the loop tool
+# set ONLY when ``--query-freshness`` is on (see ``orchestrator._synthesize``).
+# No-args asks "is my CURRENT context stale?" (the orchestrator records the
+# unit ids of the last assembled context); a ``unit_ids`` list checks
+# arbitrary ids. MAY-phrased (never imperative -- per
+# [[llm-tool-use-prompts-optional]]). ``dispatch_tool`` ->
+# ``orchestrator.check_freshness_context`` (read-only structural report).
+CHECK_FRESHNESS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "check_freshness",
+        "description": (
+            "Check whether the memory context you were given is up to date "
+            "before trusting it (e.g. for facts like dates, versions or "
+            "statuses that may have been superseded). With no arguments this "
+            "checks YOUR current context; you may also pass specific ids. "
+            "Returns a fresh/stale verdict per id."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "unit_ids": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": (
+                        "Optional explicit unit ids to check; omit to check "
+                        "your current context."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+
 def _err(msg: str) -> str:
     """A short tool-result error string (never raises)."""
     return json.dumps({"error": msg})
@@ -362,6 +400,22 @@ def dispatch_tool(orchestrator, name: str, args: Any) -> str:
                 node_mapping=nmapping,
             )
             return result if isinstance(result, str) and result else _err("update_canvas returned nothing")
+
+        if name == "check_freshness":
+            # R4 per-query freshness: a read-only structural staleness report
+            # (see CHECK_FRESHNESS_SCHEMA above). ``check_freshness_context``
+            # is best-effort and never raises -- the outer ``except`` is the
+            # final net. Gated by ``--query-freshness`` at the loop_tools
+            # append (the schema is never handed to the model when the flag is
+            # off, so this branch is unreachable then).
+            unit_ids = args.get("unit_ids")
+            if unit_ids is not None and not (
+                    isinstance(unit_ids, list)
+                    and all(isinstance(u, str) and u.strip() for u in unit_ids)):
+                return _err("check_freshness 'unit_ids' must be an array of non-empty strings")
+            report = orchestrator.check_freshness_context(
+                unit_ids=unit_ids if isinstance(unit_ids, list) else None)
+            return report if isinstance(report, str) and report else _err("check_freshness returned nothing")
 
         return _err(f"unknown tool: {name}")
     except Exception as e:  # noqa: BLE001 - never break the consumer's loop

@@ -588,6 +588,18 @@ def main() -> int:
                         "still-stale M-nodes are kept + annotated. "
                         "DEFAULT OFF -> no derived-node keys, no recheck -> "
                         "byte-identical.")
+    p.add_argument("--query-freshness", action="store_true", default=False,
+                   help="R4 (Graft steal #2): per-query freshness on derived "
+                        "context. (a) Context units that R1 kept + annotated "
+                        "stale (requires --stale-propagation to ever fire) "
+                        "render a STALE provenance note ('verify before "
+                        "trusting'); (b) the loop gains a check_freshness "
+                        "tool -- a read-only structural stat (supersession-"
+                        "tip check, works mark-free) the LLM MAY call before "
+                        "trusting context; no args checks the units assembled "
+                        "into its current context. DEFAULT OFF -> no stamp / "
+                        "no tool -> byte-identical. EXPERIMENTAL (mechanism "
+                        "shipped, recall A/B pending).")
     p.add_argument("--dream-consolidation", action="store_true",
                    default=False,
                    help="Phase 3a: wire the GNN dream-state consolidator into "
@@ -748,6 +760,13 @@ def main() -> int:
     # BEFORE build_ponder (build_ponder also sets it from its param, covering
     # direct callers). Default OFF -> byte-identical.
     _config.stale_propagation_enabled = args.stale_propagation
+    # R4: query_freshness_enabled is read at call time inside
+    # build_context_string (assembly-time STALE stamp) -- set the global
+    # BEFORE build_ponder (build_ponder also sets it from its param). Note
+    # the loop-path tool + id tracking gate the ORCHESTRATOR param, not this
+    # config key, so both are threaded independently. Default OFF ->
+    # byte-identical.
+    _config.query_freshness_enabled = args.query_freshness
     if args.bonsai_isolation and not args.async_distill:
         print("WARNING: --bonsai-isolation without --async-distill will block the "
               "response ~22.8 s/turn (10 Bonsai calls on the sync path). Enable "
@@ -1056,6 +1075,7 @@ def main() -> int:
     print(f"[load] drill_down={args.drill_down}", file=sys.stderr)
     print(f"[load] reclaim={args.reclaim}", file=sys.stderr)
     print(f"[load] task_canvas={args.task_canvas}", file=sys.stderr)
+    print(f"[load] query_freshness={args.query_freshness}", file=sys.stderr)
     if args.ssm_chunker_gist_backend == "mamba3":
         shared = (args.fade_memory and args.fade_memory_voice_backend == "mamba3")
         cue_label = ("Q: {user_prompt}\\nA:" if args.ssm_chunker_gist_query_conditioned
@@ -1162,6 +1182,7 @@ def main() -> int:
         ssm_chunker_gist_query_conditioned=args.ssm_chunker_gist_query_conditioned,
         ssm_chunker_gist_per_episode=args.ssm_chunker_gist_per_episode,
         stale_propagation=args.stale_propagation,
+        query_freshness=args.query_freshness,
         dream_consolidation=args.dream_consolidation,
         dream_checkpoint=args.dream_checkpoint,
         dream_interval_s=args.dream_interval,

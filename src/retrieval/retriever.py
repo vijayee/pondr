@@ -868,6 +868,18 @@ class HippocampalRetriever:
             # hybrid results, which carry ``strategy="hybrid"`` unconditionally
             # but are not surfaced when the flag is off).
             strat = ep.get("strategy") if config.drill_down_enabled else None
+            # R4: render the kept-stale M-node's provenance stamp inside the
+            # chunk (the R1 recheck annotated the hydrated dict; assembly-time
+            # is where the model finally SEES it). Flag off / no annotation ->
+            # no note -> byte-identical. The note counts against the budget:
+            # it is appended BEFORE the token estimate (no bypass).
+            stale_note = ""
+            if config.query_freshness_enabled and ep.get("stale_since"):
+                stale_note = (
+                    "Stale: derives from superseded source(s) "
+                    f"{', '.join(ep.get('stale_of') or ['(marked)'])} (marked "
+                    f"{ep['stale_since']}) -- verify before trusting.\n"
+                )
             if kind == "section":
                 # Section (per-chunk) result: the matched chunk body is in
                 # ``text`` (materialized at hydrate), so no store/cold pull here.
@@ -932,6 +944,8 @@ class HippocampalRetriever:
             # it (no budget bypass).
             if strat:
                 chunk = f"[strategy:{strat}]\n" + chunk
+            if stale_note:
+                chunk = f"{chunk}\n{stale_note}"
             chunk_tokens = len(chunk) // 4
             if token_count + chunk_tokens > max_tokens:
                 break

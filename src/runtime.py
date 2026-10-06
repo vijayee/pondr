@@ -113,6 +113,7 @@ def build_ponder(
     ssm_chunker_gist_query_conditioned: bool = False,
     ssm_chunker_gist_per_episode: bool = False,
     stale_propagation: bool = False,
+    query_freshness: bool = False,
     dream_consolidation: bool = False,
     dream_checkpoint: Optional[str] = None,
     dream_interval_s: float = 86400.0,
@@ -297,6 +298,20 @@ def build_ponder(
             resolves-or-drops them at query time. ``False`` (default) -> no
             derived-node keys are written and the read side is a no-op ->
             byte-identical to pre-R1.
+        query_freshness: R4 (Graft steal #2) -- when True, derived context
+            carries its staleness PER QUERY instead of relying on write-side
+            marks alone: (a) ``build_context_string`` renders a STALE note on
+            any unit the R1 recheck kept + annotated (kept M-nodes), and (b)
+            the loop gets a ``check_freshness`` tool -- a READ-ONLY structural
+            stat (``GraphTraversal.check_freshness``) the LLM can call before
+            trusting context (works mark-free too; no-args = "my current
+            context"). Requires ``stale_propagation`` for deliverable (a) to
+            ever fire (stamps render only marked units) but NOT for the tool
+            (the structural stat needs no marks). ``False`` (default) -> no
+            stamp, no schema append, no tracking -> byte-identical to pre-R4.
+            Loop-path-only: requires the tool loop
+            (``self_chat_tool_loop_enabled``, ON by default); the flag does
+            NOT auto-enable the loop.
         dream_consolidation: Phase 3a -- wire the GNN dream-state consolidation
             into serve. When True, a ``DreamWorker`` (daemon thread,
             wall-clock interval, foreground-gated to run only between turns)
@@ -395,6 +410,7 @@ def build_ponder(
     # resolve) inherit the flag with no constructor threading. Default OFF ->
     # no derived-node keys written, no recheck -> byte-identical.
     config.stale_propagation_enabled = stale_propagation
+    config.query_freshness_enabled = query_freshness
     if llm_telemetry:
         # Swap the module sink to a path-backed JSONL writer. The null sink
         # (default) records nothing, so flag-on-without-configure is a silent
@@ -819,6 +835,7 @@ def build_ponder(
         fade_inject=fade_inject,
         consolidation_worker=consolidation_worker,
         tier2_recall_menu=tier2_recall_menu,
+        query_freshness=query_freshness,
         scene_blocks=scene_blocks,
         scene_worker=scene_worker,
         task_canvas=task_canvas,

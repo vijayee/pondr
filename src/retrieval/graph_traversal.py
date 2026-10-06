@@ -386,6 +386,75 @@ class GraphTraversal:
             self.db.batch_sync(resolve_ops)
         return keep, annotations
 
+    def check_freshness(self, node_ids: list[str]) -> dict[str, dict]:
+        """Structural freshness report on unit ids (R4, Graft steal #2).
+
+        The READ-ONLY ``stat'' counterpart of ``_filter_stale_derived``: a
+        per-node check with no stale marks needed, so it answers "is THIS unit
+        stale?" for anything the consumer saw in context, including
+        supersessions that happened outside the mark window. Two rules:
+
+        * an episode/doc id is FRESH iff its own supersession tip is itself
+          (``_supersession_tip``) -- a tip deeper in the MVCC chain means the
+          id describes a superseded value (A1 dedup / Consolidator /
+          contradiction resolve all supersede through this chain);
+        * a scene/``M:`` id is FRESH iff for EVERY source in its
+          ``cites``/``abstracts`` union that source's tip is still the source
+          itself, OR the node already cites the tip too (re-derived --
+          re-authoring grows the union). Any cited source superseded behind
+          the node's back -> stale, and the reason names source + tip.
+
+        Pure read: NO writes, NO mark lifecycle (resizing ``stale_of`` stays
+        ``_filter_stale_derived``'s job -- this never fights it). Cost is
+        ~2 out-edge calls + one tip-chain per source -- a stat, not a
+        rebuild. Unknown ids (missing, empty, wrong shape) report
+        ``"kind": "unknown"`` with ``"fresh": True`` + a note rather than
+        pretending knowledge. Returns ``{id: {"kind", "fresh", "reasons",
+        "sources"?}}`` -- ``stale_count`` keys are derivable by the caller.
+        """
+        report: dict[str, dict] = {}
+        cited_cache: dict[str, set] = {}
+        for eid in node_ids:
+            if not isinstance(eid, str) or not eid.strip():
+                report[eid] = {
+                    "kind": "unknown", "fresh": True,
+                    "reasons": ["non-string id" if not isinstance(eid, str)
+                                else "blank id"],
+                }
+                continue
+            eid = eid.strip()
+            if eid.startswith("scene_") or eid.startswith("M:"):
+                prefix = "scene" if eid.startswith("scene_") else "mem"
+                cited = cited_cache.get(eid)
+                if cited is None:
+                    cited = cited_cache[eid] = self._node_citations(eid)
+                # Stale iff some cited source's tip moved AND this node has
+                # not re-derived against the tip. Citing nothing is NOT
+                # staleness (no verifiable derivation -> honest fresh + note).
+                superseded: list[str] = []
+                for src in sorted(cited):
+                    tip = self._supersession_tip(src)
+                    if tip != src and tip not in cited:
+                        superseded.append(f"source {src} superseded by {tip}")
+                fresh = True if not cited else not superseded
+                reasons: list = (
+                    superseded if cited
+                    else ["cites nothing (nothing verifiable)"])
+                report[eid] = {"kind": prefix, "fresh": fresh,
+                               "reasons": reasons, "sources": sorted(cited)}
+                continue
+            if eid.startswith("ep_") or eid.startswith("doc_"):
+                tip = self._supersession_tip(eid)
+                fresh = tip == eid
+                report[eid] = {"kind": "episode" if eid.startswith("ep_")
+                               else "doc", "fresh": fresh,
+                               "reasons": (["superseded by " + tip]
+                                           if not fresh else [])}
+                continue
+            report[eid] = {"kind": "unknown", "fresh": True,
+                           "reasons": ["not a freshness-checkable id"]}
+        return report
+
     # ── User-scope filter (the retrieval user boundary) ──
 
     @staticmethod

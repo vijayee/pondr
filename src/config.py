@@ -364,6 +364,27 @@ class Config:
     # recheck, no drops, no new hydrate keys -> byte-identical.
     stale_propagation_enabled: bool = False
 
+    # ── R4: per-query freshness on derived context (Graft steal #2) ──
+    # R1's read side FILTERS silently (stale scenes dropped, M-nodes annotated
+    # on the hydrated dict) -- the derived context carries provenance but the
+    # model never SEES it and cannot ASK about it. When True:
+    # (a) assembly-time provenance: ``build_context_string`` renders a STALE
+    #     note on a chunk whose hydrated dict carries an ``stale_since``
+    #     annotation (needs ``stale_propagation_enabled`` too -- annotations
+    #     only exist when R1 marks them);
+    # (b) the ``check_freshness`` agent tool (tier-2 standalone schema,
+    #     loop-path only): ``GraphTraversal.check_freshness`` returns a
+    #     READ-ONLY structural report on ANY unit id -- no stale marks needed:
+    #     an episode is fresh iff its supersession tip is itself; a
+    #     scene/memory is fresh iff every cited source's tip is still in its
+    #     ``cites``/``abstracts`` union. ~2 out-edge calls + chain follows per
+    #     node -- a stat, not a rebuild-on-write.
+    # The orchestrator records the unit ids assembled into the last context
+    # (``_current_fresh_ids``; ungated internal state like ``_current_query``)
+    # so the tool with no args answers "is MY context stale?".
+    # Default False: no stamps, no schema append, pure no-op -> byte-identical.
+    query_freshness_enabled: bool = False
+
     # ── Phase 2c+: self-chat full agent loop ──
     # When True, the Bonsai self-chat synthesize path runs a multi-turn tool
     # loop (``run_tool_loop``): the model may call ``expand`` / ``search_memory``

@@ -67,6 +67,7 @@ from .subconscious.canvas_format import (
     apply_replace_blocks, parse_canvas_meta, validate_canvas,
 )
 from .tools import (
+    CHECK_FRESHNESS_SCHEMA,
     LOOP_TOOLS, REMEMBER_SCHEMA, SEARCH_MEMORY_DRILLDOWN_SCHEMA,
     UPDATE_CANVAS_SCHEMA,
     SELF_CHAT_TOOLS, TOOL_SCHEMAS, dispatch_tool,
@@ -284,6 +285,7 @@ class PonderOrchestrator:
         fade_inject: bool = False,
         consolidation_worker: "Optional[ConsolidationWorker]" = None,
         tier2_recall_menu: bool = False,
+        query_freshness: bool = False,
         scene_blocks: bool = False,
         scene_worker: "Optional[SceneAuthoringWorker]" = None,
         dream_worker: "Optional[DreamWorker]" = None,
@@ -514,6 +516,26 @@ class PonderOrchestrator:
         # flag is off / the LLM never called ``remember`` -> key ABSENT ->
         # byte-identical.
         self._last_remember_menu: Optional[list] = None
+
+        # R4: per-query freshness (Graft steal #2 -- ``--query-freshness``).
+        # Two halves live BEHIND this gate: (a) the loop-path synthesize
+        # appends ``CHECK_FRESHNESS_SCHEMA`` to the tool set (same new-list
+        # discipline as the ``remember``/``update_canvas`` appends above),
+        # and (b) the tracked unit-id set below gives the tool's no-args case
+        # its "your current context" semantics. The assembly-time STALE stamp
+        # (deliverable a) is gated on ``config.query_freshness_enabled``
+        # inside ``build_context_string`` instead so it also works for the
+        # external consumer / one-shot path. ``False`` (default) -> no schema
+        # append, no tracking writes, no stamp -> byte-identical.
+        self._query_freshness = bool(query_freshness)
+        # Tracked unit ids (episode/doc/scene/M) of the context ASSEMBLED last
+        # -- the tool's "your current context" id set. Mirror of the
+        # ``_current_query`` lifecycle: init None, set per query AFTER
+        # assembly, reset alongside ``_current_query`` on every return path.
+        # Internal per-query state (UNGATED): collecting ids is free (it reads
+        # the episode dicts already in hand) and observability-only, so the
+        # flag-off path never reads them -> byte-identical.
+        self._current_fresh_ids: Optional[list] = None
 
         # B4: Mermaid task canvas (``--task-canvas``). A structural short-term
         # task-state axis the fade cannot provide (fade is prose-only; R4 never
@@ -813,6 +835,7 @@ class PonderOrchestrator:
                 if self._dream_worker is not None:
                     self._dream_worker.foreground_busy.clear()
                 self._current_query = None
+                self._current_fresh_ids = None
                 return {
                     "response": ack,
                     "pending_consolidation_reviews":
@@ -829,6 +852,10 @@ class PonderOrchestrator:
         # early-return at the route gate below + the happy-path tail) so it never
         # leaks into the next query -- if a new return path is added, clear there.
         self._current_query = user_prompt
+        # R4: start the tracked-id set EMPTY for this query so a mid-query
+        # failure never leaks the PREVIOUS context's ids into the tool's
+        # no-args case (a stale-context answer would be worse than none).
+        self._current_fresh_ids = None
         # B4: reset the per-turn canvas state so a skipped/failed turn never
         # leaks the previous turn's active canvas / surfaced confirmation. The
         # L1.5 gate below re-sets ``_active_canvas_id`` (or leaves it ``None``
@@ -927,6 +954,7 @@ class PonderOrchestrator:
                 if self._dream_worker is not None:
                     self._dream_worker.foreground_busy.clear()
                 self._current_query = None
+                self._current_fresh_ids = None
                 return {
                     "response": None, "route": route, "retrieved_episodes": [],
                     "context_used": None, "chunked": None,
@@ -1116,6 +1144,29 @@ class PonderOrchestrator:
             query=user_prompt if self.ssm_chunker_gist_query_conditioned else None,
         )
 
+        # R4: record the tracked unit ids of THIS turn's assembled context (the
+        # ``check_freshness`` tool's no-args case). Ordered episodes carry
+        # ``episode_id`` (scene ids too when A3 keeps them in ``episodes`` --
+        # the scene_results subset only covers the ``self._scene_blocks`` case,
+        # so read ``episode_id`` off the union); M-node ids are NOT in
+        # ``episodes`` here (they come back inside the scene dict's sources
+        # when retrieved), so the tool's explicit ``unit_ids`` arg covers
+        # checking those. UNGATED (internal observability like
+        # ``_current_query``): a failed/id-less episode simply contributes
+        # nothing.
+        tracked_ids: list = []
+        for _ep in ordered_episodes:
+            _eid = _ep.get("episode_id")
+            if isinstance(_eid, str) and _eid:
+                tracked_ids.append(_eid)
+        if scene_results:
+            seen_ids = set(tracked_ids)
+            tracked_ids.extend(
+                s.get("episode_id") for s in scene_results
+                if isinstance(s.get("episode_id"), str)
+                and s.get("episode_id") and s.get("episode_id") not in seen_ids)
+        self._current_fresh_ids = tracked_ids
+
         # 8/9. format + dispatch on end state.
         # Reset the expand handler's per-query counter for the outcome signal.
         self.expand_handler.expand_count = 0
@@ -1262,6 +1313,15 @@ class PonderOrchestrator:
                 # when the loop is off (mirrors ``REMEMBER_SCHEMA``).
                 if _runtime_config.task_canvas_enabled:
                     loop_tools = [*loop_tools, UPDATE_CANVAS_SCHEMA]
+                # R4: append the ``check_freshness`` schema to a NEW list when
+                # ``--query-freshness`` is on (same new-list discipline as the
+                # appends above -- never mutate the module-level lists, so the
+                # flag-off path hands the model the exact prior tool set ->
+                # byte-identical). Loop-path-only: the one-shot path below
+                # never sees it, so ``check_freshness`` cannot be dispatched
+                # when the loop is off (mirrors ``REMEMBER_SCHEMA``).
+                if self._query_freshness:
+                    loop_tools = [*loop_tools, CHECK_FRESHNESS_SCHEMA]
                 # B2: when ``--drill-down`` is on, swap the ``search_memory``
                 # entry for the variant WITH the ``verbatim`` param (the
                 # conversation-vs-memory split). Build a NEW list -- never
@@ -1462,6 +1522,7 @@ class PonderOrchestrator:
         if self._dream_worker is not None:
             self._dream_worker.foreground_busy.clear()
         self._current_query = None
+        self._current_fresh_ids = None
         return result
 
     def _try_resolve_review(self, user_prompt: str) -> Optional[str]:
@@ -2035,6 +2096,57 @@ class PonderOrchestrator:
         except Exception as e:  # noqa: BLE001 - search is best-effort
             print(f"[search_memory-fail] {e}", file=sys.stderr)
             return ""
+
+    def check_freshness_context(
+        self, unit_ids: Optional[list] = None,
+    ) -> str:
+        """R4 per-query freshness -- the ``check_freshness`` tool's handler.
+
+        Runs the READ-ONLY structural staleness stat
+        (``GraphTraversal.check_freshness``, the unmarked sibling of R1's
+        ``_filter_stale_derived`` recheck: an episode is fresh iff its
+        supersession tip is itself; a scene / M-node is fresh iff every cited
+        source's tip is still that source (or is also cited)). NEVER writes
+        (no ``stale_since`` / ``stale_of`` marks -- those stay R1's write-side
+        job; a stat that wrote would fight the recheck's own bookkeeping).
+
+        ``unit_ids`` is the explicit list to check; ``None`` (no-args) checks
+        ``self._current_fresh_ids`` -- the units assembled into the LAST
+        context -- so the model can ask "is my context stale?" directly. Empty
+        either way -> nothing to check.
+
+        Returns a labeled ASCII text block (one line per id) or ``""`` when
+        the flag is off / there is nothing to check (``dispatch_tool`` turns
+        that into an honest error string). Best-effort at every stage: any
+        failure is logged and ``""`` returned (never raises; the outer
+        ``except`` in ``dispatch_tool`` is the final net). The R1-kept M-node
+        annotations (mark-driven) remain the ASSEMBLY-time surface; this tool
+        is the QUERY-TIME ask (works mark-free too).
+        """
+        if not self._query_freshness:
+            return ""
+        ids = list(unit_ids) if unit_ids else list(self._current_fresh_ids or [])
+        if not ids:
+            return ""
+        traversal = getattr(self.retriever, "traversal", None) \
+            if self.retriever is not None else None
+        if traversal is None or not hasattr(traversal, "check_freshness"):
+            return ""
+        try:
+            report = traversal.check_freshness(ids)
+        except Exception as e:  # noqa: BLE001 - best-effort report
+            print(f"[check-freshness-fail] {e}", file=sys.stderr)
+            return ""
+        lines = [f"[freshness] {len(report)} unit(s) checked"]
+        for eid in ids:
+            r = report.get(eid) or {"fresh": True,
+                                    "reasons": ["no report returned"]}
+            if r.get("fresh"):
+                lines.append(f"{eid}: fresh")
+            else:
+                reasons = "; ".join(r.get("reasons") or ())
+                lines.append(f"{eid}: STALE -- {reasons}")
+        return "\n".join(lines)
 
     def remember_menu(self) -> str:
         """Tier-2 recall menu -- the on-demand ``remember`` tool's handler.
