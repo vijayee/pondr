@@ -25,6 +25,11 @@ write"): the decider returns ``None`` (Bonsai down / parse fail / unrecognized
 action) OR ``skip`` -> the worker DEFERS, never writes a scene. CREATE/UPDATE/
 MERGE each apply atomically (one ``encode_scene``/``delete_scene`` batch each).
 MERGE deletes the source scene (D5) and is offered ONE pre-filtered target (D7).
+The DELETE is also a NOTES-PRESERVE invariant touchpoint (steal R5): before
+MERGE's source delete, the worker transfers the source's extra annotations to
+the surviving target (``store.transfer_scene_annotations``) -- eviction deletes
+everything (intended forgetting), regeneration must not lose what was written
+against the scene it supersedes.
 
 Failure semantics: a per-job exception is logged and the batch is skipped --
 the queue survives, the next turn still authors. Cold-start honest: ``None``
@@ -297,7 +302,17 @@ class SceneAuthoringWorker:
         # D5: delete the SOURCE scene (the topic's existing scene). The merged
         # body supersedes it; symmetric to fade consolidation's in-place replace.
         # No orphan edges (delete_scene is the symmetric-reversal chokepoint).
+        # NOTES-PRESERVE (steal R5): move the source's extra annotations onto
+        # the surviving target FIRST -- delete_scene is the only key-clearing
+        # path, so anything not transferred here would be destroyed with the
+        # superseded source. Eviction is the intentional-forgetting path and
+        # must NOT transfer.
         if existing is not None and existing.get("scene_id") != target_id:
+            moved = self._store.transfer_scene_annotations(
+                existing["scene_id"], target_id)
+            if moved:
+                print(f"[scene-annotations-move] {existing['scene_id']} -> "
+                      f"{target_id}: {' '.join(moved)}", file=sys.stderr)
             self._store.delete_scene(existing["scene_id"])
 
     # -- helpers --

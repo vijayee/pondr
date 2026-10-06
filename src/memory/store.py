@@ -83,6 +83,32 @@ _BOOST_MIN = 0.25
 _BOOST_MAX = 4.0
 
 
+# NOTES-PRESERVE invariant (steal R5): the scene-block standard content fields.
+# The extra fields ``scene_annotations``/``transfer_scene_annotations`` operate
+# on are everything under ``content/scene/{id}/`` NOT in this set. Kept in sync
+# with ``_scene_content_ops`` (which writes exactly these + optional
+# ``embedding``).
+_SCENE_STANDARD_FIELDS = {
+    "body", "topic", "heat", "updated_ts", "user_id", "source_eps", "embedding",
+}
+
+
+def _merge_annotation_values(dst_val: str, src_val: str) -> "Optional[str]":
+    """The transfer merge rule for one annotation field (see
+    ``transfer_scene_annotations``). Returns the value to put on dst, or
+    ``None`` for "no write" (already equal, or dst wins the conflict)."""
+    if dst_val == src_val:
+        return None  # already equal -> no-op
+    try:
+        dst_l = json.loads(dst_val)
+        src_l = json.loads(src_val)
+    except (ValueError, TypeError):
+        return None  # non-JSON or differing scalars -> dst wins
+    if isinstance(dst_l, list) and isinstance(src_l, list):
+        return json.dumps(list(dict.fromkeys(dst_l + src_l)))  # union, dst first
+    return None  # at most one is a list -> dst wins
+
+
 def safe_edge_component(part: str) -> str:
     """A graph-key path component, hashing any part containing ``/`` or NUL.
 
@@ -460,7 +486,15 @@ class HippocampalStore:
         effort (a vector-index hiccup must never fail an encode). Idempotent: re-
         encoding the same ``scene_id`` overwrites in place (``batch_sync`` puts
         replace); with ``topic`` held stable the ``has_topic``/``owned_by`` edges
-        are unchanged and only ``cites`` churns."""
+        are unchanged and only ``cites`` churns.
+
+        NOTES-PRESERVE invariant (steal R5): this method is PUT-ONLY over the
+        standard fields -- it never deletes or reads unknown keys, so extra
+        annotations (R1's ``stale_of``/``stale_since`` marks, future user
+        notes) survive a re-encode untouched. ``delete_scene`` is the ONLY
+        key-clearing path on a live scene; a regeneration delete (MERGE) must
+        call ``transfer_scene_annotations(src, dst)`` FIRST, while eviction
+        intentionally deletes everything."""
         ops = (self._scene_content_ops(scene_id, body, topic, heat, updated_ts,
                                        user_id, source_eps, body_embedding)
                + self._scene_edge_ops(scene_id, topic, user_id, source_eps, delete=False))
@@ -549,6 +583,81 @@ class HippocampalStore:
                                  "value": str(new_heat)}])
         except Exception:  # noqa: BLE001 - touch is best-effort, never breaks retrieval
             pass
+
+    # NOTES-PRESERVE invariant (steal R5, from Graft): a scene may carry extra
+    # content fields BEYOND the standard ones (``_SCENE_STANDARD_FIELDS``) --
+    # today R1's ``stale_of``/``stale_since`` marks, tomorrow user notes /
+    # system annotations. Rules:
+    #
+    # * ``encode_scene`` is PUT-ONLY over the standard fields -- it never deletes
+    #   or even reads unknown keys, so extras survive re-encoding (UPDATE).
+    # * ``delete_scene`` is the ONLY key-clearing path on a live scene -- and it
+    #   is called both for EVICTION (macro-forgetting: deleting everything,
+    #   annotations included, is INTENDED) and by ``SceneAuthoringWorker._merge``
+    #   (regeneration: the merged body supersedes the source). The regeneration
+    #   path MUST transfer annotations to the surviving scene FIRST
+    #   (``transfer_scene_annotations``); the eviction path must not.
+    #
+    # ``scene_annotations`` reads the extra set; ``transfer_scene_annotations``
+    # moves it src -> dst in one atomic batch.
+
+    def scene_annotations(self, scene_id: str) -> dict:
+        """Extra (non-standard) fields under ``content/scene/{scene_id}/...``.
+
+        The NOTES-PRESERVE reader (see the invariant block above). Returns
+        ``{field: raw string value}`` for every content key under the scene's
+        prefix EXCEPT the standard fields (``_SCENE_STANDARD_FIELDS``) and
+        anything containing a ``/`` (malformed -- never a field). Values are
+        returned raw (strings as stored); ``{}`` for an absent scene or a scene
+        with no extras."""
+        start = f"content/scene/{scene_id}/"
+        end = f"content/scene/{scene_id}/\x7f"
+        out: dict = {}
+        for k, v in self.db.create_read_stream(start=start, end=end):
+            field = k[len(start):]
+            if not field or field in _SCENE_STANDARD_FIELDS or "/" in field:
+                continue
+            out[field] = _b2s(v)
+        return out
+
+    def transfer_scene_annotations(self, src_id: str, dst_id: str) -> list:
+        """Move ``src_id``'s extra content fields onto ``dst_id`` in ONE atomic
+        batch -- the regeneration half of the NOTES-PRESERVE invariant (see the
+        invariant block above). Called BEFORE ``delete_scene(src_id)`` so the
+        merged/regenerated scene inherits the source's annotations. Returns the
+        sorted list of transferred field names (``[]`` = nothing to move).
+
+        Per-field semantics:
+
+        * dst key ABSENT -> copy the src value verbatim.
+        * BOTH values parse as JSON lists -> union merge (dst members first,
+          ``dict.fromkeys`` de-dup, src's additions appended -- e.g. two
+          ``stale_of`` marks union into one list).
+        * otherwise (conflict on a non-list value, or differing scalars) ->
+          the DST value wins (the surviving node's own view stands; the src
+          annotation was written against the now-superseded body).
+        Same-value skips are not transferred. An absent dst scene is fine (the
+        annotations land on the keys that will be part of it)."""
+        src_ann = self.scene_annotations(src_id)
+        if not src_ann:
+            return []
+        ops: list[dict] = []
+        transferred: list = []
+        for field in sorted(src_ann):
+            dst_key = f"content/scene/{dst_id}/{field}"
+            src_val = src_ann[field]
+            dst_raw = self.db.get_sync(dst_key)
+            if dst_raw is None:
+                new_val: "Optional[str]" = src_val  # dst absent -> verbatim copy
+            else:
+                new_val = _merge_annotation_values(_b2s(dst_raw), src_val)
+            if new_val is None:
+                continue  # no-op / dst wins the conflict
+            ops.append({"type": "put", "key": dst_key, "value": new_val})
+            transferred.append(field)
+        if ops:
+            self.db.batch_sync(ops)
+        return transferred
 
     def scene_ids_for_user(self, user_id: str) -> set:
         """All scene ids owned by a user (scan the ``owns_scene`` SPO index).
