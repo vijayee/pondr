@@ -577,6 +577,27 @@ def main() -> int:
                         "Historical canvases are reclaimed (never delete active, "
                         "floor 15, oldest-by-mtime). DEFAULT OFF -> no gate call / "
                         "tool / injection / reclaim -> byte-identical.")
+    p.add_argument("--decision-backend", default="bonsai",
+                   help="R8: decision-model backend for the five CLOSED-VOCAB "
+                        "decision call sites (A1 dedup 4-action, fade fidelity "
+                        "corruption noul, anomaly + contradiction fix/ask_user/"
+                        "dismiss, doc-kind classify). 'bonsai' (default) keeps "
+                        "all decisions on the local Bonsai 8B (byte-identical); "
+                        "any other value is an Ollama Jev decision-model name "
+                        "'clef-flash' / 'nimble' / 'tev1' / 'tev1:0.8b' (needs "
+                        "Ollama >=0.35.1 + the model pulled at "
+                        "--decision-endpoint) routed to the /v1/systemone "
+                        "typed-question endpoint. Generation (gist, scene "
+                        "bodies, ontology class proposals, task labels) STAYS "
+                        "Bonsai 8B. A down/unpulled model is a cold-start "
+                        "condition: decision calls defer / record-only (same "
+                        "contract as a down Bonsai), never crash -- the "
+                        "startup health check only warns.")
+    p.add_argument("--decision-endpoint", default=None,
+                   help="R8: the Ollama base URL serving the Jev decision "
+                        "model (default: DECISION_ENDPOINT, http://localhost:"
+                        "11434). Only used when --decision-backend is not "
+                        "'bonsai'.")
     p.add_argument("--stale-propagation", action="store_true", default=False,
                    help="R1 (Graft steal): supersede blast-radius propagation. "
                         "On supersession (dedup update/merge, reconcile, "
@@ -755,6 +776,14 @@ def main() -> int:
     # so set the global BEFORE build_ponder (build_ponder also sets it from its
     # param, covering direct callers). Default OFF -> byte-identical.
     _config.task_canvas_enabled = args.task_canvas
+    # R8: decision_backend is read at CONSTRUCT time by make_decider (the DI
+    # factory every decider wiring site uses) and decision_endpoint by
+    # JevDecider's ctor -- so set both globals BEFORE build_ponder (build_ponder
+    # also sets backend from its param, covering direct callers). Default
+    # 'bonsai' -> plain BonsaiDecider everywhere -> byte-identical.
+    _config.decision_backend = args.decision_backend
+    if args.decision_endpoint:
+        _config.decision_endpoint = args.decision_endpoint
     # R1: stale_propagation_enabled is read at call time by supersede_episode
     # (write side) AND GraphTraversal.retrieve (read side) -- so set the global
     # BEFORE build_ponder (build_ponder also sets it from its param, covering
@@ -1075,6 +1104,20 @@ def main() -> int:
     print(f"[load] drill_down={args.drill_down}", file=sys.stderr)
     print(f"[load] reclaim={args.reclaim}", file=sys.stderr)
     print(f"[load] task_canvas={args.task_canvas}", file=sys.stderr)
+    print(f"[load] decision_backend={args.decision_backend}", file=sys.stderr)
+    if args.decision_backend != "bonsai":
+        from src.gnn.jev_decider import JevDecider  # noqa: E402
+        _jev = JevDecider(jev_model=args.decision_backend,
+                          jev_endpoint=(args.decision_endpoint
+                                        or _config.decision_endpoint))
+        if _jev.jev_health_check():
+            print(f"[load] Jev decision model healthy: {_jev.jev_model} @ "
+                  f"{_jev.jev_endpoint}", file=sys.stderr)
+        else:
+            print(f"WARNING: --decision-backend={args.decision_backend} set "
+                  f"but nothing answers at {_jev.jev_endpoint}/v1/models "
+                  f"(is Ollama running and the model pulled?). Decision calls "
+                  f"will defer (record-only) until it is up.", file=sys.stderr)
     print(f"[load] query_freshness={args.query_freshness}", file=sys.stderr)
     if args.ssm_chunker_gist_backend == "mamba3":
         shared = (args.fade_memory and args.fade_memory_voice_backend == "mamba3")
@@ -1176,6 +1219,7 @@ def main() -> int:
         drill_down=args.drill_down,
         reclaim=args.reclaim,
         task_canvas=args.task_canvas,
+        decision_backend=args.decision_backend,
         ssm_chunker_gist_backend=args.ssm_chunker_gist_backend,
         ssm_chunker_gist_cue=args.ssm_chunker_gist_cue,
         ssm_chunker_gist_cue_preset=args.ssm_chunker_gist_cue_preset,

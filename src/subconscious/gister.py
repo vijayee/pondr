@@ -32,6 +32,7 @@ from typing import Optional
 from ..encoding.assertion_extractor import extract_state_assertions
 from ..encoding.bonsai_relations import BonsaiRelationExtractor
 from ..gnn.bonsai_decider import BonsaiDecider
+from ..gnn.jev_decider import make_decider
 
 
 @dataclass
@@ -121,7 +122,7 @@ def default_gister() -> BonsaiGister:
     their own ``__init__``; the HTTP call is lazy (one per ``gist``), so this is
     import-safe and constructible offline.
     """
-    return BonsaiGister(BonsaiRelationExtractor(), BonsaiDecider())
+    return BonsaiGister(BonsaiRelationExtractor(), make_decider())
 
 
 class BonsaiSceneAuthor:
@@ -152,9 +153,9 @@ class BonsaiSceneAuthor:
 def default_scene_author() -> BonsaiSceneAuthor:
     """Construct a ``BonsaiSceneAuthor`` from ``config.bonsai_*`` defaults.
 
-    Lazy convenience for ``build_ponder`` -- ``BonsaiDecider`` reads
-    ``config.bonsai_endpoint`` / ``bonsai_model`` / ``bonsai_temperature`` in
+    Lazy convenience for ``build_ponder`` -- the decider (Bonsai OR the R8
+    ``JevDecider`` per ``config.decision_backend``) reads its endpoints in
     its own ``__init__``; the HTTP call is lazy (one per ``author_scene``), so
     this is import-safe and constructible offline.
     """
-    return BonsaiSceneAuthor(BonsaiDecider())
+    return BonsaiSceneAuthor(make_decider())

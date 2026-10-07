@@ -65,6 +65,23 @@ class Config:
     bonsai_temperature: float = 0.1
     bonsai_n_ctx: int = 4096
 
+    # ── R8: decision-model backend (Jev typed-question API on Ollama) ──
+    # When "bonsai" (the default), every decider wiring site constructs a plain
+    # BonsaiDecider -- byte-identical to pre-R8. Any other value is treated as
+    # an Ollama Jev decision-model name ("clef-flash" / "nimble" / "tev1" /
+    # "tev1:0.8b"; requires Ollama >=0.35.1 and the model pulled) and routed to
+    # a JevDecider, whose CLOSED-VOCAB decision methods (judge_dedup_pairs,
+    # verify_fidelity, decide_anomaly, decide_contradiction, classify_doc_kind)
+    # call the /v1/systemone typed-question endpoint at decision_endpoint
+    # instead. DECISION call sites ONLY: generation (gist, consolidate_gist,
+    # author_scene bodies) and open-vocab judges (verify_typing's class
+    # proposals, judge_task_lifecycle's generated labels) STAY Bonsai 8B --
+    # see src/gnn/jev_decider.py for the method split. A down / unpulled model
+    # is a cold-start condition routing to the callers' defer/record-only
+    # fallbacks (identical contract to a down Bonsai), never a crash.
+    decision_backend: str = os.getenv("DECISION_BACKEND", "bonsai")
+    decision_endpoint: str = os.getenv("DECISION_ENDPOINT", "http://localhost:11434")
+
     # ── Encoding ──
     episode_salience_default: float = 0.5
     discovery_buffer_threshold: int = 10  # promote a discovered label after N occurrences

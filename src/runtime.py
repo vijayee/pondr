@@ -107,6 +107,7 @@ def build_ponder(
     drill_down: bool = False,
     reclaim: bool = False,
     task_canvas: bool = False,
+    decision_backend: Optional[str] = None,
     ssm_chunker_gist_backend: str = "topics",
     ssm_chunker_gist_cue: str = "Summary:",
     ssm_chunker_gist_cue_preset: Optional[str] = None,
@@ -411,6 +412,12 @@ def build_ponder(
     # no derived-node keys written, no recheck -> byte-identical.
     config.stale_propagation_enabled = stale_propagation
     config.query_freshness_enabled = query_freshness
+    # R8: the decision-model backend. The kwarg overrides for THIS build's
+    # five closure-decision sites (make_decider is called with it explicitly
+    # below); when it is None the config value (env DECISION_BACKEND, or the
+    # serve CLI's assignment) governs -- e.g. ``default_gister``'s decider.
+    if decision_backend is not None:
+        config.decision_backend = decision_backend
     if llm_telemetry:
         # Swap the module sink to a path-backed JSONL writer. The null sink
         # (default) records nothing, so flag-on-without-configure is a silent
@@ -513,16 +520,26 @@ def build_ponder(
     # so we don't have to thread the retriever/vector_search into the encoder
     # ctor. Off -> ``encoder._dedup_judge`` stays ``None`` -> ``_maybe_dedup``
     # early-returns -> byte-identical to pre-A1. The judge's decider is a fresh
-    # ``BonsaiDecider()`` (reads endpoint/model from config); its HTTP call is
+    # instance from ``make_decider`` (a plain ``BonsaiDecider`` by default, the
+    # ``JevDecider`` subclass per backend); its HTTP call is
     # lazy (one per encoded episode), and it carries the foreground ``pause_gate``
     # the DistillWorker installs so a background dedup call yields to queries.
+    # R8: one decision-backend source for the whole build. The backend value
+    # ("bonsai" default OR an Ollama Jev model name) selects the adapter -- a
+    # plain ``BonsaiDecider`` or the ``JevDecider`` subclass for the five
+    # closed-vocab decision methods (see src/gnn/jev_decider.py). Each site
+    # keeps its OWN fresh instance (mirroring the pre-R8 per-site pattern):
+    # the DistillWorker installs a pause_gate on the DEDUP instance only, and
+    # the B4 canvas gate must stay gate-free (a shared gated instance would
+    # deadlock the synchronous inline query() path).
+    from .gnn.jev_decider import make_decider
+
     if dedup and encoder is not None and retriever is not None:
         vs = getattr(retriever, "vector_search", None)
         if vs is not None:
-            from .gnn.bonsai_decider import BonsaiDecider
             from .encoding.dedup import DedupJudge
             encoder._dedup_judge = DedupJudge(
-                BonsaiDecider(), vs, store)
+                make_decider(decision_backend), vs, store)
 
     cfg = config_override or Phase2cConfig()
     if config_override is None:
@@ -752,9 +769,8 @@ def build_ponder(
     scene_worker = None
     if scene_blocks:
         from .subconscious.scene_worker import SceneAuthoringWorker
-        from .subconscious.gister import default_scene_author
         scene_worker = SceneAuthoringWorker(
-            store, default_scene_author().decider, embedder)
+            store, make_decider(decision_backend), embedder)
 
     # B4: the L1.5 task-canvas lifecycle gate's decider. Constructed ONLY when
     # ``task_canvas`` is on (the byte-identical-OFF gate: flag off -> no decider
@@ -768,8 +784,7 @@ def build_ponder(
     # matches the dedup path's ``BonsaiDecider()`` pattern.
     canvas_decider = None
     if task_canvas:
-        from .gnn.bonsai_decider import BonsaiDecider
-        canvas_decider = BonsaiDecider()
+        canvas_decider = make_decider(decision_backend)
 
     # Dream-state consolidation (Phase 3a, serve-wired): the previously
     # unwired path -- the serve loop never constructed the Consolidator and
@@ -806,10 +821,10 @@ def build_ponder(
                   "scripts/eval_consolidation_recall.py on a DB copy first; "
                   "the apply-time eval gate still bounds each pass.",
                   file=sys.stderr)
-        from .gnn.bonsai_decider import BonsaiDecider
         dream_worker = DreamWorker(
             store, checkpoint=ckpt_path, interval_s=dream_interval_s,
-            apply=dream_apply, device=device, decider=BonsaiDecider(),
+            apply=dream_apply, device=device,
+            decider=make_decider(decision_backend),
         )
 
     orch = PonderOrchestrator(
