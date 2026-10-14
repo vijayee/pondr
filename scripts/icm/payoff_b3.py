@@ -1,13 +1,16 @@
 """PAYOFF BENCHMARK B3 -- the weak thesis, trained, with every baseline armed.
 
-Pre-registered interpretation (BEFORE the run):
-    LOSS  (head fails to beat P1's misranking / any baseline)  -> the dense leg
-          is unemployed AND unemployable: the relevance/binding/expectation
-          edifice has no substrate. Final, valuable result.
-    WIN   -> the WEAK thesis only: a trained goal-conditioned head beats static
-          topical similarity. TERNARY dependence (same memory flips payoff
-          under a different goal) and INTENT-vs-stated-goal divergence remain
-          unbuilt -- the next benchmark's job. A win is a foundation.
+TWO-LINE LEDGER (the two theses are different bars -- do not collapse them):
+    WEAK  thesis (trained goal-conditioned head beats static topical similarity):
+          PROVEN -- 12/12 held-out vs raw-cosine 0/12, dense-only inputs.
+    STRONG thesis (dense beats every CHEAP leg -- irreducible to identity/value/
+          vocabulary): NOT PROVEN -- the lexical marker scorer TIED at 12/12; the
+          world's signal was lexically decidable.
+THE FIXED-POINT THEOREM (six collapses, one cause): an authored world's
+discriminator is a compact rule written by the author, hence ALWAYS reducible
+to the handles the author had (identity/value/vocabulary) -- engineered worlds
+cannot touch the strong thesis. v3 is cancelled pre-emptively; the next
+benchmark must be ORGANIC (real content, discriminators not authored).
 
 Competitors (the opponent set, pre-registered):
     raw-cosine    (untrained bge: query vs candidate)
