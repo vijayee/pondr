@@ -53,3 +53,33 @@ def test_tampered_label_fails_determinism(tmp_path):
     assert gate["verdict"] == "FAIL"
     assert gate["checks"]["g3_determinism"]["ok"] is False
     assert gate["checks"]["g3_determinism"]["value"] >= 1
+
+
+def test_inverted_severity_recover_fails_g4(tmp_path):
+    # violated labels land ONLY in the mildest world -> recovery order inverts
+    from icm.instrument import ICMSession, ExpectationDecl, OutcomeDecl
+    from icm.agent_pilot import SEV_LEVEL
+
+    db = str(tmp_path / "inverted")
+    planted = {}
+    with ICMLedger(db) as led:
+        for si, sev in enumerate(["healthy", "healthy", "warning", "broken"]):
+            sid = f"sess-{si}"
+            s = ICMSession(led, sid)
+            s.begin()
+            iid = s.declare_intent(f"task {si}", intent_id=f"int-{si}")
+            planted[iid] = sev
+            branches = {"desired": "ok", "feared": None, "default": "meh"}
+            for k in range(3):
+                eid = s.expect(ExpectationDecl(intent_id=iid, statement=f"check {k}",
+                                               branches=branches,
+                                               horizon={"kind": "manual"}),
+                               exp_id=f"exp-{si}-{k}")
+                # healthy sessions -> all violated; severe worlds -> confirmed
+                branch = "other" if sev == "healthy" else "desired"
+                s.resolve(OutcomeDecl(eid, f"obs {k}", branch, "env"),
+                          outcome_id=f"out-{si}-{k}")
+            s.finish()
+        gate = compute_gate_metrics(led, planted=planted, level_map=SEV_LEVEL)
+    assert gate["verdict"] == "FAIL"
+    assert gate["checks"]["g4_signal_recovery"]["ok"] is False

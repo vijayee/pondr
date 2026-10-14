@@ -26,13 +26,19 @@ DEFAULT_THRESHOLDS = {
     "coverage_min": 0.60,          # share of expectations resolved (not expired/pending)
     "minority_share_min": 0.05,    # violated labels present (not all-confirmed)
     "majority_share_max": 0.95,    # confirmed labels not vacuous-all
-    "recovery_corr_min": 0.80,     # corr(per-intent violated rate, planted drift)
+    "spread_min": 0.50,            # violated-rate(broken extreme) - violated-rate(calm extreme)
 }
+
+# Map a pilot's planted world-state names onto the severity axis used by g4,
+# ASCENDING order matters: groups must line up from mild to severe.
+DEFAULT_LEVEL_MAP = {"calm": 0.0, "partial": 0.5, "full": 1.0}
 
 
 def compute_gate_metrics(ledger: ICMLedger, planted: dict[str, str] | None = None,
-                         thresholds: dict | None = None) -> dict:
+                         thresholds: dict | None = None,
+                         level_map: dict[str, float] | None = None) -> dict:
     th = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+    level = dict(DEFAULT_LEVEL_MAP if level_map is None else level_map)
     expectations = list(ledger.records("expectation"))
     intents = {r["intent_id"]: r for r in ledger.records("intent")}
 
@@ -69,24 +75,44 @@ def compute_gate_metrics(ledger: ICMLedger, planted: dict[str, str] | None = Non
                    and all(e["resolution"].get("rule_version") == RULE_VERSION for e in resolved))
 
     # g4 signal recovery: per-intent violated rate vs planted drift level
-    recovery = {"evaluated": False, "correlation": None}
+    # g4 signal recovery: do the labels recover the planted severity ORDER?
+    # Point-level Pearson is structurally ~0.77 between a ~3-level xs and a
+    # binary ys even for a perfectly separated world -- so the GATE checks the
+    # hypothesis directly (group-mean violated rates monotone in severity +
+    # spread between the extremes), and reports the Pearson as a diagnostic.
+    recovery = {"evaluated": False, "correlation": None, "group_rates": None}
+    recovery_ok = False
     if planted is not None and n_res >= 4:
-        level = {"calm": 0.0, "partial": 0.5, "full": 1.0}
         xs, ys = [], []
+        group_acc: dict[str, list[float]] = {}
         for intent_id, world in planted.items():
             exps = [e for e in resolved if e["intent_id"] == intent_id]
             if not exps:
                 continue
             v = sum(1 for e in exps if e["resolution"]["congruence"] == Congruence.VIOLATED.value)
             if world not in level:
-                raise KeyError(f"unknown planted world state {world!r}")
+                raise KeyError(f"planted world state {world!r} missing from level_map "
+                               f"{sorted(level)}")
             xs.append(level[world])
             ys.append(v / len(exps))
-        recovery = {"evaluated": True, "n_intents": len(xs),
-                    "correlation": _pearson(xs, ys)}
-    corr = recovery.get("correlation")
-    recovery_ok = bool(recovery["evaluated"] and corr is not None
-                       and math.isfinite(corr) and corr >= th["recovery_corr_min"])
+            group_acc.setdefault(world, []).append(v / len(exps))
+        if len(xs) >= 2:
+            corr = _pearson(xs, ys)
+        else:
+            corr = None
+        group_rates = None
+        ordering_ok = None
+        spread = None
+        if group_acc:
+            group_rates = {w: round(sum(v) / len(v), 4) for w, v in
+                           sorted(group_acc.items(), key=lambda kv: level[kv[0]])}
+            rates = [group_rates[w] for w in group_rates]  # already severity-ascending
+            ordering_ok = all(a <= b + 1e-9 for a, b in zip(rates, rates[1:]))
+            if len(rates) >= 2:
+                spread = rates[-1] - rates[0]
+        recovery = {"evaluated": True, "correlation": None if corr is None or not math.isfinite(corr) else round(corr, 4),
+                    "group_rates": group_rates}
+        recovery_ok = bool(ordering_ok and spread is not None and spread >= th["spread_min"])
 
     checks = {
         "g1_coverage": {"ok": coverage >= th["coverage_min"], "value": round(coverage, 4),
