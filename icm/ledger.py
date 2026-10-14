@@ -34,9 +34,8 @@ import uuid
 
 import wavedb
 
-wavedb.set_quiet(True)
-
-from icm.congruence import Congruence, evaluate_congruence, validate_branches  # noqa: E402
+from icm.congruence import (Congruence, RESIDUE_VALUES, evaluate_congruence,  # noqa: E402
+                            validate_branches)
 
 HORIZON_KINDS = ("step", "time", "manual")
 STATUS_PENDING, STATUS_RESOLVED, STATUS_EXPIRED = "pending", "resolved", "expired"
@@ -63,8 +62,13 @@ def _parse(raw: bytes, key: str) -> dict:
 class ICMLedger:
     """Sync-only expectation ledger on WaveDB (KV subtree + graph links)."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, quiet: bool = True):
         os.makedirs(db_path, exist_ok=True)
+        # quiet=False streams WaveDB's C-layer logs (WAL recovery, compaction,
+        # eviction) -- diagnostics runs should stay LOUD: the recovery lines
+        # ("Read N manifest entries / Found N WAL files") are the state
+        # transition record when data loss needs forensics.
+        wavedb.set_quiet(quiet)
         self._db = wavedb.WaveDB(db_path)
         self._store = self._db.open_subtree("icm")
         self._graph = wavedb.GraphLayer("icm", self._db)
@@ -134,11 +138,23 @@ class ICMLedger:
         self.put("session", rec)
         return rec
 
-    def put_intent(self, intent_id: str, session_id: str, aim: str, created_step: int = 0) -> dict:
+    def put_intent(self, intent_id: str, session_id: str, aim: str,
+                   created_step: int = 0, slots: dict | None = None) -> dict:
+        """slots = S-P-O decomposition (docs/Intent_Subject_Predicate_Object_Schema.md):
+        {subject, attitude, relation, object, residue, propositions, slot_version}.
+        residue == "underspecified" marks an OPEN intent -- an object that does
+        not yet exist, i.e. a prospect to be checked, not a malformed record."""
         if not aim:
             raise LedgerError("intent aim must be non-empty")
+        if slots is not None:
+            residue = slots.get("residue")
+            if residue is not None and residue not in RESIDUE_VALUES[1:]:
+                raise LedgerError(f"residue {residue!r} not in {RESIDUE_VALUES[1:]}")
         rec = {"intent_id": intent_id, "session_id": session_id, "aim": aim,
                "status": "active", "created_step": created_step, "created_ts": time.time()}
+        if slots is not None:
+            rec["slots"] = dict(slots)
+            rec["open_object"] = slots.get("residue") == "underspecified"
         self.put("intent", rec)
         self._graph.insert_sync(f"intent:{intent_id}", "is_a", "Intent")
         return rec

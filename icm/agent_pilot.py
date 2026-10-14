@@ -25,6 +25,17 @@ import random
 from icm.instrument import ICMSession, OutcomeDecl
 from icm.ledger import ICMLedger
 
+
+def _slots_of(policy, decl, task):
+    """Two-call slots: second extraction AFTER the declaration is recorded's
+    shape was decided -- best effort, metadata only."""
+    try:
+        s = policy.declare_slots(decl.intent, decl.statement, task)
+    except Exception:
+        return None
+    return s.to_slots() if s is not None else None
+
+
 SEVERITIES = ("healthy", "warning", "broken")
 SEV_LEVEL = {"healthy": 0.0, "warning": 0.5, "broken": 1.0}
 SEV_OUTCOME_P = {
@@ -90,7 +101,7 @@ def run_agent_pilot(db_path: str, policy, n_sessions: int = 30, seed: int = 7,
                 sess.finish(close_status="abandoned")
                 return {"sessions": n_sessions, "planted": planted, "seed": seed,
                         "error": f"policy declare failed at session {si}: {e!r}"}
-            sess.declare_intent(d1.intent, intent_id=intent_id)
+            sess.declare_intent(d1.intent, intent_id=intent_id, slots=_slots_of(policy, d1, task))
             planted[intent_id] = (severity, task)
 
             if rng.random() < expire_frac:

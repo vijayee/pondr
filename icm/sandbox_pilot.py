@@ -20,6 +20,17 @@ import random
 
 from icm.instrument import ICMSession, OutcomeDecl
 from icm.ledger import ICMLedger
+
+
+def _slots_of(policy, decl, task):
+    """Two-call slots: second extraction AFTER the declaration is recorded's
+    shape was decided -- best effort, metadata only."""
+    try:
+        s = policy.declare_slots(decl.intent, decl.statement, task)
+    except Exception:
+        return None
+    return s.to_slots() if s is not None else None
+
 from icm.sandbox_env import SandboxEnv, BRANCH_FOR_EVENT, FIXTURES, classify_run
 
 TASK_TEMPLATE = "Ingest dataset {name} into the sandbox, write its manifest, and verify the checksum."
@@ -44,7 +55,7 @@ def run_sandbox_pilot(db_path: str, policy, sandbox_root: str, n_sessions: int =
 
             d1 = policy.declare(task)
             intent_id = f"int-{si:03d}"
-            sess.declare_intent(d1.intent, intent_id=intent_id)
+            sess.declare_intent(d1.intent, intent_id=intent_id, slots=_slots_of(policy, d1, task))
             sess.step()
             e1_id = sess.expect(d1.to_expectation_decl(intent_id), exp_id=f"sx-{si:03d}-e1")
 

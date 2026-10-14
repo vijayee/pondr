@@ -21,6 +21,10 @@ RULE_VERSION = "icm-congruence/1"
 # only on the observation side and always means "something unpredicted happened".
 BRANCHES = ("desired", "feared", "default")
 
+# The fixed residue vocabulary for intent S-P-O slots
+# (docs/Intent_Subject_Predicate_Object_Schema.md sec 7; None = no leak).
+RESIDUE_VALUES = (None, "state_intent", "avoid_intent", "underspecified", "other")
+
 
 class Congruence(Enum):
     CONFIRMED = "confirmed"

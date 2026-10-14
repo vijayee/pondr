@@ -64,9 +64,11 @@ class ICMSession:
         self._step += 1
         return self._step
 
-    def declare_intent(self, aim: str, intent_id: str | None = None) -> str:
+    def declare_intent(self, aim: str, intent_id: str | None = None,
+                       slots: dict | None = None) -> str:
         intent_id = intent_id or self.ledger.new_id("int")
-        self.ledger.put_intent(intent_id, self.session_id, aim, created_step=self._step)
+        self.ledger.put_intent(intent_id, self.session_id, aim,
+                               created_step=self._step, slots=slots)
         self._open_intents.append(intent_id)
         return intent_id
 

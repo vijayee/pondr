@@ -130,3 +130,30 @@ def test_persistence_across_reopen(tmp_path):
         assert exp["resolution"]["congruence"] == Congruence.CONFIRMED.value
         assert led2.ids("expectation") == ["exp-r"]
         assert [r["exp_id"] for r in led2.records("expectation")] == ["exp-r"]
+
+
+def test_intent_slots_and_open_object(ledger, session):
+    slots = {"slot_version": "spo-decl/1", "subject": "SELF", "attitude": "intend",
+             "relation": "ingest", "object": "fixture manifest verified",
+             "residue": None, "propositions": 1}
+    session.declare_intent("ingest fixture", intent_id="int-s1", slots=slots)
+    rec = ledger.get("intent", "int-s1")
+    assert rec["slots"]["subject"] == "SELF"
+    assert rec.get("open_object") is False
+
+
+def test_underspecified_residue_marks_open_object(ledger, session):
+    slots = {"subject": "SELF", "attitude": "maintain", "relation": "improve",
+             "object": "...", "residue": "underspecified", "propositions": 2}
+    session.declare_intent("make things better", intent_id="int-s2", slots=slots)
+    rec = ledger.get("intent", "int-s2")
+    assert rec.get("open_object") is True
+
+
+def test_bad_residue_rejected(ledger, session):
+    with pytest.raises(LedgerError):
+        session.declare_intent("aim", intent_id="int-s3",
+                               slots={"subject": "SELF", "attitude": "intend",
+                                      "relation": "do", "object": "x",
+                                      "residue": "without affecting production",
+                                      "propositions": 1})

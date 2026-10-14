@@ -56,7 +56,9 @@ def main() -> int:
     print(f"[run] harvested in {time.time()-t0:.0f}s", flush=True)
 
     event_by_session = {r["session"]: r["event_class"] for r in summary["session_log"]}
-    with ICMLedger(args.db_path) as ledger:
+    # LOUD: any WAL recovery / compaction event during post-run reads writes
+    # its explanation into the run log (forensics beats a quiet crash).
+    with ICMLedger(args.db_path, quiet=False) as ledger:
         exps = list(ledger.records("expectation"))
         e1 = [e for e in exps if e["exp_id"].endswith("-e1") and e["status"] == "resolved"]
         e2 = [e for e in exps if e["exp_id"].endswith("-e2") and e["status"] == "resolved"]
