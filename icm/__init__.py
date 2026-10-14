@@ -21,9 +21,11 @@ from icm.ledger import ICMLedger, LedgerError  # noqa: F401
 from icm.instrument import ExpectationDecl, ICMSession, OutcomeDecl, events_to_outcomes  # noqa: F401
 from icm.gate import compute_gate_metrics  # noqa: F401
 from icm.pilot import run_pilot  # noqa: F401
+from icm.episodic import EpisodicStore, FORGET_RULE_VERSION, gist_of  # noqa: F401
 
 __all__ = [
     "BRANCHES", "RULE_VERSION", "Congruence", "CongruenceError", "CongruenceResult",
     "evaluate_congruence", "ICMLedger", "LedgerError", "ExpectationDecl", "ICMSession",
     "OutcomeDecl", "events_to_outcomes", "compute_gate_metrics", "run_pilot",
+    "EpisodicStore", "FORGET_RULE_VERSION", "gist_of",
 ]

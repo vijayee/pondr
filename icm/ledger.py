@@ -39,9 +39,10 @@ from icm.congruence import (Congruence, RESIDUE_VALUES, evaluate_congruence,  # 
 
 HORIZON_KINDS = ("step", "time", "manual")
 STATUS_PENDING, STATUS_RESOLVED, STATUS_EXPIRED = "pending", "resolved", "expired"
-RECORD_KINDS = ("session", "intent", "expectation", "outcome")
+RECORD_KINDS = ("session", "intent", "expectation", "outcome", "episode")
 ID_KEYS = {"session": "session_id", "intent": "intent_id",
-           "expectation": "exp_id", "outcome": "outcome_id"}
+           "expectation": "exp_id", "outcome": "outcome_id",
+           "episode": "episode_id"}
 
 
 class LedgerError(ValueError):
@@ -73,12 +74,17 @@ class ICMLedger:
         self._store = self._db.open_subtree("icm")
         self._graph = wavedb.GraphLayer("icm", self._db)
         self._ids: dict[str, list[str]] = {k: [] for k in RECORD_KINDS}
+        self._extra_closers: list = []   # layers that must close BEFORE db
         raw = self._get_raw("index/ids")
         if raw is not None:
             try:
                 self._ids = json.loads(raw)
             except Exception as e:
                 raise LedgerError(f"corrupt id index: {e}") from e
+
+    def register_close(self, closer) -> None:
+        """Layer close contracts run BEFORE db.close (subtrees-first order)."""
+        self._extra_closers.append(closer)
 
     # ---- low-level ----
 
@@ -115,6 +121,18 @@ class ICMLedger:
             if rec is None:
                 raise LedgerError(f"index lists {kind}/{rec_id} but record is missing")
             yield rec
+
+    def count(self, kind: str) -> int:
+        return len(self._ids[kind])
+
+    def delete_record(self, kind: str, rec_id: str) -> None:
+        """Remove a record's KV key and registry entry (registry is the
+        enumeration source, so both must go, or records() raises)."""
+        if rec_id not in self._ids[kind]:
+            raise LedgerError(f"{kind}/{rec_id} not in registry")
+        self._ids[kind].remove(rec_id)
+        self._put_raw("index/ids", _canonical(self._ids))
+        self._db.del_sync(self.rec_key(kind, rec_id))
 
     def put(self, kind: str, rec: dict) -> None:
         """Direct record write with id/key/registry invariants enforced."""
@@ -254,6 +272,9 @@ class ICMLedger:
     # ---- lifecycle ----
 
     def close(self) -> None:
+        for closer in self._extra_closers:
+            closer()
+        self._extra_closers.clear()
         self._store.close()
         self._graph.close()
         self._db.close()
