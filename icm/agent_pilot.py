@@ -76,11 +76,13 @@ def sample_outcome(severity: str, rng: random.Random) -> str:
 
 
 def run_agent_pilot(db_path: str, policy, n_sessions: int = 30, seed: int = 7,
-                    expire_frac: float = 0.10) -> dict:
+                    expire_frac: float = 0.10, store=None, ledger=None) -> dict:
     """policy: any object with .declare(task, prior_observations=None) -> AgentDeclaration."""
     rng = random.Random(seed)
-    os.makedirs(db_path, exist_ok=True)
-    ledger = ICMLedger(db_path)
+    own_ledger = ledger is None
+    if own_ledger:
+        os.makedirs(db_path, exist_ok=True)
+        ledger = ICMLedger(db_path)
     planted: dict[str, tuple[str, str]] = {}  # intent -> (severity, task)
     try:
         for si in range(n_sessions):
@@ -132,9 +134,15 @@ def run_agent_pilot(db_path: str, policy, n_sessions: int = 30, seed: int = 7,
                          outcome_id=f"aout-{si:03d}-e1")
             sess.resolve(OutcomeDecl(e2_id, outcome_text, final_branch, "env"),
                          outcome_id=f"aout-{si:03d}-e2")
+            if store is not None:
+                store.capture(session_id, intent_id,
+                              f"Task: {task} || Mid-run evidence: {SEV_EVIDENCE[severity]} || "
+                              f"Outcome: {outcome_text}",
+                              expectation_ids=[e1_id, e2_id])
             sess.finish()
     finally:
-        ledger.close()
+        if own_ledger:
+            ledger.close()
     return {"sessions": n_sessions, "planted": planted, "seed": seed}
 
 

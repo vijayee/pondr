@@ -4,6 +4,7 @@ vacuity guard catches a perfectly-clean world."""
 
 import os
 import sys
+import time
 
 import pytest
 
@@ -16,6 +17,15 @@ LEVEL_MAP = {"clean": 0.0, "degraded": 0.5, "hardfail": 1.0, "other": 1.0}
 
 sys.path.insert(0, "tests")
 from test_icm_agent_pilot import ScriptedPolicy  # noqa: E402
+
+
+@pytest.fixture
+def ledger(tmp_path):
+    from icm.ledger import ICMLedger
+
+    led = ICMLedger(str(tmp_path / "loop_db"))
+    yield led
+    led.close()
 
 
 def test_classify_run_mapping():
@@ -82,3 +92,38 @@ def test_sandbox_pilot_flaky_world_harvest_flow(tmp_path):
         gate = compute_gate_metrics(led, planted=planted, level_map=LEVEL_MAP)
     assert gate["checks"]["g1_coverage"]["value"] > 0.9
     assert gate["checks"]["g4_signal_recovery"]["evaluated"]
+
+def test_pilot_capture_loop_closes_memory(ledger, tmp_path):
+    """Loop closure: episodes written by the REAL pilot (not seeded), linked
+    to the session's expectations; the forget pass then treats them by their
+    congruence (hardfail sessions' episodes = violated -> vivid; clean -> blur)."""
+    from icm.episodic import EpisodicStore
+    from test_icm_episodic import StubEmbedder
+
+    # single substrate: the store SHARES the pilot's ledger (the violation
+    # labels and episodes must live on one WaveDB for the forget pass to see them)
+    real_store = EpisodicStore(ledger, StubEmbedder(), dim=384,
+                               blur_horizon_days=7.0, drop_horizon_days=30.0)
+    summary = run_sandbox_pilot("unused", ScriptedPolicy(),
+                                str(tmp_path / "sandbox2"), n_sessions=9, seed=11,
+                                probe_fail_p=0.5, store=real_store, ledger=ledger)
+    # pretend episodes are 40d old (past the blur horizon) so the forget
+    # pass engages on every one
+    old = time.time() - 40 * 86400
+    for rec in list(ledger.records("episode")):
+        rec["created_ts"] = old
+        ledger.put("episode", rec)
+    # a fresh episode must exist for every session
+    assert ledger.count("episode") == 9
+    texts = [r["text"] for r in ledger.records("episode")]
+    assert any("Task:" in t and "Observed:" in t for t in texts)
+    # expectations from those episodes ARE the pilot's (both e1, e2 per session)
+    eids = {r["episode_id"] for r in ledger.records("episode")}
+    assert len(eids) == 9
+    maintain = real_store.maintain(now_ts=time.time())
+    hardfails = [r for r in summary["session_log"] if r["event_class"] == "hardfail"]
+    if hardfails:
+        # their sessions' episodes should be vivid (violated -> unpredictable observed branch)
+        vivid = [(r["episode_id"], r["fidelity"]) for r in ledger.records("episode")
+                 if r["fidelity"] == "full"]
+        assert maintain["kept_vivid"] >= len(hardfails), (maintain, hardfails)

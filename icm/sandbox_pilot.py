@@ -37,12 +37,15 @@ TASK_TEMPLATE = "Ingest dataset {name} into the sandbox, write its manifest, and
 
 
 def run_sandbox_pilot(db_path: str, policy, sandbox_root: str, n_sessions: int = 16,
-                      seed: int = 7, probe_fail_p: float = 0.35) -> dict:
+                      seed: int = 7, probe_fail_p: float = 0.35,
+                      store=None, ledger=None) -> dict:
     """policy: object with .declare(task, prior_observations=None) -> AgentDeclaration."""
     rng = random.Random(seed)
     env = SandboxEnv(sandbox_root, seed=seed, probe_fail_p=probe_fail_p)
-    os.makedirs(db_path, exist_ok=True)
-    ledger = ICMLedger(db_path)
+    own_ledger = ledger is None
+    if own_ledger:
+        os.makedirs(db_path, exist_ok=True)
+        ledger = ICMLedger(db_path)
     session_log: list[dict] = []
     try:
         names = list(FIXTURES)
@@ -101,10 +104,15 @@ def run_sandbox_pilot(db_path: str, policy, sandbox_root: str, n_sessions: int =
                          outcome_id=f"sxo-{si:03d}-e1")
             sess.resolve(OutcomeDecl(e2_id, outcome_text, branch, "env"),
                          outcome_id=f"sxo-{si:03d}-e2")
+            if store is not None:
+                store.capture(session_id, intent_id,
+                              f"Task: {task} || Observed: {outcome_text}",
+                              expectation_ids=[e1_id, e2_id])
             sess.finish()
             session_log.append({"session": session_id, "event_class": event_class,
                                 "branch": branch, "probe_steps": len(probe_events)})
     finally:
-        ledger.close()
         env.wipe()
+        if own_ledger:
+            ledger.close()
     return {"sessions": n_sessions, "seed": seed, "session_log": session_log}
