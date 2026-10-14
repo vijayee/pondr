@@ -264,11 +264,13 @@ def main() -> int:
                                         "AMBIGUOUS") if spear_mean is not None else
                                        "NOT MEASURED (insufficient candidates)"},
     }
-    path = os.path.join("data", "_scratch", "icm", "organic_500q_results.json")
+    path = os.path.join("data", "_scratch", "icm",
+                        f"organic_500q_results_o{OFFSET}.json")
     with io.open(path, "w", encoding="utf-8") as f:
         f.write(json.dumps(out, indent=2))
     # also the per-row rows for the training corpus
-    path2 = os.path.join("data", "_scratch", "icm", "organic_500q_rows.json")
+    path2 = os.path.join("data", "_scratch", "icm",
+                         f"organic_500q_rows_o{OFFSET}.json")
     with io.open(path2, "w", encoding="utf-8") as f:
         f.write(json.dumps(spear_rows, indent=2))
     print(json.dumps({k: v for k, v in out.items() if k != "per_q"}, indent=2))
