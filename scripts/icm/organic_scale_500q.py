@@ -46,7 +46,7 @@ HARNESS = r"C:\Users\victor morrow\Git-projects\memory_and_context_eval_harness"
 FULL500 = os.path.join(HARNESS, "datasets", "longmemeval", "longmemeval_interleaved_full.json")
 ANSWERER = "deepseek-v4.1-flash:cloud"
 JUDGE = "kimi-k3:cloud"
-OFFSET = 50  # questions 50-99 of the full file (disjoint from the 50-record slice)
+OFFSET = None  # --offset arg; disjoint ranges per chained harvest
 
 
 def ask_retry(policy, question, memory_block):
@@ -107,14 +107,18 @@ def _embedder(texts):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", type=int, default=50)
-    ap.add_argument("--db-path", type=str,
-                    default=os.path.join("data", "_scratch", "icm", "organic500"))
+    ap.add_argument("--offset", type=int, default=50,
+                    help="start position in the 500-record file (disjoint ranges per run)")
+    ap.add_argument("--db-path", type=str, default=None)
     args = ap.parse_args()
+    if args.db_path is None:
+        args.db_path = os.path.join("data", "_scratch", "icm", f"organic_o{args.offset}")
     policy_ans = DeepSeekAgentPolicy(model=ANSWERER)
     policy_j = DeepSeekAgentPolicy(model=JUDGE)
     shutil.rmtree(args.db_path, ignore_errors=True)
 
     data = json.load(io.open(FULL500, encoding="utf-8"))
+    OFFSET = args.offset
     qs = data[OFFSET: OFFSET + args.questions]
     print(f"[load] {len(qs)} new questions from the 500-record file (offset {OFFSET})", flush=True)
 
@@ -144,17 +148,34 @@ def main() -> int:
     results = {"none": [], "retrieval": [], "distractor": [], "gold": []}
     spear_rows = []
     offset = OFFSET
+    ckpt_path = os.path.join(os.path.dirname(args.db_path), f"organic500_ckpt_o{OFFSET}.jsonl")
+    done_qi = set()
+    if os.path.exists(ckpt_path):
+        with io.open(ckpt_path, encoding="utf-8") as cf:
+            for line in cf:
+                line = line.strip()
+                if line:
+                    try:
+                        prev = json.loads(line)
+                        done_qi.add(prev["qi"])
+                        for arm in ("none", "retrieval", "distractor", "gold"):
+                            if arm in prev:
+                                results[arm].append(prev[arm])
+                        spear_rows.append({"qi": prev["qi"],
+                                           "spearman": prev.get("spearman"),
+                                           "cand_scores": prev.get("cand_scores", [])})
+                    except Exception:
+                        continue
+        print(f"[resume] checkpoint has {len(done_qi)} done questions; skipping them", flush=True)
     try:
         for qi, rec in enumerate(qs):
+            if OFFSET + qi in done_qi:
+                continue
             q = rec["question"]
             gold_ans = rec["answer"]
             gold_sids = set(rec["answer_session_ids"])
             gold_ep_ids = [i for i in led.ids("episode") if
                            any(sid in i for sid in gold_sids)]
-            gold_text = "\n".join(texts_by_id[i] for i in gold_ep_ids
-                                  if i in (led.get("episode", i) or {}).get("episode_id", "")
-                                  ) if False else None
-            # simpler: get the gold episode's text directly
             gold_blocks = [led.get("episode", i)["text"] for i in gold_ep_ids
                            if led.get("episode", i)]
             gold_block = "\n".join(gold_blocks) if gold_blocks else None
@@ -165,17 +186,16 @@ def main() -> int:
 
             # organic distractor: another question's gold session (highest question-similarity)
             others = [o for o in range(len(qs)) if o != qi]
-            best = max(others, key=lambda o: difflib.SequenceMatcher(
-                None, q.lower(), qs[o]["question"].lower()).ratio())
-            d_ep_ids = [i for i in led.ids("episode")
-                        if i.startswith(f"lsess-{OFFSET + o}")
-                        and any(sid in i for sid in qs[o]["answer_session_ids"])
-                        for o in []] if False else []
-            d_qid = OFFSET + best
-            d_blocks = [led.get("episode", i)["text"] for i in led.ids("episode")
-                        if i.startswith(f"lsess-{d_qid}-") and
-                        any(sid in i for sid in qs[best]["answer_session_ids"])]
-            distractor_block = "\n".join(d_blocks) if d_blocks else None
+            if others:
+                best = max(others, key=lambda o: difflib.SequenceMatcher(
+                    None, q.lower(), qs[o]["question"].lower()).ratio())
+                d_qid = OFFSET + best
+                d_blocks = [led.get("episode", i)["text"] for i in led.ids("episode")
+                            if i.startswith(f"lsess-{d_qid}-") and
+                            any(sid in i for sid in qs[best]["answer_session_ids"])]
+                distractor_block = "\n".join(d_blocks) if d_blocks else None
+            else:
+                distractor_block = None
 
             arms = {
                 "none": None,
@@ -212,6 +232,9 @@ def main() -> int:
                     js = [s for _, s in cand_scores]
                     rho = spearmanr(js, cos_scores)
                     spear_rows[-1]["spearman"] = round(float(rho.statistic), 3) if hasattr(rho, "statistic") else round(float(rho[0]), 3)
+            with io.open(ckpt_path, "a", encoding="utf-8") as cf:
+                cf.write(json.dumps(row | {"spearman": spear_rows[-1].get("spearman"),
+                                           "cand_scores": spear_rows[-1].get("cand_scores")}) + "\n")
             print(f"[q {OFFSET + qi}] none={row['none']} ret={row['retrieval']} "
                   f"dist={row['distractor']} gold={row['gold']}", flush=True)
     finally:
