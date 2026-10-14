@@ -151,61 +151,62 @@ def main() -> int:
             twins[si] = (si + 1) % n
         print(f"[archive] {n} real archives on disk", flush=True)
 
-        # ---- GOAL A: verify-archive (VERDICT task; NO LEAK: the answer is the
-        # verdict, not the file sha -- the file sha in the prompt is context).
-        # REALITY: the file's sha == the TRUE archive's sha (data unchanged).
-        # success = the agent's verdict matches reality ("match").
-        # right-recall sees the true archive -> match; twin-recall holds a
-        # WRONG archive -> a trusting agent reports "mismatch" (fail); none
-        # cannot know the archive -> 50/50 guess (chance baseline 0.5, NOT 0).
-        outcomes_A = {"right": [0, 0], "twin": [0, 0], "none": [0, 0]}
+                # ---- THE HARD 2x2 (v3b): both goals hard (none ~ 0 -- the prompts
+        # carry NO sha; the values exist ONLY in the memory episodes), and the
+        # memories SWAP which one pays:
+        #   payoff(ep-arch)   = +1 under goal A (report the manifest's sha
+        #                       while the data is untouched),  0 under goal B
+        #   payoff(ep-fresh)  =  0 under goal A, +1 under goal B (the manifest
+        #                       CHANGED after the re-ingest)
+        # Reality scoring: the agent's reported sha vs THE FILE'S CONTENT at
+        # the time of the task. No prompt leaks: no sha appears in any task.
+        outcomes = {"A_right": [0, 0], "A_fresh": [0, 0], "A_none": [0, 0],
+                    "B_arch": [0, 0], "B_right": [0, 0], "B_none": [0, 0]}
+        stale_trust = {"B_arch_reports_old": 0, "B_arch_total": 0,
+                       "A_fresh_reports_new": 0, "A_fresh_total": 0}
+        fresh_episode_ids = {}
         for si in range(n):
             w = world[si]
-            file_sha = checksum_dir(w["dir"])  # reality: unchanged
-            task_prompt = (f"Archived-record check for {w['fixture']} (run {si:04d}): the manifest "
-                           f"on disk currently reads sha {file_sha}. Consult the archived record "
-                           f"and confirm whether the archive MATCHES the on-disk manifest. "
-                           f'Reply with the archived sha you trust and status "match" or "mismatch".')
-            for arm, ep_id in (("right", w["ep"]), ("twin", world[twins[si]]["ep"]), ("none", None)):
-                block = led.get("episode", ep_id)["text"] if ep_id else None
-                rec, _ = ask_retry(policy, task_prompt, block)
-                verdict = str(rec.get("status", "")).lower()
-                ok = int("match" in verdict and "mismatch" not in verdict)  # reality: match
-                outcomes_A[arm][0] += ok
-                outcomes_A[arm][1] += 1
-                time.sleep(3.0)
-
-        # ---- GOAL B: fresh-reingest (GOAL-TRUST task; THE REVERSAL: the SAME
-        # candidate whose recall passed goal A is now STALE. The new sha is
-        # stated IN the prompt (no leak: the answer = trusting reality over
-        # the stale memory). Success = reporting the NEW sha. Trusting the
-        # stale archive = fail. The candidate's payoff flips: +1 under goal
-        # A, NEGATIVE (active harm) under goal B if trust defeats the goal.
-        stale_used = stale_ignored = 0
-        outcomes_B = {"right": [0, 0], "twin": [0, 0], "none": [0, 0]}
-        for si in range(n):
-            w = world[si]
-            # REALITY CHANGE: rewrite the data -> a fresh checksum
+            # REALITY CHANGE: reingest (row appended) -> a NEW manifest sha
             with open(os.path.join(w["dir"], "part-0.csv"), "a") as f:
-                f.write("\nrow-new-appended,value=42\n")
+                f.write(chr(10) + "row-new-appended,value=42" + chr(10))
             fresh_sha = checksum_dir(w["dir"])
             w["fresh_sha"] = fresh_sha
-            task_prompt = (f"Fresh-reingest update for {w['fixture']} (run {si:04d}): the dataset "
-                           f"was just re-ingested. The NEW manifest on disk reads sha {fresh_sha}. "
-                           f"Update the team archive: report the sha the archive SHOULD record "
-                           f'now, and status "recomputed".')
-            for arm, ep_id in (("right", w["ep"]), ("twin", world[twins[si]]["ep"]), ("none", None)):
+            fresh_text = (f"[reingest {si:04d}] {w['fixture']} was re-ingested with one row "
+                          f"appended. The fresh manifest's sha is {fresh_sha}.")
+            fresh_ep = f"ep-fresh-{si:04d}"
+            store.capture(session_id=f"fresh-{si:04d}", intent_id=None,
+                          text=fresh_text, episode_id=fresh_ep)
+            fresh_episode_ids[si] = fresh_ep
+
+            # GOAL A: untouched archive question
+            q_A = (f"Compliance check for {w['fixture']} (run {si:04d}): report the manifest "
+                   f"sha recorded at the original ingest.")
+            for arm, ep_id in (("A_right", w["ep"]), ("A_fresh", fresh_ep), ("A_none", None)):
                 block = led.get("episode", ep_id)["text"] if ep_id else None
-                rec, _ = ask_retry(policy, task_prompt, block)
+                rec, _ = ask_retry(policy, q_A, block)
                 rsha = str(rec.get("sha", "")).strip()
-                ok = int(rsha == fresh_sha)
-                if arm != "none" and rsha and rsha != fresh_sha:
+                ok = int(rsha == w["sha"])  # reality: the untouched file's content
+                outcomes[arm][0] += ok
+                outcomes[arm][1] += 1
+                if arm == "A_fresh" and rsha == fresh_sha:
+                    stale_trust["A_fresh_reports_new"] += 1
+                    stale_trust["A_fresh_total"] += 1
+                time.sleep(3.0)
+            # GOAL B: post-reingest question (same run!)
+            q_B = (f"Compliance check for {w['fixture']} (run {si:04d}): the dataset was just "
+                   f"re-ingested; report the manifest sha that holds NOW.")
+            for arm_name, ep_id in (("B_arch", w["ep"]), ("B_right", fresh_ep), ("B_none", None)):
+                block = led.get("episode", ep_id)["text"] if ep_id else None
+                rec, _ = ask_retry(policy, q_B, block)
+                rsha = str(rec.get("sha", "")).strip()
+                ok = int(rsha == fresh_sha)  # reality: the CHANGED file's content
+                outcomes[arm_name][0] += ok
+                outcomes[arm_name][1] += 1
+                if arm_name == "B_arch":
+                    stale_trust["B_arch_total"] += 1
                     if rsha == w["sha"]:
-                        stale_used += 1
-                    else:
-                        stale_ignored += 1
-                outcomes_B[arm][0] += ok
-                outcomes_B[arm][1] += 1
+                        stale_trust["B_arch_reports_old"] += 1  # stale trust: wrong
                 time.sleep(3.0)
     finally:
         led.close()
@@ -214,15 +215,19 @@ def main() -> int:
         v = arms[arm]
         return {"success": v[0], "n": v[1], "rate": round(v[0] / max(1, v[1]), 4)}
 
+    def cell(a, b):
+        va, vb = outcomes[a], outcomes[b]
+        return {a: {"success": va[0], "n": va[1], "rate": round(va[0] / max(1, va[1]), 4)},
+                b: {"success": vb[0], "n": vb[1], "rate": round(vb[0] / max(1, vb[1]), 4)}}
     out = {
         "reality_oracle": "filesystem checksums (no judge, no n-gram)",
-        "goal_A_verify_archive": {k: rate(outcomes_A, k) for k in outcomes_A},
-        "goal_B_fresh_reingest": {"arms": {k: rate(outcomes_B, k) for k in outcomes_B},
-                                  "stale_sha_used": stale_used,
-                                  "stale_sha_ignored": stale_ignored},
-        "reversal_claim": ("the candidate's payoff flips with the GOAL: under verify-archive the "
-                           "archive episode is load-bearing; under fresh-reingest it is stale: "
-                           "same candidate, different goal, reality decides both"),
+        "goal_A_verify_archive": cell("A_right", "A_fresh") | {"A_none": rate(outcomes, "A_none")},
+        "goal_B_fresh_reingest": cell("B_right", "B_arch") | {"B_none": rate(outcomes, "B_none")},
+        "stale_trust_counters": stale_trust,
+        "reversal_design": ("THE HARD 2x2: payoff(ep-arch) +1 under A / ~0 under B; "
+                            "payoff(ep-fresh) ~0 under A / +1 under B -- SWAPPING which memory "
+                            "pays; both goals hard (none ~ 0: no sha in any prompt; the value "
+                            "exists ONLY in memory); measured against file CONTENT"),
     }
     path = os.path.join("data", "_scratch", "icm", "payoff_reality_results.json")
     with io.open(path, "w", encoding="utf-8") as f:
