@@ -23,9 +23,14 @@ VIOLATED (congruence axis -- a surprise keeps memory vivid; a merely-bad-but-
 expected outcome does not):
     violated-linked  -> vivid: fidelity stays "full" past all horizons
     otherwise        -> age > blur_horizon_days: fidelity "gist" (text
-                        replaced by its deterministic gist, re-embedded)
+                        re-encoded at lower fidelity and re-embedded)
                         age > drop_horizon_days: dropped (KV + index)
 Links with pending resolution neither protect nor blur early (age applies).
+
+The re-encoder is pluggable: gist_backend="heuristic" (default, deterministic
+truncation) or "ocr" (DeepSeek-OCR re-encode daemon -- write-path only,
+~1s/page warm, ~0.94 precision at Small mode; probe data in
+scripts/icm/ocr_gist_probe.py / data/_scratch/icm/ocr_gist_probe.json).
 """
 
 from __future__ import annotations
@@ -64,12 +69,21 @@ class EpisodicStore:
 
     def __init__(self, ledger: ICMLedger, embedder, dim: int = 384,
                  blur_horizon_days: float = DEFAULTS["blur_horizon_days"],
-                 drop_horizon_days: float = DEFAULTS["drop_horizon_days"]):
+                 drop_horizon_days: float = DEFAULTS["drop_horizon_days"],
+                 gist_backend: str = "heuristic"):
         self.ledger = ledger
         self.embedder = embedder  # callable: [text] -> [[float] * dim]
         self.dim = dim
         self.blur_horizon_days = blur_horizon_days
         self.drop_horizon_days = drop_horizon_days
+        # blur backend: "heuristic" (deterministic first-sentences gist,
+        # default, zero deps) or a DeepSeek-OCR re-encode via the daemon
+        # (icm.ocr_encoder.OcrGistBackend -- a flag, default OFF in this repo)
+        self._ocr_backend = None
+        if gist_backend == "ocr":
+            from icm.ocr_encoder import OcrGistBackend
+
+            self._ocr_backend = OcrGistBackend()
         from wavedb import VectorLayer, Format, IndexType, Distance, Runtime
 
         self._vector = VectorLayer.open(
@@ -141,7 +155,8 @@ class EpisodicStore:
             if age_days <= self.blur_horizon_days:
                 continue
             if rec.get("fidelity") == FIDELITY_FULL:
-                gist = gist_of(rec["text"])
+                gist = (self._ocr_backend.gist(rec["text"]) if self._ocr_backend
+                        else gist_of(rec["text"]))
                 rec["text_before_blur"] = rec["text"]
                 rec["text"] = gist
                 rec["fidelity"] = FIDELITY_GIST
