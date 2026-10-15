@@ -46,6 +46,10 @@ MARGIN = 0.1
 # harvest run's JUDGE.
 
 
+# per-segment invocation: --ckpt/--ledger/--out override these defaults
+# (the screen is segment-generic: it reads the given checkpoint's cand_scores)
+
+
 def judge_help(policy, goal_q, candidate_text) -> float:
     q = ("JUDGE: would recalling this EVIDENCE help an agent answer the GOAL? "
          'Reply ONLY JSON {"helpful": true|false, "partial": 0.0-1.0}.\n'
@@ -89,12 +93,18 @@ def main() -> int:
     global MARGIN
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="smoke: only the first N reversal questions")
+    ap.add_argument("--ckpt", type=str, default=CKPT)
+    ap.add_argument("--ledger", type=str, default=DB)
+    ap.add_argument("--out", type=str, default=OUT)
+    ap.add_argument("--offset", type=int, default=100, help="question-index base of the segment")
+    ap.add_argument("--n", type=int, default=200, help="segment size")
     args = ap.parse_args()
-    rows = [json.loads(l) for l in io.open(CKPT, encoding="utf-8") if l.strip()]
-    questions = {100 + i: rec["question"] for i, rec in
-                 enumerate(json.load(io.open(FULL500, encoding="utf-8"))[100:300])}
+    rows = [json.loads(l) for l in io.open(args.ckpt, encoding="utf-8") if l.strip()]
+    questions = {args.offset + i: rec["question"] for i, rec in
+                 enumerate(json.load(io.open(FULL500, encoding="utf-8"))
+                           [args.offset:args.offset + args.n])}
 
-    led = ICMLedger(DB)
+    led = ICMLedger(args.ledger)
     try:
         texts_by_id = {i: rec["text"] for i in led.ids("episode")
                        if (rec := led.get("episode", i))}
@@ -160,7 +170,7 @@ def main() -> int:
         print(f"[q {qi}] sp={sp} v(cos_top)={va:.2f} v(judge_fav)={vb:.2f} -> "
               f"{'VERIFIED' if vb > va + MARGIN else 'rejected'}", flush=True)
         # incremental dump so a crash loses nothing
-        with io.open(OUT, "w", encoding="utf-8") as f:
+        with io.open(args.out, "w", encoding="utf-8") as f:
             f.write(json.dumps(results | {"verified_qids": verified, "rejected_qids": rejected,
                                           "skipped_qids": skipped}, indent=2))
 
@@ -168,7 +178,7 @@ def main() -> int:
     print(f"verified:   {len(verified)}  {verified}", flush=True)
     print(f"rejected:   {len(rejected)}", flush=True)
     print(f"skipped:    {len(skipped)}  {skipped}", flush=True)
-    print(f"[done] wrote {OUT}")
+    print(f"[done] wrote {args.out}")
     return 0
 
 
