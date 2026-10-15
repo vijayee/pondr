@@ -141,9 +141,14 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--model", type=str, default="deepseek-v4.1-flash:cloud",
                     help="answerer; same model for all arms in one run")
+    ap.add_argument("--abstain-instruction", action="store_true",
+                    help="add 'say cannot determine if evidence insufficient' "
+                         "to the answerer prompt; for abstain-gold cells + "
+                         "over-abstention check")
     args = ap.parse_args()
-    global ANSWERER_MODEL
+    global ANSWERER_MODEL, ABSTAIN
     ANSWERER_MODEL = args.model
+    ABSTAIN = bool(args.abstain_instruction)
     out_p = args.out or os.path.join("data", "_scratch", "icm",
                                      f"router_oos_o{args.offset}.json")
     ck_path = out_p.replace(".json", "_ckpt.jsonl")
@@ -245,7 +250,8 @@ def main() -> int:
         return round(sum(v) / max(1, len(v)), 3), len(v)
 
     from scipy.stats import binomtest
-    report = {"n_live": len(live), "means": {}, "means_f1": {}, "model": ANSWERER_MODEL}
+    report = {"n_live": len(live), "means": {}, "means_f1": {}, "model": ANSWERER_MODEL,
+              "abstain": ABSTAIN}
     print(f"\n=== OUT-OF-SAMPLE ROUTER TEST (n={len(live)}) ===")
     def meanf(arm, key):
         v = [r_[key] for r_ in live if r_.get(key) is not None]
