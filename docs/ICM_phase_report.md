@@ -259,3 +259,35 @@ that regime is genuinely sparse under every measured leg. The taxonomy doc carri
 two proposal axes (negation/absence, contradiction/versioning), the
 inverse-bitter-lesson framing, and the external-validity note.
 
+## 10. Addendum 5 — the intent-variation adjudication (2026-10-15)
+
+The second agent's final round produced one overreach and one confirmed claim,
+and the confirmed claim closes the "why did intent never show organically"
+question with a measurement:
+
+- **Overreach: "we measured hygiene, not relevance."** The A/Bs measured
+  answer utility (the mechanical definition of relevance) throughout, and the
+  temporal/values legs are query-memory relations, not store hygiene. What was
+  never measured is NARROWER: organic intent-VARIATION.
+- **Confirmed + measured: the corpus cannot carry it.** Demo-10 gate-0 census
+  (demo10_valueflip_census.py, cb32407): in the full 500-question LongMemEval
+  file, only 8/940 sessions appear in more than one question's haystack and
+  ZERO have mixed gold/non-gold utility — same memory, different value under
+  different goals NEVER occurs naturally. The haystacks are woven per-record;
+  organic intent-variation is designed out. This is why intent only ever
+  appeared in the authored 2x2, which the fixed-point theorem flags as closed
+  — "false or untestable" now resolves further toward "UNTESTABLE ON THIS
+  CORPUS."
+- **The corrected next action:** LoCoMo is no longer just "more volume" — its
+  one-shared-conversation/many-questions shape is the INVERSE of LongMemEval's
+  per-question weaving and is the first candidate corpus that may naturally
+  carry value-flips. Next rung: run the SAME census on LoCoMo FIRST (gate-0);
+  a non-zero census unlocks organic demo #10 (for each shared session: can any
+  cheap leg separate its gold-questions from its non-gold-questions? the
+  residue = the intent-shaped signal). A zero census closes intent-variation
+  as corpus-absent in this dataset family too.
+- The Ponder live-instrumentation proposal (log intent + outcome alongside
+  retrieval; the user as oracle; harvest organic value-flips from real usage)
+  is parked as an option requiring the user's decision — it touches the main
+  repo.
+
