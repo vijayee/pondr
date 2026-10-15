@@ -192,3 +192,29 @@ four things:
    over a single leg on that segment, the head's opponent is that leg, and the
    test must be named accordingly (law 1's pre-check, applied to the opponent).
 
+## 7. Addendum 2 — corpus-growth phase results (2026-10-15, closing)
+
+1. **Abstain-instruction null:** paired on 17 cells, nothing moved (all p >=
+   0.625); explicit "cannot determine" appeared in only 6/85 cells despite the
+   instruction. Abstention is not instruction-fixable at this scale; not
+   pursued further.
+2. **Tie re-judge sweep:** 82 judge-tie rows re-judged under deepseek; only
+   21/82 became measurable — BOTH judge families tie coarsely, so the tie
+   ceiling is judge-population-wide, not kimi-specific. 6 new reversals surfaced,
+   3 survived the inverted-pair screen (deepseek primary + kimi verifier).
+3. **Verified pool = 48** (25 o100 + 20 o300 + 3 newcomers); arm runs cover all
+   of them. Still ~25-30 short of the ~70-80 head-test gate; growth options are
+   LoCoMo (harness ships none installed) or formal closure at 48.
+4. **The consolidated cross-segment tables moved the end-state one notch:** on
+   o100, freshly F1-graded, the structured index leads decisively over cosine
+   (14/3, p=0.0127) and suggestively over the token rule (10/3, p=0.092) —
+   the 6-gram read had called that pair a tie; under F1 the index dominates
+   BOTH other legs on BOTH segments. On o300 (n=19) index vs time-rule is
+   decisive (10/2, p=0.0386), router-vs-time-rule decisive (9/1, p=0.0215),
+   and OR(index|time) = 0.28 ≈ index alone (index dominates broadly there;
+   the OR only earned its keep on o100, where no single leg dominated).
+   Final leg story: the structured temporal engine is the strongest retrieval
+   leg on the verified tail everywhere it was measured; the dense lens's real
+   job remains goal-conditioned ranking only; the open question stays the
+   segmenter (and after more corpus, the head-vs-strongest-cheap-leg split).
+
