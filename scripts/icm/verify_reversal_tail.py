@@ -98,6 +98,11 @@ def main() -> int:
     ap.add_argument("--out", type=str, default=OUT)
     ap.add_argument("--offset", type=int, default=100, help="question-index base of the segment")
     ap.add_argument("--n", type=int, default=200, help="segment size")
+    ap.add_argument("--sp-min", type=float, default=None,
+                    help="screen rows with spearman >= this instead of reversal mode")
+    ap.add_argument("--sp-max", type=float, default=-0.3,
+                    help="upper spearman bound for the screened bucket; "
+                         "raise it to 0.3 to include the near-zero bucket")
     args = ap.parse_args()
     rows = [json.loads(l) for l in io.open(args.ckpt, encoding="utf-8") if l.strip()]
     questions = {args.offset + i: rec["question"] for i, rec in
@@ -126,7 +131,9 @@ def main() -> int:
     for r in rows:
         qi = r["qi"]
         sp = r.get("spearman")
-        if sp is None or sp != sp or sp >= -0.3 or qi not in questions:
+        if (sp is None or sp != sp or sp >= args.sp_max
+                or (args.sp_min is not None and sp < args.sp_min)
+                or qi not in questions):
             continue
         if args.limit and n_seen >= args.limit:
             break
