@@ -224,3 +224,22 @@ four things:
    job remains goal-conditioned ranking only; the open question stays the
    segmenter (and after more corpus, the head-vs-strongest-cheap-leg split).
 
+## 8. Addendum 3 — the power-flagged head test ran (2026-10-15, user override)
+
+Claim #5's test was executed despite the unmet corpus gate (48 of ~70-80;
+declared exploratory in the script header, verdict line says UNDERPOWERED, not
+decisive). Design: head = logistic on [cos, time-jaccard, log-len, op
+one-hots, n_sessions], z-normalized by TRAIN stats (the o100 scaling bug's
+fix), trained ONLY on o100's 75 kimi-labeled pairs, given the same full-store
+access as the index; opponent = o300's measured strongest cheap leg (index,
+F1 0.272-0.287); test = o300's 19 verified cells graded judge-free.
+
+**Result: head 0.223 vs index 0.287 — paired 1/7, p=0.0703, suggestive AGAINST
+the lens** (a real relay-fail on one cell was caught by the visibility markers
+and excluded, n=18). The head did beat the token rule (7/3, ns), landing
+between the two cheap legs. Reading: in an organic world, the cheap structured
+leg stayed ahead of a label-trained learned head — the segmenter/lens open
+question moves from open-neutral to **open-leaning-no**. The gate still applies
+to a *decisive* verdict; the direction is now measured. scripts/icm/
+head_vs_index_oos.py (96d2263).
+
