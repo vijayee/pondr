@@ -317,3 +317,34 @@ exists (unlike LongMemEval) and cheap legs capture it; intent's only
 measured job remains the goal-conditioned ranker. The arc closes at ten
 demonstrations with both rescue paths and the segmenter measured dead.
 
+## 12. Addendum 7 — the agent-intent corpus protocol takes shape (2026-10-15)
+
+The user's thesis (training data must be AGENT data — goal intent, step intent,
+process, traces) was accepted as the identification of the whole arc's unit
+error. Design response:
+
+- **Where agent data exists** (by honesty-per-cost): this repo's own sessions
+  and memory files (real user goals, small, dodges the authored-world
+  objection because goals are the user's, not a benchmark author's); public
+  agent trajectories (SWE-bench-class traces); live Ponder instrumentation
+  (parked, user decision).
+- **The extraction-precision probe ran** (probe_extraction_precision.py,
+  3ed2acc): 24 ledger records reconstructed from this arc's explicit artifacts
+  — structure (intent / branches / observed) recovered 24/24; commit messages
+  alone carry verdicts for only 12/56 rounds; **58% of miner-STATED labels were
+  valence-flipped** (adverse outcome labeled "violated" when the rule's
+  semantics are prediction-match — a predicted feared branch is CONFIRMED).
+  Protocol consequence: **labels are always COMPUTED by the congruence rule;
+  never stated by a miner.** The retroactive layer is viable for structure,
+  not labels.
+- **The granularity question ("root intent + hierarchy of step intents — what
+  granularity do we need?") gets a designed test, not an assumption:** capture
+  events with declarations at ALL levels (goal / batch / step), then ablate:
+  goal-only vs step-only vs full-hierarchy prediction of retrieval utility.
+  Each grain's marginal contribution = its measured value. "Finest wins" is a
+  registered hypothesis; Phase-0's hedging finding (heavy declarations shrink
+  the useful stream 5->2/120) bounds the design: one-line step declarations,
+  retrieval-bearing steps only.
+- The ICM ledger (Phase 0-1) is the recording schema for all of this — built
+  and gated; the new work is pointing real agent data through it.
+
