@@ -109,3 +109,18 @@ Runs `scripts/icm/` in this repo; LongMemEval organic data (500-record file);
 cross-model judge (kimi-k3 judging deepseek-v4.1-flash); WaveDB substrate.
 Memory index: `icm-*` files; every number above has a committed script and a
 result JSON behind it.
+
+## Arc summary (closing, 2026-10-15)
+
+The final three measurements: (1) the **near-zero screen** doubled the o300
+verified pool to 20 and, pooled with the reversal bucket, made two OOS results
+decisive — **index vs time-rule 10/1 (p=0.0117)** and **frozen-router vs
+time-rule 8/1 (p=0.039)**; the structured engine is the strongest temporal leg
+out-of-sample, and again beat the gold-context arm (dilution). (2) The
+**answerer-swap null**: deepseek-v4-pro vs v4.1-flash on 17 paired identical
+cells moved nothing (all discordant ratios 4/3–3/3, p=1.0) — on this tail the
+remaining loss is grader partial-credit + 2/20 abstain-type golds (whose true
+answer is refusal, which neither answerer produces) + temporal bookkeeping
+beyond the evidence text; model scale is flat here. (3) The arc closes with no
+measurement anywhere arguing a learned lens adds payoff over the cheap-leg
+router; the head-vs-router question remains power-starved, not falsified.
