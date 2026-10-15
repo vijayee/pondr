@@ -39,10 +39,11 @@ from icm.congruence import (Congruence, RESIDUE_VALUES, evaluate_congruence,  # 
 
 HORIZON_KINDS = ("step", "time", "manual")
 STATUS_PENDING, STATUS_RESOLVED, STATUS_EXPIRED = "pending", "resolved", "expired"
-RECORD_KINDS = ("session", "intent", "expectation", "outcome", "episode")
+RECORD_KINDS = ("session", "intent", "expectation", "outcome", "episode",
+                "icapture")
 ID_KEYS = {"session": "session_id", "intent": "intent_id",
            "expectation": "exp_id", "outcome": "outcome_id",
-           "episode": "episode_id"}
+           "episode": "episode_id", "icapture": "id"}
 
 
 class LedgerError(ValueError):
