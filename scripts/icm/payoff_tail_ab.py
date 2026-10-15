@@ -97,6 +97,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default=ANSWERER)
     ap.add_argument("--limit", type=int, default=0, help="smoke: first N questions")
+    ap.add_argument("--topk", type=int, default=3,
+                    help="candidates per retrieval block; ranks only matter "
+                         "through selection, so 1 is the discriminating setting")
+    ap.add_argument("--skip-gold", action="store_true",
+                    help="inherit gold grades from the topk=3 checkpoint instead of re-asking")
     args = ap.parse_args()
     ANSWERER = args.model
 
@@ -110,20 +115,27 @@ def main() -> int:
     finally:
         led.close()
 
-    try:
-        from scipy.stats import McNemar  # noqa
-        HAVE_MC = True
-    except Exception:
-        HAVE_MC = False
+    # significance test: two-sided binomial on the discordant pairs (the
+    # McNemar equivalent; scipy has no McNemar function)
+    wins_all = wins_t + wins_c
+    p = binomtest(wins_t, wins_all, 0.5).pvalue if wins_all else None
 
     rows = []
-    ck_path = os.path.join("data", "_scratch", "icm", "payoff_tail_ab_ckpt.jsonl")
+    ck_path = os.path.join("data", "_scratch", "icm", f"payoff_tail_ab_ckpt_k{args.topk}.jsonl")
+    OUT = os.path.join("data", "_scratch", "icm", f"payoff_tail_ab_results_k{args.topk}.json")
     done = set()
     if os.path.exists(ck_path):
         for l in io.open(ck_path, encoding="utf-8"):
             if l.strip():
                 r_ = json.loads(l)
                 rows.append(r_); done.add(r_["qi"])
+    gold_prior = {}
+    if args.skip_gold and os.path.exists(os.path.join("data", "_scratch", "icm", "payoff_tail_ab_ckpt.jsonl")):
+        for l in io.open(os.path.join("data", "_scratch", "icm", "payoff_tail_ab_ckpt.jsonl"), encoding="utf-8"):
+            if l.strip():
+                r_ = json.loads(l)
+                if r_["qi"] not in done:
+                    gold_prior[r_["qi"]] = r_.get("gold")
     qs = corpus if not args.limit else corpus[:args.limit]
 
     for q in qs:
@@ -142,19 +154,21 @@ def main() -> int:
                       any(sid in i for sid in gold_sids)]
 
         ans_log = {}
-        row = {"qi": q["qi"], "type": q["type"]}
+        row = {"qi": q["qi"], "type": q["type"], "topk": args.topk}
         for arm, order in (("cos", order_cos), ("time", order_tim)):
-            block = "\n".join(f"- {c['text']}" for c in order)
+            block = "\n".join(f"- {c['text']}" for c in order[:args.topk])
             ans = ask_retry(q["question"], block)
             row[arm] = round(grade(ans, gold_ans), 3)
             ans_log[arm] = ans[:200]
             time.sleep(3.0)
-        if gold_texts:
+        if gold_texts and not args.skip_gold:
             block = "\n".join(f"- {t}" for t in sorted(set(gold_texts)))
             ans = ask_retry(q["question"], block)
             row["gold"] = round(grade(ans, gold_ans), 3)
             ans_log["gold"] = ans[:200]
             time.sleep(3.0)
+        elif q["qi"] in gold_prior:
+            row["gold"] = gold_prior[q["qi"]]
         else:
             row["gold"] = None
         row["answers"] = ans_log
@@ -165,15 +179,14 @@ def main() -> int:
         print(f"[q {q['qi']}] cos={row['cos']} time={row['time']} gold={row['gold']}", flush=True)
 
     # ---- aggregate ----
+    from scipy.stats import binomtest
     n = len(rows)
     m = {a: sum((r_.get(a) or 0) for r_ in rows) / max(1, n) for a in ("cos", "time", "gold")}
     wins_t = sum(1 for r_ in rows if r_["time"] > r_["cos"])
     wins_c = sum(1 for r_ in rows if r_["cos"] > r_["time"])
     ties = n - wins_t - wins_c
     p = None
-    if HAVE_MC and (wins_t or wins_c):
-        from scipy.stats import binomtest
-        p = binomtest(wins_t, wins_t + wins_c, 0.5).pvalue
+
     out = {"n": n, "model": ANSWERER,
            "means": {k: round(v, 4) for k, v in m.items()},
            "time_beats_cos": wins_t, "cos_beats_time": wins_c, "ties": ties,
