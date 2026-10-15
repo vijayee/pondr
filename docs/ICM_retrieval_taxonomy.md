@@ -80,16 +80,28 @@ The arc's second product. Each one caught a real failure mode:
 
 ## What is honestly left open
 
-One experiment: **temporal index + reasoner vs time-rule** on the harvested
-tail — how much of the 0.400→0.680 residue is indexable structure versus
-requires an actual reasoner? The dataset carries session timestamps
-(`haystack_dates`) + `question_date`, so the index is constructible. The
-critique's pre-registration: the query engine wins.
+**Resolved 2026-10-15 (out-of-sample router confirmation, n=9 screened o300 reversals):**
+the frozen o100 dispatch held direction — router-beats-time-rule 5/0 under token-F1
+(p=0.0625, suggestive at n=9); the structured index led *every* arm on F1 mean
+(0.331 vs time 0.083, cos 0.125, and gold-context 0.296 — the selection arms can
+beat the full-gold-context arm because focused evidence produces focused answers,
+so "gold ceiling" is not a ceiling under F1). Also measured: the 6-gram grader
+floor-collapses on paraphrase golds segment-wide (o300 gold ceiling 1/10 with
+substantively correct answers like "Twice." vs "We've met up twice.") — graders
+are themselves biased instruments and must be reported alongside a soft metric.
 
-And one re-gated thesis: whether a *learned* head can beat a *proper* structured
-index (not a trivial rule) on a real train/test split of 50–75 verified
-reversals. If it cannot — or ties — the strong thesis closes as falsified
-organic-wide, and the taxonomy above is the whole answer.
+**Still open (power-starved, not answered):** whether a *learned* head beats the
+2-cheap-leg router (0.640/0.680 o100 OR-ceiling) on a real train/test split. The
+verified tail is 35 questions across two judged segments, only ~10 of which carry
+F1-gradeable golds — the head-vs-router question needs more verified reversals
+than the current file contains. As it stands, the taxonomy's temporal/relational
+row reads: the axis fills by *routing among cheap specialized legs* (timestamp
+recency, ordinal anchors), not by any single leg — and nothing measured yet
+argues a learned lens adds payoff over that router.
+
+One honest note: the op-dispatch router is fit on 25 questions and confirmed on
+9; the OR-ceiling is oracle-selected. Both carry the same caveat — cheap legs,
+cheap combination, no learning anywhere in the winning path.
 
 ## The provenance
 
