@@ -58,7 +58,7 @@ CORPUS = os.path.join("data", "_scratch", "icm", "icm_head_corpus_o100.json")
 FULL500 = r"C:\Users\victor morrow\Git-projects\memory_and_context_eval_harness" \
           r"\datasets\longmemeval\longmemeval_interleaved_full.json"
 DB = os.path.join("data", "_scratch", "icm", "organic_o100", "ledger")
-PRIOR_K1 = os.path.join("data", "_scratch", "icm", "payoff_tail_ab_ckpt.jsonl")
+PRIOR_K1 = os.path.join("data", "_scratch", "icm", "payoff_tail_ab_ckpt_k1.jsonl")
 OUT = os.path.join("data", "_scratch", "icm", "temporal_index_leg_results.json")
 
 ANSWERER = "deepseek-v4.1-flash:cloud"
