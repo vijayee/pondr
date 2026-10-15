@@ -47,6 +47,14 @@ FILE_EXT = r"\.(py|js|ts|json|md|txt|rst|yaml|yml|toml|cfg|ini|c|cpp|h|hpp|vue|i
 
 
 def main() -> int:
+    global TRAJ_DIRS
+    import argparse as _ap
+    ap = _ap.ArgumentParser()
+    ap.add_argument("--dirs", type=str, default=None,
+                    help="comma-separated tarball dirs (default: the built-ins)")
+    _args = ap.parse_args()
+    if _args.dirs:
+        TRAJ_DIRS = _args.dirs.split(",")
     manifest = {os.path.basename(r["artifact_path"]): r
                 for r in (json.loads(l) for l in io.open(MANIFEST, encoding="utf-8") if l.strip())
                 if r.get("artifact_path")}
@@ -69,6 +77,7 @@ def main() -> int:
                 continue  # keep the SWE slice (TerminalBench = isolated stores)
             task = row["task_name"]
             hid = f"ct-{task}-{row.get('agent', '?')[:12]}"
+            plan_text = parse_plan_from_tar(tar)   # BEFORE batch emit (titles come from it)
             emit({"kind": "icapture", "level": "goal", "parent": None,
                   "id": hid, "text": f"resolve {task} ({row.get('agent')}/{row.get('model')})",
                   "branches": {"desired": "patch resolves the task; verifier passes",
@@ -77,11 +86,13 @@ def main() -> int:
                   "label_basis": "human-verified (codetrace)"})
             stats["goals"] += 1
             stage_out = None
-            # hierarchy from the manifest's stages
+            # hierarchy from the manifest's stages, titled by the agent's OWN
+            # plan phases when available (the batch grain's real semantics)
+            title_of_stage = stage_titles(plan_text, row.get("stages") or [])
             for st in row.get("stages") or []:
                 emit({"kind": "icapture", "level": "batch", "parent": hid,
                       "id": f"{hid}-st{st['stage_id']}",
-                      "text": f"stage {st['stage_id']} (steps {st['start_step_id']}-{st['end_step_id']})",
+                      "text": title_of_stage(st["stage_id"], st),
                       "declared_at": None,
                       "label_basis": "human-verified (codetrace)"})
                 stats["batches"] += 1
@@ -188,6 +199,47 @@ def main() -> int:
     print(f"[mapped] {n_records} records; stats {json.dumps(stats)}")
     print(f"[flip] {len(flip_sorted)} file-units shared across tasks; -> {FLIP}")
     return 0
+
+
+def parse_plan_from_tar(tar) -> str | None:
+    """The agent's own plan/task_list from its FIRST model-call record."""
+    try:
+        t = tarfile.open(tar, "r:*")
+    except Exception:
+        return None
+    try:
+        for mem in sorted([m for m in t.getmembers()
+                           if "tensorblock" in m.name and m.name.endswith(".json")],
+                          key=lambda m: m.name):
+            try:
+                data = json.load(t.extractfile(mem))
+            except Exception:
+                continue
+            resp = data.get("response") or {}
+            msg = (resp.get("choices") or [{}])[0].get("message") or {}
+            for tc in (msg.get("tool_calls") or []):
+                args_s = str((tc.get("function") or {}).get("arguments") or "")
+                if "task_list" in args_s or '"plan"' in args_s:
+                    return args_s[:1500]
+            if msg.get("content"):
+                return str(msg["content"])[:1500]
+    finally:
+        t.close()
+    return None
+
+
+def stage_titles(plan_text, stages):
+    """Map the agent's plan phases to the manifest's stage ids by ORDER
+    (both are the task's coarse decomposition; count mismatch = ordered
+    fallback titles)."""
+    titles = []
+    if plan_text:
+        titles = re.findall(r'"title":\s*"([^"]{5,120})"', plan_text)
+    def title_of(stage_id: int, stage: dict):
+        if 1 <= stage_id <= len(titles):
+            return f"{titles[stage_id - 1]} (steps {stage.get('start_step_id')}-{stage.get('end_step_id')})"
+        return f"stage {stage_id} (steps {stage.get('start_step_id')}-{stage.get('end_step_id')})"[:240]
+    return title_of
 
 
 def ordered_tars():
