@@ -1,0 +1,154 @@
+# ICM Phase Report — Intent-Conditioned Memory, status through 2026-10-15
+
+**Purpose:** handoff summary for a second agent. Covers what happened this
+phase (2026-10-14 → 15), the measured results, where everything lives, and what
+is honestly open. The fuller evidence write-up is
+`docs/ICM_retrieval_taxonomy.md` (committed b14a3eb); this doc is the "where we
+are" map.
+
+## 0. Context — what ICM is
+
+A separate research experiment in this repo (do NOT fold into the Pondr/fade
+architecture): the plan is `docs/Intent_Conditioned_Memory_Research_Plan.md`
+(authored from an LLM-design conversation preserved in `docs/research-chat.json`).
+Central thesis under test: **relevance is irreducible to cheap signals** — i.e.,
+a learned/intent-conditioned lens should beat raw dense cosine where it matters.
+Nine pre-registered demonstrations have run against it; none has found a case
+where learning was required. `icm*/` + `scripts/icm/` are the experiment's code;
+`data/_scratch/icm/` (gitignored) holds the run artifacts.
+
+## 1. What happened this phase (chronological, with the numbers that stick)
+
+**a. The 500-question LongMemEval file was fully harvested** (segments offset
+50 / 100 / 300; 4-arm counterfactual protocol, cross-model judge, per-question
+labels-recovery spearman). Combined: ~50 raw reversals / 368 measurable questions
+(13.6%). Segment tail rates swing 6–18% — the file is heterogeneous; tail
+concentrates in temporal-reasoning / multi-session / knowledge-update types and
+is **absent (0/25) from single-session-assistant** questions.
+
+- Judge lineage: kimi-k3:cloud → **kimi-k2.7-code:cloud** (user cost decision;
+  probe-verified equal on the discriminating pair; labels coarser → more ties).
+- All rows are checkpointed JSONL with resume; artifacts are run-scoped
+  (`*_o{offset}.json`); rows carry `relay_fail` + `judge_suspect` visibility
+  markers (added after the user raised ollama rate-limit contamination — audit
+  found zero empty answers in the headline measurements; the unauditable runs
+  are harvest payoff means only, interpreted for structure).
+
+**b. Two-judge verification screens** (kimi family + deepseek as independent
+second judge, margin 0.1) — offset-100: 25/34 verified (74%); offset-300
+reversals: 10/13; offset-300 *near-zero spearmans*: 10/20 (screening the
+"cosine fails to discriminate" bucket doubled the graded pool). Combined
+verified tail: **35 questions** across two segments/judges.
+
+**c. The k=1 selection A/B on the offset-100 verified tail** (judge-free: graded
+answers, no oracle): cosine-top1 **0.160** vs time-token-rule-top1 **0.400** vs
+gold ceiling **0.680**; discordant **6/0, binomial p = 0.03125** — cosine never
+won. Recorded per the second agent's critique as **fixed-point demo #8 in a
+judge-free robe**: the oracle finally mechanical, the discriminator still a
+cheap rule — strong thesis *further falsified*, not demonstrated.
+
+**d. The structured temporal index** (generic operators before/after/total/
+earliest/latest + lexical anchor + dataset `haystack_dates` arithmetic over the
+FULL episode store; no learning): scored **0.480** — a statistical TIE with the
+trivial rule (3/1, p=0.625). The critique's pre-registered "the query engine
+wins" was REJECTED on o100.
+
+**e. Out-of-sample router test** — the o100-fit dispatch (`earliest→time, else
+→index`) was frozen and run on unseen o300 verified reversals: direction-positive
+(5/0 F1 vs time-rule, p=0.0625 at n=9). After the near-zero expansion, **pooled
+o300 (n=17, relay-clean) made both decisive: index vs time-rule 10/1 (p=0.0117);
+router vs time-rule 8/1 (p=0.039)**. Out-of-sample ordering: **index (0.304) >
+gold-context (0.271) > router (0.227) > cos (0.158) > time (0.121)** — the cheap
+structured engine is the strongest temporal leg OOS, and selection arms beat the
+full-gold-context arm a third time (focused evidence beats diluted context; a
+"gold ceiling" is not a ceiling under F1).
+
+**f. Grader-bias finding (must-read before any grading run):** the 6-gram
+containment grader floor-collapses on paraphrase-form golds segment-wide
+(o300: correct "Twice." vs gold "We've met up twice." = 0.0; "2" vs "two" = 0.0;
+the o300 gold "ceiling" of 1/10 was a grader artifact). All comparisons now
+report **token-F1 alongside 6-gram**. Graders are biased instruments; never
+grade single-metric.
+
+**g. Answerer-swap null:** deepseek-v4-pro vs v4.1-flash on 17 paired identical
+cells moved nothing (discordants 4/3, 4/3, 3/3 — all p=1.0). The "stronger
+answerer recovers the ceiling" hypothesis is dead for this tail. The o300
+residue decomposes into: grader partial-credit, **2/20 abstain-type golds**
+(LongMemEval questions whose gold is a refusal — "information not enough" —
+which neither answerer produces; an abstain instruction would fix that slice for
+every arm), and temporal bookkeeping beyond the evidence text.
+
+## 2. Where we are (the end-state)
+
+- **The taxonomy is the deliverable** (four measured axes, each with its cheap
+  leg): values/identity → lexical anchor (43/43); goal-conditioning → trained
+  dense head (12/12 vs 0/12 — the dense lens's one measured job); temporal/
+  relational → structured index + routing among cheap legs (now OOS-decisive:
+  10/1, p=0.0117); storage/decay → forgetting ledger (7/12 harm-path caught).
+- **No measurement anywhere in the arc argues a learned intent-conditioned lens
+  adds payoff** over cheap specialized legs plus routing. The weak thesis holds;
+  the strong thesis is falsified in every world tested (9 demonstrations).
+- **The one open question is power-starved, not falsified:** whether a learned
+  head beats the 2-leg router (o100 OR-ceiling 0.640/0.680) on a real train/test
+  split. The verified tail = 35 questions — too few. Needs more organic
+  segments harvested + screened before any head run counts (LOO on 24 samples
+  was rejected as a variance machine).
+- Oracle-router over index|time on o300 = 0.305 ≈ index alone (index dominates
+  there; on o100 the OR over the two legs was the big number, 0.640).
+
+## 3. Standing protocol laws (the arc's constraints; a follow-up agent should keep them)
+
+1. Pre-check before any training counts: raw cosine must fail to separate the
+   payoff winner; the none-arm must be measured; the goal string must not name
+   the memory.
+2. Report spearman as a DISTRIBUTION (the tail is the finding), never a mean.
+3. Judge labels are cosine-recoverable by construction (oracle theorem);
+   judge-free graded answers are the decisive instrument — but grade with BOTH
+   6-gram and token-F1 (grader bias finding above).
+4. Ranks pay through SELECTION (k=1 under budget), never permutation of the
+   same set (the k=3 A/B tied 25/25 for exactly this reason).
+5. Authored/synthetic worlds are closed (fixed-point theorem): only organic
+   corpora test irreducibility.
+6. Harvest-first before any learned-head test; LOO on <25 samples is noise.
+7. Judge = kimi-k2.7-code:cloud (never kimi-k3:cloud — token cost), second judge
+   = deepseek (cross-family agreement required; margin 0.1).
+8. Every run row carries `relay_fail`/`judge_suspect` markers; audit empty
+   answers before believing zeros.
+9. Runner artifacts get run-scoped names; smoke runs never write to a real
+   run's output path (a smoke once clobbered the committed offset-50 results).
+
+## 4. File map
+
+| artifact | path |
+|---|---|
+| plan / provenance | `docs/Intent_Conditioned_Memory_Research_Plan.md`, `docs/research-chat.json` |
+| evidence write-up | `docs/ICM_retrieval_taxonomy.md` |
+| this report | `docs/ICM_phase_report.md` |
+| harvest runner (offset+resume) | `scripts/icm/organic_scale_500q.py` |
+| verification screen | `scripts/icm/verify_reversal_tail.py` (--ckpt/--ledger/--out/--sp-min/--sp-max) |
+| verified corpus (25 q, o100) | `data/_scratch/icm/icm_head_corpus_o100.json` |
+| payoff A/B (k=1/k=3) | `scripts/icm/payoff_tail_ab.py` |
+| temporal index engine | `scripts/icm/temporal_index_leg.py` (`engine_pick`) |
+| OOS router test | `scripts/icm/router_oos_test.py` (--model for answerer swap) |
+| result JSONs / checkpoints | `data/_scratch/icm/*_o{50,100,300}.json`, `*_ckpt*.jsonl`, results tables in `docs` |
+
+**Model config:** answerer deepseek-v4.1-flash:cloud (pro=swap-null); judge
+kimi-k2.7-code:cloud; verifier deepseek-v4.1-flash:cloud; embedder
+BAAI/bge-small-en-v1.5 local; all via local Ollama relay :11434.
+
+## 5. Concrete next actions (in value order)
+
+1. **Abstain-instruction quick win:** add "if the evidence is insufficient say
+   'cannot determine'" to the answerer prompt; re-run the 2 abstain-gold cells
+   (q327, q325) — cheap, likely lifts every arm on those cells.
+2. **Grow the verified tail:** harvest additional organic segments (or other
+   LongMemEval files / LoCoMo) with the same runner, screen near-zero + reversal
+   buckets, aim for 70–80 verified with F1-gradeable golds → then the
+   head-vs-2-leg-router split becomes answerable.
+3. **Router v2:** the dispatch is currently `earliest→time else→index`; the o300
+   data suggests near-universal index dispatch might beat it — test out-of-sample
+   before adopting.
+
+---
+*All numbers in this doc trace to committed scripts + result JSONs. Commits run
+69d8839 → b14a3eb on main, 2026-10-14/15.*
