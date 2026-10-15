@@ -52,6 +52,21 @@ TIME_TOKENS = {"yesterday", "tomorrow", "today", "last", "next", "before",
                "october", "november", "december"}
 
 
+def grade_f1(answer: str, gold: str) -> float:
+    """Judge-free token F1 (soft 6-gram): catches paraphrase golds the
+    6-gram containment grader floor-collapses (o300 finding: 'Twice.' vs
+    "We've met up twice." graded 0.0)."""
+    def toks(v):
+        return {w for w in re.findall(r"[a-z0-9]+", str(v).lower()) if len(w) > 2}
+    g, a = toks(gold), toks(answer)
+    if not g:
+        return 0.0
+    inter = len(g & a)
+    p = inter / max(1, len(a))
+    r = inter / len(g)
+    return round(2 * p * r / (p + r), 3) if p + r else 0.0
+
+
 def tokset(text: str) -> set[str]:
     return {t.strip(".,!?;:'\"()").lower() for t in text.split()}
 
@@ -203,7 +218,8 @@ def main() -> int:
                 blk = blocks[arm]
             ans = ask_retry(q, blk)
             row[arm] = round(grade(ans, gold_ans), 3)
-            row.setdefault("answers", {})[arm] = ans[:180]
+            row[arm + "_f1"] = grade_f1(ans, gold_ans)
+            row.setdefault("answers", {})[arm] = ans
             import time as _t2
             _t2.sleep(3.0)
         rows.append(row)
@@ -223,20 +239,28 @@ def main() -> int:
         return round(sum(v) / max(1, len(v)), 3), len(v)
 
     from scipy.stats import binomtest
-    report = {"n_live": len(live), "means": {}}
+    report = {"n_live": len(live), "means": {}, "means_f1": {}}
     print(f"\n=== OUT-OF-SAMPLE ROUTER TEST (n={len(live)}) ===")
+    def meanf(arm, key):
+        v = [r_[key] for r_ in live if r_.get(key) is not None]
+        return round(sum(v) / max(1, len(v)), 3), len(v)
     for arm in ("cos", "time", "router", "index", "gold"):
         m_, n_ = mean(arm)
         report["means"][arm] = m_
-        print(f"  {arm:7s} mean: {m_:.3f} (n={n_})")
+        f1, _n2 = meanf(arm, arm + "_f1")
+        report["means_f1"][arm] = f1
+        print(f"  {arm:7s} 6gram: {m_:.3f} | f1: {f1:.3f} (n={n_})")
     for a, b in (("router", "time"), ("router", "index"), ("index", "time")):
         wa = sum(1 for r_ in live if r_[a] is not None and r_[b] is not None
                  and r_[a] > r_[b])
         wb = sum(1 for r_ in live if r_[a] is not None and r_[b] is not None
                  and r_[b] > r_[a])
+        wfa = sum(1 for r_ in live if r_[a + "_f1"] is not None and r_[b + "_f1"] is not None and r_[a + "_f1"] > r_[b + "_f1"])
+        wfb = sum(1 for r_ in live if r_[a + "_f1"] is not None and r_[b + "_f1"] is not None and r_[b + "_f1"] > r_[a + "_f1"])
         p = binomtest(wa, wa + wb, 0.5).pvalue if wa + wb else None
-        print(f"  {a} vs {b}: {wa}/{wb}  p={p if p is None else round(p, 4)}")
-        report[f"{a}_vs_{b}"] = {"a": wa, "b": wb, "p": p}
+        pf = binomtest(wfa, wfa + wfb, 0.5).pvalue if wfa + wfb else None
+        print(f"  {a} vs {b}: 6gram {wa}/{wb} p={p if p is None else round(p,4)} | f1 {wfa}/{wfb} p={pf if pf is None else round(pf,4)}")
+        report[f"{a}_vs_{b}"] = {"a_6g": wa, "b_6g": wb, "p_6g": p, "a_f1": wfa, "b_f1": wfb, "p_f1": pf}
     with io.open(out_p, "w", encoding="utf-8") as f:
         f.write(json.dumps(report | {"rows": rows}, indent=2))
     print(f"[done] wrote {out_p}")
