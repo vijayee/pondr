@@ -291,3 +291,29 @@ question with a measurement:
   is parked as an option requiring the user's decision — it touches the main
   repo.
 
+## 11. Addendum 6 — demo #10 ran (2026-10-15): the final answer to the intent question
+
+LoCoMo was acquired from the official repo (data/_scratch/locomo/locomo10.json)
+and gate-0 PASSED decisively: **272/272 sessions in value-flip shape**
+(LongMemEval: 0/940) — one shared conversation grounds ~199 questions each,
+and the evidence pointers ("D{n}:turn") give per-question gold labels FREE,
+so the whole demo ran with no relay and no oracle.
+
+**Results (local, scripts/icm/demo10_locomo_legs.py, 2b47402):**
+cheap legs separate 270/272 organic value-flips (99.3%); lexical overlap
+dominates (mean AUC 0.835, 82% of sessions' winning leg; captured>=0.8 on 65%);
+cosine second (0.697); time-tokens fail (0.515 — chat sessions carry no time
+words). **The segmenter's first organic verdict: NO — the winning leg does not
+vary enough (one leg suffices); beyond-cheap residue = 2/272 sessions.**
+
+Caveat in the record: pointer-labels are gold-by-construction (the pointed
+session contains the answer), which partially flatters the lexical leg; cosine
+at 0.697 is the non-circular cheap reference. The headline's shape — cheap
+legs capture ~99% — survives the caveat.
+
+**The user's driving question ("is it worthwhile to index memories by
+intent?") is now answered by measurement: NO** — organic intent-variation
+exists (unlike LongMemEval) and cheap legs capture it; intent's only
+measured job remains the goal-conditioned ranker. The arc closes at ten
+demonstrations with both rescue paths and the segmenter measured dead.
+
