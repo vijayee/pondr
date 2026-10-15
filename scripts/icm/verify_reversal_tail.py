@@ -103,6 +103,10 @@ def main() -> int:
     ap.add_argument("--sp-max", type=float, default=-0.3,
                     help="upper spearman bound for the screened bucket; "
                          "raise it to 0.3 to include the near-zero bucket")
+    ap.add_argument("--verifier", type=str, default="deepseek-v4.1-flash:cloud",
+                    help="second-judge model; MUST be cross-family with the "
+                         "primary judge of the --ckpt rows (rejudge-ties rows "
+                         "use deepseek as primary -> kimi family here)")
     args = ap.parse_args()
     rows = [json.loads(l) for l in io.open(args.ckpt, encoding="utf-8") if l.strip()]
     questions = {args.offset + i: rec["question"] for i, rec in
@@ -117,7 +121,7 @@ def main() -> int:
     finally:
         led.close()
 
-    verifier = DeepSeekAgentPolicy(model=VERIFIER)
+    verifier = DeepSeekAgentPolicy(model=args.verifier)
 
     # cache candidate cosines per reversal question
     cos_cache: dict[int, dict[str, float]] = {}
