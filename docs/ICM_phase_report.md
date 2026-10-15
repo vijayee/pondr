@@ -1,5 +1,11 @@
 # ICM Phase Report — Intent-Conditioned Memory, status through 2026-10-15
 
+> **ARC STATUS: CLOSED 2026-10-15** at 48 verified reversals (corpus-gated;
+> see Addendum 2). The head-vs-strongest-cheap-leg / segmenter question is
+> parked as a power-starved open thread — resumable via the LoCoMo path in §5
+> whenever a larger organic corpus is wanted. Everything measured is committed
+> (69d8839 → 48e4af5); nothing is in-flight.
+
 **Purpose:** handoff summary for a second agent. Covers what happened this
 phase (2026-10-14 → 15), the measured results, where everything lives, and what
 is honestly open. The fuller evidence write-up is
