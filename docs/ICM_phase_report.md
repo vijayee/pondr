@@ -348,3 +348,28 @@ error. Design response:
 - The ICM ledger (Phase 0-1) is the recording schema for all of this — built
   and gated; the new work is pointing real agent data through it.
 
+## 13. Addendum 8 — the capture layer + ablation SHIPPED (869f5ac, 2026-10-15)
+
+The agent-intent corpus's recording layer is live:
+
+- **icm/capture.py** — hierarchical capture: goal (structured branches,
+  at least one mandatory) -> steps (one-liners, retrieval-bearing only,
+  branchless-step inheritance from the goal's prediction) -> retrieval events
+  -> outcomes. Laws wired in: **labels are computed by the congruence rule at
+  observe() time and may never be stated by the caller**; unpredicted named
+  branches are VIOLATED (not errors); "other" = max surprise; records persist
+  via the ledger (kind "icapture" registered in RECORD_KINDS/ID_KEYS) + a
+  canonical append-only JSONL mirror. 6 tests green; all 34 ICM tests green;
+  the main-repo suite's 18 failures are the known pollution family
+  (fade/orchestrator files, flaps run-to-run), unrelated.
+- **granularity_ablation.py** — the grain-value instrument: per retrieval
+  event, utility (rule-computed) predicted by [goal+q | step+q | full |
+  query-only] cosine features; each grain's marginal = its measured value.
+  Synthetic smoke (instrument test, authored-world stamp): query-only 0.565
+  and goal+q 0.526 when the goal carries no discriminating words, **step+q
+  0.998 (+0.433 marginal)** — the machinery detects step-level signal when
+  the query carries none, and can also ABSENT a grain's signal. Real mode
+  consumes capture mirrors (requires >=3 events; events without outcomes are
+  not scored — no fabrication; the mirror stores retrieval ids, so real runs
+  join texts via the ledger).
+
