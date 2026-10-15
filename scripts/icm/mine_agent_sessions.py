@@ -46,6 +46,34 @@ RETRIEVAL_TOOLS = {"Grep", "Glob", "Task", "WebFetch", "WebSearch", "Read",
 WORK_TOOLS_ALL = RETRIEVAL_TOOLS | {"Bash", "PowerShell", "Edit", "Write",
                                     "NotebookEdit"}
 
+# The user's signal-class taxonomy (graded 2026-10-15; metadata only -- the
+# valence law holds: classes are NEVER labels). Refutes/redirects are the
+# user's strongest signals and mark goal-refinements; enlightenment marks
+# success-indicator messages; criteria mark success/failure statements.
+import re as _re
+_REFUTE = _re.compile(r"(no[,.]|nope|i disagree|that's wrong|actually, no|"
+                      r"i mean |you misunderstand|no i mean|not what|stop |"
+                      r"that's not|i'm not (asking|saying)|don't)", _re.I)
+_REDIRECT = _re.compile(r"(instead|rather|switch|pivot|let's take|focus on |"
+                        r"new direction|what if we|how about|do them in order|skip )", _re.I)
+_CRITERIA = _re.compile(r"(must|should|need to|verify|success (is|would be)|"
+                        r"(i )?expect|criteria|require)", _re.I)
+_ENLIGHTEN = _re.compile(r"(i understand|that makes sense|aha|(it )?feels right|"
+                         r"this is the first|now i (get|see)|i like (that|this))", _re.I)
+
+
+def classify_user(text: str) -> str:
+    t = (text or "").strip()
+    if not t or len(t) < 3:
+        return "noise"
+    if _REFUTE.search(t) or _REDIRECT.search(t):
+        return "refute/redirect"
+    if _CRITERIA.search(t):
+        return "criteria"
+    if _ENLIGHTEN.search(t):
+        return "enlightenment"
+    return "neutral"
+
 
 def parse_line(line: str):
     try:
@@ -114,12 +142,17 @@ def main() -> int:
                     goal = {"kind": "icapture", "level": "goal", "parent": None,
                             "id": f"mgoal-{os.path.basename(args.file)[:8]}-{goal_n}",
                             "text": u_text[:400], "branches": {"desired": None},
+                            "signal_class": classify_user(u_text),
                             "declared_at": ts,
                             "label_basis": "completion (mined)"}
                     emit(goal)
                 else:
-                    emit({"kind": "icapture", "level": "step", "parent": goal["id"],
+                    cls = classify_user(u_text)
+                    emit({"kind": "icapture",
+                          "level": "goal" if cls == "refute/redirect" else "step",
+                          "parent": goal["id"],
                           "id": f"mstep-{uuid.uuid4().hex[:8]}", "text": u_text[:400],
+                          "signal_class": cls,
                           "branches": {"desired": None},
                           "declared_at": ts,
                           "label_basis": "completion (mined)"})
