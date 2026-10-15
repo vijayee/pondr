@@ -124,3 +124,66 @@ answer is refusal, which neither answerer produces) + temporal bookkeeping
 beyond the evidence text; model scale is flat here. (3) The arc closes with no
 measurement anywhere arguing a learned lens adds payoff over the cheap-leg
 router; the head-vs-router question remains power-starved, not falsified.
+
+## Demo #9 — the zero-overlap rescue test (measured 2026-10-15)
+
+The second agent proposed the one test that could rescue the strong thesis:
+dense similarity's theoretical advantage is semantic match under zero lexical
+overlap, and no prior demo isolated it (the relational tail was relational
+queries, not similarity targets; the value axes were cheap-leg domains).
+Pre-registered and run on all 450 harvested questions' own-haystack gold pairs,
+subset = content-token Jaccard(question, gold) <= 0.05 (n = 110 of 298 pairs),
+local, no oracle:
+
+| leg | top-1 | top-3 | mean pct |
+|---|---|---|---|
+| dense (bge) | 0.30 | 0.964 | **41.7 — BELOW chance (p=0.045)** |
+| lexical (content tokens) | 0.336 | 0.936 | 41.1 |
+| **time-token channel** | **0.90** | **0.991** | **93.3** |
+| chance | ~1/n | | 50.0 |
+
+**Verdict: LOSS — airtight.** Dense has no semantic second job on organic
+zero-content-overlap pairs; it ranks gold below the median session. The
+taxonomy's "dense has one real job" sentence now stands with its one gap closed
+by measurement. And the twist: the signal that exists in this regime is carried
+by TIME tokens (0.90 top-1) — a fifth cheap leg nobody had named. Proposed new
+axes from the same round, recorded as PROPOSALS with no measurements:
+negation/absence (the router needs to return nothing confidently),
+contradiction/versioning (two fresh memories conflict — distinct from
+staleness).
+
+## Elevated findings (second-agent round 3)
+
+Each was buried in a paragraph; each is first-class:
+
+1. **Dilution, not ceiling.** "Gold ceiling" is a diluted arm; per-axis focused
+   evidence can exceed it (three replications). A ceiling you can beat isn't
+   a ceiling.
+2. **Flat-scale (measured null).** Answerer swap p=1.0 on 17 paired cells: on
+   this tail the residual error is grader partial-credit + abstain-golds +
+   bookkeeping — capacity is not where the loss lives. Next target: the
+   grader, not the model.
+3. **Grader-collapse mechanism.** Strict-gram graders conflate *recall of the
+   gold string* with *correctness of the answer* ("Twice." vs "We've met up
+   twice.") — laws 1 and 2 composing. Any strict-gram grader is a similarity
+   engine.
+4. **Ties are information, not noise.** Demo-8: 19/25 ties; the k=3 A/B:
+   25/25. A high tie rate means the arms' selected sets don't differ — which
+   is itself the payoff-lives-in-selection finding. Report tie rate as a
+   first-class metric.
+
+## Framing
+
+The inverse of Sutton's bitter lesson, worth stating precisely: the bitter
+lesson says general methods beat hand-crafted features; on the retrieval tail,
+**the right decomposition beats the general method** — and the cheap legs are
+not features that break, they are structure (indexes, ledgers, anchors). The
+precise surviving claim is not "hand-crafting wins"; it is **"similarity is the
+wrong primitive for most retrieval failure modes."**
+
+## External validity (honesty note)
+
+Every number here is substrate-local: one WaveDB index, one organic LongMemEval
+file, kimi-judging-deepseek, one answerer family. The AXES are claimed as
+general; the numbers are not.
+
