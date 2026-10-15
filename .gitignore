@@ -69,3 +69,6 @@ models/*
 
 # Claude Code local settings (project-shared config would be settings.json)
 .claude/settings.local.json
+# ICM scratch + credentials NEVER tracked
+data/_scratch/
+scripts/_scratch/
