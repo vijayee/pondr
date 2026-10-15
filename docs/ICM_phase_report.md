@@ -86,8 +86,10 @@ every arm), and temporal bookkeeping beyond the evidence text.
   relational → structured index + routing among cheap legs (now OOS-decisive:
   10/1, p=0.0117); storage/decay → forgetting ledger (7/12 harm-path caught).
 - **No measurement anywhere in the arc argues a learned intent-conditioned lens
-  adds payoff** over cheap specialized legs plus routing. The weak thesis holds;
-  the strong thesis is falsified in every world tested (9 demonstrations).
+  adds payoff** over cheap specialized legs plus routing. The weak thesis holds.
+  The strong thesis is *either false or untestable, and for engineering purposes
+  the two are indistinguishable* (learning never required in any of the 9
+  worlds; see Addendum for the precise form).
 - **The one open question is power-starved, not falsified:** whether a learned
   head beats the 2-leg router (o100 OR-ceiling 0.640/0.680) on a real train/test
   split. The verified tail = 35 questions — too few. Needs more organic
@@ -152,3 +154,41 @@ BAAI/bge-small-en-v1.5 local; all via local Ollama relay :11434.
 ---
 *All numbers in this doc trace to committed scripts + result JSONs. Commits run
 69d8839 → b14a3eb on main, 2026-10-14/15.*
+
+## 6. Addendum — the second agent's corrections, accepted (2026-10-15)
+
+The second agent's read of v1 won twice against its own priors and sharpened
+four things:
+
+1. **"Falsified 9/9" over-claims; the precise form is now:** *the strong thesis
+   is either false or untestable, and for engineering purposes the two are
+   indistinguishable* — what is proven is that learning was never REQUIRED in
+   any of the 9 worlds (and provably cannot be in authored worlds, fixed-point
+   theorem); what is not proven is the negation ("no world requires learning"),
+   which enumeration cannot establish. The engineering consequence is identical
+   either way: build the cheap legs, don't wait for the lens.
+
+2. **Gold-context is not a ceiling — PROMOTED to a headline finding.** Three
+   independent replications now show selection arms beating the
+   full-gold-context arm (o300 F1: index 0.304 > gold 0.271; o100 same
+   direction; near-zero bucket same). This is a GENERAL LLM finding, not an ICM
+   one: for this answerer on this task class, diluted-but-complete context
+   underperforms focused-but-partial context. Flagged for Ponder (NOT folded
+   into Pondr per the separation rule): Ponder's tier-1 context strategy
+   ("top-k episodes, full text") is downstream of this result — a context-focus
+   experiment there is warranted before treating top-k-full-text as a floor.
+
+3. **The router is segment-dependent, not cleanly retired:** on o300 it adds
+   nothing over index alone (0.305 vs 0.304 — the "next costume" reading); on
+   o100 the OR over the two legs reached 0.640/0.680. Both readings are honest;
+   the segmentation is the finding (tail rates 6-18% by segment) and
+   "segment, then dispatch" is the architecture shape it implies — making the
+   SEGMENTER the one remaining candidate that might need to be learned.
+
+4. **The head-vs-router open question is now DOUBLY gated:** before any head
+   run, (gate i) the corpus must reach 70-80 verified reversals with
+   F1-gradeable golds, AND (gate ii) the opponent on the TARGET segment must be
+   measured to be the strongest cheap leg there — if the router adds nothing
+   over a single leg on that segment, the head's opponent is that leg, and the
+   test must be named accordingly (law 1's pre-check, applied to the opponent).
+
