@@ -252,8 +252,9 @@ zero relay): on the 110/298 pairs with content-token Jaccard <= 0.05, dense
 (bge) ranked gold at **41.7 mean percentile — significantly below chance**
 (p = 0.045), top-1 0.30. Dense has no semantic second job; the negative result
 is airtight in exactly the regime where its theoretical advantage should live.
-Twist: the time-token channel carries that regime at 0.90 top-1 — a fifth
-cheap leg, now named and measured. The taxonomy doc carries the full elevations
+Correction (same-day): the 0.90 time-channel figure was a tie-break artifact
+(99/110 rows all-tie; on separated rows it is 0.364) — there is no fifth leg;
+that regime is genuinely sparse under every measured leg. The taxonomy doc carries the full elevations
 (dilution-not-ceiling, flat-scale null, grader-collapse, ties-as-information),
 two proposal axes (negation/absence, contradiction/versioning), the
 inverse-bitter-lesson framing, and the external-validity note.

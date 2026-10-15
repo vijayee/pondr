@@ -145,9 +145,17 @@ local, no oracle:
 **Verdict: LOSS — airtight.** Dense has no semantic second job on organic
 zero-content-overlap pairs; it ranks gold below the median session. The
 taxonomy's "dense has one real job" sentence now stands with its one gap closed
-by measurement. And the twist: the signal that exists in this regime is carried
-by TIME tokens (0.90 top-1) — a fifth cheap leg nobody had named. Proposed new
-axes from the same round, recorded as PROPOSALS with no measurements:
+by measurement.
+
+**Correction (same-day, caught by the iron-subset re-run):** the time-token
+channel's 0.90 top-1 was an ARTIFACT — tie-control shows 99/110 subset rows
+all-tie for that leg (empty question time-set -> every candidate scores 0 ->
+stable sort keeps capture order), and gold is the first haystack session 52%
+of the time. On the 11 rows where time scores genuinely separate, its top-1 is
+0.364 — ordinary. **There is no fifth leg; the zero-overlap regime is genuinely
+sparse: dense 35.8 pct (below chance, p=0.019), lex ~0.32-0.41 top-1, time
+0.364 when it separates at all. Nothing retrieves well there by any measured
+leg.** Proposed new axes from the same round, recorded as PROPOSALS with no measurements:
 negation/absence (the router needs to return nothing confidently),
 contradiction/versioning (two fresh memories conflict — distinct from
 staleness).

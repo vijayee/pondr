@@ -174,10 +174,39 @@ def main() -> int:
     lex_sub = eval_leg("lex")
     time_sub = eval_leg("time")
 
+    # position-bias control: legs whose scores ALL TIE on a row let iteration
+    # order (== capture/haystack order) decide the rank, so their "top1" can be
+    # a gold-position artifact. Measure each leg on (a) rows where the leg
+    # actually separates gold (gold's score is unique) and (b) the all-tie rows.
+    def tie_control(key):
+        sep_rows = [r for r in zov
+                    if r["gold_idx"] < len(r[key])
+                    and sorted(r[key], reverse=True)[0] != r[key][r["gold_idx"]]
+                    or (r[key].count(r[key][r["gold_idx"]]) == 1)]
+        sep_rows = [r for r in zov
+                    if r[key].count(r[key][r["gold_idx"]]) == 1
+                    and sorted(range(len(r[key])), key=lambda i: -r[key][i])[0] != r["gold_idx"]
+                    or r[key].count(r[key][r["gold_idx"]]) == 1]
+        sep_clean = [r for r in zov if r[key].count(r[key][r["gold_idx"]]) == 1]
+        tie_rows = [r for r in zov if r[key].count(r[key][r["gold_idx"]]) > 1]
+        def top1(rows):
+            if not rows:
+                return None, 0
+            w = sum(1 for r in rows
+                    if sorted(range(len(r[key])), key=lambda i: -r[key][i])[0] == r["gold_idx"])
+            return round(w / len(rows), 3), len(rows)
+        return {"sep_top1": top1(sep_clean)[0] or 0.0, "sep_n": len(sep_clean),
+                "tie_top1": top1(tie_rows)[0], "tie_n": len(tie_rows)}
+    controls = {"lex": tie_control("lex"), "time": tie_control("time")}
+
     # dense: embed per question
     d_top1 = d_top3 = 0
     d_pcts = []
-    d_all_top1 = 0
+    # iron subset: ZERO content-pure overlap AND zero time-word overlap --
+    # the all-channel-empty regime (demo #9's own scrutiny caveat)
+    iron_top1 = iron_n = 0
+    iron_lexp1 = iron_time1 = 0
+    iron_d_pcts, iron_lex_pcts, iron_time_pcts = [], [], []
     for r in zov:
         qi = r["qi"]
         # find the segment store holding this question's sessions
@@ -197,12 +226,33 @@ def main() -> int:
              and any(s in c for s in recs[qi]["answer_session_ids"])]
         if not g or len(cids) < 2:
             continue
+        qtext = recs[qi]["question"]
+        gold_text = sess[g[0]]
+        pure = TIME_TOKENS
+        qc_pure = content_toks(qtext) - pure
+        gt_ok = content_toks(gold_text)
+        q_time = content_toks(qtext) & pure
+        g_time = gt_ok & pure
+        ov_pure = tok_jaccard(qc_pure, gt_ok - pure)
+        ov_time = tok_jaccard(q_time, g_time)
+        if not (ov_pure <= 0.02 and ov_time == 0.0):
+            continue
+        iron_n += 1
         cvec = _emb(list(sess.values()))
-        qv = _emb([recs[qi]["question"]])[0]
+        qv = _emb([qtext])[0]
         cos = [float(np.dot(c, qv)) for c in cvec]
         rank = sorted(range(len(cids)), key=lambda i: -cos[i]).index(cids.index(g[0]))
         pct = 100.0 * (len(cids) - 1 - rank) / max(1, len(cids) - 1)
         d_top1 += rank == 0; d_top3 += rank < 3; d_pcts.append(pct)
+        iron_d_pcts.append(pct); iron_top1 += rank == 0
+        # lex_pure + time ranks on the iron subset
+        lexp = [tok_jaccard(qc_pure, content_toks(t) - pure) for t in sess.values()]
+        timp = [tok_jaccard(q_time, content_toks(t) & pure) for t in sess.values()]
+        lrank = sorted(range(len(cids)), key=lambda i: -lexp[i]).index(cids.index(g[0]))
+        trank = sorted(range(len(cids)), key=lambda i: -timp[i]).index(cids.index(g[0]))
+        iron_lexp1 += lrank == 0; iron_time1 += trank == 0
+        iron_lex_pcts.append(100.0 * (len(cids) - 1 - lrank) / max(1, len(cids) - 1))
+        iron_time_pcts.append(100.0 * (len(cids) - 1 - trank) / max(1, len(cids) - 1))
     n_sub = max(1, len(d_pcts))
     dense = {"n": len(d_pcts), "top1": round(d_top1 / n_sub, 3),
              "top3": round(d_top3 / n_sub, 3),
@@ -213,7 +263,8 @@ def main() -> int:
     # top-1 vs chance under unequal n_sessions: use the mean percentile vs 50
     n_win = sum(1 for p in d_pcts if p > 50)
     p_chance = binomtest(n_win, n_sub, 0.5).pvalue
-    out = {"pre_registered": OVERLAP_MAX,
+    out = {"tie_controls": controls,
+           "pre_registered": OVERLAP_MAX,
            "all_pairs_n": len(rows),
            "subset_n": len(zov),
            "dense": dense,
@@ -237,6 +288,20 @@ def main() -> int:
         print("  VERDICT: WIN -- dense has a semantic second job (fifth row).")
     else:
         print("  VERDICT: LOSS/AIR-TIGHT -- dense ~or-below chance on zero-overlap pairs.")
+    iron = {"n": iron_n,
+            "dense_top1": round(iron_top1 / max(1, iron_n), 3),
+            "lex_pure_top1": round(iron_lexp1 / max(1, iron_n), 3),
+            "time_top1": round(iron_time1 / max(1, iron_n), 3),
+            "dense_pct": round(sum(iron_d_pcts) / max(1, iron_n), 1),
+            "lex_pure_pct": round(sum(iron_lex_pcts) / max(1, iron_n), 1),
+            "time_pct": round(sum(iron_time_pcts) / max(1, iron_n), 1)}
+    out["iron_all_channels_empty"] = iron
+    print(f"IRON SUBSET (zero content-pure AND zero time overlap): n={iron_n}")
+    for k, v in iron.items():
+        if k != "n":
+            print(f"    {k}: {v}")
+    with io.open(OUT, "w", encoding="utf-8") as f:
+        f.write(json.dumps(out, indent=2))
     print(f"[done] wrote {OUT}")
     return 0
 
