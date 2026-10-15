@@ -217,6 +217,8 @@ def main() -> int:
             else:
                 blk = blocks[arm]
             ans = ask_retry(q, blk)
+            if not ans.strip():
+                row.setdefault("relay_fail", []).append(arm)
             row[arm] = round(grade(ans, gold_ans), 3)
             row[arm + "_f1"] = grade_f1(ans, gold_ans)
             row.setdefault("answers", {})[arm] = ans

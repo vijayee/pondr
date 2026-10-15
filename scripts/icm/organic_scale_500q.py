@@ -209,16 +209,23 @@ def main() -> int:
                 g = grade(ans, gold_ans)
                 results[arm].append(round(g, 3))
                 row[arm] = round(g, 3)
-                time.sleep(3.0)
+                # relay-failure visibility: empty answer = silent 429 give-up
+                if not ans.strip():
+                    row.setdefault("relay_fail", []).append(arm)
 
             # judge scoring for the labels-recovery pre-check
             cand_scores = []
+            cand_judge_fail = False
             cand_ids = [e["id"] for e in payload["episodes"]][:5]
             for cid in cand_ids:
                 j = judge_help(policy_j, q, texts_by_id.get(cid, ""))
+                if j == 0.0:
+                    cand_judge_fail = True
                 cand_scores.append((cid, j))
                 time.sleep(2.0)
-            spear_rows.append({"qi": OFFSET + qi, "cand_scores": cand_scores})
+            spear_rows.append({"qi": OFFSET + qi, "cand_scores": cand_scores,
+                               "judge_suspect": cand_judge_fail})
+            cand_judge_fail = False
 
             # cosine for the same candidates
             if cand_ids:
