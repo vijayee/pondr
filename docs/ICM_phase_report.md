@@ -243,3 +243,18 @@ question moves from open-neutral to **open-leaning-no**. The gate still applies
 to a *decisive* verdict; the direction is now measured. scripts/icm/
 head_vs_index_oos.py (96d2263).
 
+## 9. Addendum 4 — demo #9 ran (2026-10-15): the rescue test says no, airtight
+
+The second agent's rescue test (semantic match under zero lexical overlap) was
+pre-registered in `scripts/icm/demo9_zero_overlap.py` and measured same-day on
+data already on disk (all 450 harvested questions, own-haystack gold pairs,
+zero relay): on the 110/298 pairs with content-token Jaccard <= 0.05, dense
+(bge) ranked gold at **41.7 mean percentile — significantly below chance**
+(p = 0.045), top-1 0.30. Dense has no semantic second job; the negative result
+is airtight in exactly the regime where its theoretical advantage should live.
+Twist: the time-token channel carries that regime at 0.90 top-1 — a fifth
+cheap leg, now named and measured. The taxonomy doc carries the full elevations
+(dilution-not-ceiling, flat-scale null, grader-collapse, ties-as-information),
+two proposal axes (negation/absence, contradiction/versioning), the
+inverse-bitter-lesson framing, and the external-validity note.
+
