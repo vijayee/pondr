@@ -45,7 +45,7 @@ from payoff_organic_lme import grade  # noqa: E402
 HARNESS = r"C:\Users\victor morrow\Git-projects\memory_and_context_eval_harness"
 FULL500 = os.path.join(HARNESS, "datasets", "longmemeval", "longmemeval_interleaved_full.json")
 ANSWERER = "deepseek-v4.1-flash:cloud"
-JUDGE = "kimi-k3:cloud"
+JUDGE = "kimi-k2.7-code:cloud"  # cheap kimi tier; kimi-k3 retired 2026-10-14 (token cost)
 OFFSET = None  # --offset arg; disjoint ranges per chained harvest
 
 

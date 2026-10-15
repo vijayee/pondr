@@ -38,8 +38,12 @@ CKPT = os.path.join("data", "_scratch", "icm", "organic500_ckpt_o100.jsonl")
 DB = os.path.join("data", "_scratch", "icm", "organic_o100", "ledger")
 OUT = os.path.join("data", "_scratch", "icm", "reversal_verification_o100.json")
 
-VERIFIER = "deepseek-v4.1-flash:cloud"   # second judge; original was kimi-k3
+VERIFIER = "deepseek-v4.1-flash:cloud"   # second judge (cross-family)
 MARGIN = 0.1
+# NOTE: kimi-k3 retired 2026-10-14 for token cost. For post-2026-10-14 tails the
+# original judge is kimi-k2.7-code:cloud (probe-passing: no-answer episode 0.0,
+# gold 1.0, same decoy tolerance as kimi-k3); this override must match the
+# harvest run's JUDGE.
 
 
 def judge_help(policy, goal_q, candidate_text) -> float:
@@ -103,7 +107,9 @@ def main() -> int:
     # cache candidate cosines per reversal question
     cos_cache: dict[int, dict[str, float]] = {}
     verified, rejected, skipped = [], [], []
-    results = {"verifier": VERIFIER, "original_judge": "kimi-k3:cloud",
+    import os
+    ORIGINAL_JUDGE = os.environ.get("ICM_ORIGINAL_JUDGE", "kimi-k2.7-code:cloud")
+    results = {"verifier": VERIFIER, "original_judge": ORIGINAL_JUDGE,
                "margin": MARGIN, "verified": [], "rejected": [], "skipped": []}
     n_seen = 0
 
