@@ -16,6 +16,7 @@ Usage: python scripts/icm/codetrace_census.py [--traj-dir data/_scratch/codetrac
 
 from __future__ import annotations
 
+import argparse
 import collections
 import glob
 import io
@@ -94,11 +95,11 @@ def file_census(trajs_dir):
     result = {}
     for repo, fmap in per_repo.items():
         multi = {f: v for f, v in fmap.items() if len(v) >= 2}
+        top = [(f, len(v)) for f, v in
+               sorted(multi.items(), key=lambda x: -len(x[1]))[:5]]
         result[repo] = {"tasks": len({t for t, fs in task_files.items() if repo_of(t) == repo}),
                         "file_units": len(fmap), "shared_files": len(multi),
-                        "top_shared": sorted(((f, len(v)) for f, v in
-                                              sorted(multi.items(), key=lambda x: -len(x[1])))[:5],
-                                             key=lambda x: -x[1])}
+                        "top_shared": top}
     return result
 
 
