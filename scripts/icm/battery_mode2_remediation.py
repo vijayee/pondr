@@ -40,16 +40,17 @@ THE PRE-REGISTRATION (fixed BEFORE fitting; per the arc's standing laws):
     A   ANCHOR   : original exactly (random init 0.02, D=128, proj-only
                    hinge 0.1, L2 1e-4, 1200 ep) -- must reproduce ~0.565.
     B1  RESIDUAL : item-1 in additive form -- bound = cos_raw + proj delta,
-                   W ZERO-init D=128 (the score starts EXACTLY at the base
-                   geometry and can only add corrections), hinge on the
-                   TOTAL score, L2 on W in {1e-4, 1e-3}.
+                   W sigma-0.01-init D=128 (exact zero-init is a saddle:
+                   tanh(0)=0 kills d/dW; the score still starts AT the base
+                   geometry +/- noise and the delta stays small), hinge on
+                   the TOTAL score, L2 on W in {1e-4, 1e-3}.
     B2  IDENTITY : item-1 in multiplicative form -- W0 = I_384 (D=384;
                    at init the projection is a linear pass-through, so the
                    bound ranking IS the raw cosine's), proj-only hinge (the
                    baseline's loss, unchanged), L2 on (W - W0), max 600 ep.
     C   EARLYSTOP/WD : original parametrization unchanged, WD in
                    {1e-4, 1e-3, 1e-2}, checkpoints every 50 ep.
-    D   INFONCE  : residual form + in-batch negatives (K=12 candidates
+    D   INFONCE  : residual form (sigma-0.01 init) + in-batch negatives (K=12 candidates
                    sampled per question per epoch from OTHER train
                    questions -- the real distribution, no composed
                    distractor conflicts), temperature in {0.05, 0.1, 0.3}.
@@ -125,6 +126,7 @@ def ensure_embeds(rows):
         if list(z["ctexts"]) == ctexts and list(z["qtexts"]) == texts_q:
             cz, qz = z["cz"], z["qz"]
             for ri, r in enumerate(rows):
+                r["_qz"] = qz[ri]
                 for c in r["cands"]:
                     c["_z"] = cz[i_]
                     c["cos"] = round(float(np.dot(cz[i_], qz[ri])), 4)
@@ -135,6 +137,7 @@ def ensure_embeds(rows):
     cz = _emb(ctexts)
     qz = _emb(texts_q)
     for ri, r in enumerate(rows):
+        r["_qz"] = qz[ri]
         for c in r["cands"]:
             c["_z"] = cz[i_]
             c["cos"] = round(float(np.dot(cz[i_], qz[ri])), 4)
@@ -177,7 +180,10 @@ def train_hinge(cfg, tr_rows, val_rows, qz, epochs, log_tag):
         W = np.eye(384, dtype=np.float32)
         W0 = W.copy()
     elif form == "residual":
-        W = np.zeros((384, dim), dtype=np.float32)
+        # EXACT zero-init is a saddle (tanh(0)=0 => d/dW = 0 everywhere):
+        # start at sigma-0.01 noise around the base geometry instead; the L2
+        # still regularizes the delta toward 0 (= the base geometry).
+        W = (0.01 * rng.normal(0.0, 1.0, size=(384, dim))).astype(np.float32)
         W0 = np.zeros_like(W)
     else:                                # anchor: baseline's exact random init
         W = rng.normal(0, 0.02, size=(384, dim)).astype(np.float32)
@@ -220,8 +226,8 @@ def train_hinge(cfg, tr_rows, val_rows, qz, epochs, log_tag):
             # exact algebra == the original triple loop (unit-checked):
             Gu, Gp = G[unpaid], G[paid]
             dgq = (B @ Gu - A @ Gp) / dim
-            dgp = -A * gq / dim                    # per paid
-            dgu = +B * gq / dim                    # per unpaid
+            dgp = -A[:, None] * gq[None, :] / dim   # per paid (n_paid, D)
+            dgu = +B[:, None] * gq[None, :] / dim   # per unpaid (n_unpaid, D)
             GW += np.outer(xq, dgq * (1 - gq ** 2))
             for k, p in enumerate(paid):
                 if A[k] == 0.0:
@@ -247,10 +253,10 @@ def train_hinge(cfg, tr_rows, val_rows, qz, epochs, log_tag):
 
 def train_infonce(cfg, tr_rows, val_rows, qz, epochs, log_tag):
     """Residual form + multi-positive InfoNCE with in-batch negatives."""
-    dim, tau, l2, lr = cfg["dim"], cfg["tau"], cfg["l2"], cfg.get("lr", LR)
+    dim, tau, l2, lr = cfg["W"]["dim"], cfg["tau"], cfg["l2"], cfg.get("lr", LR)
     K = cfg.get("k_inbatch", K_INBATCH)
     rng = np.random.default_rng(cfg.get("seed", SEED))
-    W = np.zeros((384, dim), dtype=np.float32)
+    W = (0.01 * rng.normal(0.0, 1.0, size=(384, dim))).astype(np.float32)
     all_cands = np.stack([c["_z"] for r in tr_rows for c in r["cands"]])
     n_all = all_cands.shape[0]
     best_val, best_W, best_ep = -1.0, None, -1
@@ -365,8 +371,8 @@ def runs_unit_check(tr_rows, qvecs_tr):
         B = M.sum(axis=0).astype(np.float64)
         Gu, Gp = G[unpaid], G[paid]
         dgq = (B @ Gu - A @ Gp) / dimf
-        dgp = -A * gq / dimf
-        dgu = +B * gq / dimf
+        dgp = -A[:, None] * gq[None, :] / dimf
+        dgu = +B[:, None] * gq[None, :] / dimf
         GW += np.outer(xq, dgq * (1 - gq ** 2))
         for k, p in enumerate(paid):
             if A[k] == 0.0:
