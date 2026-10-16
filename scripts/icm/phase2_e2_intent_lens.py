@@ -1,69 +1,43 @@
-"""PHASE 2 E2, START-OVER RUN -- the intent-conditioned lens trained on
-INTENT-BEARING data (the agent-intent corpus), per the lens-corpus guard.
+"""PHASE 2 E2 -- the intent-conditioned lens on INTENT-BEARING data
+(the agent-intent corpus), per the lens-corpus guard. Module is now
+importable: build_data() / train_fold() / run_cv() are shared with the
+levers addendum (phase2_e2_intent_battery.py) -- math identical to the
+run that produced addendum 11.
 
-This is the plan's actual Phase-2 gate, executed for the first time with the
-intent operand in the loss. Everything is named in ternary terms:
+  Arms (per the plan, section 7 E2):
+    bind(state, intent) -> q_t = BUNDLE(normalize(e(task_t) + e(plan_t)))
+        (parameter-free; plan absent -> q_t = e(task_t); no session-state
+         exists in the corpus -> bind(intent) only, recorded as a GAP)
+    embed(prompt)       -> o1 = max(cos(task, act), cos(plan, act))
+    memory              -> m_i = e(step action text[:300])
+    usefulness          -> human-verified step utility INVERTED (faulty=0)
+  Splits: 8-fold task-disjoint CV; val carve from the TRAIN side (1-in-5
+    stride on the sorted train list) selects the early-stop checkpoint;
+    every scored task is held out from both fitting and selection.
+  Lens: residual -- score = bundle_cos + <tanh(z_t W), tanh(m_i W)>/D,
+    W shared 384x128 sigma-0.01 init (W->0 = the untrained bundle), hinge
+    on within-task (useful, faulty) pairs, L2, margin, max 600 ep, ckpt 25.
+  Opponents (parameter-free, identical pooled pool): o1 prompt leg,
+    o2 bundle cosine (the lens's own init geometry), o3 lexical, o4 loglen.
+  Survival: beat ALL FOUR by > 0.02 -> mandatory composition audit; ties
+    and losses are reported with direction, verdict OPEN, no dismissals.
 
-  Arms (per docs/Intent_Conditioned_Memory_Research_Plan.md section 7, E2):
-    bind(state, intent)  ->  q_t = BUNDLE(normalize(e(task_t) + e(plan_t)))
-        -- parameter-free HDC bundling analog; intent = the agent's OWN
-           declared plan (goal grain, per the measured granularity verdict),
-           state = the task description. GAPS RECORDED, NOT FAKED: the
-           corpus has no session-state beyond step position (this run
-           trains bind(intent) only) and no plan for ~47 percent of tasks
-           (there the intent bundle is the task text alone).
-    embed(prompt)        ->  o1 = max(cos(task, act), cos(plan, act))
-        -- the prompt-embedding retrieval leg the gate names as the opponent.
-    memory               ->  m_i = e(step action text[:300]).
-    usefulness           ->  human-verified step utility INVERTED (faulty=0;
-        within-task contrast = verified-faulty vs the task's other steps).
+  CORRECTION NOTE (2026-10-16): the first run of this instrument computed
+    o1 as TASK-cosine alone (a patch silently no-op'd; the offsets line was
+    accidentally correct only because task_ids is sorted). Both are FIXED
+    here; `--opponents-only` re-measures the corrected o1..o4 without
+    retraining. The lens-side numbers of addendum 11 are unaffected (they
+    never touched o1's construction).
 
-THE PRE-REGISTRATION (fixed BEFORE fitting; per the lens-corpus guard):
-  Splits:   8-fold task-disjoint CV (seeded 42; trajectory = episode unit).
-            Per fold: scored pool = that fold's tasks ONLY (never trained on
-            by this fold's model). The early-stop val carve is taken from
-            the TRAIN side (20 percent, deterministic 1-in-5 stride on the
-            sorted train-task list) -- no scored task is used for fitting
-            or checkpoint selection.
-  Lens:     residual form -- score = bundle_cos(q_t, m_i) + <tanh(z_t W),
-            tanh(m_i W)>/D (W shared 384x128, sigma-0.01 init; at W->0 the
-            score IS exactly the bundle cosine -- the untrained
-            bind(state,intent) geometry), hinge on within-task
-            (useful, faulty) pairs, L2 1e-4 on W, margin 0.1, max 600 ep,
-            checkpoints every 25. Two configs: lr 1.5 and lr 0.15.
-            Pre-registered EARLY-EXIT: hinge < 1e-6 at 4 consecutive
-            checkpoints = the bundle geometry already separates the task
-            within the fold -- a data finding, recorded as such.
-  Opponents (parameter-free, pooled over ALL steps, identical pools):
-            o1 embed(prompt) leg = max(cos(task,act), cos(plan,act))
-               (plan absent for a task -> cos(task) alone)
-            o2 bundle-cosine = cos(bundle, act) -- the lens's init geometry;
-               beats-o2 means the LEARNED delta did something
-            o3 lexical jaccard((task+plan), act)
-            o4 log length(action)
-  Readout:  pooled AUROC (all steps; unverified steps = the ORDINARY class
-            -- only VERIFIED-FAULTY carry 0s; the coverage gap is reported
-            in the gap report, not hidden). Per-fold AUC distribution also
-            reported (min/median/max).
-  Survival: lens beats ALL FOUR opponents by > 0.02 on pooled AUC = PASS ->
-            MANDATORY composition audit before any intent claim: Spearman
-            between lens scores and the cheap legs it cannot see, plus the
-            faulty-head stack numbers (0.814 head / 0.754 loglen) for
-            context; a PASS whose margin tracks loglen/lexical is the
-            router wearing intent's hat (recorded as such).
-            Tie/loss = direction reported, verdict OPEN. No dismissals.
-
-  GAP REPORT (first-class output per the standing instruction to surface
-  data gaps DURING the process -- written into the results JSON):
-  census / label coverage / usable-contrast tasks / plan presence /
-  plan-echo contamination / prompt-analog coarseness / state operand /
-  memory-side nature / flip-shape availability / outcome-label axis.
-
-Run:  python scripts/icm/phase2_e2_intent_lens.py
+Run:
+  python scripts/icm/phase2_e2_intent_lens.py                    (full, ~17 min)
+  python scripts/icm/phase2_e2_intent_lens.py --opponents-only   (seconds)
+  python scripts/icm/phase2_e2_intent_lens.py --smoke            (structure check)
 """
 
 from __future__ import annotations
 
+import argparse
 import collections
 import io
 import json
@@ -96,6 +70,7 @@ MARGIN = 0.1
 L2 = 1e-4
 DIM = 128
 
+FAULTY = ("incorrect", "unuseful")
 _model = None
 
 
@@ -113,11 +88,9 @@ def tokset(v):
     return {w for w in re.findall(r"[a-z0-9]+", str(v).lower()) if len(w) > 2}
 
 
-def main() -> int:
-    t_start = time.time()
+def build_data(verbose=True):
+    """Assembly + embeddings + per-task structures + opponents + gap report."""
     mapped = [json.loads(l) for l in io.open(MAPPED, encoding="utf-8") if l.strip()]
-
-    # ========== ASSEMBLY + GAP REPORT (surfaced DURING the process) =========
     goals, plans, steps = {}, collections.defaultdict(list), []
     for r in mapped:
         if r["level"] == "goal":
@@ -140,10 +113,9 @@ def main() -> int:
 
     n_steps = sum(len(t["steps"]) for t in tasks.values())
     n_faulty = sum(1 for t in tasks.values() for s in t["steps"]
-                   if s.get("human_label") in ("incorrect", "unuseful"))
+                   if s.get("human_label") in FAULTY)
     tasks_with_faulty = {h for h, t in tasks.items()
-                         if any(s.get("human_label") in ("incorrect", "unuseful")
-                                for s in t["steps"])}
+                         if any(s.get("human_label") in FAULTY for s in t["steps"])}
     echo_steps = sum(1 for t in tasks.values() for s in t["steps"]
                      if s["text"].lstrip().replace(" ", "").startswith('{"command":"plan"'))
     gaps = {
@@ -157,9 +129,9 @@ def main() -> int:
         "tasks_with_any_verified_faulty": len(tasks_with_faulty),
         "tasks_without_any": len(tasks) - len(tasks_with_faulty),
         "label_note": ("unverified steps are the ORDINARY class -- the bench "
-                       "verifies faulty steps and marks nothing else, so "
-                       "'ok' labels do not exist; the contrast is "
-                       "verified-faulty vs unverified-ordinary"),
+                       "verifies faulty steps and marks nothing else, so 'ok' "
+                       "labels do not exist; the contrast is verified-faulty "
+                       "vs unverified-ordinary"),
         "plan_presence": {"tasks_with_declared_plan":
                           sum(1 for t in tasks.values() if t["plan"]),
                           "rate": round(sum(1 for t in tasks.values()
@@ -174,10 +146,10 @@ def main() -> int:
                                "the recall-time prompt -- the coarsest honest "
                                "analog; a finer query-time prompt trace does "
                                "not exist in this capture"),
-        "state_operand_note": ("no session-state beyond trajectory position in "
-                               "the corpus; this run trains bind(intent) ONLY "
-                               "and claims no state conditioning -- the plan's "
-                               "full bind(state, intent) stays a GAP"),
+        "state_operand_note": ("no session-state beyond trajectory position; "
+                               "this run trains bind(intent) ONLY and claims "
+                               "no state conditioning -- the plan's full "
+                               "bind(state, intent) stays a GAP"),
         "memory_side_note": ("memory units are the agent's own step ACTIONS "
                              "from a trajectory, not independently-retrieved "
                              "records; the usefulness oracle is human "
@@ -187,8 +159,8 @@ def main() -> int:
         "flip_shape": {"shared_file_units": None,
                        "note": ("repo-shared file units exist (the flip table) "
                                 "but utility labels on them are thin (16 "
-                                "negatives) -- the flip-shape corpus is not "
-                                "yet trainable at utility-label power")},
+                                "negatives) -- not yet trainable at "
+                                "utility-label power")},
         "outcome_axis_note": ("547 rule-computed trajectory outcomes exist but "
                               "add no step-level utility signal this run -- a "
                               "second, coarser label axis left unused"),
@@ -203,42 +175,44 @@ def main() -> int:
     except Exception:
         gaps["flip_shape"]["shared_file_units"] = "file missing"
 
-    # ============================ EMBEDDINGS (cached) ========================
+    # ---------------------------------------------------- embeddings (cached)
     atexts = [s["text"][:300] for h in task_ids for s in tasks[h]["steps"]]
     gt = [tasks[h]["goal"] for h in task_ids]
-    pt = [tasks[h]["plan"] for h in task_ids]   # "" if absent (zeroed below)
-    plan_present = [bool(x) for x in pt]
+    pt = [tasks[h]["plan"] for h in task_ids]          # "" when absent
+    plan_present = np.array([bool(x) for x in pt])
     ekey = json.dumps([len(atexts), gt[0][:50], atexts[0][:50]])
     avec = gvec = pvec = None
     if os.path.exists(ECACHE):
         z = np.load(ECACHE, allow_pickle=True)
         if str(z["ekey"]) == ekey:
-            avec, gvec, pvec = z["avec"], z["gvec"], z["pvec"]
-            pvec = pvec.copy()
-            pvec[~np.array(plan_present)] = 0.0
-            print("[cache] embeds loaded", flush=True)
+            avec, gvec, pvec = z["avec"], z["gvec"], z["pvec"].copy()
+            pvec[~plan_present] = 0.0
+            if verbose:
+                print("[cache] embeds loaded", flush=True)
     if avec is None:
-        print(f"[embed] {len(atexts)} actions + {len(gt)} goals + {len(pt)} plan/goal",
-              flush=True)
+        if verbose:
+            print(f"[embed] {len(atexts)} actions + {len(gt)} goals + {len(pt)} plans",
+                  flush=True)
         avec, gvec, pvec = _emb(atexts), _emb(gt), _emb(pt)
-        pvec[~np.array(plan_present)] = 0.0      # plan-absent -> zero intent part
+        pvec[~plan_present] = 0.0
         os.makedirs(os.path.dirname(ECACHE), exist_ok=True)
         np.savez(ECACHE, ekey=ekey, avec=avec, gvec=gvec, pvec=pvec)
 
-    # per-task structures
+    # ------------------------------------------------- per-task structures
     D = {}
+    offs, acc = {}, 0
+    for h in task_ids:                      # contiguous slices in sorted order
+        offs[h] = acc
+        acc += len(tasks[h]["steps"])
     for ti, h in enumerate(task_ids):
         t = tasks[h]
-        q_raw = gvec[ti] + pvec[ti]      # bundle(state, intent), plan->goal fb
-        q_raw = q_raw / max(1e-9, np.linalg.norm(q_raw))
-        ms = avec[sum(len(tasks[x]["steps"]) for x in task_ids[:len(task_ids)]) and 0:0] \
-            if False else avec
-        lo = sum(len(tasks[x]["steps"]) for x in task_ids if x < h)
-        hi = lo + len(t["steps"])
+        q_raw = gvec[ti] + pvec[ti]         # bundle; p=0 row -> e(task)
+        q_raw = q_raw / max(1e-9, float(np.linalg.norm(q_raw)))
+        lo, hi = offs[h], offs[h] + len(t["steps"])
         ms = avec[lo:hi]
         D[h] = {"q": q_raw, "M": ms,
                 "faulty": {i for i, s in enumerate(t["steps"])
-                           if s.get("human_label") in ("incorrect", "unuseful")},
+                           if s.get("human_label") in FAULTY},
                 "bundle": (q_raw @ ms.T).tolist(),
                 "task_cos": (gvec[ti] @ ms.T).tolist(),
                 "plan_cos": (pvec[ti] @ ms.T).tolist(),
@@ -249,182 +223,222 @@ def main() -> int:
             u = ct | a
             D[h]["jacc"].append(len(ct & a) / len(u) if u else 0.0)
             D[h]["loglen"].append(math.log1p(len(s["text"])))
-    print(f"[data] {len(tasks)} tasks / {n_steps} steps / {n_faulty} verified-faulty / "
-          f"{len(tasks_with_faulty)} tasks with faulty", flush=True)
 
-    # ============ OPPONENTS (parameter-free; identical pooled pools) =========
+    # ------------------------------------------------- opponents (fixed pool)
     opp_pairs = {"o1": [], "o2": [], "o3": [], "o4": []}
     for h in task_ids:
         d = D[h]
         for i in range(len(d["M"])):
             y = 0.0 if i in d["faulty"] else 1.0
-            o1 = max(d["task_cos"][i], d["plan_cos"][i])   # plan absent -> 0 row
-            opp_pairs["o1"].append((y, o1))
+            opp_pairs["o1"].append((y, max(d["task_cos"][i], d["plan_cos"][i])))
             opp_pairs["o2"].append((y, d["bundle"][i]))
             opp_pairs["o3"].append((y, d["jacc"][i]))
             opp_pairs["o4"].append((y, d["loglen"][i]))
     opp_auc = {k: auc(v) for k, v in opp_pairs.items()}
-    best_opp = max(v for v in opp_auc.values() if v is not None)
-    print(f"[opp] o1={opp_auc['o1']} o2={opp_auc['o2']} o3={opp_auc['o3']} "
-          f"o4={opp_auc['o4']} (pooled over {n_steps} steps)", flush=True)
-
-    # ================================ THE LENS ===============================
-    def lens_step_scores(h, W):
-        d = D[h]
-        gq = np.tanh(d["q"] @ W)
-        proj = np.tanh(d["M"] @ W) @ gq / DIM
-        return d["bundle"] + np.asarray(proj).tolist()
-
-    def pooled_auc(task_list, W):
-        pairs = []
-        for h in task_list:
-            for y, s in zip((0.0 if i in D[h]["faulty"] else 1.0
-                             for i in range(len(D[h]["M"]))), lens_step_scores(h, W)):
-                pairs.append((y, s))
-        return auc(pairs)
-
-    def train_fold(lr, tr_tasks, val_tasks, log_tag):
-        rng = np.random.default_rng(SEED)
-        W = (0.01 * rng.normal(0.0, 1.0, size=(384, DIM))).astype(np.float32)
-        best_val, best_W, best_ep, exit_streak = -1.0, None, -1, 0
-        t0 = time.time()
-        for ep in range(EPOCHS):
-            GW = np.zeros_like(W)
-            loss = 0.0
-            n_pairs = 0
-            for h in tr_tasks:
-                d = D[h]
-                if not d["faulty"]:
-                    continue
-                xq, M = d["q"], d["M"]
-                gq = np.tanh(xq @ W)
-                G = np.tanh(M @ W)
-                t_scores = G @ gq / DIM + np.asarray(d["bundle"])
-                A = np.zeros(len(t_scores), dtype=np.float64)
-                fl = d["faulty"]
-                for f in fl:
-                    viol = (MARGIN - t_scores + t_scores[f]) > 0
-                    viol[list(fl)] = False          # faulty never pair with faulty
-                    c = int(viol.sum())
-                    if c == 0:
-                        continue
-                    loss += float((MARGIN - t_scores[viol] + t_scores[f]).sum())
-                    n_pairs += c
-                    dgq = (viol @ G - c * G[f]) / DIM
-                    GW += np.outer(xq, dgq * (1 - gq ** 2))
-                    A[viol] -= 1.0                  # useful side: pull DOWN
-                    A[f] += float(c)                # faulty side: push UP
-                nz = np.nonzero(A)[0]
-                for i in nz:
-                    GW += np.outer(M[i], A[i] * gq / DIM * (1 - G[i] ** 2))
-            GW += L2 * W
-            W -= lr * GW / max(1, len(tr_tasks))
-            if (ep + 1) % CKPT == 0 or ep == EPOCHS - 1:
-                v = pooled_auc(val_tasks, W) if val_tasks else None
-                if v is not None and v > best_val:
-                    best_val, best_W, best_ep = v, W.copy(), ep + 1
-                if n_pairs and loss / n_pairs < 1e-6:
-                    exit_streak += 1
-                    if exit_streak >= 4:
-                        break
-                else:
-                    exit_streak = 0
-        print(f"[{log_tag}] fold done ep={ep + 1} val={best_val if best_val is None else round(best_val, 3)} "
-              f"({time.time() - t0:.0f}s)", flush=True)
-        return {"W": best_W if best_W is not None else W, "val_best": best_val,
-                "best_epoch": best_ep, "early_exit": exit_streak >= 4}
+    if verbose:
+        print(f"[data] {len(tasks)} tasks / {n_steps} steps / {n_faulty} "
+              f"verified-faulty / {len(tasks_with_faulty)} tasks with faulty", flush=True)
+        print(f"[opp] " + " ".join(f"{k}={None if v is None else round(v, 4)}"
+                                   for k, v in opp_auc.items()), flush=True)
 
     rng = np.random.default_rng(SEED)
     perm = rng.permutation(len(task_ids))
     fold_sets = [[task_ids[i] for i in perm[k::N_FOLDS]] for k in range(N_FOLDS)]
+    return {"task_ids": task_ids, "tasks": tasks, "D": D, "fold_sets": fold_sets,
+            "opp_pairs": opp_pairs, "opp_auc": opp_auc, "gaps": gaps,
+            "n_steps": n_steps, "n_faulty": n_faulty}
 
+
+# ------------------------------------------------------------------ the lens
+
+def lens_step_scores(h, W, D):
+    d = D[h]
+    if W is None:
+        return list(d["bundle"])
+    gq = np.tanh(d["q"] @ W)
+    proj = np.tanh(d["M"] @ W) @ gq / DIM
+    return list(d["bundle"] + np.asarray(proj))
+
+
+def pooled_auc(task_list, W, D):
+    pairs = []
+    for h in task_list:
+        for y, s in zip((0.0 if i in D[h]["faulty"] else 1.0
+                         for i in range(len(D[h]["M"]))), lens_step_scores(h, W, D)):
+            pairs.append((y, s))
+    return auc(pairs)
+
+
+def train_fold(cfg, tr_tasks, val_tasks, D, log_tag, epochs=None, ckpt=None):
+    """Hinge trainer on the residual lens (math verbatim from the addendum-11 run)."""
+    lr = cfg["lr"]
+    margin = cfg.get("margin", MARGIN)
+    l2 = cfg.get("l2", L2)
+    dim = cfg.get("dim", DIM)
+    epochs = epochs or EPOCHS
+    ckpt = ckpt or CKPT
+    rng = np.random.default_rng(cfg.get("seed", SEED))
+    W = (0.01 * rng.normal(0.0, 1.0, size=(384, dim))).astype(np.float32)
+    best_val, best_W, best_ep, exit_streak = -1.0, None, -1, 0
+    t0 = time.time()
+    vi = 0
+    for ep in range(epochs):
+        GW = np.zeros_like(W)
+        loss = 0.0
+        n_pairs = 0
+        for h in tr_tasks:
+            d = D[h]
+            if not d["faulty"]:
+                continue
+            xq, M = d["q"], d["M"]
+            gq = np.tanh(xq @ W)
+            G = np.tanh(M @ W)
+            t_scores = G @ gq / dim + np.asarray(d["bundle"])
+            A = np.zeros(len(t_scores), dtype=np.float64)
+            fl = d["faulty"]
+            for f in fl:
+                viol = (margin - t_scores + t_scores[f]) > 0
+                viol[list(fl)] = False
+                c = int(viol.sum())
+                if c == 0:
+                    continue
+                loss += float((margin - t_scores[viol] + t_scores[f]).sum())
+                n_pairs += c
+                dgq = (viol @ G - c * G[f]) / dim
+                GW += np.outer(xq, dgq * (1 - gq ** 2))
+                A[viol] -= 1.0
+                A[f] += float(c)
+            for i in np.nonzero(A)[0]:
+                GW += np.outer(M[i], A[i] * gq / dim * (1 - G[i] ** 2))
+        GW += l2 * W
+        W -= lr * GW / max(1, len(tr_tasks))
+        if (ep + 1) % ckpt == 0 or ep == epochs - 1:
+            v = pooled_auc(val_tasks, W, D) if val_tasks else None
+            if v is not None and v > best_val:
+                best_val, best_W, best_ep = v, W.copy(), ep + 1
+            if n_pairs and loss / n_pairs < 1e-6:
+                exit_streak += 1
+                if exit_streak >= 4:
+                    break
+            else:
+                exit_streak = 0
+            vi = n_pairs
+    print(f"[{log_tag}] ep={ep + 1} pairs={vi} val="
+          f"{None if best_val < 0 else round(best_val, 3)} ({time.time() - t0:.0f}s)",
+          flush=True)
+    return {"W": best_W if best_W is not None else W, "val_best": best_val,
+            "best_epoch": best_ep, "early_exit": exit_streak >= 4,
+            "n_pairs_last": vi}
+
+
+def run_cv(cfg, data, tag, trainer=None, epochs=None, ckpt=None):
+    """8-fold task-disjoint CV: fit per fold, score each fold's tasks with
+    that fold's checkpoint-selected W. Returns pooled pairs + per-fold AUCs."""
+    D, task_ids, fold_sets = data["D"], data["task_ids"], data["fold_sets"]
+    trainer = trainer or train_fold
+    W_of, fold_meta = {}, []
+    t0 = time.time()
+    for k in range(N_FOLDS):
+        hold = fold_sets[k]
+        trainval = [h for h in task_ids if h not in set(hold)]
+        val_t = set(sorted(trainval)[::5])
+        tr_t = [h for h in trainval if h not in val_t]
+        tr = trainer(cfg, tr_t, sorted(val_t), D, f"{tag}.f{k}",
+                     epochs=epochs, ckpt=ckpt)
+        W_of[k] = tr["W"]
+        fold_meta.append({"fold": k, "best_epoch": tr["best_epoch"],
+                          "val_best": None if tr["val_best"] < 0 else round(tr["val_best"], 4),
+                          "early_exit": tr["early_exit"],
+                          "n_train": len(tr_t), "n_val": len(val_t),
+                          "n_hold": len(hold)})
+    pooled, per_fold = [], []
+    for k in range(N_FOLDS):
+        pp = []
+        for h in fold_sets[k]:
+            for y, s in zip((0.0 if i in D[h]["faulty"] else 1.0
+                             for i in range(len(D[h]["M"]))),
+                            lens_step_scores(h, W_of[k], D)):
+                pp.append((y, s))
+        pooled.extend(pp)
+        fa = auc(pp)
+        if fa is not None:
+            per_fold.append(round(fa, 4))
+    pa = auc(pooled)
+    opp = data["opp_auc"]
+    survived = (pa is not None and all(
+        pa > (opp[o] + 0.02) for o in opp if opp[o] is not None))
+    return {"pooled_auc": None if pa is None else round(pa, 4),
+            "per_fold_auc": sorted(per_fold), "beats_all_opponents": bool(survived),
+            "fold_meta": fold_meta, "train_s": round(time.time() - t0),
+            "pairs": pooled, "W_of": W_of}
+
+
+def spearman(a, b):
+    n = len(a)
+    ra = np.argsort(np.argsort(np.asarray(a, dtype=float)))
+    rb = np.argsort(np.argsort(np.asarray(b, dtype=float)))
+    d2 = float(((ra - rb) ** 2).sum())
+    return 1 - 6 * d2 / (n * (n * n - 1))
+
+
+def composition_audit(cfg_res, data):
+    """Spearman of the winning lens's score order vs the cheap legs."""
+    D, fold_sets = data["D"], data["fold_sets"]
+    lens_s, jacc_s, len_s = [], [], []
+    for k in range(N_FOLDS):
+        for h in fold_sets[k]:
+            lens_s.extend(lens_step_scores(h, cfg_res["W_of"][k], D))
+            jacc_s.extend(D[h]["jacc"])
+            len_s.extend(D[h]["loglen"])
+    return {"spearman_vs_jaccard": round(spearman(lens_s, jacc_s), 3),
+            "spearman_vs_loglen": round(spearman(lens_s, len_s), 3),
+            "faulty_head_context": {"stack_0.814": "loglen 0.754 workhorse"}}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--opponents-only", action="store_true")
+    ap.add_argument("--smoke", action="store_true")
+    args = ap.parse_args()
+    t_start = time.time()
+    data = build_data()
     results = {"opponents": {k: None if v is None else round(v, 4)
-                             for k, v in opp_auc.items()},
-               "gaps": gaps, "configs": {}}
-    for lr in (1.5, 0.15):
-        tag = f"lens_lr{lr:g}"
-        W_of = {}
-        fold_meta = []
-        t0 = time.time()
-        for k in range(N_FOLDS):
-            hold = fold_sets[k]
-            trainval = [h for h in task_ids if h not in set(hold)]
-            val_t = set(sorted(trainval)[::5])    # deterministic 1-in-5 carve
-            tr_t = [h for h in trainval if h not in val_t]
-            tr = train_fold(lr, tr_t, sorted(val_t), f"{tag}.f{k}")
-            W_of[k] = tr["W"]
-            fold_meta.append({"fold": k, "best_epoch": tr["best_epoch"],
-                              "val_best": None if tr["val_best"] is None else round(tr["val_best"], 4),
-                              "early_exit": tr["early_exit"],
-                              "n_train": len(tr_t), "n_val": len(val_t),
-                              "n_hold": len(hold)})
-        pooled = {"pairs": []}
-        for k in range(N_FOLDS):
-            for h in fold_sets[k]:
-                for y, s in zip((0.0 if i in D[h]["faulty"] else 1.0
-                                 for i in range(len(D[h]["M"]))),
-                                lens_step_scores(h, W_of[k])):
-                    pooled["pairs"].append((y, s))
-        pa = auc(pooled["pairs"])
-        per_fold = []
-        for k in range(N_FOLDS):
-            pp = []
-            for h in fold_sets[k]:
-                for y, s in zip((0.0 if i in D[h]["faulty"] else 1.0
-                                 for i in range(len(D[h]["M"]))),
-                                lens_step_scores(h, W_of[k])):
-                    pp.append((y, s))
-            fa = auc(pp)
-            if fa is not None:
-                per_fold.append(round(fa, 4))
-        survived = (pa is not None and all(
-            pa > (opp_auc[o] + 0.02) for o in opp_auc if opp_auc[o] is not None))
-        results["configs"][tag] = {
-            "pooled_auc": None if pa is None else round(pa, 4),
-            "per_fold_auc": sorted(per_fold),
-            "beats_all_opponents": bool(survived),
-            "fold_meta": fold_meta, "train_s": round(time.time() - t0)}
-        print(f"[{tag}] pooled={pa if pa is None else round(pa, 4)} vs best_opp "
-              f"{round(best_opp, 4)} -- BEATS_ALL={survived}", flush=True)
+                             for k, v in data["opp_auc"].items()},
+               "gaps": data["gaps"], "configs": {}}
+    if args.opponents_only:
+        results["note"] = ("opponents re-measured after the o1/offsets fix; "
+                           "lens configs not retrained (addendum-11 lens "
+                           "numbers stand)")
+        with io.open(OUT, "w", encoding="utf-8") as f:
+            f.write(json.dumps(results, indent=2))
+        print(json.dumps(results["opponents"], indent=1))
+        return 0
 
-    # --------- MANDATORY PASS AUDIT (composition of any surviving lens) ------
-    if any(c["beats_all_opponents"] for c in results["configs"].values()):
-        # Spearman between pooled lens scores and the cheap legs it cannot see
-        best_tag = max(results["configs"], key=lambda k: results["configs"][k]["pooled_auc"])
-        W_best = {}
-        # refit quickly for audit scores is heavy; approximate via the pooled
-        # (y, s) ordering correlation with the opponents' scores
-        def spearman(a, b):
-            ra = {v: i for i, v in enumerate(sorted(range(len(a)), key=lambda i: a[i]))}
-            rb = {v: i for i, v in enumerate(sorted(range(len(b)), key=lambda i: b[i]))}
-            n = len(a)
-            d2 = sum((ra[i] - rb[i]) ** 2 for i in range(n))
-            return 1 - 6 * d2 / (n * (n * n - 1))
-        results["audit_note"] = ("audit computes rank correlation of the winning "
-                                 "lens's pooled score order vs o3/o4 orders")
-        # NOTE: full per-step matched correlation needs aligned arrays; the
-        # pooled pairs are aligned in assembly order, so rebuild in order:
-        lens_s, jacc_s, len_s = [], [], []
-        for k in range(N_FOLDS):
-            for h in fold_sets[k]:
-                ss = lens_step_scores(h, W_of[k])
-                lens_s.extend(ss)
-                jacc_s.extend(D[h]["jacc"])
-                len_s.extend(D[h]["loglen"])
-        results["audit"] = {"spearman_vs_jaccard": round(spearman(lens_s, jacc_s), 3),
-                            "spearman_vs_loglen": round(spearman(lens_s, len_s), 3),
-                            "faulty_head_context": {"stack_0.814": "loglen 0.754 workhorse"}}
-    else:
+    epochs = 60 if args.smoke else None
+    ckpt = 20 if args.smoke else None
+    configs = [{"lr": 1.5}, {"lr": 0.15}]
+    if args.smoke:
+        configs = configs[:1]
+    for cfg in configs:
+        tag = f"lens_lr{cfg['lr']:g}"
+        res = run_cv(cfg, data, tag, epochs=epochs, ckpt=ckpt)
+        W_of = res.pop("W_of")
+        res.pop("pairs", None)
+        results["configs"][tag] = res
+        print(f"[{tag}] pooled={res['pooled_auc']} BEATS_ALL={res['beats_all_opponents']}",
+              flush=True)
+        if res["beats_all_opponents"]:
+            results["audit"] = composition_audit({**res, "W_of": W_of}, data)
+    if "audit" not in results:
         results["audit"] = None
-
     results["pre_registered_bar"] = ("lens pooled AUC > ALL opponents + 0.02; "
                                      "PASS audit mandatory; ties open")
     results["survivors"] = [k for k, c in results["configs"].items()
                             if c["beats_all_opponents"]]
     with io.open(OUT, "w", encoding="utf-8") as f:
         f.write(json.dumps(results, indent=2))
-    print(f"[done] survivors={results['survivors']} gaps={list(gaps.keys())[:3]}... "
-          f"-> {OUT} ({time.time() - t_start:.0f}s)", flush=True)
+    print(f"[done] survivors={results['survivors']} -> {OUT} "
+          f"({time.time() - t_start:.0f}s)", flush=True)
     return 0
 
 
