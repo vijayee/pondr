@@ -373,3 +373,28 @@ The agent-intent corpus's recording layer is live:
   not scored — no fabrication; the mirror stores retrieval ids, so real runs
   join texts via the ledger).
 
+## 14. Addendum 9 — the first training run on honest labels + its decomposition (2026-10-15)
+
+The program's first pre-registered training run ran and its composition was
+audited (both laws enforced):
+
+- **train_faulty_head.py** — faultiness prediction on the CodeTraceBench-SWE
+  mapped slice (11,963 steps / 259 tasks / 146 human-verified faulty), scored
+  LEAVE-ONE-TASK-OUT pooled. Head 0.814 vs opponents length 0.754 / lexical
+  0.64 / best-single-cosine 0.593 — **formal PASS by the pre-registered bar**.
+- **audit_faulty_head.py (mandatory audit of any PASS):** loglen is the
+  workhorse (0.754 alone); the learned context-only model scored 0.482 —
+  WORSE than its own singles (tiny per-fold overfit on correlated weak
+  features); the head's +0.06 over the best trivial rule = a STACK of cheap
+  signals (len + lexical + step-position + file-access + weak context).
+  **The win is the cheap-signal ensemble (the router) wearing a learned hat
+  = demo #11.**
+- **Round-1 correction owned:** the round-1 ablation's "context grain carries
+  the signal (0.73)" was self-similarity contamination (the context text
+  contained the compared action); clean context cosines = 0.55. Standing
+  rule: never embed the compared item inside its context feature.
+- Net: even on honest human labels + fair training + real power, no learned
+  intent lens emerges; the router/ensemble is the material — consistent with
+  all prior demonstrations. The arc's full question chain is now measured at
+  every grain it ever posed.
+
