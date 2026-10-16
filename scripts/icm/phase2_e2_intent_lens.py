@@ -405,12 +405,13 @@ def main() -> int:
                              for k, v in data["opp_auc"].items()},
                "gaps": data["gaps"], "configs": {}}
     if args.opponents_only:
-        results["note"] = ("opponents re-measured after the o1/offsets fix; "
-                           "lens configs not retrained (addendum-11 lens "
-                           "numbers stand)")
-        with io.open(OUT, "w", encoding="utf-8") as f:
+        # Never clobber the lens results file: opponents are printed only.
+        opp_out = os.path.join("data", "_scratch", "icm",
+                               "phase2_e2_intent_opponents_only.json")
+        with io.open(opp_out, "w", encoding="utf-8") as f:
             f.write(json.dumps(results, indent=2))
         print(json.dumps(results["opponents"], indent=1))
+        print(f"[opponents-only] wrote {opp_out} (lens results untouched)")
         return 0
 
     epochs = 60 if args.smoke else None
