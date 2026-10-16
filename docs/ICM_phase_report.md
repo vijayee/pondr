@@ -571,3 +571,14 @@ label power (1.2 percent coverage, 51/259 contrast-bearing tasks) cannot
 supply what the geometry lacks. Open doors unchanged: utility-label
 acquisition at scale (SWE-TaskFlow 25,200 verifier runs; user thumbs;
 captured sessions) and the two-stage re-ranker over the geometry's failures.
+
+**Addendum-12 note (de-wonk, same session):** two write-path bugs of the
+same class were found and fixed in the lens instrument -- `--opponents-only`
+and `--smoke` both wrote to the real results file (the smoke path was caught
+only on the second audit round, after the first fix). Both now write side
+files; the lens results JSON was verified intact after each. The InfoNCE
+trainer's coverage is recorded precisely: with positives = own non-faulty
+steps it ALSO trains on the 208 no-faulty tasks, i.e. it saw all 259 tasks
+(more data than the hinge family's 51 contrast tasks) and still landed on
+the init bundle. The two smoke fixes were verified behaviour-preserving
+(both trainers reproduce their pre-fix smoke values bit-for-bit).

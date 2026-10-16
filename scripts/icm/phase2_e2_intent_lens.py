@@ -280,7 +280,7 @@ def train_fold(cfg, tr_tasks, val_tasks, D, log_tag, epochs=None, ckpt=None):
     W = (0.01 * rng.normal(0.0, 1.0, size=(384, dim))).astype(np.float32)
     best_val, best_W, best_ep, exit_streak = -1.0, None, -1, 0
     t0 = time.time()
-    vi = 0
+    n_pairs_last = 0
     for ep in range(epochs):
         GW = np.zeros_like(W)
         loss = 0.0
@@ -321,13 +321,13 @@ def train_fold(cfg, tr_tasks, val_tasks, D, log_tag, epochs=None, ckpt=None):
                     break
             else:
                 exit_streak = 0
-            vi = n_pairs
-    print(f"[{log_tag}] ep={ep + 1} pairs={vi} val="
+            n_pairs_last = n_pairs
+    print(f"[{log_tag}] ep={ep + 1} pairs={n_pairs_last} val="
           f"{None if best_val < 0 else round(best_val, 3)} ({time.time() - t0:.0f}s)",
           flush=True)
     return {"W": best_W if best_W is not None else W, "val_best": best_val,
             "best_epoch": best_ep, "early_exit": exit_streak >= 4,
-            "n_pairs_last": vi}
+            "n_pairs_last": n_pairs_last}
 
 
 def run_cv(cfg, data, tag, trainer=None, epochs=None, ckpt=None):
@@ -435,9 +435,13 @@ def main() -> int:
                                      "PASS audit mandatory; ties open")
     results["survivors"] = [k for k, c in results["configs"].items()
                             if c["beats_all_opponents"]]
-    with io.open(OUT, "w", encoding="utf-8") as f:
+    # never clobber the real results file from a smoke run
+    out_path = (os.path.join("data", "_scratch", "icm",
+                             "phase2_e2_intent_lens_smoke.json")
+                if args.smoke else OUT)
+    with io.open(out_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(results, indent=2))
-    print(f"[done] survivors={results['survivors']} -> {OUT} "
+    print(f"[done] survivors={results['survivors']} -> {out_path} "
           f"({time.time() - t_start:.0f}s)", flush=True)
     return 0
 

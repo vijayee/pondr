@@ -33,6 +33,12 @@ must beat ALL FOUR opponents by > 0.02):
       as a negative -- standard in-batch practice, stated), temperature
       {0.1, 0.3}. Residual form (raw term = bundle cosine). No early-exit
       rule for InfoNCE (stated; runs the full 600 ep).
+      COVERAGE NOTE (recorded, verified 2026-10-16): with positives = own
+      non-faulty steps, InfoNCE also trains on the 208 no-faulty tasks (all
+      steps positive; the batch still pushes sampled negatives away), i.e.
+      it saw ALL 259 tasks -- MORE data than the hinge family's 51 contrast
+      tasks -- and still landed on the init bundle. The empty-task guard
+      never fires (0 such tasks in this corpus).
 
   Hypotheses (NOT verdicts): the hinge-family levers are expected to
   reproduce the geometry-declines-from-init signature if that is a property
@@ -151,7 +157,7 @@ def train_infonce(cfg, tr_tasks, val_tasks, D, log_tag, epochs=None, ckpt=None):
         n_q = 0
         for h in tr_tasks:
             d = D[h]
-            if not d["faulty"] and len(d["M"]) < 2:
+            if not len(d["M"]):
                 continue
             q, M = d["q"], d["M"]
             n_own = len(M)
