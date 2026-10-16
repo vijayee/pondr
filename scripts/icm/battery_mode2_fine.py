@@ -1,17 +1,20 @@
 """PHASE 2 E2 battery -- FINE-GRAINED ADDENDUM (the two engagement-mode holes
 opened by the main battery's measured results, same splits / same bar).
 
-WHAT THE MAIN BATTERY MEASURED (battery_mode2_results.json, no survivors):
-  * RESIDUAL/INFONCE family was SILENT: hinge loss constant (0.089) from
-    ep200 on, delta norm ~= its own sigma-0.01 init (2.22 -> 2.28 max), val
-    flat exactly at raw cosine's own level (0.843), tail recovery 0/15.
-    Mechanism: raw cosine already satisfies margin-{0.02..0.1} on most train
-    triples -> almost no violation gradient reaches the delta. The margins
-    swept were all ABOVE (or barely below) the average cosine gap.
-  * PROJ-ONLY family collapsed INSIDE the checkpoint blind window: val-best
-    over eps {50..1200} was always ep50 = 0.542/0.563 (vs cosine ~0.84), so
-    "early stopping" never saw epochs 1-49 where the identity init's bound
-    is still the base geometry.
+WHAT THE CORRECTED MAIN BATTERY MEASURED (readout bug fixed before these
+runs; training-side facts were always correct, holdout/val numbers below are
+the corrected ones, no survivors):
+  * RESIDUAL/INFONCE family SILENT (training-side, correct under both
+    readouts): hinge constant ~0.089 from ep200 on, delta norm ~= its own
+    sigma-0.01 init after 1200 epochs, tail 0/15. Mechanism: raw cosine
+    already satisfies margin-{0.02..0.1} on most train triples -> almost no
+    violation gradient reaches the delta. Corrected val also flat at raw
+    cosine's own level.
+  * PROJ-ONLY family: val-best at ep150 of 1200 (corrected A/C: 0.784) --
+    still -0.05 below cosine, and identity-family fine checkpoints (F1/F3)
+    sat AT their epoch caps, still improving when training stopped (the
+    pre-collapse blind window was real for the coarse grid, cap-not-reached
+    was real for gentle lr).
 
 THE F PRE-REGISTRATION (fixed BEFORE fitting; same data, same splits, the
 same survival bar and readouts as the main battery):
@@ -56,8 +59,7 @@ import numpy as np  # noqa: E402
 
 import battery_mode2_remediation as B  # noqa: E402  (split + data + readouts)
 from battery_mode2_remediation import (  # noqa: E402
-    OUT as MAIN_OUT, SEED, TRAIN_FRAC, holdout_readout, ensure_embeds,
-    train_hinge,
+    SEED, TRAIN_FRAC, holdout_readout, ensure_embeds, train_hinge,
 )
 
 OUT = os.path.join("data", "_scratch", "icm", "battery_mode2_fine_results.json")
@@ -81,7 +83,7 @@ def main() -> int:
     print(f"[split] train {len(tr_rows)} / val {len(val_rows)} / holdout {len(te_rows)}",
           flush=True)
 
-    cos_h = holdout_readout(te_rows, qz, None, "raw-cosine")
+    cos_h = holdout_readout(te_rows, None, "raw-cosine")
     results = {"raw_cosine_holdout": cos_h, "configs": {}}
 
     def train_cfg(tag, cfg, epochs, ckpt_every):
@@ -90,7 +92,7 @@ def main() -> int:
         dnorm = float(np.linalg.norm(tr["W"] - tr["W0"]))
         np.savez(os.path.join("data", "_scratch", "icm", f"battery_mode2_W_{tag}.npz"),
                  W=tr["W"].astype(np.float32), form=tr["form"], dim=tr["dim"])
-        ro = holdout_readout(te_rows, qz,
+        ro = holdout_readout(te_rows,
                              {"W": tr["W"], "form": tr["form"], "dim": tr["dim"]},
                              f"{tag}@bestval(ep{tr['best_epoch']})")
         res = {"val_best_auc": round(tr["val_best"], 4), "best_epoch": tr["best_epoch"],

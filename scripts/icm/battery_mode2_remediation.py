@@ -38,7 +38,11 @@ THE PRE-REGISTRATION (fixed BEFORE fitting; per the arc's standing laws):
 
   Configs (each toggles ONE remediation off the audited baseline math):
     A   ANCHOR   : original exactly (random init 0.02, D=128, proj-only
-                   hinge 0.1, L2 1e-4, 1200 ep) -- must reproduce ~0.565.
+                   hinge 0.1, L2 1e-4, 1200 ep). NOTE: the battery reports
+                   the val-best checkpoint (NOT the baseline's final-epoch
+                   0.565, which was a 400-train-question readout; the battery
+                   trains 320). Baseline fidelity is checked separately at
+                   the final epoch (see addendum).
     B1  RESIDUAL : item-1 in additive form -- bound = cos_raw + proj delta,
                    W sigma-0.01-init D=128 (exact zero-init is a saddle:
                    tanh(0)=0 kills d/dW; the score still starts AT the base
@@ -52,8 +56,9 @@ THE PRE-REGISTRATION (fixed BEFORE fitting; per the arc's standing laws):
                    {1e-4, 1e-3, 1e-2}, checkpoints every 50 ep.
     D   INFONCE  : residual form (sigma-0.01 init) + in-batch negatives (K=12 candidates
                    sampled per question per epoch from OTHER train
-                   questions -- the real distribution, no composed
-                   distractor conflicts), temperature in {0.05, 0.1, 0.3}.
+                   questions; per standard in-batch practice, a sampled
+                   candidate colliding with an own positive is treated as a
+                   negative), temperature in {0.05, 0.1, 0.3}.
     E   MARGIN   : residual hinge at margins {0.02, 0.05, 0.3}, L2 1e-4.
 
   Exactness: the vectorized gradient collapses the per-pair outer-product
@@ -240,7 +245,7 @@ def train_hinge(cfg, tr_rows, val_rows, qz, epochs, log_tag, ckpt_every=CKPT_EVE
         GW += l2 * ((W - W0) if form == "identity" else W)
         W -= lr * GW / max(1, len(C))
         if (ep + 1) % ckpt_every == 0 or ep == epochs - 1:
-            v = val_auc(val_rows, qz, {"W": W, "form": form, "dim": dim})
+            v = val_auc(val_rows, {"W": W, "form": form, "dim": dim})
             if v is not None and v > best_val:
                 best_val, best_W, best_ep = v, W.copy(), ep + 1
             if (ep + 1) % (ckpt_every * 4) == 0 or ep == epochs - 1:
@@ -295,7 +300,7 @@ def train_infonce(cfg, tr_rows, val_rows, qz, epochs, log_tag):
                 GW += np.outer(Xall[j], (w_j[j] * gq / dim) * (1 - G[j] ** 2))
         W -= lr * GW / max(1, n_q)
         if (ep + 1) % CKPT_EVERY == 0 or ep == epochs - 1:
-            v = val_auc(val_rows, qz, {"W": W, "form": "residual", "dim": dim})
+            v = val_auc(val_rows, {"W": W, "form": "residual", "dim": dim})
             if v is not None and v > best_val:
                 best_val, best_W, best_ep = v, W.copy(), ep + 1
             if (ep + 1) % (CKPT_EVERY * 4) == 0 or ep == epochs - 1:
@@ -306,7 +311,7 @@ def train_infonce(cfg, tr_rows, val_rows, qz, epochs, log_tag):
             "val_best": best_val, "best_epoch": best_ep}
 
 
-def val_auc(val_rows, qz, Wd):
+def val_auc(val_rows, Wd):
     pairs = []
     for r in val_rows:
         xq = r["_qz"]
@@ -316,7 +321,7 @@ def val_auc(val_rows, qz, Wd):
     return auc(pairs)
 
 
-def holdout_readout(te_rows, qz, Wd, tag):
+def holdout_readout(te_rows, Wd, tag):
     pairs, cpairs, tail_rows = [], [], []
     for ri, r in enumerate(te_rows):
         xq = r["_qz"]
@@ -455,7 +460,7 @@ def main() -> int:
     if not args.smoke:
         runs_unit_check(tr_rows, qz)
 
-    raw_h = holdout_readout(te_rows, qz, None, "raw-cosine")
+    raw_h = holdout_readout(te_rows, None, "raw-cosine")
     results = {"raw_cosine_holdout": raw_h, "configs": {}}
 
     def train_cfg(tag, cfg, epochs):
@@ -469,13 +474,9 @@ def main() -> int:
         Wd = {"W": tr["W"], "form": tr["form"], "dim": tr["dim"]}
         W0 = tr["W0"] if tr["W0"] is not None else np.zeros_like(tr["W"])
         dnorm = float(np.linalg.norm(tr["W"] - W0))
-        if tr["form"] == "plain":
-            Wd_final = Wd
-        else:
-            Wd_final = Wd
         np.savez(os.path.join("data", "_scratch", "icm", f"battery_mode2_W_{tag}.npz"),
                  W=tr["W"].astype(np.float32), form=tr["form"], dim=tr["dim"])
-        ro = holdout_readout(te_rows, qz, Wd, f"{tag}@bestval(ep{tr['best_epoch']})")
+        ro = holdout_readout(te_rows, Wd, f"{tag}@bestval(ep{tr['best_epoch']})")
         res = {"val_best_auc": round(tr["val_best"], 4), "best_epoch": tr["best_epoch"],
                "delta_norm": round(dnorm, 4), "holdout_bestval": ro,
                "form": tr["form"], "dim": tr["dim"], "l2": cfg["l2"],

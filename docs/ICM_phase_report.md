@@ -422,9 +422,13 @@ diverged cells, never scored as silent zeros.)
 scored against WRONG question vectors via subset-position indexing) — found,
 fixed, rerun. Corrected battery = 26 configs across 4 families:
 
-- *Anchor + early-stop/WD (from-scratch, proj-only hinge):* early stopping
-  rescues 0.565→0.774 (val-best ep150); still −0.05 below cosine (0.8235);
-  WD inert across 2 decades. Learning = slow decay from a bad init.
+- *Anchor + early-stop/WD (from-scratch, proj-only hinge):* final-epoch
+  fidelity on the battery's own 320-question split = 0.5531 (reproduces the
+  baseline's 0.565); early stopping rescues 0.5531→0.774 (val-best ep150,
+  SAME split); still −0.05 below cosine (0.8235); WD inert across 2 decades.
+  Learning = slow decay from a bad init. (Direction note: the collapsed
+  final-epoch lens recovers 5/15 tail while dropping mean-arm to 0.55 — it
+  buys tail fixes with global accuracy; useless but measured.)
 - *Identity-init / residual deltas (item 1, the mechanism target):* the ONLY
   family whose bound holds/Beats cosine OOS — 8/8 cells in 0.827–0.831
   (cosine 0.8235), deltas tiny by design, tail recovery 2/15 FROZEN across

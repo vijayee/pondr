@@ -62,7 +62,7 @@ def main() -> int:
     print(f"[split] train {len(tr_rows)} / val {len(val_rows)} / holdout {len(te_rows)}",
           flush=True)
 
-    cos_h = holdout_readout(te_rows, qz, None, "raw-cosine")
+    cos_h = holdout_readout(te_rows, None, "raw-cosine")
     results = {"raw_cosine_holdout": cos_h, "configs": {}}
     for lr in (1.0, 0.05, 0.15):
         for l2 in (1e-4, 1e-3):
@@ -74,7 +74,7 @@ def main() -> int:
             dnorm = float(np.linalg.norm(tr["W"] - tr["W0"]))
             np.savez(os.path.join("data", "_scratch", "icm", f"battery_mode2_W_{tag}.npz"),
                      W=tr["W"].astype(np.float32))
-            ro = holdout_readout(te_rows, qz,
+            ro = holdout_readout(te_rows,
                                  {"W": tr["W"], "form": tr["form"], "dim": tr["dim"]},
                                  f"{tag}@bestval(ep{tr['best_epoch']})")
             cb, cc = ro["holdout_bound_auc"], ro["holdout_cosine_auc"]
