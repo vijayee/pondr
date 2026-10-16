@@ -88,6 +88,8 @@ def main() -> int:
         t0 = time.time()
         tr = train_hinge(cfg, tr_rows, val_rows, qz, epochs, tag, ckpt_every=ckpt_every)
         dnorm = float(np.linalg.norm(tr["W"] - tr["W0"]))
+        np.savez(os.path.join("data", "_scratch", "icm", f"battery_mode2_W_{tag}.npz"),
+                 W=tr["W"].astype(np.float32), form=tr["form"], dim=tr["dim"])
         ro = holdout_readout(te_rows, qz,
                              {"W": tr["W"], "form": tr["form"], "dim": tr["dim"]},
                              f"{tag}@bestval(ep{tr['best_epoch']})")

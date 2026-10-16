@@ -308,29 +308,32 @@ def train_infonce(cfg, tr_rows, val_rows, qz, epochs, log_tag):
 
 def val_auc(val_rows, qz, Wd):
     pairs = []
-    for ri, r in enumerate(val_rows):
+    for r in val_rows:
+        xq = r["_qz"]
         for c in r["cands"]:
             pairs.append((1.0 if c["paid"] else 0.0,
-                          score(qz[ri], c["_z"], c["cos"], Wd)))
+                          score(xq, c["_z"], c["cos"], Wd)))
     return auc(pairs)
 
 
 def holdout_readout(te_rows, qz, Wd, tag):
     pairs, cpairs, tail_rows = [], [], []
     for ri, r in enumerate(te_rows):
+        xq = r["_qz"]
         best_c = max(r["cands"], key=lambda c: c["cos"])
         if not best_c["paid"]:
             tail_rows.append(ri)
         for c in r["cands"]:
             y = 1.0 if c["paid"] else 0.0
-            pairs.append((y, score(qz[ri], c["_z"], c["cos"], Wd)))
+            pairs.append((y, score(xq, c["_z"], c["cos"], Wd)))
             cpairs.append((y, c["cos"]))
     h_a = auc(pairs)
     c_a = auc(cpairs)
     rec = rec_total = 0
     for ri in tail_rows:
         r = te_rows[ri]
-        arg_b = max(r["cands"], key=lambda c: score(qz[ri], c["_z"], c["cos"], Wd))
+        xq = r["_qz"]
+        arg_b = max(r["cands"], key=lambda c: score(xq, c["_z"], c["cos"], Wd))
         rec_total += 1
         rec += 1 if arg_b["paid"] else 0
     print(f"[{tag}] bound {round(h_a, 3) if h_a else None} vs cosine "
@@ -470,6 +473,8 @@ def main() -> int:
             Wd_final = Wd
         else:
             Wd_final = Wd
+        np.savez(os.path.join("data", "_scratch", "icm", f"battery_mode2_W_{tag}.npz"),
+                 W=tr["W"].astype(np.float32), form=tr["form"], dim=tr["dim"])
         ro = holdout_readout(te_rows, qz, Wd, f"{tag}@bestval(ep{tr['best_epoch']})")
         res = {"val_best_auc": round(tr["val_best"], 4), "best_epoch": tr["best_epoch"],
                "delta_norm": round(dnorm, 4), "holdout_bestval": ro,
