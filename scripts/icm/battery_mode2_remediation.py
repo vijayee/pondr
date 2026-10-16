@@ -170,7 +170,7 @@ def score(xq, zc, cos_raw, Wd):
 
 # ---------------------------------------------------------------- training --
 
-def train_hinge(cfg, tr_rows, val_rows, qz, epochs, log_tag):
+def train_hinge(cfg, tr_rows, val_rows, qz, epochs, log_tag, ckpt_every=CKPT_EVERY):
     """Hinge trainer: original (plain), residual, or identity parametrization."""
     form, dim = cfg["W"]["form"], cfg["W"]["dim"]
     margin, l2, lr = cfg["margin"], cfg["l2"], cfg.get("lr", LR)
@@ -239,11 +239,11 @@ def train_hinge(cfg, tr_rows, val_rows, qz, epochs, log_tag):
                 GW += np.outer(d["Xc"][u], dgu[k] * (1 - Gu[k] ** 2))
         GW += l2 * ((W - W0) if form == "identity" else W)
         W -= lr * GW / max(1, len(C))
-        if (ep + 1) % CKPT_EVERY == 0 or ep == epochs - 1:
+        if (ep + 1) % ckpt_every == 0 or ep == epochs - 1:
             v = val_auc(val_rows, qz, {"W": W, "form": form, "dim": dim})
             if v is not None and v > best_val:
                 best_val, best_W, best_ep = v, W.copy(), ep + 1
-            if (ep + 1) % (CKPT_EVERY * 4) == 0 or ep == epochs - 1:
+            if (ep + 1) % (ckpt_every * 4) == 0 or ep == epochs - 1:
                 print(f"[{log_tag}] ep{ep+1} hinge={loss/max(1,n_tr):.4f} "
                       f"val={v if v is None else round(v,3)} best={round(best_val,3)} "
                       f"({time.time()-t0:.0f}s)", flush=True)
