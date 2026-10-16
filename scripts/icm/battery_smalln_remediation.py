@@ -81,15 +81,23 @@ def _emb(texts):
 
 
 def fit_ridge(Xz, y, lam, iters, lr=LR):
-    """Logistic GD with ridge on normalized weights (per-fold shrinkage)."""
+    """Logistic GD with ridge on normalized weights (per-fold shrinkage).
+
+    Numerically stable (expit) and divergence-checked: a diverged fold gets
+    flagged, never scored as a silent 0.
+    """
+    from scipy.special import expit
+
     w = np.zeros(Xz.shape[1], dtype=np.float64)
     b = 0.0
     for _ in range(iters):
         z = Xz @ w + b
-        p = 1.0 / (1.0 + np.exp(-z))
+        p = expit(z)
         d = (p - y) / len(y)
         w -= lr * (Xz.T @ d + lam * w)
         b -= lr * float(d.sum())
+        if not np.isfinite(w).all():
+            return None
     return w, b
 
 
@@ -189,9 +197,11 @@ def main() -> int:
     for t in tasks:
         task_rows[t] = [i for i, v in enumerate(tnames) if v == t]
 
+    from scipy.special import expit
+
     def run_cell(fs_name, lam, iters):
         scores = np.zeros(len(y))
-        skipped = 0
+        skipped = diverged = 0
         X_all = Xf[fs_name]
         for hid, te in task_rows.items():
             tr = [i for i, t in enumerate(tnames) if t != hid]
@@ -202,10 +212,16 @@ def main() -> int:
                 continue
             mu, sd = X_all[tr].mean(axis=0), X_all[tr].std(axis=0)
             sd = np.where(sd == 0, 1.0, sd)
-            w, b = fit_ridge((X_all[tr] - mu) / sd, yt, lam, iters)
-            scores[te] = 1.0 / (1.0 + np.exp(-(((X_all[te] - mu) / sd) @ w + b)))
-        a = auroc(scores.tolist(), y.tolist())
-        return a, skipped
+            fit = fit_ridge((X_all[tr] - mu) / sd, yt, lam, iters)
+            if fit is None:
+                scores[te] = np.nan
+                diverged += 1
+                continue
+            w, b = fit
+            scores[te] = expit(np.asarray(((X_all[te] - mu) / sd) @ w + b))
+        m = np.isfinite(scores)
+        a = auroc(scores[m].tolist(), y[m].tolist())
+        return a, skipped, diverged
 
     out = {"grid": [], "opponents": opp_scores, "original_heads":
            {"ctx_only": 0.482, "full": 0.814}}
@@ -213,10 +229,10 @@ def main() -> int:
     for fs_name in ("ctx_only", "full"):
         for lam in LAMBDAS:
             for iters in ITERSETS:
-                a, sk = run_cell(fs_name, lam, iters)
+                a, sk, dv = run_cell(fs_name, lam, iters)
                 cell = {"features": fs_name, "lambda": lam, "iters": iters,
                         "pooled_auc": round(a, 4) if a is not None else None,
-                        "folds_skipped": sk}
+                        "folds_skipped": sk, "folds_diverged": dv}
                 out["grid"].append(cell)
                 if a is not None:
                     if best_cell is None or a > best_cell[0]:
