@@ -470,3 +470,57 @@ unit-checked collapsed gradients), battery_mode2_fine.py (fine checkpoints +
 engaging margins), battery_mode2_f4.py (identity extension grid),
 battery_smalln_remediation.py (mode-1 ridge/early-stop grid). Results JSONs +
 trained W matrices under data/_scratch/icm/ (untracked).
+
+## 16. Addendum 11 — Phase-2 E2 START-OVER on intent-bearing data (2026-10-16)
+
+The corpus-drift guard (written this session after the mode-2 battery ran on
+the rejected LongMemEval-composed mixture) forced the run the plan actually
+names: the FIRST training with the intent operand in the loss. Corpus: the
+agent-intent capture slice (CodeTraceBench-SWE mapped; 259 tasks / 11,963
+steps / 146 human-verified faulty). Arms named in ternary terms --
+bind(state,intent) = parameter-free BUNDLE(normalize(e(task)+e(plan))) with a
+learned residual tanh-delta (battery-graded trainer); embed(prompt) = the
+1-in-5-strided val carve kept on the TRAIN side, every scored task fully held
+out; 8-fold task-disjoint CV; same pre-registered survival bar (beat all 4
+opponents +0.02).
+
+**Results: NO SURVIVOR, and the negative now has its intent-axis twin:**
+- o1 embed(prompt) leg 0.6114 > o2 the untrained BUNDLE 0.5901 > lexical
+  0.4482 / loglen 0.2459 (sanity: 1-0.754 loglen-inverted = 0.246 exact).
+  **The parameter-free bind(state,intent) composition LOSES to plain prompt
+  cosine before any learning.**
+- The learned delta: hinge fully engaged (7,896 violating pairs at init,
+  96.6% of all within-task useful/faulty pairs; gradient norm ~1.76) yet val
+  monotonically declines; val-best = ep25 = the least-moved checkpoint for
+  BOTH lrs; pooled = o2 exactly (delta sub-threshold at selection). Same
+  geometry-fragility signature as the battery's proj-only family, now with a
+  real intent operand. Not a cap-cut (600 ep run out).
+- Cross-check flag: task/plan cosine direction here says high cosine =
+  USEFUL (0.611), the faulty-head's reported 0.593 for faultiness used
+  max-over-THREE (incl. stage text) -- a small recorded discrepancy, unresolved.
+
+**THE GAP REPORT (first-class, numbers not adjectives):**
+- Label famine quantified: 146 verified-faulty = 1.2% of steps; contrast
+  exists in only 51/259 tasks (20%); ~208 tasks contribute NO usable
+  per-task signal. The usefulness oracle is faulty-labels-INVERTED.
+- Intent operand present but thin: declared agent plan on 53% of tasks (the
+  bundle collapses to task text elsewhere); plan-echo steps (n measured) are
+  a topically-trivial class the PASS audit must watch.
+- State operand ABSENT (trajectory position is all) -- run trains
+  bind(intent) only.
+- Memory side = the agent's own actions, not retrieved records; pay-off
+  labels for retrieval proper remain the scarce commodity (11 organic likes).
+- Flip shape present at file grain (154 shared units) but utility labels too
+  thin (16 negatives) to train on.
+- ~58% of tars unparsed; SWE-TaskFlow (25,200 verifier-labeled) untouched.
+
+**Verdict (per the standing no-dismissal rule): OPEN.** The ternary gate has
+now been run twice with the intent operand present (composed corpus: axis
+absent; this corpus: axis present, label power absent) and both times the
+learned delta loses to the geometry it starts from. What changed: the
+bottleneck is no longer attributable to the corpus lacking intent -- THIS
+corpus has it and the result replicated. The live doors are (1) label
+acquisition at utility-label power (SWE-TaskFlow verifier runs; user thumbs;
+captured sessions) and (2) the two-stage re-ranker over the geometry's
+failures. Instrument: scripts/icm/phase2_e2_intent_lens.py (gap report built
+in). Purpose guard: memory icm-lens-corpus-guard.
