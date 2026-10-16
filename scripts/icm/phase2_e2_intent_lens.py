@@ -56,7 +56,6 @@ import numpy as np  # noqa: E402
 
 from battery_mode2_remediation import auc  # noqa: E402  (audited scorer)
 
-MANIFEST = os.path.join("data", "_scratch", "codetrace", "bench_manifest.verified.jsonl")
 MAPPED = os.path.join("data", "_scratch", "icm", "capture", "codetrace_mapped.jsonl")
 FLIP_TABLE = os.path.join("data", "_scratch", "codetrace", "codetrace_flip_table.json")
 ECACHE = os.path.join("data", "_scratch", "icm", "intent_lens_embeds.npz")

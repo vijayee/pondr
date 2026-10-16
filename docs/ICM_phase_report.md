@@ -524,3 +524,50 @@ acquisition at utility-label power (SWE-TaskFlow verifier runs; user thumbs;
 captured sessions) and (2) the two-stage re-ranker over the geometry's
 failures. Instrument: scripts/icm/phase2_e2_intent_lens.py (gap report built
 in). Purpose guard: memory icm-lens-corpus-guard.
+
+## 17. Addendum 12 — the remaining levers on the intent corpus (2026-10-16)
+
+The user's question -- "did we try all the ML levers on the data that HAS the
+signal?" -- was answered by measurement: the addendum-11 run had used only
+part of the battery. The rest ran (pre-registered, commit 1b0.., script
+phase2_e2_intent_battery.py; 8 configs x 8-fold task-disjoint CV; same
+opponents o1 0.6114 / o2 0.5901 / o3 0.4482 / o4 0.2459; same bar).
+
+| config | pooled | best epochs (per fold) |
+|---|---|---|
+| G1 margin 0.0 | 0.5901 | scattered 25..600 |
+| G1 margin 0.01 | 0.5902 | scattered |
+| G1 margin 0.05 | 0.5901 | scattered |
+| G3 WD 1e-3 | 0.5911 | clustered LATE 550..600 |
+| G3 WD 1e-2 | 0.5909 | clustered LATE 550..600 |
+| G4 low-rank rank16 | 0.5901 | mid |
+| G2 InfoNCE t0.1 | 0.5901 | earliest 25 (7/8 folds) |
+| G2 InfoNCE t0.3 | 0.5901 | earliest 25 (6/8 folds) |
+
+**NO SURVIVOR; every lever lands on the init bundle (0.5901) within +-0.001.**
+Readings: (1) margin is irrelevant to the outcome (0 through 0.1 identical);
+(2) rank-16 delta == full-rank delta == no delta; (3) InfoNCE also degrades
+from its first checkpoint and never returns (5x slower, same number);
+(4) the ONLY directional lever is weight decay: stronger L2 pushes the
+val-best checkpoint to the END of training and buys +0.001 -- the same
+"smaller perturbations hurt less" signature, with no traction; (5) the
+per-fold spread is IDENTICAL across all 8 configs (min 0.3089, max 0.7574),
+i.e. the pooled variance belongs to the corpus (51/259 tasks carry labels),
+not to any training choice. No early exits fired -- the objectives never ran
+out of violations; the trained model simply never beats its own init on
+held-out tasks.
+
+**CORRECTION recorded with this run:** the addendum-11 instrument computed
+o1 as task-cosine alone (a patch had silently no-op'd; the offset line was
+accidentally correct because task_ids is sorted). Both are fixed in the
+refactored script, which reproduces o2/o3/o4 EXACTLY (machine precision);
+the corrected o1 is IDENTICAL (0.6114) -- the plan cosine never exceeds the
+task cosine on this corpus, so the mislabel was cosmetic.
+
+**Standing verdict, now fully lever-exhausted on intent-bearing data:**
+the lens's failure is not optimizer-, schedule-, objective-, or
+subspace-shaped; it is the ternary gate itself failing on this corpus, whose
+label power (1.2 percent coverage, 51/259 contrast-bearing tasks) cannot
+supply what the geometry lacks. Open doors unchanged: utility-label
+acquisition at scale (SWE-TaskFlow 25,200 verifier runs; user thumbs;
+captured sessions) and the two-stage re-ranker over the geometry's failures.
