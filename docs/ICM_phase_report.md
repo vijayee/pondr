@@ -398,3 +398,71 @@ audited (both laws enforced):
   all prior demonstrations. The arc's full question chain is now measured at
   every grain it ever posed.
 
+
+## 15. Addendum 10 — the standard ML remediation battery RUN (2026-10-16)
+
+The lens's two failure modes were never a closed verdict — the standard ML
+toolbox had not run. It has now run, pre-registered before fitting (three
+commits of pre-registration: 15173df, smalln, + fine/F4), seeded task-disjoint
+splits, direction-always reporting.
+
+**MODE 1 (small-n, CodeTraceBench head — battery_smalln_remediation.py):**
+ridge-λ {0.01..10} × early-stop-iters {100/500/2500} leave-one-task-out grid,
+both heads. Result: the full stack survives regularization (best cell 0.799 =
+λ0.01/500 iters, beats all three opponents incl. loglen 0.754) and is ~at the
+original unregularized head (0.814) — regularization neither rescues nor
+destroys the stack. The ctx-only arm improved 0.482→0.558 under early stop
+(mild per-fold overfit confirmed) yet remains far below the trivial length
+rule. **Composition reading unchanged: demo #11 stands through remediation.**
+(λ=10 diverges mechanically at lr=0.3: |1−lr·λ|≈3 oscillation — reported as
+diverged cells, never scored as silent zeros.)
+
+**MODE 2 (the E2 lens on the composed mixture — battery_mode2_remediation.py
++ fine addendum + F4):** the original readouts had a bug (val/holdout bound
+scored against WRONG question vectors via subset-position indexing) — found,
+fixed, rerun. Corrected battery = 26 configs across 4 families:
+
+- *Anchor + early-stop/WD (from-scratch, proj-only hinge):* early stopping
+  rescues 0.565→0.774 (val-best ep150); still −0.05 below cosine (0.8235);
+  WD inert across 2 decades. Learning = slow decay from a bad init.
+- *Identity-init / residual deltas (item 1, the mechanism target):* the ONLY
+  family whose bound holds/Beats cosine OOS — 8/8 cells in 0.827–0.831
+  (cosine 0.8235), deltas tiny by design, tail recovery 2/15 FROZEN across
+  every lr/L2/epoch cell. A hair of extra agreement; not the failure cases.
+  The geometry is knife-edge: the first hinge step out of identity drops val
+  0.84→0.57 with lr 1.5, while lr 0.05–0.15 rides a slow, convergent
+  improvement plateau (val flat 0.849 from ~ep300).
+- *Residual-hinge at margins {0.02..0.3}+{0,0.005}:* SILENT — delta ≈ its
+  σ-init after 1200 epochs, hinge constant, tail 0/15. Mechanism measured:
+  the raw cosine already satisfies these margins in train, so the violation
+  gradient is nearly empty; the targeted-loss framing has nothing to learn.
+- *InfoNCE in-batch negatives (τ {0.05,0.1,0.3}):* same silence — delta ≈
+  init, val at raw-cosine's own level, tail 0/15. The real-distribution
+  negatives change nothing because the residual framing's softmax is dominated
+  by the raw term.
+
+**Verdict by the pre-registered bar (bound ≥ cosine−0.01 AND tail ≥ 0.5 AND
+non-noop): NO SURVIVOR in 26 configs.** But the battery UPGRADES the negative
+into structure, not silence: (a) perturb-don't-destroy WORKS in direction —
+identity-init is the first lens parametrization that ends OOS *above* the
+cosine it starts from, consistently; (b) it recovers only 2/15 of cosine's
+tail failures regardless of every swept hyperparameter — the missing piece is
+not training hygiene but violations to learn from; (c) on the composed
+mixture the residual/InfoNCE objectives are empirically empty (margins
+satisfied by cosine). **The measured bottleneck has moved from the optimizer
+to the objective+data: the lens needs violations (real payoff contrasts), and
+this corpus supplies almost none beyond what cosine already resolves.**
+
+Still OPEN (none dismissed): more organic payoff data (LoCoMo harvest — the
+one-shared-conversation corpus with value-flip shape), the two-stage residual
+re-ranker (a loss defined ONLY on cosine's failures), curriculum, and identity
++ violation-enriched data (the battery cannot distinguish "identity helps a
+little" from "identity + real violations helps a lot"). No E2 relay was run:
+no config survived the discrimination gate, so by the pre-registration there
+is nothing to relay yet.
+
+Instruments (committed): battery_mode2_remediation.py (13 configs, exact
+unit-checked collapsed gradients), battery_mode2_fine.py (fine checkpoints +
+engaging margins), battery_mode2_f4.py (identity extension grid),
+battery_smalln_remediation.py (mode-1 ridge/early-stop grid). Results JSONs +
+trained W matrices under data/_scratch/icm/ (untracked).
