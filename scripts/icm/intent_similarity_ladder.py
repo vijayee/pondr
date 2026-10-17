@@ -250,13 +250,15 @@ def main() -> int:
 
     pairs = []   # (rung, a, b, note)
 
-    # R1 identical -- duplicated goal texts
+    # R1 identical -- duplicated goal RECORDS (built from the raw rows: the
+    # goals dict is keyed by id and collapses exact duplicates)
     seen = {}
-    for hid, g in goals.items():
-        seen.setdefault(g, []).append(hid)
+    for r in mapped:
+        if r["level"] == "goal":
+            seen.setdefault(r["text"], []).append(r["id"])
     dups = [v for v in seen.values() if len(v) > 1]
     for v in dups[:20]:
-        pairs.append(("R1_identical", goals[v[0]], goals[v[1]], v[0]))
+        pairs.append(("R1_identical", goals[v[0]], goals[v[0]], v[0]))
 
     # R2 paraphrase -- AUTHORED (declared): paraphrases of public plan phases
     authored = [
