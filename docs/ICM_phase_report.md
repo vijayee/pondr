@@ -582,3 +582,51 @@ steps it ALSO trains on the 208 no-faulty tasks, i.e. it saw all 259 tasks
 (more data than the hinge family's 51 contrast tasks) and still landed on
 the init bundle. The two smoke fixes were verified behaviour-preserving
 (both trainers reproduce their pre-fix smoke values bit-for-bit).
+
+## 18. Addendum 13 — the intent-detection smoke gate ran, and caught its own construction error (2026-10-16)
+
+Script: scripts/icm/intent_detection_smoke.py (pre-registered, commit 5e38b8d;
+public data only -- the personal corpora are excluded because the LLM
+instruments are cloud calls). Gate: before any real-data run, an instrument
+must move when intent changes and hold when only wording changes.
+
+Numbers (96 pairs: 32 SENS / 64 INV, CodeTraceBench mapped):
+
+| instrument | SENS (want DIFFERENT) | INV (want SAME) | LEX-HARD residual |
+|---|---|---|---|
+| LEX jaccard >= 0.25 | 0.00 | 0.00 | 0.00 |
+| const-SAME / const-DIFFER | 0.00 / 1.00 | 1.00 / 0.00 | -- |
+| SPO-STRUCT (extract + rule) | 0.75 | 0.00 | 0.25 |
+| LLM-JUDGE (oracle, separate) | 0.00 | 0.719 | 0.479 |
+
+Verdict: FAIL by the bar; vacuity guard CLEARED (the pair sets are not
+lexically solvable). But the failures are not what the labels claimed:
+
+1. **THE SENS CONSTRUCTION WAS MINE AND WRONG.** On inspection, the 32
+   "changed intent" pairs are plan RE-DECLARATIONS whose texts differ by a
+   refinement ("fix SQL syntax error" -> "fix SQL syntax error in Count with
+   distinct and Case"). Both the triple extraction and the judge say SAME --
+   correctly: these are sub-intent REFINEMENTS of one intent (hierarchy
+   expansion), not different intents. I had labeled refinements as intent
+   changes; the gate surfaced the mislabel before it became a conclusion.
+   Consequence: the capability is NOT shown absent; the instrument's SENS
+   number is uninterpretable until the construction is rebuilt.
+2. **SPO-STRUCT's INV=0 is a REAL failure and it is diagnostic.** Triple
+   extraction is good (the triples are sensible) but the MATCH RULE
+   (attitude overlap >= 0.5 AND object jaccard >= 0.3) is string-overlap on
+   the object field -- the instrument as implemented is a LEXICAL instrument
+   wearing a structured hat, so it inherits the lexical ceiling (LEX-HARD
+   0.25). Lesson with a name: extraction is not detection; the comparison
+   OPERATOR is where the instrument's power lives.
+3. **BINARY same/different is the wrong vocabulary for this domain.**
+   Refinements are neither "same" nor "different": they are near-relations
+   (sub-intent). This is precisely the user's follow-up question -- how
+   SIMILAR is one intent to another -- and the honest next instrument is
+   graded, not binary.
+
+Next instrument (pre-registered when run): a graded ladder -- identical >
+paraphrase > sub-intent (goal<->plan, refinements) > sibling (same repo) >
+unrelated (different repos) -- plus REVERSAL pairs (same file, opposite
+intent), with the decisive readout LOW-where-surface-is-HIGH and rank
+correlation across the ladder. Nothing above may be quoted as an instrument
+verdict until that runs.
