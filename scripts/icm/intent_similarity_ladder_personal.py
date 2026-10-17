@@ -5,8 +5,9 @@ public benchmark cannot supply, using the SAME instruments (imported, not
 re-implemented) and the SAME extraction cache:
 
   R2p PARAPHRASE, NATURAL (expect HIGH): the user's own corpora -- goals from
-      DIFFERENT sessions that share a project (HPMT spans 12 sessions,
-      liboffs 7, Pondr 4, WaveDB 2 by the 2026-10-17 census). VALIDITY
+      DIFFERENT sessions that share a project keyword (several projects span
+      multiple sessions by the 2026-10-17 census; the keyword list itself
+      lives in an untracked config). VALIDITY
       CAVEAT, declared: same project does not guarantee the same intent
       (different tasks in one project exist); this rung is therefore
       "same-project cross-session" with the caveat reported, and the lowest-
