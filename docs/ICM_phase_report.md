@@ -630,3 +630,46 @@ unrelated (different repos) -- plus REVERSAL pairs (same file, opposite
 intent), with the decisive readout LOW-where-surface-is-HIGH and rank
 correlation across the ladder. Nothing above may be quoted as an instrument
 verdict until that runs.
+
+## 19. Addendum 14 — the comparator's capacity, measured (2026-10-17)
+
+The comparator was the bottleneck, not the data (measured: all instruments
+called OPPOSITE intents similar -- lex 0.471 / emb 0.906 / struct-v1 0.667).
+So the comparator was fixed first, against a constructed capacity test with
+known answers (42 pairs, 7 rungs; script comparator_capacity_test.py,
+pre-registered 86c7c78; NO mined corpora, no personal text).
+
+THE FIX (schema extension, not more lexicon): the object slot carries a
+STATE QUALIFIER (ARCHIVED vs CURRENT, read by fixed rules), plus opposition
+rules for state / antonym relations / negation mismatch, plus a SEMANTIC
+entity fallback (object-phrase embedding cosine >= 0.60) because paraphrases
+share no tokens, plus a completed predicate-class table (the earlier antonym
+list had named classes that were never defined -- a bug).
+
+| rung (want) | lexical | embeddings | v1 | v4 |
+|---|---|---|---|---|
+| same (>=0.90) | 1.00 | 1.00 | 1.00 | **1.00** |
+| paraphrase (>=0.60) | 0.02 | 0.77 | 0.33 | **0.75** |
+| refinement (>=0.60) | 0.51 | 0.83 | 0.70 | **0.96** |
+| unrelated (<=0.35) | 0.00 | 0.54 | 0.08 | **0.375 FAIL** |
+| reversal-antonym (<=0.35) | 0.61 | 0.91 | 0.33 | **0.125** |
+| reversal-state (<=0.35) | 0.47 | 0.91 | 0.67 | **0.000** |
+| negation (<=0.40) | 0.80 | 0.94 | 0.75 | **0.000** |
+
+9 of 10 checks pass. The decisive reversal (same memory, archived-vs-current)
+goes 0.667 -> 0.000 while paraphrase recognition RISES 0.333 -> 0.75 -- the
+first time a structural comparator separates "same intent reworded" from
+"opposite aim, same words". The single failure is the recorded COST of the
+semantic entity fallback: some unrelated pairs (0.375 vs the 0.35 bar) now
+count as entity-matched. No per-case tuning was done; raising tau would be
+tuning on these fixtures, so it is left for the arbiter.
+
+ARBITER AND CAVEAT (state it plainly): v4 was designed after seeing these
+fixtures, so this test can no longer decide the comparator's fate. The
+arbiter is the INTEGRATION test on LIFTED data -- real intent text with
+mechanical outcomes: CodeTraceBench's trajectories carry the real issue/PR
+description in messages[1] (the capture mapper had discarded it in favour of
+the template goal) plus plans, per-step THOUGHTS, verifier outcomes and the
+154-file shared-unit structure. If v4 passes the fixtures but fails the
+lifted data, the fixture work was the fixed-point trap and the record will
+say so.
