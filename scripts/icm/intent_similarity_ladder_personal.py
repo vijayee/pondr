@@ -74,7 +74,15 @@ REALITY = os.path.join("data", "_scratch", "icm", "reality", "env")
 OUT = os.path.join("data", "_scratch", "icm", "intent_ladder_personal_results.json")
 
 KEYWORDS_FILE = os.path.join("data", "_scratch", "icm", "project_keywords.json")
-PROJECTS: tuple = tuple(json.load(io.open(KEYWORDS_FILE, encoding="utf-8"))["keywords"]) \n    if os.path.exists(KEYWORDS_FILE) else ()   # personal names stay out of tracked code
+
+def _projects():
+    """Personal project keywords come from an UNTRACKED config so that
+    tracked code carries no personal identifiers."""
+    if os.path.exists(KEYWORDS_FILE):
+        return tuple(json.load(io.open(KEYWORDS_FILE, encoding="utf-8"))["keywords"])
+    return ()
+
+PROJECTS = _projects()
 ERROR_PAT = re.compile(r"traceback|error:|exception|stack trace|line \d+, in |file \"", re.I)
 
 
