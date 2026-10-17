@@ -424,9 +424,11 @@ def main() -> int:
         "struct_subintent_mean": round(sum(sub) / len(sub), 3) if sub else None,
         "lex_reversal_mean": round(sum(rev_lex) / len(rev_lex), 3) if rev_lex else None,
     }
-    hi = [v for rg in ("R2_paraphrase_AUTHORED", "R3_subintent") for v in [table["struct"][rg]] if v]
-    lo = [v for rg in ("R4_sibling", "R5_unrelated", "R6_reversal_samefile", "R6_reversal_metric")
-          for v in [table["struct"][rg]] if v]
+    def _s(rg):
+        return table["struct"].get(rg)
+    hi = [v for rg in ("R2_paraphrase_AUTHORED", "R3_subintent") for v in [_s(rg)] if v]
+    lo = [v for rg in ("R4_sibling", "R5_unrelated", "R6_reversal_samefile",
+                       "R6_reversal_metric") for v in [_s(rg)] if v]
     sep_ok = bool(hi and lo and min(hi) >= 0.60 and max(lo) <= 0.35)
     gap_ok = bool(res["reversal_readout"]["struct_subintent_mean"] is not None
                   and res["reversal_readout"]["struct_reversal_mean"] is not None
@@ -436,9 +438,8 @@ def main() -> int:
                       and res["reversal_readout"]["struct_reversal_mean"] is not None
                       and res["reversal_readout"]["struct_reversal_mean"]
                       < res["reversal_readout"]["lex_reversal_mean"])
-    lex_sep = bool(table["lex"]["R2_paraphrase_AUTHORED"] and table["lex"]["R6_reversal_samefile"]
-                   and table["lex"]["R2_paraphrase_AUTHORED"] >= 0.60
-                   and table["lex"]["R6_reversal_samefile"] <= 0.35)
+    _l2, _l6 = table["lex"].get("R2_paraphrase_AUTHORED"), table["lex"].get("R6_reversal_samefile")
+    lex_sep = bool(_l2 is not None and _l6 is not None and _l2 >= 0.60 and _l6 <= 0.35)
     res["checks"] = {"separation": sep_ok, "reversal_gap": gap_ok,
                      "beats_lex_on_reversal": lex_fooled, "vacuous": lex_sep}
     res["pass"] = bool(sep_ok and gap_ok and lex_fooled and not lex_sep)
