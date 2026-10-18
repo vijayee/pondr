@@ -188,8 +188,9 @@ def main() -> int:
     q_emb = emb([q["issue"][:1500] for q in queries]) if queries else np.zeros((0, 384))
 
     def metrics(order_idx, useful_set):
-        ranks = [i for i, f in enumerate(cand) if f in useful_set]
-        hits = [r for r in ranks]
+        # positions of the useful files IN THE RANKING (not in the file list)
+        ranks = [pos for pos, fi in enumerate(order_idx) if cand[fi] in useful_set]
+        hits = ranks
         rec10 = sum(1 for r in hits if r < K1) / len(useful_set)
         rec50 = sum(1 for r in hits if r < K2) / len(useful_set)
         mrr = max((1.0 / (r + 1) for r in hits), default=0.0)
