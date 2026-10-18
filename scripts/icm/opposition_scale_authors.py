@@ -116,19 +116,48 @@ Sentences must be 6-20 words, concrete, and about ordinary software or data work
 JSON only, no prose."""
 
 
+def first_json_obj(raw: str):
+    """Extract the FIRST balanced JSON object (string/escape aware)."""
+    if not raw:
+        return None
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(raw[start:i + 1])
+                except Exception:
+                    return None
+    return None
+
+
 def generate() -> int:
     out = []
     for model, n_opp, n_same in AUTHORS:
         prompt = AUTHOR_PROMPT.format(n_opp=n_opp, n_same=n_same)
         print(f"[author] {model}: requesting {n_opp}+{n_same}", flush=True)
         raw = ask(model, prompt)
-        m = re.search(r"\{.*\}", raw or "", re.S)
-        pairs = []
-        if m:
-            try:
-                pairs = json.loads(m.group(0)).get("pairs", [])
-            except Exception as e:
-                print(f"  parse failed: {e}", flush=True)
+        obj = first_json_obj(raw or "")
+        pairs = obj.get("pairs", []) if isinstance(obj, dict) else []
+        if not pairs:
+            print("  parse produced no pairs", flush=True)
         kept = []
         for p in pairs:
             if not isinstance(p, dict):
