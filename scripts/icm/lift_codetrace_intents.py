@@ -48,8 +48,11 @@ OUTDIR = os.path.join("data", "_scratch", "icm", "lifted")
 OUT = os.path.join(OUTDIR, "codetrace_intents.jsonl")
 GAPS = os.path.join(OUTDIR, "gap_report.json")
 
+# extension must END at a non-word boundary: without it, ".c" matched the
+# first two chars of ".contrib" and produced junk units like "django.c"
 FILE_PAT = re.compile(
-    r"[A-Za-z0-9_./-]+\.(?:py|js|ts|tsx|jsx|rs|go|java|c|h|cc|cpp|md|json|ya?ml|toml|cfg|ini|txt)")
+    r"[A-Za-z0-9_./-]+\.(?:py|js|ts|tsx|jsx|rs|go|java|cc|cpp|md|json|ya?ml|toml|cfg|ini|txt)(?![\w])"
+    r"|[A-Za-z0-9_./-]+\.(?:c|h)(?![\w])")
 ISSUE_PATS = (re.compile(r"<issue_description>(.*?)</issue_description>", re.S),
               re.compile(r"<pr_description>(.*?)</pr_description>", re.S))
 THOUGHT = re.compile(r"THOUGHT:\s*(.*?)(?:\n\s*```|\Z)", re.S)
