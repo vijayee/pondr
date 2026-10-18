@@ -133,18 +133,42 @@ def key_sim(qk, tk) -> float:
     return max(0.0, min(1.0, 0.5 * cls + 0.5 * ent - opp))
 
 
+def as_key_list(v):
+    """Normalise a key field: v1 stores one triple (dict), v2 a list of triples."""
+    if isinstance(v, dict):
+        return [v]
+    if isinstance(v, list):
+        return [x for x in v if isinstance(x, dict)]
+    return []
+
+
+def key_sim_list(qks, tks) -> float:
+    """Max key_sim over the requirement pairs of two intents."""
+    q, t = as_key_list(qks), as_key_list(tks)
+    if not q or not t:
+        return 0.0
+    return max((key_sim(a, b) for a in q for b in t), default=0.0)
+
+
 def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--keys", default=KEYS)
+    ap.add_argument("--rels", default=RELS)
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+    out_path = args.out or OUT
     runs = [json.loads(l) for l in io.open(LIFT, encoding="utf-8") if l.strip()]
     files = [json.loads(l) for l in io.open(FILES, encoding="utf-8") if l.strip()]
     keys = {}
-    for l in io.open(KEYS, encoding="utf-8"):
+    for l in io.open(args.keys, encoding="utf-8"):
         if l.strip():
             r = json.loads(l)
-            keys[r["run_id"]] = r.get("key")
-    rels = [json.loads(l) for l in io.open(RELS, encoding="utf-8") if l.strip()] \
-        if os.path.exists(RELS) else []
+            keys[r["run_id"]] = r.get("keys") if "keys" in r else r.get("key")
+    rels = [json.loads(l) for l in io.open(args.rels, encoding="utf-8") if l.strip()] \
+        if os.path.exists(args.rels) else []
     print(f"[load] runs={len(runs)} file_records={len(files)} keys={len(keys)} "
-          f"rels={len(rels)}", flush=True)
+          f"rels={len(rels)} keys_file={os.path.basename(args.keys)}", flush=True)
 
     good = [r for r in runs if r.get("issue") and keys.get(r["run_id"])]
     tasks = sorted({task_key(r["run_id"]) for r in good})
@@ -205,7 +229,7 @@ def main() -> int:
         qtok = tokset(qtext)
         lex = np.array([len(qtok & tokset(store_text[f])) /
                         max(1, len(qtok | tokset(store_text[f]))) for f in cand])
-        struct = np.array([max([key_sim(qk, tk) for tk in store_keys.get(f, []) if tk] or [0.0])
+        struct = np.array([max([key_sim_list(qk, tk) for tk in store_keys.get(f, []) if tk] or [0.0])
                            for f in cand])
         order = {a: np.argsort(-s) for a, s in
                  (("dense", dense), ("lex", lex), ("struct", struct))}
@@ -234,7 +258,7 @@ def main() -> int:
                 continue
             ku = keys.get(row["useful_run"]); kn = keys.get(row["nonuseful_run"])
             if ku and kn:
-                vals.append(key_sim(ku, kn))
+                vals.append(key_sim_list(ku, kn))
         rel_stats[rel] = (round(statistics.mean(vals), 3) if vals else None, len(vals))
     checks = {
         "hybrid_beats_dense_recall": (table["hybrid"]["recall@10"] or 0)
@@ -252,11 +276,11 @@ def main() -> int:
            "verdict": ("PASS -- intent-keyed index beats plain similarity on "
                        "verifier-grounded usefulness" if all(checks.values()) else
                        "FAIL -- the failing row names the missing piece")}
-    with io.open(OUT, "w", encoding="utf-8") as f:
+    with io.open(out_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(res, indent=2, default=str))
     print(json.dumps({k: res[k] for k in ("table", "relation_key_sim", "checks", "pass",
                                           "verdict")}, indent=1, default=str), flush=True)
-    print(f"[done] -> {OUT}", flush=True)
+    print(f"[done] -> {out_path}", flush=True)
     return 0
 
 
