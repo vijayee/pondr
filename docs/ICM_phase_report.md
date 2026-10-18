@@ -764,3 +764,36 @@ NEXT: the lifted-data integration test (CodeTraceBench messages[1] issue
 texts + plans + step THOUGHTS + verifier outcomes + the 154 shared file
 units) -- judge canonicalises intents and flags oppositions on the SAME
 shared files; the structural index answers; outcomes judge the result.
+
+## 22. Addendum 17 — the LIFT: real intents from raw trajectories (2026-10-18)
+
+The capture mapper had been recording the TEMPLATE goal
+(`resolve {task} ({agent})`) and discarding the real intent, which lives in
+the trajectory: the benchmark's own issue description. The lift now parses
+ALL THREE agent layouts in trajs3/ and joins verifier outcomes from the
+manifest by artifact basename (script lift_codetrace_intents.py, 5s for 489
+tars; corpus untracked).
+
+| agent | runs | real issue text | declared plan | step THOUGHTS | outcome |
+|---|---|---|---|---|---|
+| miniswe | 68 | 68 | 0 (none declared) | 68 | 68 |
+| openhands | 259 | 259 | **256** | 0 (none emitted) | 259 |
+| sweagent | 108 | 90 | 0 (none declared) | 107 | 108 |
+| **total** | **435** | **417 (96%)** | 256 | 175 | **435 (100%)** |
+
+Corpus: 16,830 steps (vs 11,963 in the template-goal capture),
+**3,759 distinct files, 543 shared-file units** (vs 154), outcomes
+319 solved / 116 unsolved (mechanical), issue texts median 1,296 chars.
+54 tars (11%) failed to parse -- counted, not hidden.
+
+GAPS SURFACED: openhands emits no THOUGHT blocks (reasoning is in tool-call
+arguments); miniswe/sweagent declare no plan; sweagent issue text missing for
+18 runs; 54 parse failures (mixed/odd layouts). These bound what each grain
+can be trained or tested on.
+
+WHAT THIS ENABLES: the integration test the program has been unable to run --
+real intent statements (issue texts) against mechanical outcomes over a
+shared-file structure 3.5x larger than the flip table. Next: the judge builds
+the intent keyspace over the 417 real intents (canonicalise, flag
+oppositions among the 543 shared-file units); the structural index answers;
+the verifier outcomes judge the result.
