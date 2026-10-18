@@ -721,3 +721,46 @@ second author/model) before building on it; (b) integration test on LIFTED
 data -- real intent texts (messages[1] issue descriptions, plans, step
 THOUGHTS) + verifier outcomes + the 154-file shared-unit structure -- with
 the judge building the key space and the structural index answering.
+
+## 21. Addendum 16 — the judge route replicated across authors (2026-10-18)
+
+Scale-up of addendum 15 with author != comparator != judge: three generator
+models (glm-5.3-flash:cloud, minimax-m3:cloud, qwen3:8b local) each wrote
+10 opposed + 5 same-intent pairs under a fixed authoring prompt (same
+artifact, shared wording, no marker words, explicit shared_memory and
+why_opposite); plus the user's 15. One frozen scoring pass, 60 pairs,
+comparator and judge unchanged.
+
+| author | n | unmarked | judge_opp (want low) | judge_same (want high) | v4_opp | lex_opp (fooled) |
+|---|---|---|---|---|---|---|
+| user | 15 | 13 | 0.10 | 1.00 | 0.82 | 0.58 |
+| glm-5.3-flash:cloud | 15 | 15 | 0.00 | 1.00 | 0.83 | 0.68 |
+| minimax-m3:cloud | 15 | 13 | 0.00 | 0.80 | 0.82 | 0.81 |
+| qwen3:8b (local) | 15 | 12 | 0.20 | 0.80 | 0.72 | 0.52 |
+| POOLED | 60 | | **0.075** | **0.90** | **0.796** | 0.646 |
+
+Checks: judge_opposite_low PASS, judge_same_high PASS, two_of_three_authors
+PASS (all three), v4_failure_replicates PASS. Embeddings (reported): 0.922
+opposed / 0.842 same -- fooled on everything, as always.
+
+READING: (1) the judge generalises across authors (0.00-0.20 on opposed,
+0.80-1.00 on same-intent); (2) the structural comparator's ceiling
+replicates on every author's unmarked pairs (0.72-0.83 on opposed) while it
+remains adequate on sameness (0.81); (3) the pair sets have teeth (lexical
+0.52-0.81 on opposed, 0.22 on same -- no constant answer passes).
+
+CAVEATS: judge is a cloud model (no local equivalent measured yet); 45/60
+pairs are model-authored, so "matches real work distribution" is not
+established; same-intent rungs are small (n=5/author) with two authors at
+0.80 (1 of 5 wrong each). These bound the claim to: OPPOSITION COMPARISON
+under the stated authoring conditions.
+
+DIVISION OF LABOR this establishes: semantics (judge) is needed for
+opposition/canonicalisation; structure remains adequate for sameness,
+refinement and the query-time index. That is the architecture: judge-built
+intent key space at write time + deterministic local index at query time.
+
+NEXT: the lifted-data integration test (CodeTraceBench messages[1] issue
+texts + plans + step THOUGHTS + verifier outcomes + the 154 shared file
+units) -- judge canonicalises intents and flags oppositions on the SAME
+shared files; the structural index answers; outcomes judge the result.
