@@ -797,3 +797,38 @@ shared-file structure 3.5x larger than the flip table. Next: the judge builds
 the intent keyspace over the 417 real intents (canonicalise, flag
 oppositions among the 543 shared-file units); the structural index answers;
 the verifier outcomes judge the result.
+
+## 23. Addendum 18 — per-file usefulness labels from the accepted patch (2026-10-18)
+
+The integration test needs a usefulness signal at the memory-unit grain. This
+lift derives it mechanically: a file is USEFUL for a run when it appears in
+the run's final patch AND the verifier accepted the run; ATTEMPTED when it
+appears in the patch but the run failed; CONTEXT when touched without being
+changed. Patches come from the tars (patch.diff / .patch / .pred /
+SWE-agent info.submission); paths are normalised on both sides.
+
+| label | count |
+|---|---|
+| useful | 2,380 |
+| attempted | 239 |
+| context | 3,734 |
+| **records** | **6,353 (run,file)** |
+
+Coverage: 295/435 runs carry a patch (openhands 198/259, sweagent 83/108,
+miniswe 14/68 -- a counted GAP, likely a member-naming difference). 5,182
+distinct files; 562 multi-run units; **98 units carry BOTH useful and
+non-useful labels** -- the outcome-flip evaluation set. A file-path regex bug
+was fixed first (".c" matching the start of ".contrib" had produced junk
+units; shared-file count corrected 543 -> 430 pre-normalisation).
+
+CAVEATS recorded: diffs sometimes include environment files (package.json,
+pyproject.toml appear as "useful" patch files in some runs); miniswe's low
+patch coverage limits that agent's weight; 98 flip units is a small first
+pass, adequate for a paired readout but not for a confident single number.
+
+WHAT REMAINS for the integration test: (1) the judge keyspace pass over the
+417 real intents (~600 calls: SPO extraction + canonicalisation + relation
+labels among the flip units); (2) the harness -- task-disjoint split, arms =
+dense (issue -> file text proxy) vs structural keys vs hybrid, primary
+metric recall@k / MRR for the patch files of held-out runs, secondary the
+outcome-flip readout on the 98 units.
