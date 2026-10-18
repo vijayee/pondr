@@ -67,7 +67,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import numpy as np  # noqa: E402
 
-from intent_similarity_ladder import PRED_CLASSES, tokset  # noqa: E402
+from intent_similarity_ladder import PRED_CLASSES, toks as tokset  # noqa: E402
 
 LIFT = os.path.join("data", "_scratch", "icm", "lifted", "codetrace_intents.jsonl")
 FILES = os.path.join("data", "_scratch", "icm", "lifted", "codetrace_files.jsonl")
