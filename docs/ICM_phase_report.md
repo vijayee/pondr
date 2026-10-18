@@ -832,3 +832,47 @@ labels among the flip units); (2) the harness -- task-disjoint split, arms =
 dense (issue -> file text proxy) vs structural keys vs hybrid, primary
 metric recall@k / MRR for the patch files of held-out runs, secondary the
 outcome-flip readout on the 98 units.
+
+## 24. Addendum 19 — the INTEGRATION TEST ran: the single-key keyspace does not transfer (2026-10-18)
+
+Pre-registered harness (integration_test.py) on the lifted corpus: task-disjoint
+split (344 tasks -> 68 held out; 338 train runs / 79 test runs); store built
+from train runs only (4,562 candidate files); 28 held-out runs with usable
+ground truth (their accepted-patch files present in the pool); query = the
+run's REAL issue text; ground truth = its USEFUL (accepted-patch) files.
+
+| arm | recall@10 | recall@50 | MRR |
+|---|---|---|---|
+| DENSE (issue -> file text proxy) | **0.179** | **0.339** | **0.092** |
+| LEXICAL | 0.179 | 0.321 | 0.061 |
+| STRUCT (judge SPO keys) | **0.000** | **0.000** | 0.001 |
+| HYBRID (RRF) | 0.071 | 0.286 | 0.036 |
+
+ALL pre-registered checks FAIL. Chance recall@10 for ~2 useful files among
+4,562 is about 0.004 -- so DENSE at 0.179 is ~45x chance and clearly the only
+working signal; the judge-built single-key keyspace is indistinguishable from
+noise, and fusing it into dense DEGRADES dense (0.179 -> 0.071).
+
+DIAGNOSIS (named, not hand-waved):
+1. ONE key per intent is too coarse for real issue texts. The addendum-15/16
+   tests used 6-20-word sentences where a single SPO triple captures the
+   intent; real issues are ~1,300 chars carrying several requirements, and
+   one triple throws that away -- key_sim barely varies across files.
+2. The relation-labelling prompt collapsed on long texts: 94/96 pairs called
+   DIFFERENT, 0 OPPOSED (vs 2 SAME), so the secondary keyspace-vs-judge check
+   could not run. A file-centric question ("would the changes these two tasks
+   require to THIS file conflict?") is the obvious reformulation.
+3. The keyspace bar in intent_keyspace.py used the wrong denominator
+   (562 multi-run units instead of the ~98 outcome-flip units): the honest
+   reading is 96/98 flip units labelled = 98 percent, but the pre-registered
+   number (17 percent) is what the record shows; the bar was mis-specified.
+   Also fixed en route: a harness ranking bug that scored positions over the
+   alphabetical file list instead of the ranked order (made every arm look
+   like chance at recall 0.0).
+
+WHAT SURVIVES / WHAT DOES NOT: dense text similarity is the working retrieval
+signal on real intents (45x chance); the judge-built keyspace as ONE triple
+per intent does not transfer. The addenda 15/16 result stands only for short
+intent sentences under those authoring conditions. The next honest iteration,
+if attempted, is multi-requirement keys (3-5 SPO triples per issue) + a
+file-centric relation prompt -- a NEW pre-registered test, not a re-score.
