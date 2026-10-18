@@ -876,3 +876,43 @@ per intent does not transfer. The addenda 15/16 result stands only for short
 intent sentences under those authoring conditions. The next honest iteration,
 if attempted, is multi-requirement keys (3-5 SPO triples per issue) + a
 file-centric relation prompt -- a NEW pre-registered test, not a re-score.
+
+## 25. Addendum 20 — v2 keyspace (multi-requirement) still loses to dense; the opposition test has no bed (2026-10-18)
+
+Keyspace v2: 417/417 intents keyed, mean **4.63 requirements per issue**
+(median 5, range 3-6), keys visibly decomposing real issues (e.g. four
+separate requirements from one FITS-card bug). Harness unchanged in every
+other respect (same split, pool, ground truth).
+
+| arm | recall@10 | recall@50 | MRR |
+|---|---|---|---|
+| DENSE | **0.179** | 0.339 | **0.092** |
+| LEXICAL | 0.179 | 0.321 | 0.061 |
+| STRUCT (multi-keys) | 0.000 | 0.089 | 0.009 |
+| HYBRID | 0.107 | **0.429** | 0.053 |
+
+ALL pre-registered checks FAIL again. READINGS:
+1. Multi-requirement keys clearly help the TAIL: struct goes 0.000 -> 0.089
+   @50; hybrid @50 0.286 -> 0.429, now ABOVE dense (0.339). But at the HEAD
+   that matters (recall@10, MRR) dense still wins. The keyspace carries real
+   but weak signal relative to dense at this grain.
+2. The file-centric relation prompt did NOT "collapse" -- it agreed with the
+   corpus: 95/96 shared-file task pairs are DIFFERENT purposes, 1 SAME, 0
+   OPPOSED. That is almost certainly TRUE, not an instrument failure: two
+   different tasks sharing a file in a repo have different purposes. **The
+   corpus contains no natural opposed-intent pairs at all** (consistent with
+   the Onyx census 0/6336 and the absence of same-task-two-intent runs), so
+   the keyspace's opposition capability from addenda 15/16 has NO test bed
+   here. The relation-gap check was mis-specified against this corpus.
+
+CUMULATIVE STATE OF THE RETRIEVAL QUESTION: dense text similarity is the
+working retrieval mechanism (45x chance on real intents); a judge-built
+intent keyspace -- one triple or five -- does not beat it at the head of
+ranking, though multi-keys add tail signal. The judge's intent COMPARISON
+capability stands only on constructed short-sentence pairs and is untested
+where it matters (natural opposed intents on a shared memory).
+
+WHAT WOULD CHANGE THIS (named, not promised): a corpus with the same memory
+under genuinely opposed intents with mechanical outcomes -- i.e. production
+usage of the store, or a purpose-built harness in the 2x2-fixture family at
+scale. Nothing in the current public corpora supplies it.
