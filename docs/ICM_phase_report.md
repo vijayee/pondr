@@ -673,3 +673,51 @@ the template goal) plus plans, per-step THOUGHTS, verifier outcomes and the
 154-file shared-unit structure. If v4 passes the fixtures but fails the
 lifted data, the fixture work was the fixed-point trap and the record will
 say so.
+
+## 20. Addendum 15 — the non-circular test: the structural comparator's ceiling, and the judge's clean win (2026-10-18)
+
+The capacity test in addendum 14 was authored by the same hand as the
+comparator and iterated until it passed — weak evidence, and its fixtures
+STATED their opposition in the marker words the rules detect. The
+non-circular version: 10 opposed + 5 same-intent pairs authored by the USER
+(untracked file; content never committed), comparator FROZEN before seeing
+them (sha256 recorded in the results), one run, no iteration.
+
+| instrument | opposed pairs (want low) | same-intent pairs (want high) |
+|---|---|---|
+| lexical | 0.577 (fooled -- set has teeth) | 0.241 |
+| embeddings | 0.911 (maximally fooled) | 0.821 |
+| structural v4 (frozen) | **0.820 FAIL** | 0.850 |
+| **LLM judge (separate diagnostic)** | **0.000** | **1.000** |
+
+Two findings, both durable:
+
+1. **The structural comparator's ceiling is now measured**: it handles
+   paraphrase (0.85) and catches opposition only when the opposition is
+   stated in words or verb classes -- it scores UNMARKED opposition at 0.82,
+   i.e. as similar. Nine of the ten user-authored opposed pairs scored
+   0.75-1.0. The pre-registered prediction was correct, and no iteration is
+   permitted on this result.
+2. **The semantic judge separated the same pairs perfectly** (0.0 on all ten
+   opposed, 1.0 on all five same-intent). Note the judge's earlier "failure"
+   in the detection smoke was a MISLABEL (the SENS pairs were refiments it
+   correctly called same); on the first clean reversal test it wins outright.
+
+CAVEATS, stated: n=15, single author, single model, single prompt; pairs are
+correlated by authorship; the judge is a similarity engine by construction
+(icm-reality-oracle-reframe) and costs a cloud call per comparison.
+
+**THE ARCHITECTURAL CONSEQUENCE** (this is what the result buys): intent
+COMPARISON can run offline at index-build time -- the judge canonicalises
+and detects oppositions between intents when writing the store -- while
+QUERY time stays deterministic, local and cheap over the resulting intent
+key space. That is the plan's "intelligence lives in the front-end, the
+store stays dumb", implemented as a judge-built key space rather than a
+learned lens; and it is the first such implementation our non-circular test
+supports.
+
+NEXT (in order): (a) scale the unmarked-opposition test (more pairs,
+second author/model) before building on it; (b) integration test on LIFTED
+data -- real intent texts (messages[1] issue descriptions, plans, step
+THOUGHTS) + verifier outcomes + the 154-file shared-unit structure -- with
+the judge building the key space and the structural index answering.

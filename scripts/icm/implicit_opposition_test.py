@@ -108,6 +108,20 @@ def main() -> int:
                        "FAIL -- the comparator catches opposition stated in words, "
                        "not opposition derived from what each intent requires of "
                        "the same memory (the pre-registered prediction)")}
+    # ---- judge diagnostic (separate instrument; the comparator stays frozen)
+    import argparse
+    if "--judge" in sys.argv:
+        from intent_detection_smoke import judge_same
+        jvals = {"opposite": [], "same": []}
+        for p_ in good:
+            j = judge_same(p_["a"], p_["b"])
+            if j is not None:
+                jvals[p_["relation"]].append(1.0 if j else 0.0)
+        # judge answers "same" -> 1.0; for OPPOSED pairs we want 0.0
+        res["judge"] = {rel: (round(sum(v) / len(v), 3) if v else None)
+                        for rel, v in jvals.items()}
+        print("[judge]", res["judge"], flush=True)
+
     res["per_pair"] = [{"relation": r["relation"], "lex": r["lex"], "emb": r["emb"],
                         "v4": r["v4"]} for r in rows]   # numbers only, no texts
     with io.open(OUT, "w", encoding="utf-8") as f:
