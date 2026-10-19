@@ -1222,3 +1222,62 @@ available corpus: **~171 verified pairs** (local liboffs + WaveDB ~159, public
 pilot ~12) -- enough for a first powered run. The corresponding Claude
 sessions are NOT needed for this test: they were censused at 1/280 opposed
 (addendum 25) and add intent text, not counterfactual pairs.
+
+## 32. Addendum 27 — the first git-counterfactual run FAILS its vacuity guard (2026-10-19)
+
+Pre-registered harness (`scripts/icm/git_counterfactual_test.py`, docstring
+written before the run): one adversarial trial per verified inverse pair --
+"Restore the FIRST version of <file> (the state that existed before this
+change): <add-commit message>" -- pool = unique blobs among before/after/
+removed + 4 decoys from other files; answer = the parent-of-add blob; oracle =
+the git blob content. Arms: DENSE@1, SEMANTIC-ONLY (type filter -> judge epoch
+re-rank), TWO-STAGE (dense top-5 -> same filter/rank).
+
+DISCOVERY: 25 valid trials from 12 repos (liboffs 5, WaveDB 17, CRABS 1,
+EAuth 1, poseidon 1). Strict validity filters cut the 159 inverse pairs:
+121 missing the pre-change blob (file added in the add commit or deleted at
+removal), 44 with the added lines outside the 6,000-char record cap, 9 not
+ancestor-ordered.
+
+RESULT (25 trials, full pool mean 6.96, relevant versions mean 2.96):
+
+| arm | accuracy |
+|---|---|
+| DENSE@1 (full pool; chance 0.144) | 0.400 |
+| **DENSE relevant** (first same-file version; chance 0.338) | **0.560** |
+| SEMANTIC-ONLY | 0.960 |
+| TWO-STAGE | 0.960 |
+| STAGE-1 recall@5 | 1.000 |
+| JUDGE ordinal (EARLIEST) | 25/25 |
+
+**VERDICT: FAIL -- the construction is DISCARDED, per the pre-registered
+vacuity rule.** Both gates fail:
+1. POWER: n=25 < 100.
+2. VACUITY: dense@1 0.400 > 0.144 + 0.15. The corrected relevant-candidate
+   diagnostic (dense's first same-file version vs 1/2.96 = 0.338) is 0.560,
+   still above 0.338 + 0.15. Dense is not at chance on the decision that
+   matters -- the message's surrounding context matches the no-feature
+   versions, so whole-file records dilute the feature. The 0.96 mechanism
+   direction is recorded but is NOT admissible evidence.
+
+DIAGNOSIS (named, not hand-waved):
+1. WHOLE-FILE RECORDS dilute the feature: the message's code/module context
+   dominates the 512-token embedding; dense picks a version without the
+   feature 56 % of the time, not the post-add version 20 %.
+2. POWER: the 159 inverse candidates are not 159 valid trials. The pre-change
+   blob must exist, the feature must be visible, and the add must be an
+   ancestor of the removal.
+3. ONE semantic failure: WaveDB `src/Database/database.h`, where commit
+   timestamps are not monotonic with ancestry; the order key must be the
+   commit graph, not wall-clock time.
+
+NEXT CONSTRUCTION (new pre-registration required; not a re-score):
+- record text = a localized window (+/- 30 lines) around the changed hunk,
+  aligned on the old/new hunk starts, so the feature is a large fraction of
+  the record (also recovers the 44 feature-not-visible pairs);
+- order key = ancestry depth (git rev-list --count) or a topological index,
+  never commit timestamps;
+- vacuity guard = dense's first same-file version vs 1/versions, same +0.15
+  margin, plus n >= 100 (clone the remaining own repos to reach power);
+- report the easy direction separately. The 0.96 direction from this run stays
+  a recorded, inadmissible signal until a construction passes its guard.
