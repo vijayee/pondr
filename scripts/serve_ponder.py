@@ -153,6 +153,20 @@ def main() -> int:
                         "flag-off when off.")
     p.add_argument("--user-id", default="ponder", help="user the encoder attributes episodes to")
     p.add_argument("--query", default=None, help="one-shot query; omit for the interactive REPL")
+    p.add_argument("--icm-capture", action="store_true", default=False,
+                   help="Record this session into the ICM intent ledger "
+                        "(separate research experiment; DEFAULT OFF). Writes the "
+                        "declared prompt, the episode ids the runtime actually "
+                        "retrieved, epoch and a write-time judge intent key to a "
+                        "gitignored ledger. Chat answers are NOT scored as "
+                        "outcomes (they are not mechanical). Keying needs the "
+                        "ollama judge; --icm-capture-no-keyer skips it.")
+    p.add_argument("--icm-capture-db", default=None,
+                   help="ICM ledger path (default "
+                        "data/_scratch/icm/live_ledger; untracked)")
+    p.add_argument("--icm-capture-no-keyer", action="store_true", default=False,
+                   help="ICM capture without write-time judge keying (no model "
+                        "calls; records declared intent + memory links only)")
     p.add_argument("--bonsai-endpoint", default=None, help="override the Bonsai LLM endpoint")
     p.add_argument("--async-distill", action=argparse.BooleanOptionalAction, default=True,
                    help="background episode distillation: the response returns immediately "
@@ -1242,6 +1256,31 @@ def main() -> int:
         print(f"[claim-docs] stamped {claimed} unscoped document(s) to user "
               f"'{args.user_id}' (idempotent; rerun anytime).", file=sys.stderr)
 
+    # --icm-capture (DEFAULT OFF): the real-data test bed for the separate ICM
+    # experiment. Records declared intents + retrieved episode ids + epochs +
+    # write-time judge keys. Never scores the chat answer as an outcome. Capture
+    # failures are surfaced on the result and never block the turn.
+    icm_session = None
+    icm_ledger = None
+    if args.icm_capture:
+        from icm.intent_keys import IntentKeyer, ollama_ask
+        from icm.ledger import ICMLedger
+        from icm.runtime_capture import SessionCapture
+
+        icm_db = args.icm_capture_db or str(
+            Path("data") / "_scratch" / "icm" / "live_ledger")
+        icm_ledger = ICMLedger(icm_db)
+        keyer = None
+        if not args.icm_capture_no_keyer:
+            # live path: one attempt, short timeout -- a missing judge must not
+            # stall the turn (the capture records key_status="error" instead)
+            keyer = IntentKeyer(
+                ask=lambda prompt: ollama_ask(prompt, tries=1, timeout=10))
+        icm_session = SessionCapture(orch, icm_ledger, keyer=keyer)
+        print(f"[icm] capture ON -> {icm_db} "
+              f"(keyer={'off' if keyer is None else 'on'})", file=sys.stderr)
+    query_fn = icm_session.query if icm_session is not None else orch.query
+
     # --force-synthesize (default OFF): pass end_state="synthesize" to every
     # query() so the presentation gate does not route to 'direct' (no LLM call)
     # and --fade-inject fires -> the 27B consumes the [FADE MEMORY]/carry block.
@@ -1256,7 +1295,7 @@ def main() -> int:
 
     try:
         if args.query is not None:
-            res = orch.query(args.query, end_state=force_es)
+            res = query_fn(args.query, end_state=force_es)
             _print_result(res)
             if args.fade_debug:
                 print(f"[fade] {res.get('fade_recalls', [])}", file=sys.stderr)
@@ -1274,8 +1313,8 @@ def main() -> int:
                 break
             if not line.strip():
                 break
-            res = orch.query(line, conversation_history=list(history),
-                             end_state=force_es)
+            res = query_fn(line, conversation_history=list(history),
+                           end_state=force_es)
             _print_result(res)
             if args.fade_debug:
                 print(f"[fade] {res.get('fade_recalls', [])}", file=sys.stderr)
@@ -1316,6 +1355,19 @@ def main() -> int:
                       f"{args.user_id}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001 - never crash on cleanup
                 print(f"[save-fail] {e}", file=sys.stderr)
+        # ICM capture (when ON): flush the JSONL mirror, then close its own
+        # WaveDB. Independent of the orchestrator store; best-effort.
+        if icm_session is not None:
+            try:
+                print(f"[icm] capture mirror -> {icm_session.close()}",
+                      file=sys.stderr)
+            except Exception as e:  # noqa: BLE001 - never crash on cleanup
+                print(f"[icm-close-fail] {e}", file=sys.stderr)
+        if icm_ledger is not None:
+            try:
+                icm_ledger.close()
+            except Exception as e:  # noqa: BLE001 - never crash on cleanup
+                print(f"[icm-ledger-close-fail] {e}", file=sys.stderr)
         try:
             orch.store.close()
         except Exception as e:  # noqa: BLE001 - never crash on cleanup

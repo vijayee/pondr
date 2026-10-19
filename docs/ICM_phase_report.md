@@ -1075,7 +1075,10 @@ WHAT WAS BUILT (all default OFF; no runtime behaviour changed):
    answer is NOT a mechanical outcome, so turns are recorded as
    `outcome: unmeasured` and no congruence label is computed. Capture failure
    never loses the answer. `variation_index()` is the census: memory id ->
-   the distinct intents it was retrieved under.
+   the distinct intents it was retrieved under. Wiring is an opt-in
+   `--icm-capture` flag on `scripts/serve_ponder.py` (default OFF; writes to
+   the untracked `data/_scratch/icm/live_ledger`; `--icm-capture-no-keyer`
+   records intent + memory links without a judge call).
 
 REGRESSION (the harness is unchanged; `git diff` on twobytwo_stage2.py is
 empty). Re-run 2026-10-18: 60 trials, chance 1/3.
