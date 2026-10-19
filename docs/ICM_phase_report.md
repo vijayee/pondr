@@ -916,3 +916,46 @@ WHAT WOULD CHANGE THIS (named, not promised): a corpus with the same memory
 under genuinely opposed intents with mechanical outcomes -- i.e. production
 usage of the store, or a purpose-built harness in the 2x2-fixture family at
 scale. Nothing in the current public corpora supplies it.
+
+## 26. Addendum 21 — the scaled 2x2 harness: the construction failed its own vacuity guard (2026-10-18)
+
+40 filesystem-verified trials (4 artifact types x 5 scenarios x 2 intents; the
+answer is READ FROM THE CHOSEN FILE and compared to the computed value).
+
+| arm | accuracy |
+|---|---|
+| DENSE | **0.850** |
+| LEXICAL | 0.875 |
+| KEYSPACE | 0.500 |
+| HYBRID | 0.500 (artifact -- see below) |
+
+ALL checks fail, and the FIRST failure is the one that matters: **the vacuity
+guard** (dense must sit near chance for the construction to prove anything).
+At 0.85 dense simply reads the state words ("Recorded at the original
+ingest" vs "Appended one row") -- the fixed-point theorem again: the authored
+world carried a discriminator I did not intend. This harness therefore says
+NOTHING about intent conditioning; it must be redesigned with a harder
+construction (state NOT stated in words: inferable only from chronology or an
+external log).
+
+The keyspace arm (0.500 = chance) is also not a fair test yet -- three named
+implementation gaps found by inspecting the cached keys:
+  1. the memory-side "object" is the VALUE (checksum digits), so object
+     overlap with the intent's object ("dataset alpha") is zero BY
+     CONSTRUCTION; memory matching must run on relation/class + epoch, not
+     object;
+  2. "report" is not in the predicate-class table, so class match is 0 for
+     every trial;
+  3. qualifier opposition is decided by marker words, and the intent's
+     qualifier ("saved at the first ingest") contains none of them -- the
+     OLD/NEW comparison needs a SEMANTIC test (the addendum-15 finding:
+     the judge separates epochs, rules do not).
+The hybrid's 0.500 is a tie artifact: RRF with two candidates produces ties
+when the arms disagree and argmax then always picks index 0 -- needs a
+tie-break, not a conclusion.
+
+STATE: the retrieval question now has a measured answer (dense works, 45x
+chance on real intents), an untested opposition claim (judge separates short
+constructed pairs; no natural corpus carries opposed intents), and a
+2x2 construction that is too easy for its own guard. The next honest move is
+a HARDER construction, not another score on this one.
