@@ -1333,3 +1333,14 @@ the strongest organic-substrate direction the program has, and it is
 underpowered by its own pre-registered rule. Meeting n>=100 requires new
 valid pairs -- the own-repo corpus is exhausted at this construction -- or a
 new, effect-size-calibrated power rule pre-registered before a fresh run.
+
+COVERAGE AUDIT (2026-10-19, after the run): the own corpus is 69 public
+non-fork repos (67 cloned; Hydra retried with --no-checkout; Pondr local) plus
+OFFS, Space-Walk and HPMT. Adding OFFS/Space-Walk/Hydra yields 2 more valid
+trials (**58 total**), so 58 is the own-work ceiling at this construction.
+Excluded by design: 71 public FORKS and 10 upstream clones on the machine
+(openssl, vcpkg, gbrain, TencentDB, headroom, etc.) -- their commit messages
+are upstream intent, not the user's. Of the ~71 scanned repos, only 8 produce
+valid trials (WaveDB 30, liboffs 14, tourguide 5, CRABS 2, poseidon 2,
+Account/EAuth/resonantdao 1 each); 63 produce zero. The 56-trial run above
+remains the pre-registered record; the 58-trial pool is the coverage ceiling.

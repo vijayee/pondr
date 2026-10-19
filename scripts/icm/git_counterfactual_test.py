@@ -79,7 +79,7 @@ TRIALS = os.path.join(OUTDIR, "trials.jsonl")
 RESULTS = os.path.join(OUTDIR, "results.json")
 CACHE = os.path.join(OUTDIR, "keys_cache.jsonl")
 
-LOCAL = ["Pondr", "HPMT", "liboffs", "WaveDB"]
+LOCAL = ["Pondr", "HPMT", "liboffs", "WaveDB", "OFFS", "Space-Walk"]
 SKIP_EXT = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".pdf", ".zip",
             ".tar", ".gz", ".woff", ".ttf", ".eot", ".mp4", ".webm",
             ".min.js", ".min.css", ".lock")
