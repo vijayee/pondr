@@ -1281,3 +1281,55 @@ NEXT CONSTRUCTION (new pre-registration required; not a re-score):
   margin, plus n >= 100 (clone the remaining own repos to reach power);
 - report the easy direction separately. The 0.96 direction from this run stays
   a recorded, inadmissible signal until a construction passes its guard.
+
+## 33. Addendum 28 — v2 (windows + ancestry order) PASSES every substantive check, FAILS the power bar (2026-10-19)
+
+New pre-registration (`scripts/icm/git_counterfactual_test.py` v2, docstring
+written before the run; v1 is addendum 27 and was not re-scored):
+records are LOCALIZED CHANGE WINDOWS (+/- around the first added hunk, 8 lines
+before / 40+ after) instead of whole files; the order key is ANCESTRY DEPTH,
+not commit time; the vacuity guard is on the RELEVANT candidate set (dense's
+first same-file version vs 1/versions). The corpus was widened to 67 repos (58
+more own public non-fork repos cloned). Discovery: **56 valid trials, 42
+distinct files** (123 candidates still lack a pre-change blob, 20 fail the
+window visibility, 9 are not ancestor-ordered; no file hit the per-file cap).
+
+RESULT (56 trials, mean pool 6.96, mean versions 2.96; relevant chance 0.339):
+
+| arm | accuracy |
+|---|---|
+| DENSE@1 (full pool; chance 0.144) | 0.179 |
+| **DENSE first same-file version** (chance 0.339) | **0.286** |
+| SEMANTIC-ONLY | **1.000 (56/56)** |
+| TWO-STAGE | **0.964 (54/56)** |
+| STAGE-1 recall@5 | 0.964 |
+| JUDGE ordinal (EARLIEST) | 56/56 |
+| dense prefers the post-add version | 0.411 full / **0.536 relevant** |
+
+CHECKS: vacuity PASS (0.286 <= 0.339 + 0.15), stage-1 PASS, two-stage PASS,
+two-stage vs dense-relevant PASS (0.964 vs 0.286 + 0.25), judge PASS.
+**POWER FAIL: n=56 < 100.** Pre-registered verdict: **UNDERPOWERED**, not a
+PASS.
+
+WHAT THE CONSTRUCTION FIXED: v1's dense baseline was above chance (0.56
+relevant) and failed vacuity; the windowed records put dense at/below chance
+(0.286 vs 0.339), and the adversarial premise now materializes -- dense
+prefers the post-add (wrong) version 53.6 % of the time. The ancestry-depth
+order removed v1's timestamp failure; the judge read EARLIEST in all 56
+queries; there were no fallbacks.
+
+DIAGNOSTIC (not a re-score): 54/56 vs 1/3 gives a 95 % Wilson CI of
+0.879-0.990 and a binomial tail P(X>=54 | p=1/3) of about 1.2e-23. The two
+two-stage misses are STAGE-1 misses (the correct version was outside dense's
+top-5); semantic-only over the full pool was perfect. The n>=100 bar was set
+without an effect-size calibration; at the observed effect the achieved power
+is essentially 1. That is recorded as a pre-registration design flaw, not used
+to turn this run into a PASS.
+
+CAVEATS: 56 trials concentrated in two repos (WaveDB 30, liboffs 14); the
+query template and the pair-centred pool are authored; the pre-change answer
+is the parent-of-add blob, not a user-declared retrieval target. The result is
+the strongest organic-substrate direction the program has, and it is
+underpowered by its own pre-registered rule. Meeting n>=100 requires new
+valid pairs -- the own-repo corpus is exhausted at this construction -- or a
+new, effect-size-calibrated power rule pre-registered before a fresh run.
