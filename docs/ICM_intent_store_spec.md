@@ -98,6 +98,15 @@ intents + retrieved episode ids + epochs + keys, marking every turn
 `outcome: unmeasured` because a chat answer is not a mechanical outcome. No
 real session has been recorded yet, so the wall stands.
 
+**PERSONAL-CORPUS CENSUS (2026-10-18, addendum 25).** The real-data test bed
+was attempted on the corpora we actually hold. Claude sessions: 3,716 turns,
+407 shared edited files, 1,141 turn pairs; a seeded judge sample found 1
+opposed pair in 120 (0.8 %). Session-goal grain: 0/80. Onyx shared documents:
+0/80. Pooled 1/280 = 0.36 % (95 % CI 0.06-2.0 %), replicating CodeTraceBench
+0/96 and the prior Onyx census. The corpora carry plenty of DIFFERENT aims over
+the same memory and almost no OPPOSED aims; more sessions of the same kind will
+not change the shape. The wall is a data-shape problem, not a data-volume one.
+
 # 5. Open questions the spec does not answer
 
 - How many epochs/intents per memory unit are needed before the re-rank pays

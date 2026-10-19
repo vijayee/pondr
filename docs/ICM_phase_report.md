@@ -1104,3 +1104,60 @@ wall stands. The next honest measurement is the first real session capture;
 no authored world substitutes for it. Open questions unchanged: judge cost per
 write vs epochs per memory; entity filtering on messy real entities; the
 abstention fallback (now visible as `fallback` rather than assumed).
+
+## 30. Addendum 25 — the personal-corpus census: the flip shape is not there (2026-10-18)
+
+User directive: re-check the Claude sessions and Onyx, extracting intent rather
+than assuming the old mining's goals. Two lifts were built (pre-registered
+docstrings; census only, no training, no retrieval claim):
+
+**Claude sessions** (`scripts/icm/lift_claude_sessions.py`). 44 transcripts ->
+3,716 turns (3,407 substantive), 33,632 tool events. Intent = the user's
+directive at the turn start (271 terse directives lifted with the agent's own
+first plan sentence, marked `user+agent-plan`); memory unit = the file paths in
+Read/Edit/Write; outcome = the tool result (`is_error`, stdout/stderr) and the
+structured patch, mechanical. Result: 1,991 distinct edited files, **407
+shared edited files, 1,141 turn pairs**; per-(turn,file) labels useful 3,120 /
+context 3,081 / attempted 227. Only **33 turns ran a verification command**
+(all 33 passed), so external verification is thin.
+
+**Turn-level judge sample** (120 seeded pairs, addendum-16 prompt):
+
+| relation | n |
+|---|---|
+| same | 64 |
+| different | 55 |
+| **opposed** | **1** (0.8 %, Wilson 95 % CI 0.15-4.6 %) |
+
+Stratified, the single opposed pair is a project-relative verdict file; memory
+notes 0/23, absolute paths 0/31.
+
+**Session-goal grain** (`scripts/icm/census_session_goals.py`; first
+substantive edit turn per session/file, sessions paired over shared files):
+66 shared units, 254 pairs, sample 80 -> different 66 / same 14 / **opposed 0**.
+
+**Onyx shared documents** (`scripts/icm/census_onyx_docs.py`; two queries that
+retrieved the same document): 510 shared docs, 2,457 pairs, sample 80 ->
+different 76 / same 4 / **opposed 0**.
+
+**POOLED: 1 opposed in 280 sampled pairs = 0.36 % (95 % CI 0.06-2.0 %).**
+
+READING: these corpora are task work. The same file or document recurs under
+DIFFERENT aims -- plenty of variation -- but essentially never under OPPOSED
+aims. The 2x2 mechanism needs the swap (one memory right under A, wrong under
+B); "different" cannot supply it, and a retrieval run on different-aim pairs
+would only re-measure dense candidate generation, which addenda 17-20 already
+settled. This replicates CodeTraceBench (0/96) and the prior Onyx census
+(0/6336) with the new judge and two new grains.
+
+CAVEATS: the intent is the user's directive, which may under-specify the aim
+(the agent-plan lift covers terse directives only); the judge is the measured
+instrument but reads long, context-dependent directives; the samples are seeded
+and not exhaustive; and the mechanical verification is thin (33 test turns),
+so even a discovered flip unit would usually lack a per-memory outcome.
+
+WHAT THIS DOES NOT CHANGE: the mechanism (addenda 22-23) stands, and the data
+wall stands. More sessions of the same kind do not fix a shape problem -- the
+next honest source is a task family that actually produces counterfactual
+pairs (revert/rollback, flag on/off, archive-vs-refresh, hypothesis-vs-refute)
+with a mechanical check, captured as it happens.
