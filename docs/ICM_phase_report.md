@@ -1002,3 +1002,37 @@ non-temporal oppositions) is the next test; the immediate candidate for
 retrieval is a two-stage design -- dense candidate generation, then
 epoch/opposition re-ranking -- which is exactly what the naive hybrid failed
 to approximate.
+
+## 28. Addendum 23 — the scaled two-stage retriever PASSES (2026-10-18)
+
+60 filesystem-verified trials (4 artifact types x 5 datasets x 3 epochs;
+chance = 1/3); pools = the 15 same-type records + 10 seeded decoys (25
+candidates). Records differ only in value/run/date -- no state words; intents
+refer to the epoch relatively; the judge classifies each intent's epoch
+(12 template calls, all correct) and DATE ORDER is mechanical.
+
+| arm | accuracy |
+|---|---|
+| DENSE@1 (top-1 over 25 candidates) | 0.433 (chance 0.333 -- vacuity PASS) |
+| SEMANTIC-ONLY (judge epoch + entity/type filter + date rank) | **1.000** |
+| **TWO-STAGE (dense top-5 -> filter -> epoch rank)** | **1.000** |
+| HYBRID (semantic primary, dense fallback) | **1.000** |
+| STAGE-1 recall@5 | **1.000** |
+
+ALL checks PASS. The architecture measured across addenda 15/16/22/23 is
+coherent and now demonstrated at this scale:
+  build time   : judge reads the intent (epoch/opposition);
+  match time   : deterministic entity/type filtering + date ordering;
+  stage 1      : dense generates candidates (recall@5 = 1.0 here);
+  stage 2      : intent re-ranks -- 1.000 where dense@1 is at chance.
+The addendum-22 failure (score blending) is explained by this design: fusing
+scores at one level cancels; filtering and re-ranking do not.
+
+CAVEATS (unchanged): constructed world; 60 trials; the epoch axis is temporal
+and the judge's 3-way classification is easy for language models; the date is
+a surface feature not carried by the intent's words. What has NOT transferred
+is the real corpus -- CodeTraceBench has no epochs or opposed intents per
+memory (addendum 20), so the real-data side of this architecture still has no
+test bed. The honest status: the MECHANISM is measured; its REAL-WORLD
+APPLICABILITY awaits a corpus with per-memory intent variation (production
+usage of the store, or a multi-run-per-task corpus).
