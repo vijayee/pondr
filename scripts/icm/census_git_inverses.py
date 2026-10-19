@@ -41,7 +41,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-OUT = os.path.join("data", "_scratch", "icm", "lifted", "git_inverse_census.json")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+OUT = os.path.join(REPO_ROOT, "data", "_scratch", "icm", "lifted",
+                   "git_inverse_census.json")
 REPOS_DEFAULT = ["Pondr", "HPMT", "liboffs", "WaveDB"]
 ADD_RE = re.compile(r"\b(add|adds|added|enable|enables|introduce|pin|pins|restore|re-enable)\b", re.I)
 REM_RE = re.compile(r"\b(remove|removes|removed|delete|deletes|disable|disables|drop|drops|unpin|unpins|strip|revert|reverts)\b", re.I)

@@ -1210,3 +1210,15 @@ moves can produce false positives); pairs are concentrated in two repos; the
 query layer is authored; and a first run must report the adversarial direction
 separately from any easy direction. This does not settle the strong thesis by
 itself, but it is the first organic counterfactual corpus large enough to try.
+
+PUBLIC-REPO PILOT (2026-10-19, same rule): eight public non-fork repos
+(CRABS, SecretAgent, poll-dancer, EAuth, poseidon, poseidon-crdt,
+liboffs_pony, Tangerine-Id-Migrator) were cloned and censused with the same
+script. 178 message-level candidates; seeded 160-pair sample -> **11 verified
+= 6.9 % (95 % CI 3.9-11.9 %)**, estimated **~12 pairs** (CRABS 4, EAuth 4,
+poseidon 3). The public repos are mostly smaller histories with fewer
+add/remove cycles; they add domain diversity but not much volume. POOLED
+available corpus: **~171 verified pairs** (local liboffs + WaveDB ~159, public
+pilot ~12) -- enough for a first powered run. The corresponding Claude
+sessions are NOT needed for this test: they were censused at 1/280 opposed
+(addendum 25) and add intent text, not counterfactual pairs.
