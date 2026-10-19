@@ -1036,3 +1036,68 @@ memory (addendum 20), so the real-data side of this architecture still has no
 test bed. The honest status: the MECHANISM is measured; its REAL-WORLD
 APPLICABILITY awaits a corpus with per-memory intent variation (production
 usage of the store, or a multi-run-per-task corpus).
+
+## 29. Addendum 24 — the store build: schema, write-time keys, two-stage query, live seam (2026-10-18)
+
+The spec's build items 1-4 are implemented and item 5 is seamed. No new
+research claim is made here; the only measured number is the regression.
+
+WHAT WAS BUILT (all default OFF; no runtime behaviour changed):
+1. **Capture schema v2** (`icm/capture.py`). Every goal/step now records
+   `qualifier`, `requirements` (an S-P-O LIST -- measured 4.63 per real issue;
+   a single triple is accepted and never padded), `epoch` (declared run
+   number/timestamp, else capture time with `epoch_source` saying so), and an
+   expansion link `triggered_by`. The link is enforced: it must reference an
+   outcome whose rule-computed label is `violated` -- a confirmed outcome
+   cannot spawn a new intent (the causal-direction law). Retrieval events now
+   carry the operative intent id, its key, epoch and qualifier beside the
+   memory-unit ids. A prediction-free `intent()` record exists for live work;
+   it can never produce a congruence label (`outcome()` refuses it), so the
+   label law is unchanged. Outcome ids gained a uuid suffix (the old
+   len()-only id collided across captures sharing a ledger).
+2. **Write-time judge keying** (`icm/intent_keys.py`). One call per unique
+   intent: requirement LIST + qualifier + `epoch_ref` {kind: ordinal/absolute/
+   none, value}. Cache key = prompt version + model + declared qualifier +
+   normalised text, so a model switch does not serve the old model's keys.
+   Four explicit statuses (judged / cached / abstained / error); failure
+   returns no key and never blocks the write. Pairwise SAME/DIFFERENT/OPPOSED
+   is available as `relation_between()` and is deliberately NOT run on every
+   write -- the cost-per-write / epochs-per-memory question is still open.
+3. **Two-stage query path** (`icm/intent_query.py`). Dense cosine generates;
+   a type/entity filter narrows; the key's epoch reference re-ranks (ordinal
+   EARLIEST/MIDDLE/LATEST, or absolute date/run by distance). NO score
+   blending. Every fallback is explicit and returned: `no_key`,
+   `empty_filter`, `no_epoch` (including an epoch-domain mismatch, e.g. a date
+   key against a pool of run numbers). Missing epochs never rank first.
+4. **Live seam** (`icm/runtime_capture.py`). `SessionCapture` wraps an
+   orchestrator's `query()` and records the user prompt (declared intent), the
+   episode ids actually retrieved, the epoch and the write-time key. A chat
+   answer is NOT a mechanical outcome, so turns are recorded as
+   `outcome: unmeasured` and no congruence label is computed. Capture failure
+   never loses the answer. `variation_index()` is the census: memory id ->
+   the distinct intents it was retrieved under.
+
+REGRESSION (the harness is unchanged; `git diff` on twobytwo_stage2.py is
+empty). Re-run 2026-10-18: 60 trials, chance 1/3.
+
+| arm | accuracy |
+|---|---|
+| DENSE@1 | 0.433 (vacuity PASS) |
+| SEMANTIC-ONLY | 1.000 |
+| **TWO-STAGE** | **1.000** |
+| HYBRID | 1.000 |
+| STAGE-1 recall@5 | 1.000 |
+
+All four pre-registered checks PASS -- byte-for-byte the addendum-23 result.
+The build therefore did not disturb the measured mechanism.
+
+TESTS: `python -m pytest tests/ -q -k icm` -> 84 passed (35 new tests across
+the four modules; no network in tests -- transports and keyers are injected).
+
+WHAT THIS DOES AND DOES NOT CHANGE: the store can now RECORD the six-field
+shape and ANSWER with the measured two-stage mechanism. It has not yet been
+run behind real work, so `variation_index()` has no real-session data and the
+wall stands. The next honest measurement is the first real session capture;
+no authored world substitutes for it. Open questions unchanged: judge cost per
+write vs epochs per memory; entity filtering on messy real entities; the
+abstention fallback (now visible as `fallback` rather than assumed).

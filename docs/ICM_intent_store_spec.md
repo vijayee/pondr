@@ -85,6 +85,19 @@ from them, never stated by a caller.
    with the capture layer writing fields 1–6. Until then, real-corpus claims
    stop at "dense generates candidates".
 
+**BUILD STATUS (2026-10-18, addendum 24).** Items 1-4 are implemented, default
+OFF, with 35 new tests: `icm/capture.py` (schema v2: qualifier, requirement
+list, epoch, expansion link, prediction-free intents), `icm/intent_keys.py`
+(write-time judge keys with a model-partitioned hash cache and explicit
+judged/cached/abstained/error statuses), `icm/intent_query.py` (dense ->
+type/entity filter -> epoch re-rank, no blending, explicit fallbacks). The
+unchanged 60-trial harness re-ran to the addendum-23 numbers (dense@1 0.433,
+two-stage 1.000, stage-1 recall@5 1.000). Item 5 is seamed, not measured:
+`icm/runtime_capture.py` wraps a live orchestrator and records declared
+intents + retrieved episode ids + epochs + keys, marking every turn
+`outcome: unmeasured` because a chat answer is not a mechanical outcome. No
+real session has been recorded yet, so the wall stands.
+
 # 5. Open questions the spec does not answer
 
 - How many epochs/intents per memory unit are needed before the re-rank pays
