@@ -959,3 +959,46 @@ chance on real intents), an untested opposition claim (judge separates short
 constructed pairs; no natural corpus carries opposed intents), and a
 2x2 construction that is too easy for its own guard. The next honest move is
 a HARDER construction, not another score on this one.
+
+## 27. Addendum 22 — the HARD construction: intent interpretation beats chance similarity 40/40 (2026-10-18)
+
+The first 2x2 failed its vacuity guard because memory records stated their own
+state. The hard version removes the tell: records differ ONLY in value, run
+number and date; intents refer to the epoch relatively ("at the first load",
+"at the most recent load") using none of the records' date words; ordering is
+mechanical by date. 40 trials, answers read from the chosen file.
+
+| arm | accuracy |
+|---|---|
+| DENSE | 0.575 (vacuity guard PASSED: near chance) |
+| LEXICAL | 0.500 |
+| **SEMANTIC (judge EARLIEST/LATEST -> date ordering)** | **1.000 (40/40)** |
+| HYBRID | 0.575 |
+
+Checks: vacuity PASS, semantic >= 0.85 PASS, semantic >= dense + 0.25 PASS,
+hybrid >= dense + 0.25 FAIL. Epoch judgments: 20 EARLIEST / 20 LATEST, 0
+abstentions.
+
+WHAT THIS ESTABLISHES (first fair construction of the arc): when the epoch is
+NOT written on the surface, plain similarity is at chance (0.575 / 0.500)
+while a mechanism that INTERPRETS the intent's temporal reference and applies
+mechanical ordering decides every trial correctly. That is intent
+conditioning doing real work -- and it required exactly the architecture
+addenda 15/16 pointed at: semantics at build time + deterministic structure at
+match time.
+
+THE HYBRID FAILURE IS A DESIGN FLAW, RECORDED AS SUCH: equal weights
+(0.5 dense + 0.5 semantic) with a dense tie-break reproduce DENSE wherever the
+arms disagree, so the fused arm inherits 0.575. Re-weighting is a NEW
+pre-registered variant, not a rescore of this run.
+
+CAVEATS: n=40; constructed world (the date is a surface feature, though not
+one the intent's words carry); one judge model; the epoch question is a 2-way
+classification, which language models do easily. The claim is bounded:
+"the judge can read an intent's temporal reference and mechanical ordering
+turns that into correct memory selection where text similarity is at chance."
+Scaling the construction (more artifact types, more than two epochs,
+non-temporal oppositions) is the next test; the immediate candidate for
+retrieval is a two-stage design -- dense candidate generation, then
+epoch/opposition re-ranking -- which is exactly what the naive hybrid failed
+to approximate.
