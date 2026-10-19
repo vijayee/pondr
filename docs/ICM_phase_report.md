@@ -1161,3 +1161,52 @@ wall stands. More sessions of the same kind do not fix a shape problem -- the
 next honest source is a task family that actually produces counterfactual
 pairs (revert/rollback, flag on/off, archive-vs-refresh, hypothesis-vs-refute)
 with a mechanical check, captured as it happens.
+
+## 31. Addendum 26 — git history IS a counterfactual producer: ~159 patch-verified inverse pairs (2026-10-19)
+
+The personal-corpus census (addendum 25) found no opposed aims. The next place
+to look was the one we already own: the git history of the local repos. A
+commit pair over the SAME file whose patches invert each other is a real
+counterfactual pair -- real memory units (file snapshots), real oracle (the
+blob content), and real intent text (the commit messages).
+
+CENSUS (`scripts/icm/census_git_inverses.py`, pre-registered; message-level
+candidates capped at 8/file, sampled 120 seeded pairs, patches compared with
+`git show --unified=0`; inverse = later commit removes >= max(2, 50 %) of the
+lines the earlier added, or the reverse):
+
+| repo | files | msg-level candidates |
+|---|---|---|
+| Pondr | 904 | 5 |
+| HPMT | 1,234 | 31 |
+| liboffs | 695 | 418 |
+| WaveDB | 621 | 453 |
+| **total (capped)** | | **907** |
+
+Patch verification on the 120-pair sample: **21 true inverses = 17.5 %**
+(Wilson 95 % CI 11.7-25.3 %), 9 in liboffs and 12 in WaveDB. Estimated
+**~159 inverse pairs** in the capped pool (uncapped message-level opposite
+pairs were ~3,044 before the per-file cap). That is the order needed for a
+first powered run (~159 memories, one adversarial trial each).
+
+WHY THIS MATTERS: this is not an authored world. The memory units are real
+file versions, the opposition is verified against the actual patches, and the
+label is the file content at the expected commit -- no judge. The only authored
+part is the QUERY PHRASING that turns a commit message into a retrieval
+request ("restore the state before this change" / "select the state this
+change produced"), which must be pre-registered and must pass the vacuity
+guard: if dense similarity reads the feature words and wins, the construction
+is vacuous and is discarded (the addendum-21 failure mode).
+
+FAIRNESS NOTE: commit messages STATE their change ("add tracing", "remove
+tracing"). That is a surface tell in the INTENT, which is allowed -- the 2x2
+also states "the first load"; the test is whether the MEMORY records state
+their state. File snapshots do not. The adversarial direction is the removal /
+revert: the message mentions the feature, the wrong snapshot contains it, and
+the intent key must select the version without it.
+
+CAVEATS: the inverse rule is a heuristic on line overlap (reformatting and
+moves can produce false positives); pairs are concentrated in two repos; the
+query layer is authored; and a first run must report the adversarial direction
+separately from any easy direction. This does not settle the strong thesis by
+itself, but it is the first organic counterfactual corpus large enough to try.
