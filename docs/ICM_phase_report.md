@@ -1534,3 +1534,51 @@ fix is learnable in one step; one model (deepseek-v4.1-flash:cloud); the
 retry arm is deterministic and the no-evidence arm can guess the hash mode.
 The mechanism claim is bounded accordingly; organic multi-turn applicability
 still needs a real task family.
+
+## 38. Addendum 33 — E5-lite PASSES: expectation-driven adaptation beats accumulation, and recovery is real (2026-10-20)
+
+The plan's Phase-4 headline is E5: memory policies improve from their own
+outcomes over successive episodes, and the improvement is driven by the
+expectation signal, not accumulation. This run tests the mechanism in the
+layer-3 world, with the plan's required ablation.
+
+DESIGN (pre-registered; prepared fixture): 6 users x 24 episodes. Each user has
+a hidden convention among the four verification rules, stable for 8 episodes
+and then CHANGED at unknown points (episodes 8 and 16). Every episode is a
+fresh dataset; the manifest is built deterministically from the chosen
+convention + metadata. Three arms:
+  ADAPTIVE          per-user convention counts; on a violation, decay all
+                    counts (0.2) and increment the convention the failure
+                    reason identifies; on success, reinforce.
+  ACCUMULATION-ONLY same counts, NO decay (stores outcomes, ignores recency).
+  NO-LEDGER         a uniformly random convention each episode.
+No model calls; the policy prior is the memory, the verifier is the oracle.
+
+A WORLD BUG WAS FOUND AND FIXED BEFORE THE SCORED RUN: the dedupe truth
+subtracted the duplicate count twice (the copies raise the line total; the
+unique row count is the original count), so the correct dedupe manifest failed
+every time in the first run. The first run's numbers are not reported as a
+result; the run below is the corrected, still-pre-registered one.
+
+| arm | post-first reach | all-episode reach | recovery mean | within 2 | unrecovered |
+|---|---|---|---|---|---|
+| **ADAPTIVE** | **0.905** | 0.806 | **2.0** | **1.000** | **0** |
+| ACCUMULATION-ONLY | 0.333 | 0.306 | none | 0.000 | 12/12 |
+| NO-LEDGER | 0.278 | 0.285 | 2.545 | 0.500 | 1 |
+
+Checks: power (144 episodes; 126 post-first), adaptive >= 0.85, no-ledger <=
+0.40, lift >= 0.25 (0.572), recovery within 2 >= 0.90 and mean <= 2.0,
+regime-change violation rate 1.000, expansion-link rate 1.000. **Verdict:
+PASS.**
+
+READING: the violation signal drives adaptation. ADAPTIVE learns each user's
+convention and switches within two episodes of an unannounced change; the
+same stored outcomes without recency weighting (ACCUMULATION-ONLY) never
+recover -- 12/12 changes unrecovered -- and a memoryless random policy stays
+at chance. The capture records the loop across episodes: every post-violation
+goal's `triggered_by` names the rule-computed violated outcome (1.000).
+
+CAVEATS: prepared world; scheduled regime changes; deterministic policy with
+a chosen decay (0.2); one run; the policy prior is the "memory" (no live LLM's
+longitudinal learning). This closes the E5 MECHANISM, not the plan's full
+longitudinal user study. Organic multi-turn applicability remains.

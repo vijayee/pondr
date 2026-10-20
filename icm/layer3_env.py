@@ -78,8 +78,10 @@ class Layer3Env:
         data_rows = sum(counts)
         if rule == "exclude":
             data_rows -= counts[3]
-        if rule == "dedupe":
-            data_rows -= DUPLICATE_ROWS
+        # dedupe: the copied rows are duplicates; the UNIQUE data rows are the
+        # original counts. (The duplicate copies raise the line total, not the
+        # unique row count.) The -DUPLICATE_ROWS subtraction belongs to the
+        # agent's spec construction (total_lines - duplicates), not the truth.
         truth = {
             "rule": rule,
             "files": 4 - (1 if rule == "exclude" else 0),
