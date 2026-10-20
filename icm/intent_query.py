@@ -80,16 +80,21 @@ def entities_of(key: dict | None, query_meta: dict | None = None) -> set[str]:
     type's own tokens are removed: the type filter already narrows on the
     artifact kind, and leaving those tokens in the entity set would let every
     record of the same kind pass (measured failure in the first unit run).
+
+    `ignore_key_entities` keeps ONLY the explicit entities: when the caller has
+    already narrowed the artifact (e.g. type = the exact file path), the key's
+    REQUIREMENT tokens must not filter candidates -- the correct pre-change
+    version may legitimately lack the feature those tokens name.
     """
     toks: set[str] = set()
-    if key:
+    meta = query_meta or {}
+    if key and not meta.get("ignore_key_entities"):
         toks |= content_tokens(key.get("object", ""))
         for req in key.get("requirements") or []:
             if not isinstance(req, dict):
                 continue
             toks |= content_tokens(req.get("subject", ""))
             toks |= content_tokens(req.get("object", ""))
-    meta = query_meta or {}
     if meta.get("type"):
         toks -= content_tokens(meta["type"])
     if meta.get("entity"):

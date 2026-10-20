@@ -163,6 +163,32 @@ def test_absolute_reference_in_another_epoch_domain_is_no_epoch():
     assert res["fallback"] == "no_epoch"
 
 
+def test_ignore_key_entities_keeps_only_explicit_entities():
+    meta = {"type": "checksum", "ignore_key_entities": True}
+    assert entities_of(key(), meta) == set()
+    assert entities_of(key(), {**meta, "entity": "alpha"}) == {"alpha"}
+
+
+def test_pre_change_version_is_not_filtered_out_by_feature_tokens():
+    """The correct pre-change version may lack the feature the key names."""
+    r = TwoStageRetriever(embed)
+    pool = [
+        {"id": "v-before", "type": "src/gate.py", "epoch": "2026-01-01",
+         "text": "dataset alpha: checksum 111, dated 2026-01-01"},
+        {"id": "v-after", "type": "src/gate.py", "epoch": "2026-02-01",
+         "text": "dataset alpha: timeout 800, checksum 222, report load"},
+    ]
+    qkey = {"requirements": [{"subject": "SELF", "attitude": "restore",
+                              "relation": "restore", "object": "the timeout 800"}],
+            "qualifier": "", "epoch_ref": {"kind": "ordinal", "value": "EARLIEST"},
+            "abstained": False}
+    res = r.query("restore the first version of src/gate.py",
+                  pool, query_key=qkey,
+                  query_meta={"type": "src/gate.py", "ignore_key_entities": True})
+    assert set(res["filtered_ids"]) == {"v-before", "v-after"}
+    assert res["top"][0]["id"] == "v-before"
+
+
 def test_keyer_is_used_when_no_key_is_supplied():
     class StubKeyer:
         def __init__(self):
