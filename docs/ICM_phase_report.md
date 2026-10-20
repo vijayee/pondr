@@ -1582,3 +1582,46 @@ CAVEATS: prepared world; scheduled regime changes; deterministic policy with
 a chosen decay (0.2); one run; the policy prior is the "memory" (no live LLM's
 longitudinal learning). This closes the E5 MECHANISM, not the plan's full
 longitudinal user study. Organic multi-turn applicability remains.
+
+## 39. Addendum 34 — E0-lite PASSES: episodic recall carries an early user fact across the context horizon (2026-10-20)
+
+The plan's E0 asks whether adding memory improves long-horizon task success vs
+a context-only baseline, inside a per-turn latency budget. No public agent
+benchmark is runnable on this Windows machine (no Docker), so this is E0's
+MECHANISM in a prepared world -- not external validity.
+
+DESIGN (pre-registered): four users x 20 tasks. Each user's verification
+convention (header / excluded file / name-hash / duplicate rows) is stated
+ONCE in a profile message; every task is a fresh dataset and the convention is
+never restated. The verifier is mechanical and GENERIC ("verification failed",
+no defect), so the profile is the only source.
+  MEMORY   a WaveDB EpisodicStore holds the profile + prior episodes; before
+           each task the agent recalls the user's convention (bge + vector
+           search, per-user filtered) and builds the manifest from it.
+  CONTEXT  no store; a 2-message context window + the current task. The profile
+           is visible at task 1 and falls out of the window at task 2+; with no
+           convention the agent emits a naive manifest (wrong for every rule).
+The agent is deterministic; no model calls.
+
+| arm | task success |
+|---|---|
+| **MEMORY** | **1.000 (80/80)** |
+| CONTEXT | 0.050 (4/80 -- task 1 only) |
+| **lift** | **0.950** |
+
+Recall latency (bge + WaveDB, 80 recalls): mean **8.7 ms**, p95 **9.3 ms**, max
+180 ms (first-call model load) -- under the pre-registered 250 ms per-turn
+budget. The profile was outside the context window for every task >= 2.
+ALL checks PASS: power, memory >= 0.90, context <= 0.20, lift >= 0.50,
+latency p95 <= 250 ms, profile-out-of-window. **Verdict: PASS.**
+
+READING: the Phase-1 episodic store carries a user-level fact across a horizon
+the context window loses, and the recall is cheap enough for the per-turn
+budget. This is the plan's E0 mechanism demonstrated; it is not a public
+benchmark and not a live LLM agent.
+
+CAVEATS: prepared world; a two-message context window is a simulation of
+long-horizon context loss, not a real token budget; the profile states the
+convention explicitly; the agent is deterministic. External validity needs a
+runnable benchmark (Terminal-Bench / StateM / SWE-bench) with Docker or on a
+Linux/RunPod host.
