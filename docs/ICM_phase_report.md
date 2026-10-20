@@ -1344,3 +1344,56 @@ are upstream intent, not the user's. Of the ~71 scanned repos, only 8 produce
 valid trials (WaveDB 30, liboffs 14, tourguide 5, CRABS 2, poseidon 2,
 Account/EAuth/resonantdao 1 each); 63 produce zero. The 56-trial run above
 remains the pre-registered record; the 58-trial pool is the coverage ceiling.
+
+## 34. Addendum 29 — v3 PASSES: intent keys select the pre-change version on 561 real counterfactual pairs (2026-10-19)
+
+V3 is a new corpus run with the v2 construction and bars unchanged: major
+upstream public repos added because the own-work corpus was exhausted at 58
+valid trials. The discovery was killed by an idle-memory reaper partway
+through, but the streaming pool preserved **561 valid trials, 0 partial
+lines** from 19 repos (503 upstream, 58 own; upstream repos include express,
+axum, clap, black, bat, axios, click, fd, cobra; own: WaveDB, liboffs,
+tourguide, ...). Scoring resumed from a per-trial checkpoint in three
+foreground batches; **561/561 scored**.
+
+| arm | pooled | upstream | own |
+|---|---|---|---|
+| DENSE@1 (chance 0.143) | 0.160 | 0.159 | 0.172 |
+| **DENSE first same-file** (chance 0.337) | **0.242** | 0.239 | 0.276 |
+| SEMANTIC-ONLY | **1.000 (561/561)** | 1.000 | 1.000 |
+| TWO-STAGE | **0.909** | 0.903 | 0.966 |
+| STAGE-1 recall@5 | 0.909 | | |
+| JUDGE ordinal (EARLIEST) | 561/561 | 561/561 | 561/561 |
+| dense prefers post-add version | 0.449 (relevant) | | |
+
+ALL PRE-REGISTERED CHECKS PASS: power (561 >= 100), vacuity (0.242 <= 0.337 +
+0.15; dense is at/below chance), stage-1 (0.909 >= 0.85), two-stage (0.909 >=
+0.85), two-stage vs dense-relevant (0.909 >= 0.242 + 0.25), judge (561/561).
+**Verdict: PASS.**
+
+WHAT IT ESTABLISHES: on real, mechanically verified counterfactual pairs --
+real file versions, real commit messages, git blob oracle -- an intent-keyed
+deterministic filter and ancestry ordering selects the pre-change version
+where dense similarity is at/below chance. The adversarial premise
+materialized: dense, restricted to same-file versions, picks the wrong
+post-add version 44.9 % of the time and the correct pre-change version only
+24.2 % (chance 33.7 %). The result holds in both sources (upstream 0.903, own
+0.966).
+
+THE NEW DESIGN FINDING: SEMANTIC-ONLY over the full pool is perfect (561/561)
+while TWO-STAGE is 0.909; the difference is entirely STAGE-1 recall@5 (0.909).
+Dense's top-5 misses the answer in 51 trials. The binding constraint is the
+candidate generator, not the intent key: when the artifact is already fixed by
+the type filter, the epoch re-rank over the full (filtered) pool beats
+restricting to dense top-5. That is a concrete follow-up: widen stage-1
+(top-10/20) or let the filter bypass dense when the artifact is known.
+
+CAVEATS: 503/561 trials are UPSTREAM repos (their authors' intents, not the
+user's); the query template ("Restore the FIRST version ...") and the
+pair-centred pool are authored; the answer is the parent-of-add blob, not a
+user-declared retrieval target. The epoch reference is template-driven and
+the judge reads it perfectly (561/561), so this tests the build-time-key ->
+deterministic-filter/order pipeline, not free-form intent inference. The pool
+is the 561 trials streamed before the discovery kill, not the full 22-repo
+sweep. Within those bounds, this is the program's first pre-registered PASS on
+an organic substrate.

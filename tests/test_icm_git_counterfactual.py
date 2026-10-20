@@ -47,7 +47,7 @@ def test_discovery_builds_the_pre_change_trial(tmp_path):
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "remove debug tracing")
 
-    trials, skipped = gc.discover([("synthetic", repo)], decoys_n=2)
+    trials, skipped = gc.discover([("synthetic", repo, "own")], decoys_n=2)
     gate = [t for t in trials if t["file"] == "gate.py"]
     assert len(gate) == 1, (trials, skipped)
     t = gate[0]

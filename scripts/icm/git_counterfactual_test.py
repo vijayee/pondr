@@ -1,47 +1,36 @@
-"""GIT COUNTERFACTUAL TEST v2 -- windowed records + ancestry ordering.
+"""GIT COUNTERFACTUAL TEST v3 -- same construction, broader organic corpus.
 
-V1 (addendum 27) FAILED its pre-registered guard and is discarded: whole-file
-records diluted the feature (dense's first same-file version 0.56 vs chance
-0.34), the corpus was underpowered (25 valid trials), and one failure came from
-non-monotonic commit timestamps. This v2 is a NEW pre-registration, written
-before the v2 run; it does not re-score v1.
+V1 (addendum 27) failed vacuity+power and was discarded. V2 (addendum 28) --
+windowed records + ancestry depth -- passed every substantive check but failed
+its pre-registered power bar at n=56 (own-work corpus exhausted at 58). V3 is a
+NEW corpus run, not a re-score: the construction and the bars are IDENTICAL to
+v2, and the corpus now adds major upstream public repos (real developer commit
+messages, real history, same mechanical git oracle). The own/upstream split is
+reported as a diagnostic; the pre-registered bar applies to the pooled corpus.
 
-CORPUS: patch-verified inverse pairs in real git history (add commit introduced
-lines; a later descendant removed them from the same file). Memory units are
-the real file regions around that change; the intent text is the real add
-commit message; the oracle is the git blob content.
-
-PRE-REGISTERED v2 DESIGN (written before the run; no fitting afterward):
-  RECORD TEXT = a LOCALIZED CHANGE WINDOW, not the whole file: for the after
-    version, 8 lines before the first added hunk line through 40 lines after;
-    for the before/removed versions the same-sized window at the old/new hunk
-    start. The feature is therefore a large fraction of the 512-token record
-    (v1's whole-file records diluted it). Decoys use their first 48 lines.
-  ORDER KEY = ANCESTRY DEPTH (`git rev-list --count`), never commit
-    timestamps; depth is monotone along ancestry.
-  TRIAL (one per pair, adversarial): query = "Restore the FIRST version of
-    <file> (the state that existed before this change): <add message>";
-    pool = unique blobs among before/after/removed + up to 4 decoys from other
-    files; answer = the parent-of-add blob.
-  ARMS: DENSE@1 (full pool), DENSE-RELEVANT@1 (first same-file record in the
-    dense order -- the fair baseline for the decision), SEMANTIC-ONLY (type =
-    exact file path -> epoch re-rank), TWO-STAGE (dense top-5 -> same filter/
-    rank). No score blending; the entity filter is disabled (the key's feature
-    tokens are absent from the correct pre-change version by construction).
-  EASY DIRECTION: reported via the dense-relevant preference for the post-add
-    version, not scored as an arm (scoring it would inflate the primary).
+V2 DESIGN (unchanged):
+  RECORD TEXT = a LOCALIZED CHANGE WINDOW around the first added hunk line
+    (8 lines before, 40+ after; same-sized window at the old/new hunk start for
+    the before/removed versions). Decoys = their first 48 lines.
+  ORDER KEY = ANCESTRY DEPTH (`git rev-list --count`), never commit time.
+  TRIAL (one per verified inverse pair, adversarial): "Restore the FIRST
+    version of <file> (the state that existed before this change): <add
+    message>"; pool = unique blobs among before/after/removed + up to 4
+    decoys; answer = the parent-of-add blob.
+  ARMS: DENSE@1 (full pool), DENSE-RELEVANT@1 (first same-file record),
+    SEMANTIC-ONLY (type filter -> judge epoch re-rank), TWO-STAGE (dense top-5
+    -> same). No blending; entity filter disabled.
+  EASY DIRECTION: reported via dense-relevant's post-add preference, not
+    scored (scoring it would inflate the primary).
 
   PRE-REGISTERED BAR:
     (1) POWER:      n >= 100 trials
-    (2) VACUITY:    DENSE-RELEVANT@1 <= 1/versions + 0.15 (the decision that
-                    matters is among same-file versions; the full-pool number
-                    is reported too)
+    (2) VACUITY:    DENSE-RELEVANT@1 <= 1/versions + 0.15
     (3) STAGE1@5    >= 0.85
     (4) TWO-STAGE   >= 0.85
     (5) TWO-STAGE   >= DENSE-RELEVANT@1 + 0.25
     (6) JUDGE       >= 90% of keys carry an ordinal epoch reference
-    PASS requires all. A dense win means the construction is vacuous and is
-    DISCARDED (addendum 21/27), never explained away.
+    PASS requires all; a dense win discards the construction.
 
 Usage:
   python scripts/icm/git_counterfactual_test.py --discover-only   # build pool
@@ -73,11 +62,12 @@ import census_git_inverses as gi  # noqa: E402
 from icm.intent_keys import IntentKeyer  # noqa: E402
 from icm.intent_query import TwoStageRetriever  # noqa: E402
 
-OUTDIR = os.path.join(REPO_ROOT, "data", "_scratch", "icm", "lifted", "git_cf_v2")
+OUTDIR = os.path.join(REPO_ROOT, "data", "_scratch", "icm", "lifted", "git_cf_v3")
 POOL = os.path.join(OUTDIR, "pool.jsonl")
 TRIALS = os.path.join(OUTDIR, "trials.jsonl")
 RESULTS = os.path.join(OUTDIR, "results.json")
 CACHE = os.path.join(OUTDIR, "keys_cache.jsonl")
+CHECKPOINT = os.path.join(OUTDIR, "rows.jsonl")
 
 LOCAL = ["Pondr", "HPMT", "liboffs", "WaveDB", "OFFS", "Space-Walk"]
 SKIP_EXT = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".pdf", ".zip",
@@ -115,6 +105,7 @@ def blob_size(repo, blob):
 
 
 _blob_cache: dict[tuple[str, str], str] = {}
+_BLOB_CACHE_MAX = 512   # bounded: entries are >=6 KB, so ~3 MB at most
 
 
 def blob_text(repo, blob, cap=6000):
@@ -128,7 +119,10 @@ def blob_text(repo, blob, cap=6000):
     rc, out = run_git(repo, "cat-file", "-p", blob)
     if rc != 0 or "\x00" in out:
         out = ""
-    _blob_cache[key] = out
+    # cache only the window-sized head, never the full blob (v3 memory fix)
+    _blob_cache[key] = out[:6000]
+    if len(_blob_cache) > _BLOB_CACHE_MAX:
+        _blob_cache.clear()
     return out[:cap]
 
 
@@ -218,112 +212,133 @@ def decoy_records(repo, commit, exclude, n, seen, rng):
     return recs
 
 
-def discover(repos, max_per_file=8, decoys_n=4, seed=42):
+def discover(repos, max_per_file=8, decoys_n=4, seed=42, out_path=None):
+    """Find trials. `out_path` streams each trial to disk and returns the count
+    (memory-safe for large corpora); without it the trials are returned as a
+    list (tests / small runs)."""
     rng = random.Random(seed)
-    trials, skipped = [], {"not_ancestor": 0, "missing_blob": 0,
-                           "feature_not_visible": 0, "same_before_after": 0,
-                           "no_hunk": 0}
-    for name, repo in repos:
-        by_file = gi.commits_by_file(repo)
-        repo_trials = 0
-        for f, cs in by_file.items():
-            if not is_text_path(f):
-                continue
-            local = 0
-            for i in range(len(cs)):
-                for j in range(i + 1, len(cs)):
-                    a, b = cs[i], cs[j]
-                    if a["h"] == b["h"]:
-                        continue
-                    a_add, a_rem = bool(gi.ADD_RE.search(a["m"])), bool(gi.REM_RE.search(a["m"]))
-                    b_add, b_rem = bool(gi.ADD_RE.search(b["m"])), bool(gi.REM_RE.search(b["m"]))
-                    if not ((a_add and b_rem) or (a_rem and b_add)):
-                        continue
-                    try:
-                        pa = gi.patch_lines(repo, a["h"], f)
-                        pb = gi.patch_lines(repo, b["h"], f)
-                    except Exception:
-                        continue
-                    if overlap_ok(pa[0], pb[1]):
-                        add, rem, added = a, b, pa[0]
-                    elif overlap_ok(pb[0], pa[1]):
-                        add, rem, added = b, a, pb[0]
-                    else:
-                        continue
-                    rc, _ = run_git(repo, "merge-base", "--is-ancestor",
-                                    add["h"], rem["h"])
-                    if rc != 0:
-                        skipped["not_ancestor"] += 1
-                        continue
-                    before = blob_at(repo, add["h"] + "^", f)
-                    after = blob_at(repo, add["h"], f)
-                    removed = blob_at(repo, rem["h"], f)
-                    if not (before and after and removed):
-                        skipped["missing_blob"] += 1
-                        continue
-                    if before == after:
-                        skipped["same_before_after"] += 1
-                        continue
-                    add_hunk = next((h for h in diff_hunks(repo, add["h"], f)
-                                     if h["added"]), None)
-                    rem_hunk = next((h for h in diff_hunks(repo, rem["h"], f)
-                                     if h["removed"]), None)
-                    if add_hunk is None or rem_hunk is None:
-                        skipped["no_hunk"] += 1
-                        continue
-                    after_win = window_text(
-                        blob_text(repo, after), add_hunk["new"],
-                        after=max(40, len(add_hunk["added"]) + 12))
-                    # visibility is checked on the TARGETED hunk's own lines;
-                    # `added` spans all hunks and would falsely fail a pair
-                    # whose other hunks fall outside this window.
-                    hunk_added = [line.strip() for line in add_hunk["added"]
-                                  if len(re.sub(r"\W", "", line.strip())) >= 3]
-                    visible = sum(1 for line in hunk_added if line in after_win)
-                    if hunk_added and visible < max(1, math.ceil(0.8 * len(hunk_added))):
-                        skipped["feature_not_visible"] += 1
-                        continue
-                    widen = max(40, len(add_hunk["added"]) + 12)
-                    windows = {
-                        "before": window_text(blob_text(repo, before),
-                                              add_hunk["old"], after=widen),
-                        "after": after_win,
-                        "removed": window_text(blob_text(repo, removed),
-                                               rem_hunk["new"],
-                                               after=max(40, len(rem_hunk["removed"]) + 12)),
-                    }
-                    seen, records = set(), []
-                    for label, blob, rev in (("before", before, add["h"] + "^"),
-                                             ("after", after, add["h"]),
-                                             ("removed", removed, rem["h"])):
-                        if blob in seen:
+    streamed = out_path is not None
+    fh = (io.open(out_path, "w", encoding="utf-8", newline="\n")
+          if streamed else None)
+    trials, n_trials = [], 0
+    skipped = {"not_ancestor": 0, "missing_blob": 0,
+               "feature_not_visible": 0, "same_before_after": 0,
+               "no_hunk": 0}
+    try:
+        for name, repo, source in repos:
+            # bound memory per repo: caches must not accumulate across repos
+            _blob_cache.clear()
+            _depth.clear()
+            by_file = gi.commits_by_file(repo)
+            repo_trials = 0
+            for f, cs in by_file.items():
+                if not is_text_path(f):
+                    continue
+                local = 0
+                for i in range(len(cs)):
+                    for j in range(i + 1, len(cs)):
+                        a, b = cs[i], cs[j]
+                        if a["h"] == b["h"]:
                             continue
-                        seen.add(blob)
-                        records.append({"id": blob, "path": f, "type": f,
-                                        "epoch": depth(repo, rev),
-                                        "text": windows[label],
-                                        "kind": "version", "label": label})
-                    records += decoy_records(repo, add["h"], f, decoys_n, seen, rng)
-                    if len(records) < 2:
-                        continue
-                    query = ("Restore the FIRST version of " + f + " (the state "
-                             "that existed before this change): " + add["m"][:600])
-                    trials.append({
-                        "trial": f"{name}:{f}:{add['h'][:8]}",
-                        "repo": name, "file": f, "query": query,
-                        "records": records, "correct": before, "after": after,
-                        "versions": sum(1 for r in records if r["kind"] == "version"),
-                        "pool": len(records),
-                        "add_msg": add["m"][:300], "add": add["h"], "rem": rem["h"],
-                    })
-                    repo_trials += 1
-                    local += 1
+                        a_add, a_rem = bool(gi.ADD_RE.search(a["m"])), bool(gi.REM_RE.search(a["m"]))
+                        b_add, b_rem = bool(gi.ADD_RE.search(b["m"])), bool(gi.REM_RE.search(b["m"]))
+                        if not ((a_add and b_rem) or (a_rem and b_add)):
+                            continue
+                        try:
+                            pa = gi.patch_lines(repo, a["h"], f)
+                            pb = gi.patch_lines(repo, b["h"], f)
+                        except Exception:
+                            continue
+                        if overlap_ok(pa[0], pb[1]):
+                            add, rem, added = a, b, pa[0]
+                        elif overlap_ok(pb[0], pa[1]):
+                            add, rem, added = b, a, pb[0]
+                        else:
+                            continue
+                        rc, _ = run_git(repo, "merge-base", "--is-ancestor",
+                                        add["h"], rem["h"])
+                        if rc != 0:
+                            skipped["not_ancestor"] += 1
+                            continue
+                        before = blob_at(repo, add["h"] + "^", f)
+                        after = blob_at(repo, add["h"], f)
+                        removed = blob_at(repo, rem["h"], f)
+                        if not (before and after and removed):
+                            skipped["missing_blob"] += 1
+                            continue
+                        if before == after:
+                            skipped["same_before_after"] += 1
+                            continue
+                        add_hunk = next((h for h in diff_hunks(repo, add["h"], f)
+                                         if h["added"]), None)
+                        rem_hunk = next((h for h in diff_hunks(repo, rem["h"], f)
+                                         if h["removed"]), None)
+                        if add_hunk is None or rem_hunk is None:
+                            skipped["no_hunk"] += 1
+                            continue
+                        after_win = window_text(
+                            blob_text(repo, after), add_hunk["new"],
+                            after=max(40, len(add_hunk["added"]) + 12))
+                        # visibility is checked on the TARGETED hunk's own lines;
+                        # `added` spans all hunks and would falsely fail a pair
+                        # whose other hunks fall outside this window.
+                        hunk_added = [line.strip() for line in add_hunk["added"]
+                                      if len(re.sub(r"\W", "", line.strip())) >= 3]
+                        visible = sum(1 for line in hunk_added if line in after_win)
+                        if hunk_added and visible < max(1, math.ceil(0.8 * len(hunk_added))):
+                            skipped["feature_not_visible"] += 1
+                            continue
+                        widen = max(40, len(add_hunk["added"]) + 12)
+                        windows = {
+                            "before": window_text(blob_text(repo, before),
+                                                  add_hunk["old"], after=widen),
+                            "after": after_win,
+                            "removed": window_text(blob_text(repo, removed),
+                                                   rem_hunk["new"],
+                                                   after=max(40, len(rem_hunk["removed"]) + 12)),
+                        }
+                        seen, records = set(), []
+                        for label, blob, rev in (("before", before, add["h"] + "^"),
+                                                 ("after", after, add["h"]),
+                                                 ("removed", removed, rem["h"])):
+                            if blob in seen:
+                                continue
+                            seen.add(blob)
+                            records.append({"id": blob, "path": f, "type": f,
+                                            "epoch": depth(repo, rev),
+                                            "text": windows[label],
+                                            "kind": "version", "label": label})
+                        records += decoy_records(repo, add["h"], f, decoys_n, seen, rng)
+                        if len(records) < 2:
+                            continue
+                        query = ("Restore the FIRST version of " + f + " (the state "
+                                 "that existed before this change): " + add["m"][:600])
+                        trial = {
+                            "trial": f"{name}:{f}:{add['h'][:8]}",
+                            "repo": name, "source": source, "file": f,
+                            "query": query,
+                            "records": records, "correct": before, "after": after,
+                            "versions": sum(1 for r in records if r["kind"] == "version"),
+                            "pool": len(records),
+                            "add_msg": add["m"][:300], "add": add["h"], "rem": rem["h"],
+                        }
+                        if streamed:
+                            fh.write(json.dumps(trial, ensure_ascii=True) + "\n")
+                            fh.flush()
+                            n_trials += 1
+                        else:
+                            trials.append(trial)
+                        repo_trials += 1
+                        local += 1
+                        if local >= max_per_file:
+                            break
                     if local >= max_per_file:
                         break
-                if local >= max_per_file:
-                    break
-        print(f"  [{name}] trials={repo_trials}", flush=True)
-    return trials, skipped
+            print(f"  [{name}] trials={repo_trials}", flush=True)
+    finally:
+        if fh is not None:
+            fh.close()
+    return (n_trials if streamed else trials), skipped
 
 
 def main() -> int:
@@ -332,6 +347,9 @@ def main() -> int:
     ap.add_argument("--public-root",
                     default=os.path.join(REPO_ROOT, "data", "_scratch", "icm",
                                          "public_repos"))
+    ap.add_argument("--upstream-root",
+                    default=os.path.join(REPO_ROOT, "data", "_scratch", "icm",
+                                         "upstream_repos"))
     ap.add_argument("--only", nargs="*", default=None,
                     help="restrict to these repo names")
     ap.add_argument("--limit", type=int, default=0,
@@ -342,19 +360,27 @@ def main() -> int:
                     help="reuse the persisted trial pool instead of rediscovering")
     ap.add_argument("--decoys", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--time-budget", type=int, default=0,
+                    help="stop cleanly after N seconds (checkpointed; 0=no cap)")
     args = ap.parse_args()
 
     repos = []
     for name in LOCAL:
         p = os.path.join(args.local_root, name)
         if os.path.isdir(os.path.join(p, ".git")):
-            repos.append((name, p))
-    # every cloned repo under the public root (breadth for power)
+            repos.append((name, p, "own"))
+    # every cloned repo under the own public root (breadth for power)
     if os.path.isdir(args.public_root):
         for name in sorted(os.listdir(args.public_root)):
             p = os.path.join(args.public_root, name)
             if os.path.isdir(os.path.join(p, ".git")):
-                repos.append((name, p))
+                repos.append((name, p, "own"))
+    # major upstream public repos: real intent text by their authors (v3)
+    if os.path.isdir(args.upstream_root):
+        for name in sorted(os.listdir(args.upstream_root)):
+            p = os.path.join(args.upstream_root, name)
+            if os.path.isdir(os.path.join(p, ".git")):
+                repos.append((name, p, "upstream"))
     if args.only:
         repos = [r for r in repos if r[0] in set(args.only)]
     print(f"[repos] {[r[0] for r in repos]}", flush=True)
@@ -369,12 +395,16 @@ def main() -> int:
         skipped = {"reused_pool": len(trials)}
         print(f"[pool] reused {len(trials)} trials from {POOL}", flush=True)
     else:
-        trials, skipped = discover(repos, decoys_n=args.decoys, seed=args.seed)
-        with io.open(POOL, "w", encoding="utf-8", newline="\n") as f:
-            for t in trials:
-                f.write(json.dumps(t, ensure_ascii=True) + "\n")
-        print(f"[discover] trials={len(trials)} skipped={skipped} "
+        n, skipped = discover(repos, decoys_n=args.decoys, seed=args.seed,
+                              out_path=POOL)
+        print(f"[discover] trials={n} skipped={skipped} "
               f"({time.time()-t0:.0f}s) -> {POOL}", flush=True)
+        if args.discover_only:
+            print(f"[discover-only] {n} trials; not scoring")
+            return 0 if n else 1
+        trials = [json.loads(line) for line in io.open(POOL, encoding="utf-8")
+                  if line.strip()]
+        print(f"[pool] loaded {len(trials)} trials", flush=True)
     if args.discover_only:
         print(f"[discover-only] {len(trials)} trials; not scoring")
         return 0 if trials else 1
@@ -389,57 +419,100 @@ def main() -> int:
 
     keyer = IntentKeyer(cache_path=CACHE)
     retriever = TwoStageRetriever(embed, keyer=keyer)
+    done = {}
+    if os.path.exists(CHECKPOINT):
+        for line in io.open(CHECKPOINT, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                done[r["trial"]] = r
+            except Exception:
+                continue
+    print(f"[checkpoint] {len(done)} trials already scored", flush=True)
+    ck = io.open(CHECKPOINT, "a", encoding="utf-8", newline="\n")
+    try:
+        for i, t in enumerate(trials, 1):
+            if t["trial"] in done:
+                continue
+            records = t["records"]
+            meta = {"type": t["file"], "ignore_key_entities": True, "k": 5}
+            full = retriever.query(t["query"], records, query_meta=meta)
+            key = full["key"]
+            e = (key or {}).get("epoch_ref", {}).get("value", "none") or "none"
+            by_id = {r["id"]: r for r in records}
+            cands5 = [by_id[x] for x in full["stage1_ids"][:5] if x in by_id]
+            two = retriever.query(t["query"], cands5, query_key=key, query_meta=meta)
+
+            dense_top = full["stage1_ids"][0]
+            same_file = [x for x in full["stage1_ids"]
+                         if by_id.get(x, {}).get("type") == t["file"]]
+            dense_relevant_top = same_file[0] if same_file else None
+            sem_top = full["top"][0]["id"] if full["top"] else None
+            two_top = two["top"][0]["id"] if two["top"] else None
+            correct = t["correct"]
+            row = {
+                "trial": t["trial"], "repo": t["repo"],
+                "source": t.get("source", "own"), "file": t["file"],
+                "correct": correct, "dense_top": dense_top,
+                "dense_relevant_top": dense_relevant_top,
+                "semantic_top": sem_top, "two_top": two_top,
+                "epoch_ref": e, "fallback": full["fallback"],
+                "pool": t["pool"], "versions": t["versions"],
+                "judge_status": full["key_status"],
+                "stage1_ok": 1.0 if correct in full["stage1_ids"][:5] else 0.0,
+                "prefers_after": 1.0 if dense_top == t["after"] else 0.0,
+                "rel_prefers_after": 1.0 if dense_relevant_top == t["after"] else 0.0,
+            }
+            done[t["trial"]] = row
+            ck.write(json.dumps(row, ensure_ascii=True) + "\n")
+            ck.flush()
+            if len(done) % 10 == 0:
+                print(f"  [checkpoint {len(done)}/{len(trials)}] "
+                      f"({time.time()-t0:.0f}s)", flush=True)
+            if args.time_budget and (time.time() - t0) >= args.time_budget:
+                print(f"[budget] stopping after {len(done)} scored "
+                      f"({time.time()-t0:.0f}s)", flush=True)
+                break
+    finally:
+        ck.close()
+
+    rows = [done[t["trial"]] for t in trials if t["trial"] in done]
+    missing = len(trials) - len(rows)
+    complete = missing == 0
+    if missing:
+        print(f"[warn] {missing} trials unscored (incomplete run)", flush=True)
     arms = {"dense@1": [], "dense_relevant@1": [], "semantic_only": [],
             "two_stage": []}
+    by_source: dict[str, dict[str, list]] = {}
     stage1, epochs, fallbacks = [], {}, {}
     prefers_after, relevant_prefers_after = [], []
-    rows = []
-    for i, t in enumerate(trials, 1):
-        records = t["records"]
-        meta = {"type": t["file"], "ignore_key_entities": True, "k": 5}
-        full = retriever.query(t["query"], records, query_meta=meta)
-        key = full["key"]
-        e = (key or {}).get("epoch_ref", {}).get("value", "none") or "none"
-        epochs[e] = epochs.get(e, 0) + 1
-        fallbacks[full["fallback"] or "none"] = fallbacks.get(full["fallback"] or "none", 0) + 1
-        by_id = {r["id"]: r for r in records}
-        cands5 = [by_id[x] for x in full["stage1_ids"][:5] if x in by_id]
-        two = retriever.query(t["query"], cands5, query_key=key, query_meta=meta)
-
-        dense_top = full["stage1_ids"][0]
-        same_file = [x for x in full["stage1_ids"]
-                     if by_id.get(x, {}).get("type") == t["file"]]
-        dense_relevant_top = same_file[0] if same_file else None
-        sem_top = full["top"][0]["id"] if full["top"] else None
-        two_top = two["top"][0]["id"] if two["top"] else None
-        correct = t["correct"]
-        arms["dense@1"].append(1.0 if dense_top == correct else 0.0)
-        arms["dense_relevant@1"].append(
-            1.0 if dense_relevant_top == correct else 0.0)
-        arms["semantic_only"].append(1.0 if sem_top == correct else 0.0)
-        arms["two_stage"].append(1.0 if two_top == correct else 0.0)
-        stage1.append(1.0 if correct in full["stage1_ids"][:5] else 0.0)
-        prefers_after.append(1.0 if dense_top == t["after"] else 0.0)
-        relevant_prefers_after.append(
-            1.0 if dense_relevant_top == t["after"] else 0.0)
-        rows.append({"trial": t["trial"], "repo": t["repo"], "file": t["file"],
-                     "correct": correct, "dense_top": dense_top,
-                     "dense_relevant_top": dense_relevant_top,
-                     "semantic_top": sem_top, "two_top": two_top,
-                     "epoch_ref": e, "fallback": full["fallback"],
-                     "pool": t["pool"], "versions": t["versions"],
-                     "judge_status": full["key_status"]})
-        if i % 10 == 0:
-            print(f"  [{i}/{len(trials)}] dense={statistics.mean(arms['dense@1']):.3f} "
-                  f"rel={statistics.mean(arms['dense_relevant@1']):.3f} "
-                  f"sem={statistics.mean(arms['semantic_only']):.3f} "
-                  f"two={statistics.mean(arms['two_stage']):.3f} "
-                  f"({time.time()-t0:.0f}s)", flush=True)
+    for r in rows:
+        vals = {
+            "dense@1": 1.0 if r["dense_top"] == r["correct"] else 0.0,
+            "dense_relevant@1": 1.0 if r["dense_relevant_top"] == r["correct"] else 0.0,
+            "semantic_only": 1.0 if r["semantic_top"] == r["correct"] else 0.0,
+            "two_stage": 1.0 if r["two_top"] == r["correct"] else 0.0,
+        }
+        for arm, val in vals.items():
+            arms[arm].append(val)
+            by_source.setdefault(r.get("source", "own"), {}).setdefault(
+                arm, []).append(val)
+        stage1.append(r["stage1_ok"])
+        prefers_after.append(r["prefers_after"])
+        relevant_prefers_after.append(r["rel_prefers_after"])
+        epochs[r["epoch_ref"]] = epochs.get(r["epoch_ref"], 0) + 1
+        fallbacks[r["fallback"] or "none"] = fallbacks.get(
+            r["fallback"] or "none", 0) + 1
 
     means = {k: round(statistics.mean(v), 3) for k, v in arms.items()}
+    source_means = {src: {arm: round(statistics.mean(v), 3)
+                          for arm, v in d.items()}
+                    for src, d in by_source.items()}
     chance_mean = round(statistics.mean(1.0 / t["pool"] for t in trials), 3)
     relevant_chance = round(statistics.mean(1.0 / t["versions"] for t in trials), 3)
-    earliest_rate = round(epochs.get("EARLIEST", 0) / len(trials), 3)
+    earliest_rate = round(epochs.get("EARLIEST", 0) / max(1, len(rows)), 3)
     checks = {
         "power_n_ge_100": len(trials) >= 100,
         "vacuity_dense_relevant": means["dense_relevant@1"] <= relevant_chance + 0.15,
@@ -456,14 +529,17 @@ def main() -> int:
         "chance_dense_mean": chance_mean,
         "chance_relevant_mean": relevant_chance,
         "arms": means,
+        "by_source": source_means,
         "stage1_recall@5": round(statistics.mean(stage1), 3),
         "dense_prefers_after": round(statistics.mean(prefers_after), 3),
         "dense_relevant_prefers_after": round(
             statistics.mean(relevant_prefers_after), 3),
         "epoch_refs": epochs, "judge_earliest_rate": earliest_rate,
         "fallbacks": fallbacks,
-        "checks": checks, "pass": all(checks.values()),
-        "verdict": ("PASS -- the intent key selects the pre-change version "
+        "checks": checks, "complete": complete, "scored": len(rows),
+        "pass": all(checks.values()) and complete,
+        "verdict": ("INCOMPLETE -- resume the scoring run" if not complete else
+                    "PASS -- the intent key selects the pre-change version "
                     "where similarity is at chance" if all(checks.values()) else
                     "FAIL -- the failing row names the missing piece"),
         "scope": "organic substrate; authored query template and pair-centered pool",
@@ -478,13 +554,14 @@ def main() -> int:
     with io.open(RESULTS, "w", encoding="utf-8") as f:
         f.write(json.dumps({**res, "rows": rows}, indent=2, default=str))
     print(json.dumps({k: res[k] for k in
-                      ("trials", "pool_sizes", "chance_dense_mean",
-                       "chance_relevant_mean", "arms", "stage1_recall@5",
-                       "dense_prefers_after", "dense_relevant_prefers_after",
-                       "epoch_refs", "fallbacks", "checks", "pass", "verdict")},
+                      ("trials", "scored", "complete", "pool_sizes",
+                       "chance_dense_mean", "chance_relevant_mean", "arms",
+                       "by_source", "stage1_recall@5", "dense_prefers_after",
+                       "dense_relevant_prefers_after", "epoch_refs",
+                       "fallbacks", "checks", "pass", "verdict")},
                      indent=1, default=str), flush=True)
     print(f"[done] -> {RESULTS}", flush=True)
-    return 0 if res["pass"] else 2
+    return (0 if (complete and res["pass"]) else (2 if complete else 3))
 
 
 if __name__ == "__main__":
