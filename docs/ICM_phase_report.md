@@ -1397,3 +1397,56 @@ deterministic-filter/order pipeline, not free-form intent inference. The pool
 is the 561 trials streamed before the discovery kill, not the full 22-repo
 sweep. Within those bounds, this is the program's first pre-registered PASS on
 an organic substrate.
+
+## 35. Addendum 30 — free-form phrasing PASSES: user-originated before/after requests swap the answer (2026-10-20)
+
+The v3 PASS used a fixed template; the judge's EARLIEST reading was guaranteed
+by the words "FIRST/before". The user supplied 20 before + 22 after natural
+phrasings. The FIRST attempt used the store's abstract epoch keyer on them:
+**0/8 smoke**. The judge returned absolute anchors ("today", "last week's",
+the commit text) because the phrasings reference times the isolated trial does
+not contain, and several are not version-selection requests. The instrument,
+not the phrasings, was template-shaped.
+
+With user authorization the phrasings were minimally edited for legibility:
+every line is a version-selection request anchored to `{change}`; external
+time anchors and non-selection asks were removed or re-anchored. The keyer
+became TASK-AWARE: one judge call per query answering BEFORE / AFTER / NEITHER
+(BEFORE -> earliest, AFTER -> latest, NEITHER -> abstain). The original file is
+untouched; the test set is user-originated with assistant legibility edits.
+
+150 pairs x 2 directions = 300 runs, checkpointed and completed in two
+foreground batches:
+
+| direction | extraction | semantic (keyed) | two-stage | dense-relevant | chance |
+|---|---|---|---|---|---|
+| before | 1.000 | **1.000** | 0.893 | 0.280 | 0.337 |
+| after | 0.927 | **1.000** | 0.947 | 0.660 | 0.500 |
+
+**SWAP (both directions keyed, n=133): semantic 1.000, two-stage 0.887.**
+ALL PRE-REGISTERED CHECKS PASS: power (150 pairs), extraction 0.963, before
+and after semantic >= 0.85, swap >= 0.75, before-direction vacuity (dense
+0.280 <= 0.337 + 0.15). **Verdict: PASS.**
+
+The 11 after-direction extraction misses are all "what changes were made ...
+after/since `<change>`" -- change-list questions, not version selection. The
+judge correctly returned NEITHER; they are counted as extraction failures.
+The keyer abstains rather than guessing.
+
+WHAT THIS ESTABLISHES: ordinary before/after wording, not a template, drives
+the key. The same real pair yields the pre-change version under before
+phrasings and the post-change version under after phrasings; the semantic path
+is perfect on keyed runs and the swap is perfect. The template is no longer
+the operative author.
+
+CAVEATS: the phrasings are user-originated but assistant-edited for
+legibility; the keyer is task-aware (a new prompt); 150 pairs from the
+upstream/own pool; the after direction is the easy one for dense (0.660 vs
+0.500), the before direction is the adversarial one; two-stage remains capped
+by stage-1 (swap 0.887).
+
+DESIGN IMPLICATION: the store's write-time keyer needs a task-aware variant
+for free-form queries; the abstract "time reference" prompt fails on natural
+anchors and should abstain on non-selection requests. That is a concrete build
+item, and the reason the free-form keyer is a separate prompt rather than the
+existing one.
