@@ -1489,3 +1489,48 @@ CAVEATS: same 561-trial corpus and construction as v3; the type filter is exact
 (file path), so the bypass arm is easy by construction; the top-10 result is a
 width sweep, not a new semantic claim. The intent key, not the generator, was
 already established; this closes the engineering loose end.
+
+## 37. Addendum 32 — layer 3 PASSES: non-reach produces a reaching new intent (2026-10-20)
+
+The causal-direction law says intent is prior to outcomes; a non-reach is a
+VERDICT and a generator of the next intent layer (curiosity -> explanation ->
+re-intent). The capture layer has enforced the link (`triggered_by` must name
+a rule-computed `violated` outcome) since the store build; this is its first
+measurement.
+
+WORLD (prepared fixture, track C -- not an organic claim): a real dataset with
+one hidden verification rule (header row / excluded file / name-inclusive
+checksum / duplicate rows). The agent submits a manifest {files, rows,
+hash_mode}; the verifier is mechanical and reports ALL mismatches, naming the
+defect. The first manifest is produced from the task + file metadata only, so
+the rule is unknowable before the failure.
+
+ARMS on the 40 first attempts (all 40 violated):
+
+| arm | reach rate |
+|---|---|
+| **EXPANSION (failure reason -> explanation -> new intent -> retry)** | **1.000 (40/40)** |
+| RETRY (same spec resubmitted) | 0.000 |
+| NO-EVIDENCE (retry without the reason) | 0.050 (2/40, both name-hash guesses) |
+
+Checks: power (40 failed), expansion >= 0.80, retry <= 0.10, no-evidence <=
+0.30, lift >= 0.40, link conformance 1.000, explanation alignment 1.000.
+**Verdict: PASS.**
+
+LINK CONFORMANCE: every expansion goal's `triggered_by` is the first
+attempt's rule-computed violated outcome -- 40/40. The hierarchy is recorded
+in the capture (goal -> attempt -> violated outcome -> new goal -> attempt ->
+outcome).
+
+READING: the loop works. A missed prediction plus the failure evidence is
+sufficient to generate a new intent that reaches; the same retry without the
+evidence fails (0/40) and a retry with no evidence reaches only by guessing
+(2/40). The causal factor is the violation + its evidence, not the extra
+attempt.
+
+CAVEATS: prepared world, not organic; one-step expansion (not the plan's
+longitudinal E5 self-improvement); the verifier names all defects, so the
+fix is learnable in one step; one model (deepseek-v4.1-flash:cloud); the
+retry arm is deterministic and the no-evidence arm can guess the hash mode.
+The mechanism claim is bounded accordingly; organic multi-turn applicability
+still needs a real task family.
