@@ -1450,3 +1450,42 @@ for free-form queries; the abstract "time reference" prompt fails on natural
 anchors and should abstain on non-selection requests. That is a concrete build
 item, and the reason the free-form keyer is a separate prompt rather than the
 existing one.
+
+## 36. Addendum 31 — stage-1 fix PASSES: top-10 (or bypass) closes the two-stage gap (2026-10-20)
+
+Pre-registered sweep on the 561 v3 trials; the v3 key cache answered every
+query, so this run made **no new judge calls**. Same records, oracles,
+ancestry order and vacuity guard; only the generator width changed.
+
+| arm | accuracy |
+|---|---|
+| DENSE@1 (chance 0.143) | 0.164 |
+| DENSE-RELEVANT@1 (chance 0.337) | 0.246 |
+| **FILTER-ONLY (bypass dense)** | **1.000 (561/561)** |
+| STAGE-1 recall@5 | 0.914 |
+| **STAGE-1 recall@10** | **1.000** |
+| STAGE-1 recall@20 | 1.000 |
+| TWO-STAGE@5 | 0.914 |
+| **TWO-STAGE@10** | **1.000** |
+| TWO-STAGE@20 | 1.000 |
+
+ALL PRE-REGISTERED CHECKS PASS: power, filter-only >= 0.95, stage-1@10 >=
+0.95, two-stage@10 >= 0.95, two-stage@20 >= 0.95, vacuity (dense-relevant 2.46
+<= 3.37 + 0.15). **Verdict: PASS.**
+
+READING: the addendum-29 diagnosis was correct. The intent key and the
+deterministic order were already perfect; the only loss was the generator's
+top-5 missing 48-49 answers. Widening to top-10 recovers every one, and the
+bypass arm (type filter -> epoch order over the full pool, no dense stage) is
+perfect by construction. The fix is not a new mechanism; it is the correct
+default for a known artifact.
+
+STORE IMPLICATION: the query path should use the FILTER-ONLY arm when the type
+filter already fixes the artifact (the exact-file case here), and dense
+top-10 as the generator when the pool is open-ended. Dense@1 was at chance
+throughout, so it remains a generator only, never the answer.
+
+CAVEATS: same 561-trial corpus and construction as v3; the type filter is exact
+(file path), so the bypass arm is easy by construction; the top-10 result is a
+width sweep, not a new semantic claim. The intent key, not the generator, was
+already established; this closes the engineering loose end.

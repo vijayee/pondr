@@ -107,6 +107,19 @@ opposed pair in 120 (0.8 %). Session-goal grain: 0/80. Onyx shared documents:
 the same memory and almost no OPPOSED aims; more sessions of the same kind will
 not change the shape. The wall is a data-shape problem, not a data-volume one.
 
+**QUERY-PATH UPDATE (2026-10-20, addenda 29-31).** The real-corpus test bed
+changed: git history supplied 561 patch-verified counterfactual pairs (503
+upstream, 58 own), and the store mechanism passed all pre-registered checks
+(semantic-only 1.000; two-stage 0.909; dense at/below chance; judge 561/561).
+A user-authored free-form phrasing test also passed (extraction 0.963;
+semantic 1.000 on keyed runs; before/after swap 1.000), with a task-aware
+BEFORE/AFTER keyer. Stage-1 width, not the intent key, was the binding
+constraint: top-10 and the filter-only bypass both scored 1.000 versus 0.914
+at top-5. The store should use the FILTER-ONLY path when the type filter
+already fixes the artifact, and dense top-10 when the pool is open-ended.
+The write-time keyer needs a task-aware variant for free-form queries and
+should abstain on non-selection requests.
+
 # 5. Open questions the spec does not answer
 
 - How many epochs/intents per memory unit are needed before the re-rank pays
