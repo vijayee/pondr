@@ -1115,6 +1115,73 @@ void main() {
           reason: 'an unparseable ask folds nothing — the card never mounts');
       harness.dispose();
     });
+
+    test('a second ask record for the SAME sid REPLACES the store entry '
+        '(the fold\'s last-writer-wins — nothing double-mounts)', () async {
+      final harness = await chatHarness();
+      harness.emit(
+        'sessions/r',
+        1,
+        jsonEncode(<String, dynamic>{
+          'type': 'ask',
+          'payload': <String, dynamic>{
+            'askId': '11111111',
+            'question': 'the first ask?',
+            'options': <String>['Approve', 'Reject'],
+          },
+        }),
+      );
+      harness.emit(
+        'sessions/r',
+        2,
+        jsonEncode(<String, dynamic>{
+          'type': 'ask',
+          'payload': <String, dynamic>{
+            'askId': '22222222',
+            'question': 'the replacement ask',
+            'options': <String>['yes', 'no'],
+            'plan': '1. replace',
+          },
+        }),
+      );
+      await drain();
+      expect(harness.asks['sessions/r']?.askId, '22222222',
+          reason: 'the SECOND record is the sid\'s row (last-writer-wins)');
+      expect(harness.asks['sessions/r']?.question, 'the replacement ask');
+      expect(harness.asks['sessions/r']?.plan, '1. replace');
+      expect(harness.asks, hasLength(1),
+          reason: 'one row per sid — the replacement replaces, never '
+              'double-mounts');
+      harness.dispose();
+    });
+
+    test('the not-delivered reply posts no records — the ask + the blocked '
+        'closer and the entry STANDS (the "delivered:false keeps the entry" '
+        'fold-side pin)', () async {
+      final harness = await chatHarness();
+      // A delivered:false reply op produces NOTHING on the events stream:
+      // no ask.reply record, no msg.append — the fold never hears it. The
+      // entry stands (the card stays rideable) until an ask.reply record
+      // lands.
+      harness.emit(
+        'sessions/d1',
+        1,
+        jsonEncode(<String, dynamic>{
+          'type': 'ask',
+          'payload': <String, dynamic>{
+            'askId': 'a1b2c3d4',
+            'question': 'Approve this plan?',
+            'options': <String>['Approve', 'Reject'],
+          },
+        }),
+      );
+      harness.emit('sessions/d1', 2, turnEndRecord('blocked'));
+      await drain();
+      expect(harness.asks['sessions/d1']?.askId, 'a1b2c3d4',
+          reason: 'nothing cleared the entry — a not-delivered reply leaves '
+              'the parked ask standing');
+      harness.dispose();
+    });
   });
 
   group('FfiSettingsService (the store ride + the daemon adoption)', () {
