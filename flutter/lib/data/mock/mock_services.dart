@@ -9,6 +9,7 @@ import 'dart:async';
 import 'dart:math';
 
 import '../models.dart';
+import '../pending_ask.dart';
 import '../services.dart';
 import 'mock_data.dart';
 
@@ -113,25 +114,61 @@ class MockChatService implements ChatService {
   final MockSessionsService _sessions;
   final Random _random;
 
-  /// The ask stream's fan-out (the escalation slice). EMPTY until Task 3's
-  /// scripted plan-gate ask emits through it — the interface's contract
-  /// compiles today; the scripted ask rides the SAME pending-ask-store
-  /// path as the daemon's record fold.
+  /// The ask stream's fan-out (the escalation slice). The scripted plan
+  /// ask parks through it — the SAME `AskUpsert`/`AskCleared` records the
+  /// daemon's fold emits, so the card's store cannot tell the halves
+  /// apart. Broadcast and unbuffered: an ask landed before anything
+  /// listens is dropped (the fold's contract, mirrored honestly).
   final StreamController<Object> _asks = StreamController<Object>.broadcast();
+
+  /// The in-flight parked ask per sid — the mock's fold of the ask
+  /// records. At most one per session (the engine's parked-ask law);
+  /// answering (the `ask.reply` record's face) is what clears it.
+  final Map<String, PendingAsk> _pendingMockAsk = <String, PendingAsk>{};
 
   @override
   Stream<Object> asks() => _asks.stream;
 
-  /// The reply op's mock shape: always delivered (the mock's scripted ask
-  /// always resumes — Task 3 replaces this stub with the scripted flow).
+  /// The reply op's mock shape: only the parked plan ask delivers. The
+  /// correct askId consumes it (the reply records clear the store), writes
+  /// the acknowledgment as the session's assistant message, and answers
+  /// delivered; anything else (no ask, wrong askId, already consumed)
+  /// answers false.
   @override
   Future<bool> answerAsk({
     required String sid,
     required String askId,
     required bool reject,
     required String value,
-  }) =>
-      Future<bool>.value(true);
+  }) async {
+    final ask = _pendingMockAsk[sid];
+    if (ask == null || ask.askId != askId) return false;
+    _pendingMockAsk.remove(sid);
+    _asks.add(AskCleared(sid));
+    // The honest resume: the send stream already ended (the ask was the
+    // turn's terminal face), so the resumed flow's reply can only ride
+    // the session store — the same write the daemon's deliver step makes,
+    // minus the replayed typing/ChatEvents no receiver would see.
+    final target = _sessions.byId(sid);
+    if (target != null) {
+      final repliedAt = DateTime.now();
+      _sessions.replaceSession(
+        target.copyWith(
+          messages: [
+            ...target.messages,
+            Message(
+              id: _nextMessageId(),
+              role: MessageRole.assistant,
+              content: reject ? mockPlanRejectedReply : mockPlanApprovedReply,
+              timestamp: repliedAt,
+            ),
+          ],
+          updatedAt: repliedAt,
+        ),
+      );
+    }
+    return true;
+  }
 
   /// The message-id monotonic guard. The export's `m${Date.now()}` collides
   /// when two messages compose in the same millisecond: a test's fake-async
@@ -139,13 +176,15 @@ class MockChatService implements ChatService {
   /// millisecond (and a real user's instant double-send the same way), and
   /// the canvas's bubble key then trips the duplicate-key debug check. Each
   /// id keeps the export's `m<ms>` shape; a same-millisecond follower just
-  /// ticks the counter forward one.
+  /// ticks the counter forward one. The parked ask's id rides the SAME
+  /// guard under its own prefix (`a:<ms>`) — distinct namespace, same
+  /// monotonic clock.
   int _lastMessageIdMs = 0;
 
-  String _nextMessageId() {
+  String _nextMessageId([String prefix = 'm']) {
     final int ms = DateTime.now().millisecondsSinceEpoch;
     _lastMessageIdMs = ms > _lastMessageIdMs ? ms : _lastMessageIdMs + 1;
-    return 'm$_lastMessageIdMs';
+    return '$prefix$_lastMessageIdMs';
   }
 
   @override
@@ -197,6 +236,49 @@ class MockChatService implements ChatService {
     final delay = Duration(
       milliseconds: 1100 + (_random.nextDouble() * 700).floor(),
     );
+
+    // The SCRIPTED PLAN ASK (the ask-ux-spec.md §4): a message containing
+    // 'plan' (case-insensitive) parks the turn as a plan-gate ask instead
+    // of the pool reply. The same typing face plays out, the plan text
+    // lands as the assistant message, and the ask rides the SAME pending-
+    // ask-store path as the daemon's fold — then the stream ends WITHOUT
+    // ChatDone (the ask is the turn's terminal face; the fold's blocked
+    // contract, mirrored). Answering hands control to [answerAsk].
+    if (capturedId != null && trimmed.toLowerCase().contains('plan')) {
+      yield ChatTyping(duration: delay);
+      await Future<void>.delayed(delay);
+
+      final planAt = DateTime.now();
+      final target = _sessions.byId(capturedId);
+      if (target != null) {
+        _sessions.replaceSession(
+          target.copyWith(
+            messages: [
+              ...target.messages,
+              Message(
+                id: _nextMessageId(),
+                role: MessageRole.assistant,
+                content: mockPlanText,
+                timestamp: planAt,
+              ),
+            ],
+            updatedAt: planAt,
+          ),
+        );
+        final ask = PendingAsk(
+          askId: _nextMessageId('a:'),
+          question: 'Approve this plan?',
+          options: const <String>['Approve', 'Reject'],
+          plan: mockPlanText,
+        );
+        _pendingMockAsk[capturedId] = ask;
+        _asks.add(AskUpsert(capturedId, ask));
+      }
+      // Deleted mid-typing → no write, no ask, no ChatDone (the pool
+      // reply path's absent-target rule, and the parked turn still opens).
+      return;
+    }
+
     yield ChatTyping(duration: delay);
     await Future<void>.delayed(delay);
 

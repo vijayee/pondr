@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:pondr/data/bindings.dart';
 import 'package:pondr/data/mock/mock_services.dart';
 import 'package:pondr/data/models.dart';
+import 'package:pondr/data/pending_ask.dart';
 import 'package:pondr/data/services.dart';
 
 /// Task 2's contract pins: the send stream's shape, the date buckets, the
@@ -231,6 +232,134 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 50));
       expect(fired.length, 2); // the user append + the assistant append
     });
+  });
+
+  group('MockChatService the scripted plan ask (the ask-ux-spec.md §4)', () {
+    test('the scripted plan ask rides the ask stream and answering resumes',
+        () async {
+      final sessions = MockSessionsService(seed: const <ChatSession>[]);
+      sessions.create();
+      final sid = sessions.active()!.id;
+      final chat = MockChatService(sessions);
+      final asks = <Object>[];
+      chat.asks().listen(asks.add); // subscribe BEFORE the send: unbuffered
+
+      // The parked turn: typing fires, then the stream ENDS without
+      // ChatDone — the ask is the turn's terminal face.
+      final events = await chat
+          .send('plan the refactor', const <AttachedFile>[])
+          .toList();
+      expect(events, hasLength(1));
+      expect(events.single, isA<ChatTyping>());
+      // The plan text landed as the turn's assistant message in the store.
+      final parked = sessions.byId(sid)!;
+      expect(parked.messages.first.role, MessageRole.user);
+      expect(parked.messages.last.role, MessageRole.assistant);
+      expect(parked.messages.last.content, mockPlanText);
+
+      // The ask upsert rode the SAME ask stream the daemon's fold uses.
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(asks, hasLength(1));
+      final upsert = asks.single as AskUpsert;
+      expect(upsert.sid, sid);
+      final ask = upsert.ask;
+      expect(ask.question, 'Approve this plan?');
+      expect(ask.options, <String>['Approve', 'Reject']);
+      expect(ask.plan, mockPlanText);
+      expect(ask.askId, startsWith('a:'));
+
+      // Answering consumes the ask: delivered=true, the reply bubble
+      // lands in the store (the resumed flow's face — the send stream
+      // cannot replay), and the clear rides the stream.
+      expect(
+        await chat.answerAsk(
+          sid: sid,
+          askId: ask.askId,
+          reject: false,
+          value: 'Approve',
+        ),
+        isTrue,
+      );
+      final answered = sessions.byId(sid)!;
+      expect(answered.messages.last.content, mockPlanApprovedReply);
+      expect(answered.messages.last.role, MessageRole.assistant);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(asks, hasLength(2));
+      expect(asks.last, isA<AskCleared>());
+
+      // A second reply for the same askId answers false: already consumed.
+      expect(
+        await chat.answerAsk(
+          sid: sid,
+          askId: ask.askId,
+          reject: false,
+          value: 'Approve',
+        ),
+        isFalse,
+      );
+    }, timeout: const Timeout(Duration(seconds: 10)));
+
+    test('reject answers true + writes the declined line; a wrong askId '
+        'answers false and does not consume', () async {
+      final sessions = MockSessionsService(seed: const <ChatSession>[]);
+      sessions.create();
+      final sid = sessions.active()!.id;
+      final chat = MockChatService(sessions);
+      final asks = <Object>[];
+      chat.asks().listen(asks.add);
+      // Case-insensitive magic phrase: 'Plan' triggers the scripted ask.
+      await chat.send('Plan out the split', const <AttachedFile>[]).toList();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final ask = (asks.single as AskUpsert).ask;
+
+      // A wrong askId answers false, no clear, no write.
+      expect(
+        await chat.answerAsk(
+          sid: sid,
+          askId: 'a:nowhere',
+          reject: true,
+          value: 'Reject',
+        ),
+        isFalse,
+      );
+      expect(asks.whereType<AskCleared>(), isEmpty);
+
+      // The reject through the right askId still delivers (true), writes
+      // the pinned decline line, and clears the ask.
+      expect(
+        await chat.answerAsk(
+          sid: sid,
+          askId: ask.askId,
+          reject: true,
+          value: 'Reject',
+        ),
+        isTrue,
+      );
+      final declined = sessions.byId(sid)!;
+      expect(declined.messages.last.content, mockPlanRejectedReply);
+      expect(declined.messages.last.role, MessageRole.assistant);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(asks.whereType<AskCleared>(), hasLength(1));
+      // Nothing else rode the stream (one upsert, one clear).
+      expect(asks, hasLength(2));
+    }, timeout: const Timeout(Duration(seconds: 10)));
+
+    test('the magic phrase is containment, case-insensitive', () async {
+      final sessions = MockSessionsService();
+      final chat = MockChatService(sessions);
+      final asks = <Object>[];
+      chat.asks().listen(asks.add);
+      // 'plan' inside a normal word still matches the phrase — the spec's
+      // magic phrase is containment ('planck' contains it).
+      final events = await chat
+          .send('explain the planck length', const <AttachedFile>[])
+          .toList();
+      expect(events, hasLength(1));
+      expect(events.single, isA<ChatTyping>());
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(asks, hasLength(1));
+      expect(sessions.byId('s1')!.messages.last.content, mockPlanText);
+    }, timeout: const Timeout(Duration(seconds: 10)));
   });
 
   group('MockSettingsService (the export state + saveProvider/saveModel)', () {

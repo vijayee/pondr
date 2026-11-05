@@ -47,6 +47,25 @@ The conventional framing treats this as a binary — either X or Y. But that's a
 What makes this practically useful is understanding which factors move things toward which end, and when that movement matters. The map is simpler than it looks once you have the right coordinate system.''',
 ];
 
+/// The scripted plan ask's fixtures (the ask-ux-spec.md §4 magic phrase
+/// 'plan' → the mock's plan-gate ask). The ONLY mock texts not traceable
+/// to the export — this ask is the Pondr escalation's stand-in for the
+/// plan gate, riding the same store path as the daemon's record fold.
+const String mockPlanText = '''## The refactor plan
+
+1. Untangle the send flow from the composer state.
+2. Split the attachment sheet out of the canvas.
+3. Fold the provider list into a single store.
+
+Nothing lands until an owner approves — this ask is the gate.''';
+
+/// The mock's acknowledgment when the plan ask is answered (not rejected).
+const String mockPlanApprovedReply =
+    'Plan approved — starting with step 1 of "The refactor plan".';
+
+/// The mock's decline line (the plan's pinned rejection sentence).
+const String mockPlanRejectedReply = 'Plan rejected: the owner declined the plan.';
+
 /// The export's `SUGGESTIONS` — the four chips shown on an empty session.
 const List<String> suggestions = <String>[
   'Explain the Fermi paradox',
