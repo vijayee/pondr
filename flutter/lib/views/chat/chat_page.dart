@@ -4,7 +4,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/shell.dart' show ShellMode, kPaneBreakpoint;
 import '../../data/bindings.dart' show suggestions;
 import '../../data/models.dart';
+import '../../data/pending_ask.dart' show PendingAsk, pendingAskProvider;
 import '../../theme/tokens.dart';
+import 'ask_card.dart';
 import 'chat_state.dart';
 import 'common.dart';
 import 'composer.dart';
@@ -181,6 +183,15 @@ class _MessageCanvasState extends ConsumerState<MessageCanvas> {
     final bool isTyping = ref.watch(
       composerStoreProvider.select((ComposerState s) => s.isTyping),
     );
+    // The parked ask (§3): the last canvas row, keyed to the ACTIVE
+    // session — a null active id means no key and no card.
+    final String? activeId = ref.watch(activeIdProvider);
+    final PendingAsk? pendingAsk = ref.watch(
+      pendingAskProvider.select(
+        (Map<String, PendingAsk> asks) =>
+            activeId == null ? null : asks[activeId],
+      ),
+    );
 
     // The export's scroll effect triggers (`app.tsx:851-853`).
     ref.listen<List<Message>>(activeMessagesProvider, (
@@ -239,6 +250,17 @@ class _MessageCanvasState extends ConsumerState<MessageCanvas> {
                                 ),
                         ),
                       ),
+                      // The parked ask's row (§3): after the turn, with
+                      // the loop's spacing — it unmounts when the store's
+                      // `ask.reply` record drops the sid.
+                      if (pendingAsk != null) ...<Widget>[
+                        const SizedBox(height: 24),
+                        AskCard(
+                          key: const Key('chat.ask-card'),
+                          sid: activeId!,
+                          ask: pendingAsk,
+                        ),
+                      ],
                       // The `bottomRef` anchor (`app.tsx:2181`).
                       const SizedBox(height: 4),
                     ],

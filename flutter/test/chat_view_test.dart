@@ -3,11 +3,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+// riverpod 3.4's `Override` export moved behind misc.dart (the container's
+// literal passes need no type; a param does).
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:pondr/app/shell.dart';
 import 'package:pondr/data/bindings.dart';
 import 'package:pondr/data/mock/mock_services.dart';
+import 'package:pondr/data/pending_ask.dart';
 import 'package:pondr/app/router.dart'
     show AuthState, authStateProvider;
 import 'package:pondr/data/models.dart' hide Provider;
@@ -128,15 +132,55 @@ class _FailedChatService implements ChatService {
       Future<bool>.value(true);
 }
 
+/// The ask-op recorder (the card's contract probe): every [answerAsk] call
+/// lands in [requests] verbatim; the op answers DELIVERED. Nothing ever
+/// emits an `ask.reply` record — no store, no stream, no clear — which is
+/// exactly the silent-drop corner the card's pinned test exercises.
+class _RecordingAskService implements ChatService {
+  final List<({String sid, String askId, bool reject, String value})> requests =
+      <({String sid, String askId, bool reject, String value})>[];
+
+  @override
+  Future<bool> answerAsk({
+    required String sid,
+    required String askId,
+    required bool reject,
+    required String value,
+  }) {
+    requests.add((sid: sid, askId: askId, reject: reject, value: value));
+    return Future<bool>.value(true);
+  }
+
+  @override
+  Stream<ChatEvent> send(String text, List<AttachedFile> files) async* {
+    yield const ChatDone('unused');
+  }
+
+  @override
+  Stream<Object> asks() => const Stream<Object>.empty();
+}
+
+/// The pre-seeded pending-ask store (the no-options ask's fixture): 's1'
+/// parks ask `a1` with NO options — never cleared, since the fixed fake
+/// emits no `ask.reply` record.
+class _ParkedAskStore extends PendingAskStore {
+  @override
+  Map<String, PendingAsk> build() => <String, PendingAsk>{
+        's1': const PendingAsk(askId: 'a1', question: 'which?', options: <String>[]),
+      };
+}
+
 void main() {
   /// Pumps the app logged in at [size]; each test gets its own container and
   /// therefore its own Mock services. [chat] swaps the chat binding (the
-  /// failed-turn shape's stub; the mock never fails).
+  /// failed-turn shape's stub; the mock never fails). [extraOverrides] rides
+  /// the container verbatim (the ask card's pre-seeded pending-ask store).
   Future<ProviderContainer> pumpChat(
     WidgetTester tester,
     Size size, {
     MockSettingsService? settings,
     ChatService? chat,
+    List<Override> extraOverrides = const <Override>[],
   }) async {
     final AuthState authenticator = AuthState();
     final ProviderContainer container = ProviderContainer(
@@ -144,6 +188,7 @@ void main() {
         authStateProvider.overrideWith((_) => authenticator),
         if (settings != null) settingsProvider.overrideWith((_) => settings),
         if (chat != null) chatServiceProvider.overrideWith((_) => chat),
+        ...extraOverrides,
       ],
     );
     addTearDown(container.dispose);
@@ -174,6 +219,14 @@ void main() {
     await tester.pump();
     await tester.tap(find.byKey(const Key('composer.send')));
     await tester.pump();
+  }
+
+  /// The scripted ask's setup (send 'plan <...>' → the mock parks the
+  /// plan-gate ask through the SAME pending-ask-store path).
+  Future<void> sendPlanPhrase(WidgetTester tester) async {
+    await sendDraft(tester, 'plan the refactor');
+    await tester.pump(const Duration(milliseconds: 2000)); // the typing window
+    await tester.pumpAndSettle();
   }
 
   group('the send flow through the real Mock services', () {
@@ -1036,6 +1089,102 @@ void main() {
           matching: find.text('The Fermi Paradox'),
         ),
         findsOneWidget,
+      );
+    });
+  });
+
+  group('the ask card (the escalation slice)', () {
+    testWidgets('the pending ask renders as a card — the question, the two '
+        'options; reject ABSENT because the options carry it',
+        (WidgetTester tester) async {
+      await pumpChat(tester, const Size(1100, 800));
+      await sendPlanPhrase(tester);
+
+      expect(find.byKey(const Key('chat.ask-card')), findsOneWidget);
+      expect(find.text('Approve this plan?'), findsOneWidget);
+      expect(find.byKey(const Key('chat.ask-option-0')), findsOneWidget);
+      expect(find.byKey(const Key('chat.ask-option-1')), findsOneWidget);
+      expect(find.byKey(const Key('chat.ask-reject')), findsNothing);
+    });
+
+    testWidgets('option tap posts the LABEL as the value; the card clears '
+        'on the ask.reply record and the approval reply lands',
+        (WidgetTester tester) async {
+      await pumpChat(tester, const Size(1100, 800));
+      await sendPlanPhrase(tester);
+
+      await tester.tap(find.byKey(const Key('chat.ask-option-0')));
+      await tester.pumpAndSettle();
+
+      // The mock's answerAsk clears the parked ask (its face of the
+      // `ask.reply` record) and writes the acknowledgment into the session.
+      expect(find.byKey(const Key('chat.ask-card')), findsNothing);
+      expect(find.text(mockPlanApprovedReply), findsOneWidget);
+    });
+
+    testWidgets('free text posts the TYPED value ("type a different answer")',
+        (WidgetTester tester) async {
+      await pumpChat(tester, const Size(1100, 800));
+      await sendPlanPhrase(tester);
+
+      await tester.enterText(
+        find.byKey(const Key('chat.ask-free')),
+        'approve it, but step 2 first',
+      );
+      await tester.pump();
+      await tester.tap(find.byKey(const Key('chat.ask-send-free')));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('chat.ask-card')), findsNothing);
+      expect(find.text(mockPlanApprovedReply), findsOneWidget);
+    });
+
+    testWidgets('a no-options ask shows the reject; the silent-drop corner: '
+        'a DELIVERED ack re-enables but the card clears only on the record',
+        (WidgetTester tester) async {
+      final _RecordingAskService service = _RecordingAskService();
+      await pumpChat(
+        tester,
+        const Size(1100, 800),
+        chat: service,
+        extraOverrides: <Override>[
+          pendingAskProvider.overrideWith(_ParkedAskStore.new),
+        ],
+      );
+
+      expect(find.byKey(const Key('chat.ask-card')), findsOneWidget);
+      expect(find.text('which?'), findsOneWidget);
+      final TextButton reject =
+          tester.widget<TextButton>(find.byKey(const Key('chat.ask-reject')));
+      expect(reject.onPressed, isNotNull);
+      // The options are empty, so the option keys must not exist.
+      expect(find.byKey(const Key('chat.ask-option-0')), findsNothing);
+
+      // The card is the canvas's last row — bring the bottom anchor in
+      // (the auto-scroll ran for the message, not for the mounted card).
+      await tester.ensureVisible(find.byKey(const Key('chat.ask-reject')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('chat.ask-reject')));
+      await tester.pumpAndSettle();
+
+      // The tap posted decision 1 with the empty value (the engine's
+      // default refusal wording rides the value's emptiness).
+      expect(service.requests, hasLength(1));
+      expect(service.requests.single.sid, 's1');
+      expect(service.requests.single.askId, 'a1');
+      expect(service.requests.single.reject, isTrue);
+      expect(service.requests.single.value, isEmpty);
+
+      // THE PIN (§3): the op answered DELIVERED but no `ask.reply` record
+      // ever arrived — the card REMAINS (no local clear), busy released,
+      // retryable, and no error line (delivered was the answer).
+      expect(find.byKey(const Key('chat.ask-card')), findsOneWidget);
+      final TextButton retry =
+          tester.widget<TextButton>(find.byKey(const Key('chat.ask-reject')));
+      expect(retry.onPressed, isNotNull);
+      expect(
+        find.text('not delivered — the session may be gone'),
+        findsNothing,
       );
     });
   });
