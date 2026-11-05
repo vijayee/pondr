@@ -73,9 +73,9 @@ handler, and `SaClientNative.askReply(...)` (:840 area). The op's completion rid
   needed — the label rides verbatim).
 - Free-text: a one-line input + send affordance ("type a different answer"); posting uses the
   typed value.
-- Reject: when the ask's own options list LACKS a reject-shaped entry, the card always shows a
-  text button "reject" → `askReply(..., 1, value)` (empty value → the engine's default refusal
-  wording).
+- Reject: the card shows its own reject affordance when the ask's options are EMPTY; an options
+  list that merely lacks a reject-shaped entry is not detected (recorded). The reject posts
+  `askReply(..., 1, value)` (empty value → the engine's default refusal wording).
 - In-flight: buttons disable + a spinner line until the op resolves; then either the card
   clears (delivered) or the error line + re-enabled buttons (not delivered).
 - The silent-drop corner (pinned): a DELIVERED ack re-enables the buttons immediately, but the
