@@ -305,7 +305,8 @@ class _AskButton extends StatelessWidget {
 }
 
 /// The free-text send affordance — the composer's 32×32 send button
-/// verbatim (the send icon on `#E0EFE4`, disabled at 0.4 with onTap null).
+/// verbatim (`composer.dart`'s `_SendButton`: the send icon on `#E0EFE4`,
+/// the glow only while sendable, disabled at 0.4 with onTap null).
 class _AskSendButton extends StatelessWidget {
   const _AskSendButton({
     required this.inkKey,
@@ -334,15 +335,25 @@ class _AskSendButton extends StatelessWidget {
             key: inkKey,
             onTap: onTap,
             borderRadius: BorderRadius.circular(8),
-            child: const SizedBox(
+            child: Container(
               width: 32,
               height: 32,
-              child: Center(
-                child: Icon(
-                  Icons.send,
-                  size: 15,
-                  color: Color(0xFF0C0B1A),
-                ),
+              decoration: enabled
+                  ? const BoxDecoration(
+                      boxShadow: <BoxShadow>[
+                        BoxShadow(
+                          color: Color(0x80E0EFE4),
+                          blurRadius: 14,
+                          offset: Offset(0, 2),
+                        ),
+                      ],
+                    )
+                  : null,
+              alignment: Alignment.center,
+              child: const Icon(
+                Icons.send,
+                size: 15,
+                color: Color(0xFF0C0B1A),
               ),
             ),
           ),

@@ -133,12 +133,18 @@ class _FailedChatService implements ChatService {
 }
 
 /// The ask-op recorder (the card's contract probe): every [answerAsk] call
-/// lands in [requests] verbatim; the op answers DELIVERED. Nothing ever
+/// lands in [requests] verbatim; the op answers DELIVERED unless
+/// [answersDelivered] is flipped false (the not-delivered line's stub), or
+/// [throwsOnAnswer] is set (the catch contract — services.dart rejects the
+/// future with a thrown StateError when the client is gone). Nothing ever
 /// emits an `ask.reply` record — no store, no stream, no clear — which is
 /// exactly the silent-drop corner the card's pinned test exercises.
 class _RecordingAskService implements ChatService {
   final List<({String sid, String askId, bool reject, String value})> requests =
       <({String sid, String askId, bool reject, String value})>[];
+
+  bool answersDelivered = true;
+  bool throwsOnAnswer = false;
 
   @override
   Future<bool> answerAsk({
@@ -148,7 +154,10 @@ class _RecordingAskService implements ChatService {
     required String value,
   }) {
     requests.add((sid: sid, askId: askId, reject: reject, value: value));
-    return Future<bool>.value(true);
+    if (throwsOnAnswer) {
+      throw StateError('the client is not connected');
+    }
+    return Future<bool>.value(answersDelivered);
   }
 
   @override
@@ -1186,6 +1195,68 @@ void main() {
         find.text('not delivered — the session may be gone'),
         findsNothing,
       );
+    });
+
+    testWidgets('a false answer shows the not-delivered line: busy released, '
+        'the reject retryable, the card remains', (WidgetTester tester) async {
+      final _RecordingAskService service = _RecordingAskService()
+        ..answersDelivered = false;
+      await pumpChat(
+        tester,
+        const Size(1100, 800),
+        chat: service,
+        extraOverrides: <Override>[
+          pendingAskProvider.overrideWith(_ParkedAskStore.new),
+        ],
+      );
+
+      await tester.ensureVisible(find.byKey(const Key('chat.ask-reject')));
+      await tester.tap(find.byKey(const Key('chat.ask-reject')));
+      await tester.pumpAndSettle();
+
+      expect(service.requests, hasLength(1));
+      // The op answered DELIVERED=false — the error line rides, the busy
+      // released with the controls re-enabled (retryable), and the card
+      // stays (no record ever cleared it).
+      expect(
+        find.text('not delivered — the session may be gone'),
+        findsOneWidget,
+      );
+      final TextButton retry =
+          tester.widget<TextButton>(find.byKey(const Key('chat.ask-reject')));
+      expect(retry.onPressed, isNotNull);
+      expect(find.byKey(const Key('chat.ask-card')), findsOneWidget);
+    });
+
+    testWidgets('a THROWN StateError counts as not delivered too (the catch '
+        'contract): the same line, the retryable reject, the card remains',
+        (WidgetTester tester) async {
+      final _RecordingAskService service = _RecordingAskService()
+        ..throwsOnAnswer = true;
+      await pumpChat(
+        tester,
+        const Size(1100, 800),
+        chat: service,
+        extraOverrides: <Override>[
+          pendingAskProvider.overrideWith(_ParkedAskStore.new),
+        ],
+      );
+
+      await tester.ensureVisible(find.byKey(const Key('chat.ask-reject')));
+      await tester.tap(find.byKey(const Key('chat.ask-reject')));
+      await tester.pumpAndSettle();
+
+      expect(service.requests, hasLength(1));
+      // The future REJECTED with StateError — the card folds it into the
+      // same not-delivered shape as a false answer (services.dart's doc).
+      expect(
+        find.text('not delivered — the session may be gone'),
+        findsOneWidget,
+      );
+      final TextButton retry =
+          tester.widget<TextButton>(find.byKey(const Key('chat.ask-reject')));
+      expect(retry.onPressed, isNotNull);
+      expect(find.byKey(const Key('chat.ask-card')), findsOneWidget);
     });
   });
 }
