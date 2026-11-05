@@ -133,7 +133,8 @@ class MockChatService implements ChatService {
   /// correct askId consumes it (the reply records clear the store), writes
   /// the acknowledgment as the session's assistant message, and answers
   /// delivered; anything else (no ask, wrong askId, already consumed)
-  /// answers false.
+  /// answers false. [value] rides for the interface — the mock's scripted
+  /// reply text ignores it (the reject/answer wording is const).
   @override
   Future<bool> answerAsk({
     required String sid,
@@ -274,8 +275,9 @@ class MockChatService implements ChatService {
         _pendingMockAsk[capturedId] = ask;
         _asks.add(AskUpsert(capturedId, ask));
       }
-      // Deleted mid-typing → no write, no ask, no ChatDone (the pool
-      // reply path's absent-target rule, and the parked turn still opens).
+      // Deleted mid-typing → no write, no ask, and (unlike the pool path,
+      // which still yields ChatDone) no ChatDone — a parked turn cannot
+      // open into a deleted session: the ask was its whole face.
       return;
     }
 
