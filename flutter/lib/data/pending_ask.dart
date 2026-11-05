@@ -68,7 +68,9 @@ sealed class AskEvent {
 /// REPLACEMENT ask must be seen as a change even when its fields match the
 /// old one's (fresh list identity each upsert). The stream is broadcast and
 /// UNBUFFERED — an ask record landing before anything watches the store is
-/// dropped; the session's re-subscription replay recovers it in practice.
+/// dropped; recovery is an app RESTART (a fresh fold state) or the next
+/// turn's stream — a same-run re-subscribe replays nothing (the fold's
+/// (sid, seq) dedupe never clears, so a replay re-folds nothing).
 class PendingAskStore extends Notifier<Map<String, PendingAsk>> {
   @override
   Map<String, PendingAsk> build() {

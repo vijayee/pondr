@@ -1,8 +1,9 @@
 /// The pending ask's card (`docs/ask-ux-spec.md` §3): the escalation slice's
 /// owner surface, rendered by [MessageCanvas] as the canvas's last row. The
 /// card holds the question, the plan block, the ask's own option buttons,
-/// the free-text escape, and — only when the ask's options LACK a
-/// reject-shaped entry — the explicit reject. The store
+/// the free-text escape, and — only when the ask's options are EMPTY —
+/// the explicit reject (a list merely lacking a reject-shaped entry is not
+/// detected). The store
 /// (`lib/data/pending_ask.dart`) is the card's single source of truth: the
 /// card never clears itself, whatever the reply op's future answers.
 library;
@@ -199,8 +200,9 @@ class _AskCardState extends ConsumerState<AskCard> {
                 ),
               ],
             ),
-            // The explicit reject ONLY when the ask's own options lack a
-            // reject-shaped entry (`askReply(..., 1, '')`).
+            // The explicit reject ONLY when the ask's options are EMPTY
+            // (`askReply(..., 1, '')`); a list merely lacking a
+            // reject-shaped entry is not detected (recorded).
             if (ask.options.isEmpty)
               Align(
                 alignment: Alignment.centerLeft,

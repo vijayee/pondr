@@ -38,7 +38,8 @@ surfaces the ask as an inline card and posts replies through the FFI op isolate.
    otherwise done/report (`ffi_chat_service.dart:429-445`). Reason kind **`blocked`** → the turn
    is LEFT OPEN — no ChatFailed, no ChatDone. The pending-ask card IS that turn's face until the
    reply re-enters and the next terminal arrives. (Today a parked turn would render
-   report-less-done.)
+   report-less-done.) WHILE a turn is parked, the send flow's typing indicator honestly rides —
+   nothing feeds a terminal until the reply's turn terminal arrives (the parked turn is open).
 3. `type == "ask.reply"` → clear that sid's store entry. The RESOLUTION record itself renders no
    canvas text: the answer's user-side `msg.append` record ALREADY lands as an ordinary bubble
    (the engine composes it in the same batch) — the conversation shows "you: Approve" naturally.
@@ -88,7 +89,9 @@ handler, and `SaClientNative.askReply(...)` (:840 area). The op's completion rid
 `MockChatService` (flutter/lib/data/mock/mock_services.dart:105) gains a scripted ask: a magic
 phrase ("plan") makes its reply flow emit a plan-gate-shaped ask (question "Approve this plan?",
 options `["Approve", "Reject"]`, a small plan text) through the SAME store path; answering
-resumes the normal mock typing/reply flow. Mock implements the same PendingAskStore contract so
+(`answerAsk`) writes the assistant reply straight into the session store — no typing beat (the
+send stream already ended with the ask; `value` rides the interface, but the mock's scripted
+reply text is const). Mock implements the same PendingAskStore contract so
 view tests drive the card without the C side.
 
 ## 5. Tests (the standing bar: `flutter analyze` zero + `flutter test`)
