@@ -129,7 +129,9 @@ abstract class ChatService {
   /// the frame's mailbox — the ack contract is bind/post only: the CARD
   /// clears on the `ask.reply` RECORD's arrival, never on this future; a
   /// delivered:false or a transport failure answers false and the card
-  /// stays retryable).
+  /// stays retryable). A not-yet-connected or disposed client REJECTS the
+  /// future with a thrown StateError instead — the card must also tolerate
+  /// that; the record stays the truth either way.
   Future<bool> answerAsk({
     required String sid,
     required String askId,

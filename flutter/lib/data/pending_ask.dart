@@ -66,7 +66,9 @@ sealed class AskEvent {
 /// stores' idiom) — an [AskUpsert] parks the sid's ask, an [AskCleared]
 /// drops it. [PendingAsk] has no identity-based equality on purpose: the
 /// REPLACEMENT ask must be seen as a change even when its fields match the
-/// old one's (fresh list identity each upsert).
+/// old one's (fresh list identity each upsert). The stream is broadcast and
+/// UNBUFFERED — an ask record landing before anything watches the store is
+/// dropped; the session's re-subscription replay recovers it in practice.
 class PendingAskStore extends Notifier<Map<String, PendingAsk>> {
   @override
   Map<String, PendingAsk> build() {

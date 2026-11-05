@@ -161,7 +161,9 @@ final class FfiChatService implements ChatService {
     _eventSub?.cancel();
     _failureSub?.cancel();
     _changeSub?.cancel();
-    unawaited(_asks.close());
+    if (!_asks.isClosed) {
+      unawaited(_asks.close());
+    }
     for (final queue in _waiters.values) {
       while (queue.isNotEmpty) {
         final waiter = queue.removeFirst();
