@@ -23,6 +23,7 @@ import 'package:pondr/data/daemon/ffi_settings_service.dart';
 import 'package:pondr/data/daemon/ffi_sessions_service.dart';
 import 'package:pondr/data/mock/mock_services.dart';
 import 'package:pondr/data/models.dart' hide Provider;
+import 'package:pondr/data/pending_ask.dart';
 import 'package:pondr/data/models.dart' as mockup show Provider;
 import 'package:pondr/data/services.dart';
 import 'package:pondr/ffi/sa_client_binding.dart';
@@ -101,7 +102,7 @@ Future<(SaClientNative, FakeSaFfi)> connectFake([
 /// controller, the supervisor's `events` fan-out's role in production.
 final class ChatHarness {
   ChatHarness._(this.client, this.fake, this.sessions, this.chat, this.events,
-      this.failures);
+      this.failures, this.asks, this._asksSub);
 
   final SaClientNative client;
   final FakeSaFfi fake;
@@ -114,11 +115,21 @@ final class ChatHarness {
   /// The raw failures (the DISCONNECTED shape's producer in a test).
   final StreamController<SaFailure> failures;
 
+  /// The fold's ask surface, as the pending-ask STORE reads it: the
+  /// service's EMITTING is what these pins own (the store's provider
+  /// composition is view-test territory) — the harness subscribes
+  /// [FfiChatService.asks] and folds the events into this map exactly the
+  /// way [PendingAskStore] does.
+  final Map<String, PendingAsk> asks;
+
+  final StreamSubscription<Object> _asksSub;
+
   /// One record's fold (the daemon's store-notify shape).
   void emit(String sid, int seq, String? recordJson) => events
       .add(SaEventRecord(sid: sid, seq: seq, op: 0, recordJson: recordJson));
 
   void dispose() {
+    _asksSub.cancel();
     chat.dispose();
     events.close();
     failures.close();
@@ -137,7 +148,25 @@ Future<ChatHarness> chatHarness() async {
     events: events.stream,
     failures: failures.stream,
   );
-  return ChatHarness._(client, fake, sessions, chat, events, failures);
+  final asks = <String, PendingAsk>{};
+  final asksSub = chat.asks().listen((Object event) {
+    switch (event) {
+      case AskUpsert(:final sid, :final ask):
+        asks[sid] = ask;
+      case AskCleared(:final sid):
+        asks.remove(sid);
+    }
+  });
+  return ChatHarness._(
+    client,
+    fake,
+    sessions,
+    chat,
+    events,
+    failures,
+    asks,
+    asksSub,
+  );
 }
 
 /// A sessions-only harness (the fold's store reads).
@@ -885,6 +914,205 @@ void main() {
       ));
       await secondDone.future.timeout(const Duration(seconds: 2));
       expect((second.last as ChatDone).content, 'the next reply');
+      harness.dispose();
+    });
+
+    test('THE PARKED ASK: an ask record upserts the store and a turn.end '
+        '{blocked} keeps the turn OPEN — no done, no failed, the report '
+        'queue untouched', () async {
+      final harness = await chatHarness();
+      final chat = harness.chat;
+      final fake = harness.fake;
+      final sessions = harness.sessions;
+      final rawEvents = harness.events;
+
+      fake.listed = <FakeRow>[
+        (
+          sid: 'sessions/a',
+          status: 'running',
+          goal: '',
+          created: 10,
+          depth: 1,
+        ),
+      ];
+      await sessions.refresh();
+      sessions.select('sessions/a');
+      fake.promptSid = ''; // the steer's queued registration
+      final collected = <ChatEvent>[];
+      final done = Completer<void>();
+      late final StreamSubscription<ChatEvent> sub;
+      sub = chat.send('make it fast', const <AttachedFile>[]).listen(
+          collected.add,
+          onDone: () {
+            sub.cancel();
+            done.complete();
+          }, onError: done.completeError);
+      await drain();
+      var seq = 0;
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/a',
+        seq: ++seq,
+        op: 0,
+        recordJson: msgRecord('user', 'make it fast'),
+      ));
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/a',
+        seq: ++seq,
+        op: 0,
+        recordJson: jsonEncode(<String, dynamic>{
+          'type': 'ask',
+          'payload': <String, dynamic>{
+            'askId': 'a1b2c3d4',
+            'question': 'Approve this plan?',
+            'options': <String>['Approve', 'Reject'],
+            'plan': '1. measure',
+          },
+        }),
+      ));
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/a',
+        seq: ++seq,
+        op: 0,
+        recordJson: turnEndRecord('blocked'),
+      ));
+      await drain();
+      // THE TURN STAYS OPEN: no ChatDone, no ChatFailed fed — the parked
+      // turn's face is the pending-ask card, not a terminal.
+      expect(done.isCompleted, isFalse,
+          reason: 'the blocked closer settles nothing — the turn waits for '
+              'the reply re-entry');
+      expect(collected, hasLength(1),
+          reason: 'the typing rode the send, and NOTHING else arrived');
+      // THE PARKED ASK is on the fold's ask stream (the store's feed).
+      expect(harness.asks['sessions/a']?.askId, 'a1b2c3d4');
+      expect(harness.asks['sessions/a']?.question, 'Approve this plan?');
+      expect(harness.asks['sessions/a']?.options,
+          <String>['Approve', 'Reject']);
+      expect(harness.asks['sessions/a']?.plan, '1. measure');
+
+      // The reply re-enters: the ask.reply record clears the store, the
+      // answer's user bubble rides its own msg.append, and the post-reply
+      // turn's closer consumes the report that arrived AFTER the blocked
+      // closer (the blocked terminal never touched the queue).
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/a',
+        seq: ++seq,
+        op: 0,
+        recordJson: jsonEncode(<String, dynamic>{
+          'type': 'ask.reply',
+          'payload': <String, dynamic>{
+            'askId': 'a1b2c3d4',
+            'decision': 'answer',
+            'value': 'Approve',
+          },
+        }),
+      ));
+      await drain();
+      expect(harness.asks['sessions/a'], isNull,
+          reason: 'the ask.reply record clears the parked ask');
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/a',
+        seq: ++seq,
+        op: 0,
+        recordJson: msgRecord('user', 'Approve'),
+      ));
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/a',
+        seq: ++seq,
+        op: 0,
+        recordJson: reportRecord('the resumed turn finished'),
+      ));
+      rawEvents.add(SaEventRecord(
+        sid: 'sessions/a',
+        seq: ++seq,
+        op: 0,
+        recordJson: turnEndRecord('completed'),
+      ));
+      await done.future.timeout(const Duration(seconds: 2));
+      expect((collected.last as ChatDone).content, 'the resumed turn finished',
+          reason: 'the report queued behind the blocked closer rides the '
+              'post-reply turn\'s done');
+      expect(messagesOf(sessions, 'sessions/a').map((m) => m.content).toList(),
+          <String>['make it fast', 'Approve'],
+          reason: 'the RESOLUTION record renders no canvas text — the '
+              'answer\'s user bubble is its own msg.append');
+      harness.dispose();
+    });
+
+    test('the ask.reply clears the store and the answer bubble rides '
+        'msg.append (the plain-emits shape)', () async {
+      final harness = await chatHarness();
+      final sessions = harness.sessions;
+
+      harness.emit(
+        'sessions/s1',
+        1,
+        msgRecord('user', 'make it fast'),
+      );
+      harness.emit(
+        'sessions/s1',
+        2,
+        jsonEncode(<String, dynamic>{
+          'type': 'ask',
+          'payload': <String, dynamic>{
+            'askId': 'a1b2c3d4',
+            'question': 'Approve this plan?',
+            'options': <String>['Approve', 'Reject'],
+          },
+        }),
+      );
+      await drain();
+      expect(harness.asks['sessions/s1']?.askId, 'a1b2c3d4');
+      expect(harness.asks['sessions/s1']?.plan, isNull,
+          reason: 'an optionless-plan ask rides a null plan');
+      // The daemon's reply batch: the ask.reply record, then the answer's
+      // own user bubble record.
+      harness.emit(
+        'sessions/s1',
+        3,
+        jsonEncode(<String, dynamic>{
+          'type': 'ask.reply',
+          'payload': <String, dynamic>{
+            'askId': 'a1b2c3d4',
+            'decision': 'answer',
+            'value': 'Approve',
+          },
+        }),
+      );
+      harness.emit(
+        'sessions/s1',
+        4,
+        msgRecord('user', 'Approve'),
+      );
+      await drain();
+      expect(harness.asks['sessions/s1'], isNull);
+      final stored = messagesOf(sessions, 'sessions/s1');
+      expect(stored.map((m) => m.content).toList(),
+          <String>['make it fast', 'Approve']);
+      expect(stored.last.role, MessageRole.user,
+          reason: 'the answer lands as an ordinary user bubble');
+      harness.dispose();
+    });
+
+    test('a garbled ask record never mounts (the honest raw-record '
+        'fallback covers it)', () async {
+      final harness = await chatHarness();
+
+      harness.emit(
+        'sessions/g1',
+        1,
+        '{"type":"ask","payload":{"question":"no id"}}',
+      );
+      harness.emit(
+        'sessions/g2',
+        1,
+        '{"type":"ask","payload":{"askId":"a1b2c3d4"}}',
+      );
+      harness.emit('sessions/g3', 1, '{"type":"ask","payload":"junk"}');
+      harness.emit('sessions/g4', 1, '{"type":"ask"}');
+      await drain();
+      expect(harness.asks, isEmpty,
+          reason: 'an unparseable ask folds nothing — the card never mounts');
       harness.dispose();
     });
   });

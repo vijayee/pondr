@@ -116,6 +116,26 @@ abstract class ChatService {
   /// The session writes go through the session store, so its change stream
   /// fires on both steps.
   Stream<ChatEvent> send(String text, List<AttachedFile> files);
+
+  /// The ask stream (the escalation slice's parked ask —
+  /// `docs/ask-ux-spec.md` §1): the `ask` record's [AskUpsert] and the
+  /// `ask.reply` record's [AskCleared], one broadcast per service. Typed
+  /// `Object` because the event models live beside the pending-ask store
+  /// (`pending_ask.dart`) — the interface stays model-free; the store
+  /// switches on the runtime type. A garbled ask record emits nothing.
+  Stream<Object> asks();
+
+  /// Reply to the sid's parked ask. true = DELIVERED (the answer entered
+  /// the frame's mailbox — the ack contract is bind/post only: the CARD
+  /// clears on the `ask.reply` RECORD's arrival, never on this future; a
+  /// delivered:false or a transport failure answers false and the card
+  /// stays retryable).
+  Future<bool> answerAsk({
+    required String sid,
+    required String askId,
+    required bool reject,
+    required String value,
+  });
 }
 
 abstract class SettingsService {

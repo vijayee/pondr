@@ -112,6 +112,20 @@ class _FailedChatService implements ChatService {
     await Future<void>.delayed(const Duration(milliseconds: 100));
     yield const ChatFailed('the model refused');
   }
+
+  // The ask surface rides no failure shape — an empty stream (this stub
+  // exists for the composer's ChatFailed handling only).
+  @override
+  Stream<Object> asks() => const Stream<Object>.empty();
+
+  @override
+  Future<bool> answerAsk({
+    required String sid,
+    required String askId,
+    required bool reject,
+    required String value,
+  }) =>
+      Future<bool>.value(true);
 }
 
 void main() {

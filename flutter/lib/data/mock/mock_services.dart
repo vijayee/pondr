@@ -113,6 +113,26 @@ class MockChatService implements ChatService {
   final MockSessionsService _sessions;
   final Random _random;
 
+  /// The ask stream's fan-out (the escalation slice). EMPTY until Task 3's
+  /// scripted plan-gate ask emits through it — the interface's contract
+  /// compiles today; the scripted ask rides the SAME pending-ask-store
+  /// path as the daemon's record fold.
+  final StreamController<Object> _asks = StreamController<Object>.broadcast();
+
+  @override
+  Stream<Object> asks() => _asks.stream;
+
+  /// The reply op's mock shape: always delivered (the mock's scripted ask
+  /// always resumes — Task 3 replaces this stub with the scripted flow).
+  @override
+  Future<bool> answerAsk({
+    required String sid,
+    required String askId,
+    required bool reject,
+    required String value,
+  }) =>
+      Future<bool>.value(true);
+
   /// The message-id monotonic guard. The export's `m${Date.now()}` collides
   /// when two messages compose in the same millisecond: a test's fake-async
   /// pump lands the whole 1100-1799 ms typing delay inside one real

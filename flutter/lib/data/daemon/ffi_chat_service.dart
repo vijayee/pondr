@@ -24,8 +24,16 @@
 /// completes it with a [ChatFailed] (the fold also writes the dimmed
 /// assistant line the view renders). A `turn.end` that arrives after its
 /// turn's assistant `msg.append` already fed the waiter settles nothing —
-/// the fed turn's own closer passes. The remaining cell/control records
-/// fold nothing — the chat view never sees them.
+/// the fed turn's own closer passes. THE BLOCKED TERMINAL (the escalation
+/// slice): a `turn.end {blocked}` — the frame parked on an owner ask —
+/// closes NOTHING; the turn stays open (no [ChatDone], no [ChatFailed],
+/// and the report queue is left for the post-reply turn's closer) until
+/// the reply re-enters and the next terminal arrives. THE ASKS: an `ask`
+/// record upserts the sid's [PendingAsk] through [FfiChatService.asks]
+/// (the pending-ask store's feed — last-writer-wins per sid), an
+/// `ask.reply` record clears it; a garbled ask record emits nothing. The
+/// remaining cell/control records fold nothing — the chat view never sees
+/// them.
 ///
 /// THE SUBSCRIPTION POLICY: the C contract is ONE active subscription per
 /// client, so the service follows the ACTIVE session ([_focus]; the
@@ -45,6 +53,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 
+import 'package:pondr/data/pending_ask.dart';
 import 'package:pondr/ffi/sa_client_binding.dart';
 import 'package:pondr/ffi/sa_ffi.dart';
 
@@ -131,6 +140,12 @@ final class FfiChatService implements ChatService {
   /// Sends in the prompt-awaiting-its-create-sid window.
   int _pendingCreates = 0;
 
+  /// The asks' fan-out (the pending-ask store's feed): the `ask` record's
+  /// [AskUpsert] and the `ask.reply` record's [AskCleared]. Broadcast —
+  /// the store is the only listener in production; the tests read the map
+  /// they build from it.
+  final StreamController<Object> _asks = StreamController<Object>.broadcast();
+
   /// Focus changes serialize (the unsubscribe's marker has to land before
   /// the next subscribe's request — the C's one-subscription contract). The
   /// chain's tail CLEARS at its own completion (an equal target that
@@ -146,6 +161,7 @@ final class FfiChatService implements ChatService {
     _eventSub?.cancel();
     _failureSub?.cancel();
     _changeSub?.cancel();
+    unawaited(_asks.close());
     for (final queue in _waiters.values) {
       while (queue.isNotEmpty) {
         final waiter = queue.removeFirst();
@@ -161,6 +177,28 @@ final class FfiChatService implements ChatService {
     _changeSub = null;
     _focusJob = null;
   }
+
+  // ── the asks (the escalation slice) ─────────────────────────────────────
+
+  /// The fold's ask stream (the pending-ask store's feed). The events are
+  /// the RECORDS' shape, not the reply op's ack — see [answerAsk].
+  @override
+  Stream<Object> asks() => _asks.stream;
+
+  /// The reply op: posted through the op isolate (a button tap's shape —
+  /// NEVER from inside an events callback, the C re-entry rule). true =
+  /// DELIVERED (the reply entered the frame's mailbox). The ack contract
+  /// binds/post only: the card clears on the `ask.reply` RECORD's arrival
+  /// through [asks], never on this future — a delivered reply whose record
+  /// never lands leaves the card honest and retryable.
+  @override
+  Future<bool> answerAsk({
+    required String sid,
+    required String askId,
+    required bool reject,
+    required String value,
+  }) =>
+      _client.then((c) => c.askReply(sid, askId, reject, value));
 
   // ── the send ─────────────────────────────────────────────────────────────
 
@@ -336,6 +374,12 @@ final class FfiChatService implements ChatService {
       case 'turn.end':
         _onTurnEnd(sid, record.seq, decoded['payload']);
         return;
+      case 'ask':
+        _onAsk(sid, decoded['payload']);
+        return;
+      case 'ask.reply':
+        _onAskReply(sid, decoded['payload']);
+        return;
       default:
         return; // the cell/control records: the chat ignores them
     }
@@ -378,6 +422,48 @@ final class FfiChatService implements ChatService {
     _reports.putIfAbsent(sid, () => Queue<String>()).add(text);
   }
 
+  /// The `ask` fold (the escalation slice): the parked ask upserts the
+  /// sid's store entry through the asks stream. The strict parse — a
+  /// missing askId/question (or a non-map payload) folds NOTHING: the
+  /// standing raw-record fallback covers it and the card never mounts.
+  /// Options filter to their String entries (a malicious stream's mixed
+  /// list degrades honestly); plan rides null when absent or non-String.
+  /// The engine parks at most one ask per frame — an impossible second
+  /// record replaces (last-writer-wins), never double-mounts.
+  void _onAsk(String sid, dynamic payloadDyn) {
+    if (payloadDyn is! Map<String, dynamic>) return;
+    final askId = payloadDyn['askId'];
+    final question = payloadDyn['question'];
+    if (askId is! String || question is! String) return;
+    final options = switch (payloadDyn['options']) {
+      final List<dynamic> l => [for (final o in l) if (o is String) o],
+      _ => const <String>[],
+    };
+    final plan = switch (payloadDyn['plan']) {
+      final String s => s,
+      _ => null,
+    };
+    _asks.add(
+      AskUpsert(
+        sid,
+        PendingAsk(
+          askId: askId,
+          question: question,
+          options: options,
+          plan: plan,
+        ),
+      ),
+    );
+  }
+
+  /// The `ask.reply` fold: the answer entered the frame's mailbox — the
+  /// sid's parked ask leaves the store. The payload's own shape rides no
+  /// decision here (the RESOLUTION record renders no canvas text; the
+  /// answer's user bubble is its own `msg.append` record).
+  void _onAskReply(String sid, dynamic _) {
+    _asks.add(AskCleared(sid));
+  }
+
   /// The `turn.end` fold — THE TERMINAL: the turn's send never hangs past
   /// its closer (the finding: a report-completed or errored turn left the
   /// typing flag up until dispose).
@@ -395,6 +481,14 @@ final class FfiChatService implements ChatService {
     if (reason is! Map<String, dynamic>) return;
     final kind = reason['kind'];
     if (kind is! String) return;
+
+    // THE BLOCKED TERMINAL (the escalation slice): the frame parked on an
+    // owner ask — the turn stays OPEN. No ChatDone, no ChatFailed: the
+    // pending-ask card is this turn's face until the reply re-enters and
+    // the next terminal arrives. THE REPORT QUEUE IS UNTOUCHED: any report
+    // queued for the parked turn stays queued — the post-reply turn's
+    // closer consumes it (the blocked turn folded nothing yet).
+    if (kind == 'blocked') return;
 
     // The unread report text (FIFO — the record order's pairing), consumed
     // by THIS closer either way.
