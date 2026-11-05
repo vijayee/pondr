@@ -521,7 +521,7 @@ abstract interface class SaFfiApi {
 // ── the real implementation ─────────────────────────────────────────────────
 
 /// The real [SaFfiApi]: loads `libsa_client.so` via [resolveSaLibraryPath]
-/// and binds the eleven exports. The blocking ops are meant for the op
+/// and binds the twelve exports. The blocking ops are meant for the op
 /// isolate's runner (`sa_client_binding.dart`) — NEVER the main isolate.
 final class SaFfi implements SaFfiApi {
   SaFfi([String? path]) : _explicitPath = path;
