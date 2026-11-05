@@ -286,6 +286,24 @@ final class SaInterruptCmd extends SaOpCommand {
   final int cb;
 }
 
+final class SaAskReplyCmd extends SaOpCommand {
+  const SaAskReplyCmd(this.serial, this.sid, this.askId, this.decision,
+      this.value, this.cb);
+
+  @override
+  final int serial;
+  final String sid;
+  final String askId;
+
+  /// false = answer, true = reject (the C's uint8 0|1).
+  final bool decision;
+  final String value;
+
+  /// The ask callback's native function pointer (the interrupt-shaped cb;
+  /// an address).
+  final int cb;
+}
+
 final class SaListCmd extends SaOpCommand {
   const SaListCmd(this.serial, this.cb);
 
@@ -448,6 +466,18 @@ final class SaClientOpRunner {
       case SaInterruptCmd(:final serial, :final sid, :final cb):
         emit(SaOpDone(
             serial, api.interrupt(_clientOrBust, serial, sid, cb)));
+      case SaAskReplyCmd(
+            :final serial,
+            :final sid,
+            :final askId,
+            :final decision,
+            :final value,
+            :final cb,
+          ):
+        emit(SaOpDone(
+            serial,
+            api.askReply(_clientOrBust, serial, sid, askId,
+                decision ? 1 : 0, value, cb)));
       case SaListCmd(:final serial, :final cb):
         emit(SaOpDone(serial, api.listSessions(_clientOrBust, serial, cb)));
       case SaSubscribeCmd(:final serial, :final sid, :final cb):
@@ -720,10 +750,10 @@ enum _SaClientState { idle, connecting, ready, closing, closed }
 
 /// The op kinds the pending map distinguishes: a `doneDriven` one (subscribe
 /// / unsubscribe) resolves on its done message; the callback-driven ones
-/// (prompt / interrupt / listSessions / the config pair) resolve on their
-/// callback's listener post — and each kind names its OWN refusal shape (the
-/// C's -1 return fires no callback and carries no status).
-enum _SaOpKind { prompt, interrupt, list, subscribe, unsubscribe, configGet, configSet }
+/// (prompt / interrupt / askReply / listSessions / the config pair) resolve
+/// on their callback's listener post — and each kind names its OWN refusal
+/// shape (the C's -1 return fires no callback and carries no status).
+enum _SaOpKind { prompt, interrupt, askReply, list, subscribe, unsubscribe, configGet, configSet }
 
 /// One op's pending completion: serial-keyed. The map's remove-on-complete
 /// IS the dedup (the callback's post may land before or after the done;
@@ -741,7 +771,7 @@ final class _PendingOp {
   /// The outright refusal's value (the C's -1 return; no callback ever).
   Object? refusal(int status) => switch (kind) {
         _SaOpKind.prompt => SaPromptResult(status, ''),
-        _SaOpKind.interrupt => SaErr(status),
+        _SaOpKind.interrupt || _SaOpKind.askReply => SaErr(status),
         _SaOpKind.list => SaSessionsResult(status, const <SaSessionRecord>[]),
         _SaOpKind.subscribe || _SaOpKind.unsubscribe => SaErr(status),
         _SaOpKind.configGet || _SaOpKind.configSet =>
@@ -782,11 +812,12 @@ final class SaClientNative {
 
   StreamSubscription<SaOpEvent>? _eventsSub;
 
-  /// The six listeners (created on connect; closed at the dispose flow's
+  /// The seven listeners (created on connect; closed at the dispose flow's
   /// ack or a failed connect — a NativeCallable.listener keeps the main
   /// isolate alive until closed).
   late final ffi.NativeCallable<SaPromptCbNative> _promptCb;
   late final ffi.NativeCallable<SaInterruptCbNative> _interruptCb;
+  late final ffi.NativeCallable<SaInterruptCbNative> _askReplyCb;
   late final ffi.NativeCallable<SaSessionsCbNative> _sessionsCb;
   late final ffi.NativeCallable<SaEventsCbNative> _eventsCb;
   late final ffi.NativeCallable<SaErrorCbNative> _errorCb;
@@ -901,6 +932,20 @@ final class SaClientNative {
     return pending.future.then((value) => value! as SaResult);
   }
 
+  /// Reply to a parked owner-surface ask. Returns true when DELIVERED
+  /// (cb status 0). delivered-false (cb 1), the transport statuses (cb
+  /// 10..15), and the outright refusal (-1, mapped SaErr(-1)) all answer
+  /// false. NEVER call from inside an events callback (the C re-entry rule:
+  /// sa_client_ask_reply refuses that shape — a reply originates from a
+  /// button tap, main isolate → op isolate).
+  Future<bool> askReply(String sid, String askId, bool reject, String value) {
+    _guardReady();
+    final pending = _beginOp(_SaOpKind.askReply);
+    host.send(SaAskReplyCmd(pending.serial, sid, askId, reject, value,
+        _askReplyCb.nativeFunction.address));
+    return pending.future.then((op) => op! is SaOk);
+  }
+
   Future<SaSessionsResult> listSessions() {
     _guardReady();
     final pending = _beginOp(_SaOpKind.list);
@@ -991,6 +1036,8 @@ final class SaClientNative {
     _promptCb = ffi.NativeCallable<SaPromptCbNative>.listener(_onPrompt);
     _interruptCb =
         ffi.NativeCallable<SaInterruptCbNative>.listener(_onInterrupt);
+    _askReplyCb =
+        ffi.NativeCallable<SaInterruptCbNative>.listener(_onAskReply);
     _sessionsCb = ffi.NativeCallable<SaSessionsCbNative>.listener(_onSessions);
     _eventsCb = ffi.NativeCallable<SaEventsCbNative>.listener(_onEvent);
     _errorCb = ffi.NativeCallable<SaErrorCbNative>.listener(_onError);
@@ -1002,6 +1049,7 @@ final class SaClientNative {
     if (!_listenersOpen) return;
     _promptCb.close();
     _interruptCb.close();
+    _askReplyCb.close();
     _sessionsCb.close();
     _eventsCb.close();
     _errorCb.close();
@@ -1027,6 +1075,11 @@ final class SaClientNative {
   }
 
   void _onInterrupt(ffi.Pointer<ffi.Void> ctx, int status) {
+    _resolveOp(ctx.address,
+        status == saClientStatusOk ? const SaOk() : SaErr(status));
+  }
+
+  void _onAskReply(ffi.Pointer<ffi.Void> ctx, int status) {
     _resolveOp(ctx.address,
         status == saClientStatusOk ? const SaOk() : SaErr(status));
   }

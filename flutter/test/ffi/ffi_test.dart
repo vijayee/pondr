@@ -90,6 +90,13 @@ final class FakeSaFfi implements SaFfiApi {
   /// callback per the C's contract).
   bool configFires = true;
 
+  /// The ask-reply op's cb status the fake fires (0 = delivered, 1 =
+  /// delivered-false — the interrupt-shaped cb's contract).
+  int askDeliveredStatus = 0;
+
+  /// The recorded ask-reply decision (0 = answer, 1 = reject).
+  int? lastAskDecision;
+
   /// The recorded SET calls (the members as they rode — absent = null).
   final List<(String?, String?, String?)> configSets = <(String?, String?, String?)>[];
   int configGetCalls = 0;
@@ -219,6 +226,20 @@ final class FakeSaFfi implements SaFfiApi {
         .asFunction<SaInterruptCbDart>())(
       ffi.Pointer<ffi.Void>.fromAddress(serial),
       0,
+    );
+    return 0;
+  }
+
+  @override
+  int askReply(int client, int serial, String sid, String askId, int decision,
+      String value, int askCb) {
+    order.add('askReply(sid=$sid,ask=$askId,d=$decision,v=$value)');
+    lastAskDecision = decision;
+    // The C's contract: the callback fires BEFORE the call returns.
+    (SaFfi.nativeFn<SaInterruptCbNative>(askCb)
+        .asFunction<SaInterruptCbDart>())(
+      ffi.Pointer<ffi.Void>.fromAddress(serial),
+      askDeliveredStatus,
     );
     return 0;
   }
@@ -632,6 +653,27 @@ void main() {
       expect(releaseIndex, greaterThan(promptIndex),
           reason: 'the copy happened before the release was posted');
       await wrapper.dispose();
+    });
+
+    test('askReply round-trips delivered', () async {
+      final (wrapper, fake, _, _) = await connectHarness();
+      final delivered = await wrapper.askReply(
+          'sessions/frame-9', 'a1b2c3d4', false, 'Approve');
+      expect(delivered, isTrue);
+      expect(fake.order,
+          contains('askReply(sid=sessions/frame-9,ask=a1b2c3d4,d=0,v=Approve)'));
+      expect(fake.lastAskDecision, 0);
+      await wrapper.dispose();
+      await pump();
+    });
+
+    test('askReply not-delivered answers false', () async {
+      // the fake variant firing cb(status 1) — delivered-false
+      final (wrapper, fake, _, _) = await connectHarness();
+      fake.askDeliveredStatus = 1;
+      expect(await wrapper.askReply('s', 'a1b2c3d4', false, 'x'), isFalse);
+      await wrapper.dispose();
+      await pump();
     });
 
     test('the dedup: the callback resolves once — the opposite order too',

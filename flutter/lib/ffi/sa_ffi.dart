@@ -318,6 +318,27 @@ typedef SaInterruptFnDart = int Function(
     ffi.Pointer<ffi.NativeFunction<SaInterruptCbNative>> callback,
     ffi.Pointer<ffi.Void> ctx);
 
+/// The ask-reply op (sa_client.h's `sa_client_ask_reply`): decision 0 =
+/// answer, 1 = reject; the callback is the interrupt's own
+/// `sa_client_interrupt_cb_t` (status 0 = delivered, 1 = delivered-false,
+/// 10..15 = the transport failures).
+typedef SaAskReplyFnNative = ffi.Int32 Function(
+    ffi.Pointer<ffi.Void> client,
+    ffi.Pointer<ffi.Uint8> sid,
+    ffi.Pointer<ffi.Uint8> askId,
+    ffi.Uint8 decision,
+    ffi.Pointer<ffi.Uint8> value,
+    ffi.Pointer<ffi.NativeFunction<SaInterruptCbNative>> callback,
+    ffi.Pointer<ffi.Void> ctx);
+typedef SaAskReplyFnDart = int Function(
+    ffi.Pointer<ffi.Void> client,
+    ffi.Pointer<ffi.Uint8> sid,
+    ffi.Pointer<ffi.Uint8> askId,
+    int decision,
+    ffi.Pointer<ffi.Uint8> value,
+    ffi.Pointer<ffi.NativeFunction<SaInterruptCbNative>> callback,
+    ffi.Pointer<ffi.Void> ctx);
+
 typedef SaListSessionsFnNative = ffi.Int32 Function(
     ffi.Pointer<ffi.Void> client,
     ffi.Pointer<ffi.NativeFunction<SaSessionsCbNative>> callback,
@@ -474,6 +495,13 @@ abstract interface class SaFfiApi {
   /// through as the callback's ctx (the C passes it through untouched).
   int prompt(int client, int serial, String? sid, String text, int promptCb);
   int interrupt(int client, int serial, String sid, int interruptCb);
+
+  /// The ask-reply op: 0 = the cb fired (ctx = serial), -1 = refused loud
+  /// (no cb — the events-callback re-entry rule covers this op: a reply
+  /// must never originate from inside a C events callback).
+  int askReply(
+      int client, int serial, String sid, String askId, int decision,
+      String value, int askCb);
   int listSessions(int client, int serial, int sessionsCb);
   int subscribeEvents(int client, int serial, String sid, int eventsCb);
   int unsubscribeEvents(int client);
@@ -538,6 +566,9 @@ final class SaFfi implements SaFfiApi {
   late final _interruptFn = _theLib
       .lookupFunction<SaInterruptFnNative, SaInterruptFnDart>(
           'sa_client_interrupt');
+  late final _askReplyFn = _theLib
+      .lookupFunction<SaAskReplyFnNative, SaAskReplyFnDart>(
+          'sa_client_ask_reply');
   late final _listSessionsFn = _theLib
       .lookupFunction<SaListSessionsFnNative, SaListSessionsFnDart>(
           'sa_client_list_sessions');
@@ -655,6 +686,32 @@ final class SaFfi implements SaFfiApi {
       );
     } finally {
       SaUtf8.free(sidP);
+    }
+  }
+
+  @override
+  int askReply(
+      int client, int serial, String sid, String askId, int decision,
+      String value, int askCb) {
+    final sidP = SaUtf8.toNative(sid);
+    final askP = SaUtf8.toNative(askId);
+    final valP = SaUtf8.toNative(value);
+    try {
+      return _askReplyFn(
+        ffi.Pointer<ffi.Void>.fromAddress(client),
+        sidP,
+        askP,
+        decision,
+        valP,
+        SaFfi.nativeFn<SaInterruptCbNative>(askCb),
+        ffi.Pointer<ffi.Void>.fromAddress(serial),
+      );
+    } finally {
+      // The C dups all three strings at entry (sa_client_ask_reply) — the
+      // caller's buffers are consumed by the time the call returns.
+      SaUtf8.free(sidP);
+      SaUtf8.free(askP);
+      SaUtf8.free(valP);
     }
   }
 
