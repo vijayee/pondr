@@ -6,6 +6,9 @@ Related work:
 
 - `docs/ICM_intent_store_spec.md`
 - `docs/ICM_final_report.md`
+- `docs/ICM_predicate_intent_model_plan.md`
+- `docs/ICM_frontier_parent_child_architecture.md`
+- `docs/ICM_frontier_parent_child_plan.md`
 - `icm/spo_extract.py`
 - `icm/intent_keys.py`
 - `icm/intent_query.py`
