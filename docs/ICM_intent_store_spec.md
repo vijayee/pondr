@@ -3,6 +3,8 @@
 *Date:* 18 October 2026
 *Status:* Derived from measured results (ICM_phase_report.md addenda 14–23)
 *Audience:* whoever builds the next iteration
+*Related proposal:* `docs/ICM_predicate_intent_model.md` and
+`docs/ICM_predicate_intent_model_plan.md`
 
 ---
 
