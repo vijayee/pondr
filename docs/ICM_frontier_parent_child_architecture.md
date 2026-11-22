@@ -6,6 +6,7 @@ Related work:
 
 - `docs/ICM_predicate_intent_model.md`
 - `docs/ICM_predicate_intent_model_plan.md`
+- `docs/SEMANTIC_CARTOGRAPHY.md`
 - `docs/ICM_intent_store_spec.md`
 - `docs/ICM_final_report.md`
 - GrassmannFlow stage-6 vector-index prototype
