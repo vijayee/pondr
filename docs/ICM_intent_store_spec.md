@@ -6,8 +6,9 @@
 *Related proposal:* `docs/ICM_predicate_intent_model.md`,
 `docs/ICM_predicate_intent_model_plan.md`,
 `docs/ICM_frontier_parent_child_architecture.md`,
-`docs/ICM_frontier_parent_child_plan.md`, and
-`docs/SEMANTIC_CARTOGRAPHY.md`
+`docs/ICM_frontier_parent_child_plan.md`,
+`docs/SEMANTIC_CARTOGRAPHY.md`, and
+`docs/ALIEN_SAMPLING.md`
 
 ---
 

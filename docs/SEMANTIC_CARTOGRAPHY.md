@@ -20,6 +20,7 @@ External evidence:
 - [Dynamic Chunking for End-to-End Hierarchical Sequence Modeling](https://arxiv.org/abs/2507.07955)
 - [From Tokens to Bytes I: Scaling Hierarchical Networks](https://www.cartesia.ai/blog/from-tokens-to-bytes-part-1)
 - [From Tokens to Bytes II: Learning from Raw Data](https://www.cartesia.ai/blog/from-tokens-to-bytes-part-2)
+- [The Alien Space of Science: Sampling Coherent but Cognitively Unavailable Research Directions](https://arxiv.org/html/2603.01092)
 
 Downstream application notes:
 
@@ -148,6 +149,33 @@ H-Net does not prove universal cross-model semantic alignment. It shows that
 a learned interface can approximate another model’s internal representation
 space. Cross-model route transfer still needs shared landmarks, alignment,
 and verification.
+
+### 2.2 Alien sampling as artificial curiosity
+
+The Alien Space of Science paper supplies a complementary exploration policy.
+It separates:
+
+```text
+coherence:   whether a direction is plausible
+availability: whether a community is likely to produce it
+```
+
+For semantic cartography, this means a route need not be selected only because
+it is familiar or similar. A model can deliberately sample:
+
+```text
+high-coherence, low-availability routes
+```
+
+This is a candidate mechanism for artificial curiosity. The coherence model
+acts like intuition about which routes make sense; the availability model acts
+like a measure of which routes the model has already explored.
+
+The sampler is not a guarantee of truth or novelty. Availability is relative
+to a specified model family, corpus, and time window. Candidate routes still
+need execution and outcome verification.
+
+The full experiment and implementation roadmap is in `ops/ALIEN_SAMPLING.md`.
 
 ---
 

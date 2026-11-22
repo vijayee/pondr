@@ -326,6 +326,61 @@ Deliverable:
 docs/ICM_parent_child_security_plan.md
 ```
 
+### Workstream 11 — Alien sampling for artificial curiosity
+
+Use the parent’s reasoning routes to learn two scores:
+
+```text
+coherence(route):
+    whether the route is a viable procedure
+
+availability(route):
+    how often the model or model family has used it
+```
+
+Then sample:
+
+```text
+high-coherence, low-availability routes
+```
+
+The child executes candidate routes in a sandbox and verifies outcomes before
+promoting them to useful memory. This is an active-learning and curriculum
+mechanism, not a claim of general intuition.
+
+Evaluate against:
+
+```text
+dense similarity
+intent + geometry routing
+high-availability retrieval
+random recombination
+alien sampling without coherence
+alien sampling without availability
+```
+
+Metrics:
+
+```text
+route novelty
+outcome success rate
+route diversity
+analogical recall
+loop count
+compute cost
+```
+
+Deliverables:
+
+```text
+docs/ALIEN_SAMPLING.md
+scripts/icm/alien_scoring.py
+scripts/icm/alien_eval.py
+data/_scratch/icm/alien_routes.jsonl
+```
+
+The source paper and full experiment protocol are in `docs/ALIEN_SAMPLING.md`.
+
 ---
 
 ## 5. Training pipeline
